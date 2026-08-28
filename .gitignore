@@ -1,0 +1,17 @@
+# Local runtime data and credentials
+backend/*.db
+backend/*.db-*
+backend/waf-browser-profile/
+backend/server.*.log
+frontend/server.*.log
+
+# Reproducible dependencies and build output
+frontend/node_modules/
+frontend/dist/
+**/__pycache__/
+*.py[cod]
+
+# Local captures, archives, and verification output
+artifacts/
+*.zip
+grab_*.txt

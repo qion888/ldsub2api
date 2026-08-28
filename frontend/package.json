@@ -1,0 +1,17 @@
+{
+  "scripts": {
+    "dev": "vite --configLoader native",
+    "build": "vite build --configLoader native"
+  },
+  "type": "module",
+  "dependencies": {
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest"
+  }
+}
