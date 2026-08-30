@@ -170,15 +170,37 @@ ACCOUNT_PUBLIC_FIELDS = (
     "id", "name", "notes", "platform", "type", "proxy_id", "concurrency",
     "current_concurrency", "priority", "rate_multiplier", "status", "error_message",
     "schedulable", "expires_at", "created_at", "updated_at", "last_used_at",
-    "rate_limit_reset_at", "overload_until", "temp_unschedulable_until",
+    "rate_limited_at", "rate_limit_reset_at", "overload_until", "temp_unschedulable_until",
     "temp_unschedulable_reason", "quota_limit", "quota_used", "quota_daily_limit",
     "quota_daily_used", "quota_weekly_limit", "quota_weekly_used", "group_ids",
-    "five_hour", "seven_day", "usage_windows",
+    "quota_daily_reset_mode", "quota_daily_reset_at", "quota_weekly_reset_mode",
+    "quota_weekly_reset_at", "quota_reset_timezone", "session_window_start",
+    "session_window_end", "session_window_status", "window_cost_limit", "base_rpm",
+    "five_hour", "seven_day",
+)
+
+USAGE_WINDOW_FIELDS = (
+    "utilization", "resets_at", "remaining_seconds", "used_requests", "limit_requests",
+)
+USAGE_WINDOW_STAT_FIELDS = ("requests", "tokens", "cost", "standard_cost", "user_cost")
+USAGE_FIELDS = (
+    "source", "updated_at", "five_hour", "seven_day", "seven_day_sonnet",
+    "seven_day_fable", "thirty_day", "gemini_shared_daily", "gemini_pro_daily",
+    "gemini_flash_daily", "gemini_shared_minute", "gemini_pro_minute",
+    "gemini_flash_minute", "error_code", "error",
 )
 
 
 def _public_account(account: dict[str, Any]) -> dict[str, Any]:
     result = {key: account.get(key) for key in ACCOUNT_PUBLIC_FIELDS if key in account}
+    for key in ("five_hour", "seven_day"):
+        if key not in result:
+            continue
+        window = _public_usage_window(result[key])
+        if window is None:
+            result.pop(key)
+        else:
+            result[key] = window
     groups = account.get("groups")
     if isinstance(groups, list):
         result["groups"] = [
@@ -193,6 +215,37 @@ def _public_account(account: dict[str, Any]) -> dict[str, Any]:
             for key in ("id", "name", "protocol", "host", "port", "status")
             if key in proxy
         }
+    return result
+
+
+def _public_usage_window(window: Any) -> dict[str, Any] | None:
+    if not isinstance(window, dict):
+        return None
+    result = {key: window.get(key) for key in USAGE_WINDOW_FIELDS if key in window}
+    stats = window.get("window_stats")
+    if isinstance(stats, dict):
+        result["window_stats"] = {
+            key: stats.get(key)
+            for key in USAGE_WINDOW_STAT_FIELDS
+            if key in stats
+        }
+    return result
+
+
+def _public_usage(usage: Any) -> dict[str, Any]:
+    if not isinstance(usage, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in USAGE_FIELDS:
+        if key not in usage:
+            continue
+        if key in {"source", "updated_at", "error_code", "error"}:
+            value = usage.get(key)
+            result[key] = str(value)[:500] if value is not None else None
+            continue
+        window = _public_usage_window(usage.get(key))
+        if window is not None:
+            result[key] = window
     return result
 
 
@@ -263,7 +316,16 @@ def fetch_account_page(
             if isinstance(usage_value, dict):
                 raw_usage = usage_value.get("usage")
                 raw_errors = usage_value.get("errors")
-                usage = raw_usage if isinstance(raw_usage, dict) else {}
+                allowed_ids = {str(account_id) for account_id in account_ids}
+                usage = (
+                    {
+                        str(key): _public_usage(value)
+                        for key, value in raw_usage.items()
+                        if str(key) in allowed_ids and isinstance(value, dict)
+                    }
+                    if isinstance(raw_usage, dict)
+                    else {}
+                )
                 usage_errors = (
                     {str(key): str(value)[:300] for key, value in raw_errors.items()}
                     if isinstance(raw_errors, dict)

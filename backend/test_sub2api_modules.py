@@ -136,9 +136,26 @@ class Sub2ApiModuleTests(unittest.TestCase):
                 return 200, {"data": {"items": [{
                     "id": 4, "name": "A", "platform": "openai", "type": "oauth",
                     "credentials": {"access_token": "secret"}, "quota_limit": 10,
-                    "quota_used": 2, "groups": [{"id": 2, "name": "Codex"}],
+                    "quota_used": 2, "rate_limited_at": "2026-08-30T08:00:00Z",
+                    "quota_daily_reset_at": "2026-08-31T00:00:00Z",
+                    "five_hour": {"utilization": 10, "internal_state": "hidden"},
+                    "groups": [{"id": 2, "name": "Codex"}],
                 }], "total": 1}}, ""
-            return 200, {"data": {"usage": {"4": {"five_hour": {"used": 1, "limit": 5}}}}}, ""
+            return 200, {"data": {"usage": {"4": {
+                "source": "passive",
+                "five_hour": {
+                    "utilization": 42.5,
+                    "resets_at": "2026-08-30T12:00:00Z",
+                    "remaining_seconds": 1200,
+                    "window_stats": {
+                        "requests": 12, "tokens": 3456, "cost": 1.2,
+                        "standard_cost": 1.0, "user_cost": 1.5,
+                        "internal_trace": "hidden",
+                    },
+                    "internal_state": "hidden",
+                },
+                "credentials": {"access_token": "hidden"},
+            }}, "errors": {}}}, ""
 
         result = client.fetch_account_page(
             {"base_url": "https://sub2api.example", "admin_key": "secret"},
@@ -147,7 +164,31 @@ class Sub2ApiModuleTests(unittest.TestCase):
         )
         self.assertEqual(result["items"][0]["id"], 4)
         self.assertNotIn("credentials", result["items"][0])
-        self.assertEqual(result["usage"]["4"]["five_hour"]["limit"], 5)
+        self.assertEqual(result["items"][0]["rate_limited_at"], "2026-08-30T08:00:00Z")
+        self.assertEqual(result["items"][0]["quota_daily_reset_at"], "2026-08-31T00:00:00Z")
+        self.assertEqual(result["items"][0]["five_hour"], {"utilization": 10})
+        usage = result["usage"]["4"]
+        self.assertEqual(usage["five_hour"]["utilization"], 42.5)
+        self.assertEqual(usage["five_hour"]["window_stats"]["tokens"], 3456)
+        self.assertNotIn("internal_state", usage["five_hour"])
+        self.assertNotIn("internal_trace", usage["five_hour"]["window_stats"])
+        self.assertNotIn("credentials", usage)
+
+    def test_sse_account_test_uses_final_completion_event(self) -> None:
+        def request_json(method, endpoint, payload=None, **kwargs):
+            return 200, {}, "\n".join([
+                'data: {"type":"test_start"}',
+                'data: {"type":"content","text":"connected"}',
+                'data: {"type":"test_complete","success":false,"error":"rate limited"}',
+            ])
+
+        tested = client.test_account(
+            {"base_url": "https://sub2api.example", "admin_key": "secret"},
+            9,
+            request_json=request_json,
+        )
+        self.assertFalse(tested["ok"])
+        self.assertEqual(tested["message"], "rate limited")
 
     def test_sse_account_test_and_delete_use_admin_endpoints(self) -> None:
         seen = []

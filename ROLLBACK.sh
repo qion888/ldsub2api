@@ -17,4 +17,9 @@ $targetPath = if ([IO.Path]::IsPathRooted($target)) {
 $targetDir = Split-Path -Parent $targetPath
 New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 [IO.File]::WriteAllBytes($targetPath, [IO.File]::ReadAllBytes($baseline))
-Write-Output "Restored $targetPath from ROLLBACK_BASELINE"
+$expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $baseline).Hash
+$restoredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetPath).Hash
+if ($restoredHash -ne $expectedHash) {
+  throw "Rollback verification failed: expected $expectedHash, got $restoredHash"
+}
+Write-Output "Restored $targetPath from ROLLBACK_BASELINE; SHA256=$restoredHash"

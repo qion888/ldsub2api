@@ -2006,19 +2006,33 @@ function App() {
     try {
       const tested = await request(`/sub2api/accounts/${id}/test`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
       setSub2apiTestedAccounts(current => ({...current, [id]: {...tested, tested_at: new Date().toISOString()}}));
-      notify(tested.ok ? `${account.name || `璐﹀彿 ${id}`} 娴嬭瘯閫氳繃` : `${account.name || `璐﹀彿 ${id}`} 娴嬭瘯澶辫触`, tested.ok ? 'info' : 'error');
+      notify(tested.ok
+        ? `${account.name || `账号 ${id}`} 测试通过，状态已同步`
+        : `${account.name || `账号 ${id}`} 测试失败：${tested.message || 'Sub2API 未返回原因'}`,
+      tested.ok ? 'info' : 'error');
     } catch (error) {
       setSub2apiTestedAccounts(current => ({...current, [id]: {ok: false, message: error.message, tested_at: new Date().toISOString()}}));
       notify(error.message, 'error');
     } finally {
+      await loadSub2ApiAccounts({page: sub2apiAccounts.page, quiet: true});
       setSub2apiAccountActions(current => ({...current, [id]: null}));
+    }
+  };
+
+  const copySub2ApiAccountName = async account => {
+    const name = String(account?.name || `账号 ${account?.id || ''}`).trim();
+    try {
+      await navigator.clipboard.writeText(name);
+      notify(`已复制账号名称：${name}`);
+    } catch (error) {
+      notify('无法访问剪贴板，请检查浏览器权限', 'error');
     }
   };
 
   const deleteSub2ApiAccount = async account => {
     const id = Number(account?.id);
     if (!Number.isInteger(id) || id < 1) return;
-    if (!window.confirm(`纭畾鍒犻櫎璐﹀彿鈥?{account.name || id}鈥濓紵`)) return;
+    if (!window.confirm(`确定删除账号“${account.name || id}”？`)) return;
     setSub2apiAccountActions(current => ({...current, [id]: 'delete'}));
     try {
       await request(`/sub2api/accounts/${id}`, {method: 'DELETE'});
@@ -2481,7 +2495,7 @@ function App() {
             onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}
             accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters}
             accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts}
-            onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount}
+            onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount} onCopyAccountName={copySub2ApiAccountName}
           />
         )}
       </main>
@@ -2534,45 +2548,166 @@ function ReclaimView({config, setConfig, cardCodes, setCardCodes, result, busy, 
   );
 }
 
-function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, actions, tested, onRefresh, onTest, onDelete, onPage}) {
+function formatSub2ApiNumber(value, maximumFractionDigits = 2) {
+  if (value === null || value === undefined || value === '') return '--';
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number.toLocaleString('zh-CN', {maximumFractionDigits})
+    : String(value);
+}
+
+function formatSub2ApiCompactNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '--';
+  return new Intl.NumberFormat('zh-CN', {notation: 'compact', maximumFractionDigits: 1}).format(number);
+}
+
+function formatSub2ApiDateTime(value) {
+  if (!value) return '未记录';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '时间未知';
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date);
+}
+
+function sub2ApiFutureTime(value, now = Date.now()) {
+  if (!value) return false;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) && timestamp > now;
+}
+
+function sub2ApiQuotaExceeded(account) {
+  const quotas = [
+    ['总额度', account.quota_used, account.quota_limit],
+    ['日额度', account.quota_daily_used, account.quota_daily_limit],
+    ['周额度', account.quota_weekly_used, account.quota_weekly_limit],
+  ];
+  return quotas.find(([, used, limit]) => Number(limit) > 0 && Number(used) >= Number(limit));
+}
+
+function sub2ApiAccountState(account) {
+  if (sub2ApiFutureTime(account.rate_limit_reset_at)) {
+    return {key: 'limited', label: '限流中', tone: 'warning', detail: `429 · ${formatSub2ApiDateTime(account.rate_limit_reset_at)} 恢复`};
+  }
+  if (sub2ApiFutureTime(account.overload_until)) {
+    return {key: 'overloaded', label: '上游过载', tone: 'danger', detail: `529 · ${formatSub2ApiDateTime(account.overload_until)} 后重试`};
+  }
+  if (sub2ApiFutureTime(account.temp_unschedulable_until)) {
+    const reason = account.temp_unschedulable_reason ? `${String(account.temp_unschedulable_reason).slice(0, 80)} · ` : '';
+    return {key: 'temporary', label: '暂不可用', tone: 'warning', detail: `${reason}${formatSub2ApiDateTime(account.temp_unschedulable_until)} 恢复`};
+  }
+  if (account.status === 'error' || account.error_message) {
+    return {key: 'error', label: '异常', tone: 'danger', detail: String(account.error_message || 'Sub2API 标记账号异常').slice(0, 120)};
+  }
+  const exceeded = sub2ApiQuotaExceeded(account);
+  if (exceeded) {
+    return {key: 'quota', label: '额度耗尽', tone: 'warning', detail: `${exceeded[0]}已达到上限`};
+  }
+  if (account.schedulable === false) {
+    return {key: 'paused', label: '暂停调度', tone: 'muted', detail: 'Sub2API 当前不会为该账号分配请求'};
+  }
+  if (account.status === 'active') {
+    return {key: 'active', label: '正常', tone: 'success', detail: '状态正常，可参与调度'};
+  }
+  if (account.status === 'inactive') {
+    return {key: 'inactive', label: '已停用', tone: 'muted', detail: '账号已在 Sub2API 停用'};
+  }
+  return {key: 'unknown', label: account.status || '未知', tone: 'muted', detail: '等待 Sub2API 返回明确状态'};
+}
+
+function Sub2ApiProgress({label, utilization, used, limit, resetsAt, stats, testId}) {
+  const numericUsed = Number(used);
+  const numericLimit = Number(limit);
+  const numericUtilization = Number(utilization);
+  const ratio = Number.isFinite(numericLimit) && numericLimit > 0 && Number.isFinite(numericUsed)
+    ? (numericUsed / numericLimit) * 100
+    : null;
+  const rawPercent = Number.isFinite(numericUtilization) ? numericUtilization : ratio;
+  const hasPercent = Number.isFinite(rawPercent);
+  const displayPercent = hasPercent ? Math.max(0, rawPercent) : 0;
+  const meterPercent = Math.min(displayPercent, 100);
+  const tone = displayPercent >= 100 ? 'danger' : displayPercent >= 80 ? 'warning' : 'normal';
+  const exactValue = Number.isFinite(numericLimit) && numericLimit > 0
+    ? `${formatSub2ApiNumber(numericUsed || 0)} / ${formatSub2ApiNumber(numericLimit)}`
+    : hasPercent ? `${formatSub2ApiNumber(displayPercent, 1)}%` : '未设置';
+  const statsParts = [];
+  if (stats && typeof stats === 'object') {
+    if (Number(stats.requests) > 0) statsParts.push(`${formatSub2ApiCompactNumber(stats.requests)} 次请求`);
+    if (Number(stats.tokens) > 0) statsParts.push(`${formatSub2ApiCompactNumber(stats.tokens)} Token`);
+  }
+  const costParts = [];
+  if (stats && typeof stats === 'object') {
+    if (stats.cost !== null && stats.cost !== undefined && Number.isFinite(Number(stats.cost))) costParts.push(`账号 $${Number(stats.cost).toFixed(2)}`);
+    if (stats.standard_cost !== null && stats.standard_cost !== undefined && Number.isFinite(Number(stats.standard_cost))) costParts.push(`标准 $${Number(stats.standard_cost).toFixed(2)}`);
+    if (stats.user_cost !== null && stats.user_cost !== undefined && Number.isFinite(Number(stats.user_cost))) costParts.push(`用户 $${Number(stats.user_cost).toFixed(2)}`);
+  }
+  return <div className={`account-progress ${tone}`} data-testid={testId}>
+    <div className="account-progress-head"><span>{label}</span><strong>{exactValue}</strong></div>
+    <div className="account-progress-track" role="progressbar" aria-label={`${label}使用率`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(meterPercent)} aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '未设置'}><span style={{width: `${meterPercent}%`}}/></div>
+    <div className="account-progress-meta"><span>{hasPercent ? `${displayPercent.toFixed(1)}%` : '--'}</span><small>{resetsAt ? `${compactTime(resetsAt)} 重置` : '无重置时间'}</small></div>
+    {statsParts.length > 0 && <small className="account-usage-stats">{statsParts.join(' · ')}</small>}
+    {costParts.length > 0 && <Tooltip label="账号费用含账号倍率；标准费用不含倍率；用户费用按 API Key 与分组倍率结算"><small className="account-usage-costs">{costParts.join(' · ')}</small></Tooltip>}
+  </div>;
+}
+
+function Sub2ApiQuotaStack({account}) {
+  return <div className="account-progress-stack">
+    <Sub2ApiProgress label="总额度" used={account.quota_used} limit={account.quota_limit} testId={`quota-total-${account.id}`}/>
+    <Sub2ApiProgress label="日额度" used={account.quota_daily_used} limit={account.quota_daily_limit} resetsAt={account.quota_daily_reset_at} testId={`quota-daily-${account.id}`}/>
+    <Sub2ApiProgress label="周额度" used={account.quota_weekly_used} limit={account.quota_weekly_limit} resetsAt={account.quota_weekly_reset_at} testId={`quota-weekly-${account.id}`}/>
+  </div>;
+}
+
+function Sub2ApiUsageStack({account, usage, usageError}) {
+  const accountUsage = usage[String(account.id)] || usage[account.id] || {};
+  const windowFor = key => accountUsage?.[key] || account?.[key] || {};
+  const fiveHour = windowFor('five_hour');
+  const sevenDay = windowFor('seven_day');
+  return <div className="account-progress-stack upstream">
+    <Sub2ApiProgress label="5 小时" utilization={fiveHour.utilization ?? fiveHour.used_percent} used={fiveHour.used_requests ?? fiveHour.used} limit={fiveHour.limit_requests ?? fiveHour.limit} resetsAt={fiveHour.resets_at ?? fiveHour.reset_at} stats={fiveHour.window_stats} testId={`usage-5h-${account.id}`}/>
+    <Sub2ApiProgress label="7 天" utilization={sevenDay.utilization ?? sevenDay.used_percent} used={sevenDay.used_requests ?? sevenDay.used} limit={sevenDay.limit_requests ?? sevenDay.limit} resetsAt={sevenDay.resets_at ?? sevenDay.reset_at} stats={sevenDay.window_stats} testId={`usage-7d-${account.id}`}/>
+    {usageError && <small className="account-usage-error"><AlertCircle size={12}/>{usageError}</small>}
+  </div>;
+}
+
+function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, actions, tested, onRefresh, onTest, onDelete, onCopyName, onPage}) {
   const items = Array.isArray(data?.items) ? data.items : [];
   const usage = data?.usage && typeof data.usage === 'object' ? data.usage : {};
-  const formatQuota = value => {
-    if (value === null || value === undefined || value === '') return '--';
-    const number = Number(value);
-    return Number.isFinite(number) ? number.toLocaleString('zh-CN', {maximumFractionDigits: 2}) : String(value);
-  };
-  const formatWindow = (account, key) => {
-    const accountUsage = usage[String(account.id)] || usage[account.id] || {};
-    const window = accountUsage?.[key] || account?.[key];
-    if (!window || typeof window !== 'object') return '--';
-    const used = window.used ?? window.usage ?? window.current;
-    const limit = window.limit ?? window.max;
-    const percent = window.used_percent ?? window.utilization;
-    if (percent !== undefined && percent !== null && percent !== '') {
-      const numeric = Number(percent);
-      return `${Number.isFinite(numeric) ? numeric.toFixed(1) : percent}%${window.reset_at || window.resets_at ? ` · ${compactTime(window.reset_at || window.resets_at)}` : ''}`;
-    }
-    if (used === undefined && limit === undefined) return '--';
-    return `${formatQuota(used)} / ${formatQuota(limit)}`;
-  };
-  const statusLabel = account => account.status === 'error' || account.error_message ? '异常' : account.status === 'active' ? '正常' : (account.status || '未知');
+  const usageErrors = data?.usage_errors && typeof data.usage_errors === 'object' ? data.usage_errors : {};
   return (
     <section className="account-management-panel">
       <div className="account-management-head">
-        <div><span className="detail-kicker">SUB2API ACCOUNTS</span><h3>账号列表</h3><p>状态、额度、使用窗口和连接测试</p></div>
+        <div><span className="detail-kicker">SUB2API ACCOUNTS</span><h3>账号列表</h3><p>账号费用、上游窗口与实时调度状态</p></div>
         <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
       </div>
       <div className="account-table-wrap">
-        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 类型</th><th>状态</th><th>额度总量</th><th>日额度</th><th>周额度</th><th>5 小时窗口</th><th>7 天窗口</th><th>代理 / 分组</th><th>操作</th></tr></thead><tbody>
+        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 计费</th><th>实时状态</th><th>本地计费额度</th><th>上游使用窗口</th><th>代理 / 分组</th><th>操作</th></tr></thead><tbody>
           {items.length ? items.map(account => {
             const id = Number(account.id);
             const test = tested[id];
+            const state = sub2ApiAccountState(account);
             const accountGroups = Array.isArray(account.groups) ? account.groups.map(group => group.name).filter(Boolean).join('、') : '';
             const accountProxy = account.proxy?.name || (account.proxy_id ? `代理 #${account.proxy_id}` : '无代理');
-            const error = account.error_message || account.temp_unschedulable_reason;
-            return <tr key={account.id}><td><strong>{account.name || `账号 ${account.id}`}</strong><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td><td><span>{account.platform || '--'}</span><small>{account.type || '--'}</small></td><td><span className={`account-status ${statusLabel(account) === '正常' ? 'ok' : 'bad'}`}>{statusLabel(account)}</span><small>{account.schedulable === false ? '不可调度' : '可调度'}{error ? ` · ${String(error).slice(0, 48)}` : ''}</small></td><td><strong>{formatQuota(account.quota_used)} / {formatQuota(account.quota_limit)}</strong></td><td>{formatQuota(account.quota_daily_used)} / {formatQuota(account.quota_daily_limit)}</td><td>{formatQuota(account.quota_weekly_used)} / {formatQuota(account.quota_weekly_limit)}</td><td>{formatWindow(account, 'five_hour')}</td><td>{formatWindow(account, 'seven_day')}</td><td><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td><td><div className="account-row-actions"><IconButton label={test ? (test.ok ? '已测试' : '重新测试') : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `已测试 ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td></tr>;
-          }) : <tr><td colSpan="10"><div className="account-table-empty"><Database size={20}/><span>{busy ? '正在加载账号列表' : error || '暂无匹配账号'}</span></div></td></tr>}
+            const multiplier = Number(account.rate_multiplier ?? 1);
+            const concurrency = `${formatSub2ApiNumber(account.current_concurrency ?? 0, 0)} / ${formatSub2ApiNumber(account.concurrency ?? 0, 0)}`;
+            const usageError = usageErrors[String(account.id)] || usageErrors[account.id] || usageErrors._;
+            const accountName = account.name || `账号 ${account.id}`;
+            return <tr key={account.id} data-account-state={state.key}>
+              <td><div className="account-name-line"><strong title={accountName}>{accountName}</strong><IconButton label={`复制账号名称：${accountName}`} onClick={() => onCopyName(account)}><Clipboard size={13}/></IconButton></div><small>#{account.id} · 创建于 {formatSub2ApiDateTime(account.created_at)}</small><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td>
+              <td><strong>{account.platform || '--'}</strong><small>{account.type || '--'}</small><Tooltip label="账号费用 = 标准费用 × 账号倍率"><span className="account-billing-rate">{Number.isFinite(multiplier) && multiplier === 0 ? '免费计费' : `账号倍率 ×${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '--'}`}</span></Tooltip><small>并发 {concurrency}</small></td>
+              <td><span className={`account-status ${state.tone}`}>{state.label}</span><small className="account-status-detail" title={state.detail}>{state.detail}</small></td>
+              <td><Sub2ApiQuotaStack account={account}/></td>
+              <td><Sub2ApiUsageStack account={account} usage={usage} usageError={usageError}/></td>
+              <td><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td>
+              <td><div className="account-row-actions"><IconButton label={test ? '重新测试账号' : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `测试通过 · ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td>
+            </tr>;
+          }) : <tr><td colSpan="7"><div className="account-table-empty"><Database size={20}/><span>{busy ? '正在加载账号列表' : error || '暂无匹配账号'}</span></div></td></tr>}
         </tbody></table>
       </div>
       <div className="account-pagination"><span>共 {data?.total ?? 0} 个账号 · 第 {data?.page || 1} / {data?.pages || 1} 页</span><div><IconButton label="上一页" onClick={() => onPage(Math.max(1, (data?.page || 1) - 1))} disabled={busy || (data?.page || 1) <= 1}><ChevronLeft size={16}/></IconButton><IconButton label="下一页" onClick={() => onPage(Math.min(data?.pages || 1, (data?.page || 1) + 1))} disabled={busy || (data?.page || 1) >= (data?.pages || 1)}><ChevronRight size={16}/></IconButton></div></div>
@@ -2636,7 +2771,7 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
   );
 }
 
-function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount}) {
+function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -2778,6 +2913,7 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, se
           onRefresh={onLoadAccounts}
           onTest={onTestAccount}
           onDelete={onDeleteAccount}
+          onCopyName={onCopyAccountName}
           onPage={page => onLoadAccounts({page})}
         />
       </div>

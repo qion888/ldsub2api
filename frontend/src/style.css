@@ -2218,28 +2218,53 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .account-search { width: min(240px, 30vw); height: 36px; margin: 0 !important; padding: 0 10px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
 .account-search input { width: 100%; height: 32px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
 .account-search input:focus { outline: none; box-shadow: none; }
-.account-table-wrap { overflow-x: auto; border-block: 1px solid var(--ui-border); }
-.account-table { width: 100%; min-width: 1180px; border-collapse: collapse; table-layout: fixed; }
-.account-table th, .account-table td { padding: 11px 12px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: middle; text-align: left; }
+.account-table-wrap { overflow-x: auto; border-block: 1px solid var(--ui-border); scrollbar-gutter: stable; }
+.account-table { width: 100%; min-width: 1420px; border-collapse: collapse; table-layout: fixed; }
+.account-table th, .account-table td { padding: 13px 12px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: top; text-align: left; }
 .account-table th:last-child, .account-table td:last-child { border-right: 0; }
 .account-table th { color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 10px; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
 .account-table td { color: var(--ui-text); font-size: 12px; }
+.account-table tbody tr { transition: background-color .15s ease; }
+.account-table tbody tr:hover { background: color-mix(in srgb, var(--ui-surface-muted) 72%, transparent); }
 .account-table td > strong, .account-table td > span, .account-table td > small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-table td > strong { font-size: 12px; font-weight: 700; }
 .account-table td > small { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; line-height: 1.35; }
-.account-table th:nth-child(1) { width: 190px; }
-.account-table th:nth-child(2) { width: 115px; }
-.account-table th:nth-child(3) { width: 170px; }
-.account-table th:nth-child(4), .account-table th:nth-child(5), .account-table th:nth-child(6) { width: 105px; }
-.account-table th:nth-child(7), .account-table th:nth-child(8) { width: 112px; }
-.account-table th:nth-child(9) { width: 120px; }
-.account-table th:nth-child(10) { width: 150px; }
-.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; font-size: 10px !important; font-weight: 700; }
-.account-status.ok { color: var(--ui-success); }
-.account-status.bad { color: var(--ui-danger); }
+.account-table th:nth-child(1) { width: 235px; }
+.account-table th:nth-child(2) { width: 155px; }
+.account-table th:nth-child(3) { width: 190px; }
+.account-table th:nth-child(4) { width: 275px; }
+.account-table th:nth-child(5) { width: 300px; }
+.account-table th:nth-child(6) { width: 160px; }
+.account-table th:nth-child(7) { width: 145px; }
+.account-name-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.account-name-line > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.account-name-line .icon-button { width: 27px; height: 27px; flex: 0 0 27px; }
+.account-billing-rate { width: fit-content; max-width: 100%; margin-top: 8px; padding: 3px 6px; display: inline-flex !important; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 10px; font-weight: 700; }
+.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; border-radius: 3px; font-size: 10px !important; font-weight: 700; }
+.account-status.success { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 8%, transparent); }
+.account-status.warning { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, transparent); }
+.account-status.danger { color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); }
+.account-status.muted { color: var(--ui-text-muted); background: var(--ui-surface-muted); }
+.account-status-detail { max-width: 165px; margin-top: 7px !important; white-space: normal !important; line-height: 1.45 !important; }
+.account-progress-stack { display: grid; gap: 9px; }
+.account-progress { min-width: 0; }
+.account-progress-head { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.account-progress-head span { color: var(--ui-text-muted); font-size: 9px; font-weight: 700; }
+.account-progress-head strong { color: var(--ui-text); font-size: 10px; font-weight: 700; }
+.account-progress-track { width: 100%; height: 5px; margin-top: 5px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 70%, var(--ui-surface)); border-radius: 2px; }
+.account-progress-track > span { display: block; height: 100%; background: var(--ui-success); border-radius: inherit; transition: width .25s ease; }
+.account-progress.warning .account-progress-track > span { background: var(--ui-warning); }
+.account-progress.danger .account-progress-track > span { background: var(--ui-danger); }
+.account-progress-meta { margin-top: 4px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ui-text-faint); }
+.account-progress-meta > span { color: var(--ui-text-muted); font-size: 9px; font-weight: 700; }
+.account-progress-meta > small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
+.account-usage-stats, .account-usage-costs { margin-top: 4px; display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ui-text-muted); font-size: 9px; line-height: 1.35; }
+.account-usage-costs { color: var(--ui-text); }
+.account-usage-error { padding: 5px 6px; display: flex; align-items: flex-start; gap: 5px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-left: 2px solid var(--ui-danger); font-size: 9px; line-height: 1.4; }
+.account-usage-error svg { flex: 0 0 auto; margin-top: 1px; }
 .account-row-actions { display: flex; align-items: center; gap: 5px; }
 .account-row-actions .icon-button { width: 32px; height: 32px; }
-.account-test-result { max-width: 145px; }
+.account-test-result { max-width: 125px; white-space: normal !important; }
 .account-test-result.ok { color: var(--ui-success) !important; }
 .account-test-result.bad { color: var(--ui-danger) !important; }
 .account-table-empty { min-height: 110px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
@@ -2252,7 +2277,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .account-management-actions { justify-content: stretch; flex-wrap: wrap; }
   .account-search { width: min(100%, 320px); flex: 1 1 220px; }
   .account-management-actions select { flex: 1 1 120px; }
-  .account-table { min-width: 1080px; }
+  .account-table { min-width: 1420px; }
   .account-pagination { align-items: flex-start; flex-direction: column; }
   .account-pagination > div { align-self: flex-end; }
 }

@@ -1,64 +1,109 @@
-Branch: codex/sub2api-account-route-fix
-Changed field: backend/main.py sub2api_accounts health capability; start.ps1 Wait-LdxpBackend readiness gate and Vite executable dependency check
+Branch: codex/sub2api-account-billing-ui, rebased onto main ec4de71e9b2f52290e89d4982ae9bc9415c52e5f
+Changed field: frontend/src/main.jsx Sub2API account status priority, billing/quota progress, test-state refresh, readable test messages, creation time, and account-name copy; frontend/src/style.css coordinated responsive account table; backend/sub2api/client.py public account/usage normalization.
 
 Artifacts:
-- E:\soft\java\ldxp\MODIFIED_FILE
-- E:\soft\java\ldxp\DIFF_FILE
-- E:\soft\java\ldxp\VERIFICATION.txt
-- E:\soft\java\ldxp\ROLLBACK.sh
+- E:\soft\java\ldxp-sub2api-account-billing-ui\MODIFIED_FILE
+- E:\soft\java\ldxp-sub2api-account-billing-ui\DIFF_FILE
+- E:\soft\java\ldxp-sub2api-account-billing-ui\VERIFICATION.txt
+- E:\soft\java\ldxp-sub2api-account-billing-ui\ROLLBACK.sh
+
+SOURCE HASHES
+Original input: git blob HEAD:frontend/src/main.jsx at da0d51f7c18d46e2116fd9378e9a2b05a1c136e7
+Original git blob: f5a009636358d237031b1c30e73fa66d109ca492
+ROLLBACK_BASELINE SHA256: D02C1EAA1F5720A90FA6021AB8215DDA036ECFF4A5AF5104BD826C9DCB1FBA67
+MODIFIED_FILE git blob: 5f591ae5cd531ebed3d2deadb4722976e171749b
+MODIFIED_FILE SHA256: 6AFADE81CE266BDF78A071D5E3F4F05BC9A6EFEC40DD9388A0F622B6F0BA5B64
 
 BASELINE
 Command: python -m unittest discover -s backend -q
-Input: E:\soft\java\ldxp-sub2api-account-route-fix at 5c8e4ff before account-route changes
+Input: E:\soft\java\ldxp-sub2api-account-billing-ui\.runtime\baseline-repo extracted from da0d51f7c18d46e2116fd9378e9a2b05a1c136e7
 Literal output:
 ----------------------------------------------------------------------
-Ran 69 tests in 1.920s
+Ran 71 tests in 2.804s
 
 OK
 Result: exit 0
 
-MODIFIED
+MODIFIED BACKEND
 Command: python -m unittest discover -s backend -q
-Input: E:\soft\java\ldxp-sub2api-account-route-fix after account-route changes
+Input: E:\soft\java\ldxp-sub2api-account-billing-ui with the Sub2API account billing/status changes
 Literal output:
 ----------------------------------------------------------------------
-Ran 71 tests in 1.586s
+Ran 72 tests in 1.566s
 
 OK
 Result: exit 0
 
 MODIFIED FRONTEND
 Command: npm run build
-Input: E:\soft\java\ldxp-sub2api-account-route-fix\frontend
-Literal output: vite v8.2.2; 2378 modules transformed; built in 6.99s
+Input: E:\soft\java\ldxp-sub2api-account-billing-ui\frontend
+Literal output:
+> build
+> vite build --configLoader native
+vite v8.2.2 building client environment for production...
+transforming...
+2378 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                              0.16 kB | gzip:   0.14 kB
+dist/assets/index-BT4H3Lrv.css             158.61 kB | gzip:  27.10 kB
+dist/assets/index-b0-6sfS8.js              357.56 kB | gzip: 104.08 kB
+dist/assets/PriceHistoryChart-Bib5swCZ.js  417.72 kB | gzip: 118.45 kB
+built in 342ms
 Result: exit 0
 
-MODIFIED HTTP
-Command: Python urllib requests to GET /api/health, PUT /api/sub2api/config, GET /api/sub2api/accounts?page=1&page_size=2
-Input: temporary backend at http://127.0.0.1:8100 using acceptance-account-route.db and the locally stored Sub2API configuration
-Literal output:
-health_status=200
-sub2api_accounts_capability= True
-config_saved= True
-account_status= 200
-account_items= 2
-account_total= 8
-account_page= 1
-credentials_exposed= False
+MODIFIED BROWSER
+Command: mcp__node_repl__js(title="复验账号状态与响应式布局", timeout_ms=120000, code=<inline Playwright route-mock acceptance>)
+Input: http://127.0.0.1:5190/ at 1600x1000 and 390x844; mocked active, future-429, error, and quota-exhausted accounts; mocked 20/100 total quota and 32.5% five-hour usage; successful account-test response followed by an authoritative account-list refresh.
+Literal output/result:
+{
+  "states": [
+    {"state":"active","label":"正常"},
+    {"state":"limited","label":"限流中"},
+    {"state":"error","label":"异常"},
+    {"state":"quota","label":"额度耗尽"}
+  ],
+  "createdVisible": true,
+  "aria": {"total":"20","fiveHour":"33","width":"32.5%"},
+  "copied": "Codex 主账号",
+  "refreshedAfterTest": true,
+  "testRequests": 1,
+  "desktopNoBodyOverflow": true,
+  "desktopTableScrolls": true,
+  "mobileNoBodyOverflow": true,
+  "mobileTableScrolls": true,
+  "errors": []
+}
+Result: exit 0
+Screenshots:
+- E:\soft\java\ldxp-sub2api-account-billing-ui\artifacts\sub2api-account-ui\desktop.png
+- E:\soft\java\ldxp-sub2api-account-billing-ui\artifacts\sub2api-account-ui\mobile.png
+
+POST-REBASE ACCEPTANCE
+Command: python -m unittest discover -s backend -q
+Input: E:\soft\java\ldxp-sub2api-account-billing-ui after rebase onto ec4de71
+Literal output: Ran 72 tests in 1.609s; OK
+Result: exit 0
+Command: npm test
+Input: E:\soft\java\ldxp-sub2api-account-billing-ui\frontend after rebase onto ec4de71
+Literal output: tests 2; pass 2; fail 0; duration_ms 80.7159
+Result: exit 0
+Command: npm run build
+Input: E:\soft\java\ldxp-sub2api-account-billing-ui\frontend after rebase onto ec4de71
+Literal output: vite v8.2.2; 2379 modules transformed; index-BRxridcP.css 160.86 kB; index-DMMZGJRz.js 358.82 kB; built in 367ms
+Result: exit 0
+Command: mcp__node_repl__js(title="验收重放后的组合版本", timeout_ms=120000, code=<inline Playwright route-mock acceptance>)
+Input: rebased UI with active, future-429, error, and quota-exhausted accounts
+Literal output/result: states=["active:正常","limited:限流中","error:异常","quota:额度耗尽"]; createdVisible=true; quotaAria="20"; usageWidth="32.5%"; refreshedAfterTest=true; errors=[]; noBodyOverflow=true
 Result: exit 0
 
 ROLLBACK
-Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-account-route
-Input: MODIFIED_FILE copied to rollback-test-account-route
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script .runtime\rollback-account-ui\main.jsx
+Input: MODIFIED_FILE copied to E:\soft\java\ldxp-sub2api-account-billing-ui\.runtime\rollback-account-ui\main.jsx
 Literal output:
-Restored E:\soft\java\ldxp-sub2api-account-route-fix\rollback-test-account-route from ROLLBACK_BASELINE
+Restored E:\soft\java\ldxp-sub2api-account-billing-ui\.runtime\rollback-account-ui\main.jsx from ROLLBACK_BASELINE; SHA256=D02C1EAA1F5720A90FA6021AB8215DDA036ECFF4A5AF5104BD826C9DCB1FBA67
 Result: exit 0
-Restored hash: 03690E6B992EA0EDF5E2AD613BAA79D67CBC23169E9B567A0D1B60A46FFCF3F5
-Baseline hash: 03690E6B992EA0EDF5E2AD613BAA79D67CBC23169E9B567A0D1B60A46FFCF3F5
-Modified artifact hash left changed: 1E915B5F29B51C98B42A5FEE2904B9F9DD0447CDA6518CCF0DAF892FB1D09A03
-Restored behavior/status: rollback-test-account-route matches the original start.ps1 byte-for-byte and no longer requires the Sub2API account-list health capability; MODIFIED_FILE retains the readiness gate.
-
-Upstream contract reference:
-- GET /api/v1/admin/accounts returned HTTP 200 from the configured Sub2API service.
-- Response data contained items, total, page, page_size, and pages.
-- The configured service returned 8 accounts during acceptance.
+Restored hash: D02C1EAA1F5720A90FA6021AB8215DDA036ECFF4A5AF5104BD826C9DCB1FBA67
+Baseline hash: D02C1EAA1F5720A90FA6021AB8215DDA036ECFF4A5AF5104BD826C9DCB1FBA67
+Modified artifact hash left changed: 6AFADE81CE266BDF78A071D5E3F4F05BC9A6EFEC40DD9388A0F622B6F0BA5B64
+Restored behavior/status: rollback-account-ui/main.jsx matches the original Git blob byte-for-byte and therefore returns to the original raw quota cells, active/error-only status display, garbled test notification, and no post-test account refresh. The working frontend/src/main.jsx and MODIFIED_FILE retain the new priority status, billing progress, readable notification, creation time, copy action, and synchronized refresh behavior.
