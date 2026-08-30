@@ -15,6 +15,7 @@ import {
   Clipboard,
   Clock3,
   Database,
+  Download,
   Eye,
   EyeOff,
   FileUp,
@@ -33,6 +34,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  Send,
   SlidersHorizontal,
   Settings2,
   KeyRound,
@@ -912,6 +914,10 @@ function App() {
   const [sub2apiReclaimBusy, setSub2apiReclaimBusy] = useState(false);
   const [sub2apiReclaimResult, setSub2apiReclaimResult] = useState(null);
   const [sub2apiReclaimOrderNos, setSub2apiReclaimOrderNos] = useState([]);
+  const [sub2apiCardCodes, setSub2apiCardCodes] = useState('');
+  const [sub2apiCardMode, setSub2apiCardMode] = useState('manual');
+  const [sub2apiCardBusy, setSub2apiCardBusy] = useState(false);
+  const [sub2apiCardFlow, setSub2apiCardFlow] = useState({stage: 'idle'});
   const [sub2apiAccounts, setSub2apiAccounts] = useState({items: [], total: 0, page: 1, page_size: 12, pages: 1, usage: {}, usage_errors: {}});
   const [sub2apiAccountFilters, setSub2apiAccountFilters] = useState({search: '', status: '', platform: ''});
   const [sub2apiAccountBusy, setSub2apiAccountBusy] = useState(false);
@@ -1842,8 +1848,8 @@ function App() {
     setSub2apiPayload(merged);
     setSub2apiFileName(filename);
     setSub2apiResult(null);
-    setSub2apiReclaimOrderNos([]);
-    setSub2apiReclaimOrderNos([...new Set(usable.map(item => item?.task?.order_no).filter(Boolean).map(String))].slice(0, 100));
+    const orderNos = [...new Set(usable.map(item => item?.task?.order_no).filter(Boolean).map(String))].slice(0, 100);
+    setSub2apiReclaimOrderNos(orderNos);
     if (download) {
       const original = usable.length === 1 && usable[0].content_base64
         ? Uint8Array.from(window.atob(usable[0].content_base64), value => value.charCodeAt(0))
@@ -1857,7 +1863,7 @@ function App() {
       link.remove();
       window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
     }
-    return {accounts: merged.accounts.length, files: usable.length, filename};
+    return {accounts: merged.accounts.length, files: usable.length, filename, payload: merged, orderNos};
   };
 
   const downloadReclaimed = async task => {
@@ -2138,9 +2144,12 @@ function App() {
     }
   };
 
-  const importSub2Api = async payloadOverride => {
+  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos} = {}) => {
     const payload = payloadOverride || sub2apiPayload || reclaimPayload;
-    if (!payload) return notify('请先选择账号 JSON 文件或下载找回结果', 'error');
+    if (!payload) {
+      notify('请先选择账号 JSON 文件或下载找回结果', 'error');
+      return null;
+    }
     setSub2apiBusy(true);
     try {
       const assignExisting = sub2apiProxyChoice !== 'json' || sub2apiGroupIds.length > 0;
@@ -2150,7 +2159,7 @@ function App() {
         body: JSON.stringify({
           data: payload,
           assign_existing: assignExisting,
-          reclaim_order_nos: sub2apiReclaimOrderNos,
+          reclaim_order_nos: reclaimOrderNos,
           proxy_id: proxyId,
           group_ids: sub2apiGroupIds,
           codex_fingerprint_mode: sub2apiCodexFingerprintMode,
@@ -2165,19 +2174,117 @@ function App() {
         setSub2apiFileName('');
         setSub2apiReclaimOrderNos([]);
         await Promise.all([loadSub2ApiAccounts({page: 1, quiet: true}), loadSub2ApiOptions({quiet: true})]);
-        return;
+        return result;
       }
       if (verification) {
         notify(`导入请求已返回，但仅确认 ${verification.matched}/${verification.expected} 个新账号，请检查账号列表`, 'error');
         await loadSub2ApiAccounts({page: sub2apiAccounts.page, quiet: true});
-        return;
+        return result;
       }
       notify('Sub2API 导入请求已完成，请刷新账号列表确认结果', 'error');
+      return result;
     } catch (error) {
       notify(error.message, 'error');
+      return null;
     } finally {
       setSub2apiBusy(false);
     }
+  };
+
+  const normalizedSub2ApiCardCodes = () => [...new Set(sub2apiCardCodes.split(/[\s,，]+/).map(value => value.trim()).filter(Boolean))];
+
+  const runSub2ApiCardImport = async () => {
+    const codes = normalizedSub2ApiCardCodes();
+    if (!codes.length) return notify('请先输入卡密，每行一个', 'error');
+    if (codes.length > 100) return notify('一次最多处理 100 个卡密', 'error');
+    if (sub2apiCardMode === 'auto' && !sub2apiConfig.admin_key_set) return notify('自动推送前请先保存 Sub2API 管理员密钥', 'error');
+
+    setSub2apiCardBusy(true);
+    setSub2apiCardFlow({stage: 'verify', cardCount: codes.length, startedAt: new Date().toISOString()});
+    try {
+      const savedRedeem = await request('/redeem/config', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(redeemConfig),
+      });
+      setRedeemConfig(savedRedeem);
+      const health = await request('/redeem/health-check', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({card_codes: codes}),
+      });
+      setSub2apiCardFlow(current => ({...current, stage: 'reclaim', health}));
+
+      const submitted = await request('/redeem/reclaim', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({card_codes: codes, mode: 'all'}),
+      });
+      const downloads = new Map();
+      const rememberDownloads = values => (values || []).forEach(item => {
+        const orderNo = item?.task?.order_no || item?.filename;
+        if (orderNo && item?.data) downloads.set(String(orderNo), item);
+      });
+      let progressResult = submitted;
+      let activeTasks = Number(submitted.queued || 0) + Number(submitted.already_running || 0);
+      let attempts = 0;
+      do {
+        const progress = await request('/sub2api/reclaim-progress', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({card_codes: codes}),
+        });
+        rememberDownloads(progress.downloaded_payloads);
+        progressResult = progress.result || {};
+        activeTasks = Number(progressResult.queued || 0) + Number(progressResult.already_running || 0);
+        attempts += 1;
+        setSub2apiCardFlow(current => ({
+          ...current,
+          stage: activeTasks ? 'download' : 'stage',
+          health,
+          progress: progressResult,
+          downloaded: downloads.size,
+        }));
+        if (activeTasks > 0 && attempts < 120) await new Promise(resolve => window.setTimeout(resolve, 5000));
+      } while (activeTasks > 0 && attempts < 120);
+
+      const staged = stageRecoveredPayloads([...downloads.values()]);
+      if (!staged) {
+        if (activeTasks > 0) throw new Error('卡密任务仍在处理，自动轮询已达到 10 分钟，请稍后重试');
+        throw new Error('卡密核验已完成，但服务未返回可下载的账号 JSON');
+      }
+
+      if (sub2apiCardMode === 'manual') {
+        setSub2apiCardFlow(current => ({...current, stage: 'ready', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename}));
+        notify(`已核验并下载 ${staged.accounts} 个账号，请确认后手动推送`);
+        return;
+      }
+
+      setSub2apiCardFlow(current => ({...current, stage: 'push', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename}));
+      const pushed = await importSub2Api(staged.payload, {reclaimOrderNos: staged.orderNos});
+      if (!pushed) throw new Error('账号 JSON 已下载，但自动推送未完成');
+      const confirmed = Boolean(pushed.import_verification?.confirmed);
+      setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
+      if (confirmed) notify(`卡密直导完成：${staged.accounts} 个账号已推送并核验`);
+    } catch (error) {
+      setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
+      notify(error.message, 'error');
+    } finally {
+      setSub2apiCardBusy(false);
+    }
+  };
+
+  const pushStagedSub2ApiCards = async () => {
+    if (!sub2apiPayload) return notify('当前没有待推送的卡密账号 JSON', 'error');
+    setSub2apiCardFlow(current => ({...current, stage: 'push', error: ''}));
+    const pushed = await importSub2Api();
+    if (!pushed) {
+      setSub2apiCardFlow(current => ({...current, stage: 'error', error: '手动推送未完成'}));
+      return;
+    }
+    const confirmed = Boolean(pushed.import_verification?.confirmed);
+    setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
+    if (confirmed) notify('手动推送完成，Sub2API 已核验新增账号');
   };
 
   const changeSub2ApiProxy = value => {
@@ -2359,7 +2466,23 @@ function App() {
         ) : activeView === 'reclaim' ? (
           <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
         ) : (
-          <Sub2ApiView config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey} fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy} optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds} codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode} reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy} onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy} onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()} accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters} accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount}/>
+          <Sub2ApiView
+            config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey}
+            redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={saveRedeemConfig}
+            cardCodes={sub2apiCardCodes} onCardCodes={setSub2apiCardCodes} cardMode={sub2apiCardMode} onCardMode={setSub2apiCardMode}
+            cardBusy={sub2apiCardBusy} cardFlow={sub2apiCardFlow} onRunCardImport={runSub2ApiCardImport} onPushCards={pushStagedSub2ApiCards}
+            fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
+            optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
+            codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
+            reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401}
+            automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy}
+            onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation}
+            onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy}
+            onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}
+            accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters}
+            accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts}
+            onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount}
+          />
         )}
       </main>
 
@@ -2449,7 +2572,63 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
   );
 }
 
-function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount}) {
+function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush}) {
+  const stageLabel = {
+    idle: '等待输入',
+    verify: '正在核验',
+    reclaim: '正在提交',
+    download: '正在下载',
+    stage: '正在整理',
+    ready: '等待推送',
+    push: '正在推送',
+    done: '推送完成',
+    error: '处理异常',
+  }[flow.stage] || '等待输入';
+  const codesCount = [...new Set(codes.split(/[\s,，]+/).map(value => value.trim()).filter(Boolean))].length;
+  const health = flow.health || {};
+  const pushConfirmed = Boolean(flow.pushResult?.import_verification?.confirmed || flow.pushed);
+  const isActive = busy || importing;
+  const configuredRedeemUrl = /^https?:\/\//i.test(redeemConfig.base_url || '') ? redeemConfig.base_url : 'https://30d.team';
+
+  return (
+    <section className="card-import-console" data-testid="sub2api-card-import">
+      <div className="card-import-head">
+        <div><span className="detail-kicker">CARD DIRECT IMPORT</span><h2>卡密核验与推送</h2><p>独立于账号 JSON 导入和 401 定时监控</p></div>
+        <a href={configuredRedeemUrl} target="_blank" rel="noreferrer"><span>{configuredRedeemUrl}</span><ArrowUpRight size={14}/></a>
+      </div>
+      <div className="card-import-body">
+        <div className="card-import-inputs">
+          <label><span>核验下载服务</span><div className="card-service-field"><input value={redeemConfig.base_url} onChange={event => setRedeemConfig({...redeemConfig, base_url: event.target.value})} placeholder="https://30d.team"/><button className="icon-button" type="button" onClick={onSaveRedeem} title="保存核验下载服务地址" aria-label="保存核验下载服务地址"><Save size={15}/></button></div></label>
+          <label className="code-field"><span>卡密列表 <small>{codesCount}/100</small></span><textarea data-testid="sub2api-card-codes" value={codes} onChange={event => onCodes(event.target.value)} placeholder="每行输入一个卡密" rows={5}/></label>
+        </div>
+        <div className="card-import-control">
+          <div className="card-mode-head"><span>完成后操作</span><div className="card-mode-segment" role="group" aria-label="卡密推送模式">
+            <button type="button" className={mode === 'manual' ? 'active' : ''} onClick={() => onMode('manual')} data-testid="card-mode-manual"><Download size={14}/>手动推送</button>
+            <button type="button" className={mode === 'auto' ? 'active' : ''} onClick={() => onMode('auto')} data-testid="card-mode-auto"><Send size={14}/>自动推送</button>
+          </div></div>
+          <div className="card-flow-steps" aria-label="卡密直导进度">
+            <div className={flow.health ? 'done' : flow.stage === 'verify' ? 'active' : ''}><span>1</span><strong>核验卡密</strong><small>{flow.health ? `${health.total ?? codesCount} 个已核验` : '30d.team'}</small></div>
+            <div className={flow.downloaded ? 'done' : ['reclaim', 'download', 'stage'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.downloaded ? `${flow.downloaded} 个文件` : '账号 JSON'}</small></div>
+            <div className={pushConfirmed ? 'done' : flow.stage === 'push' ? 'active' : ''}><span>3</span><strong>{mode === 'auto' ? '自动推送' : '手动推送'}</strong><small>{pushConfirmed ? 'Sub2API 已核验' : mode === 'auto' ? '下载后执行' : '确认后执行'}</small></div>
+          </div>
+          <div className="card-flow-summary">
+            <div><span>当前状态</span><strong className={flow.stage === 'error' ? 'negative' : ''}>{stageLabel}</strong></div>
+            <div><span>核验总数</span><strong>{health.total ?? '--'}</strong></div>
+            <div><span>账号数量</span><strong>{flow.accounts ?? '--'}</strong></div>
+          </div>
+          {mode === 'auto' && !canAutoPush && <div className="card-flow-notice"><AlertCircle size={14}/><span>自动推送需要先保存 Sub2API 管理员密钥</span></div>}
+          {flow.error && <div className="card-flow-notice error"><TriangleAlert size={14}/><span>{flow.error}</span></div>}
+          <div className="card-import-actions">
+            <button className="button primary" type="button" onClick={onRun} disabled={isActive || !codesCount || (mode === 'auto' && !canAutoPush)} data-testid="run-card-import">{busy ? <RefreshCw size={15} className="spin"/> : mode === 'auto' ? <Send size={15}/> : <Download size={15}/>} {busy ? stageLabel : mode === 'auto' ? '核验、下载并推送' : '核验并下载'}</button>
+            {flow.accounts && payload && !pushConfirmed && <button className="button secondary" type="button" onClick={onPush} disabled={isActive} data-testid="push-staged-cards"><Upload size={15}/>手动推送当前 JSON</button>}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -2525,6 +2704,13 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payloa
           {fingerprint && <div className={`connection-result ${fingerprint.unresolved || fingerprint.error ? 'bad' : 'ok'}`}>指纹模式 {fingerprint.mode}：符合 {fingerprint.eligible} 个，已核对 {fingerprint.matched} 个，直接生效 {fingerprint.verified - fingerprint.repaired} 个，补写 {fingerprint.repaired} 个，未匹配 {fingerprint.unresolved} 个{fingerprint.error ? `；核对失败：${fingerprint.error}` : ''}</div>}
         </div>
       </div>
+
+      <Sub2ApiCardImportPanel
+        redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={onSaveRedeem}
+        codes={cardCodes} onCodes={onCardCodes} mode={cardMode} onMode={onCardMode}
+        busy={cardBusy} importing={busy} flow={cardFlow} payload={payload} canAutoPush={Boolean(config.admin_key_set)}
+        onRun={onRunCardImport} onPush={onPushCards}
+      />
 
       <div className="automation-console">
         <div className="automation-head">
