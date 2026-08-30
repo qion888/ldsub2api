@@ -186,6 +186,13 @@ def _public_account(account: dict[str, Any]) -> dict[str, Any]:
             for group in groups
             if isinstance(group, dict)
         ]
+    proxy = account.get("proxy")
+    if isinstance(proxy, dict):
+        result["proxy"] = {
+            key: proxy.get(key)
+            for key in ("id", "name", "protocol", "host", "port", "status")
+            if key in proxy
+        }
     return result
 
 
