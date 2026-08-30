@@ -53,7 +53,7 @@ index 39c4835..f320817 100644
            onDelete={onDeleteAccount}
            onCopyName={onCopyAccountName}
 diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
-index dd91b50..e3c9cb2 100644
+index dd91b50..249b14c 100644
 --- a/frontend/src/main.jsx
 +++ b/frontend/src/main.jsx
 @@ -987,6 +987,8 @@ function App() {
@@ -81,7 +81,7 @@ index dd91b50..e3c9cb2 100644
      setToast({id, ...notice});
      window.clearTimeout(toastTimer.current);
      toastTimer.current = window.setTimeout(() => {
-@@ -2150,7 +2155,7 @@ function App() {
+@@ -2150,11 +2155,12 @@ function App() {
        if (!quiet) notify(message, 'error');
        return null;
      } finally {
@@ -90,7 +90,12 @@ index dd91b50..e3c9cb2 100644
      }
    };
  
-@@ -2174,6 +2179,59 @@ function App() {
+   const testSub2ApiAccount = async account => {
++    if (sub2apiAccountRefreshRef.current) return;
+     const id = Number(account?.id);
+     if (!Number.isInteger(id) || id < 1) return;
+     setSub2apiAccountActions(current => ({...current, [id]: 'test'}));
+@@ -2174,6 +2180,59 @@ function App() {
      }
    };
  
@@ -150,7 +155,15 @@ index dd91b50..e3c9cb2 100644
    const copySub2ApiAccountName = async account => {
      const name = String(account?.name || `账号 ${account?.id || ''}`).trim();
      try {
-@@ -2992,8 +3050,8 @@ function App() {
+@@ -2185,6 +2244,7 @@ function App() {
+   };
+ 
+   const deleteSub2ApiAccount = async account => {
++    if (sub2apiAccountRefreshRef.current) return;
+     const id = Number(account?.id);
+     if (!Number.isInteger(id) || id < 1) return;
+     if (!window.confirm(`确定删除账号“${account.name || id}”？`)) return;
+@@ -2992,8 +3052,8 @@ function App() {
              onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy}
              onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}
              accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters}
