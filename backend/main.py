@@ -288,6 +288,115 @@ def _money(value: Any) -> str:
         return str(value)
 
 
+def _compact_number(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        number = Decimal(str(value))
+        return format(number.normalize(), "f")
+    except (InvalidOperation, ValueError):
+        return str(value)
+
+
+def _upstream_enabled(value: Any) -> bool:
+    return value is True or str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def commerce_tags_from_goods(item: dict[str, Any]) -> list[dict[str, str]]:
+    extend = item.get("extend") if isinstance(item.get("extend"), dict) else {}
+    tags: list[dict[str, str]] = []
+
+    multiple = item.get("multipleoffers") if isinstance(item.get("multipleoffers"), dict) else {}
+    multiple_rules = multiple.get("rules") if isinstance(multiple.get("rules"), list) else []
+    if _upstream_enabled(multiple.get("available")) and multiple_rules:
+        details = []
+        discount_type = str(multiple.get("discount_type") or "")
+        for rule in multiple_rules:
+            if not isinstance(rule, dict):
+                continue
+            condition = _compact_number(rule.get("condition"))
+            value = _compact_number(rule.get("value"))
+            if not condition or not value:
+                continue
+            if discount_type == "1":
+                details.append(f"购{condition}件享{value}折")
+            elif discount_type == "2":
+                details.append(f"购{condition}件减{value}元")
+            else:
+                details.append(f"购{condition}件优惠{value}")
+        tags.append({
+            "key": "multiple_offers",
+            "label": "多件折扣",
+            "tone": "promotion",
+            "detail": "；".join(details) or "购买多件可享优惠",
+        })
+
+    discount = item.get("discount") if isinstance(item.get("discount"), dict) else {}
+    if _upstream_enabled(discount.get("available")):
+        rebate = _compact_number(discount.get("rebate"))
+        tags.append({
+            "key": "discount",
+            "label": "折扣优惠",
+            "tone": "promotion",
+            "detail": f"当前享{rebate}折" if rebate else "当前商品参与折扣",
+        })
+
+    fullgift = item.get("fullgift") if isinstance(item.get("fullgift"), dict) else {}
+    gift_rules = fullgift.get("rules") if isinstance(fullgift.get("rules"), list) else []
+    if _upstream_enabled(fullgift.get("available")):
+        details = []
+        for rule in gift_rules:
+            if not isinstance(rule, dict):
+                continue
+            condition = _compact_number(rule.get("condition"))
+            value = _compact_number(rule.get("value"))
+            if condition and value:
+                details.append(f"购{condition}件赠{value}件")
+        tags.append({
+            "key": "full_gift",
+            "label": "满件赠送",
+            "tone": "promotion",
+            "detail": "；".join(details) or "达到门槛可获赠品",
+        })
+
+    if str(item.get("goods_type") or "").strip().lower() == "card":
+        tags.append({
+            "key": "delivery",
+            "label": "自动发货",
+            "tone": "success",
+            "detail": "卡密商品付款后由平台自动交付",
+        })
+
+    limit_value = _first_value(extend, ("limit_count", "limit"))
+    try:
+        minimum = max(1, int(limit_value or 1))
+    except (TypeError, ValueError):
+        minimum = 1
+    tags.append({
+        "key": "minimum",
+        "label": f"{minimum}件起购",
+        "tone": "info",
+        "detail": f"单次购买数量不得少于{minimum}件",
+    })
+
+    if _upstream_enabled(item.get("coupon_status")):
+        tags.append({
+            "key": "coupon",
+            "label": "支持优惠券",
+            "tone": "offer",
+            "detail": "结算时可输入有效优惠券",
+        })
+
+    if _upstream_enabled(extend.get("query_password_status")):
+        tags.append({
+            "key": "query_password",
+            "label": "密码保护",
+            "tone": "secure",
+            "detail": "查询订单或领取卡密时需要安全密码",
+        })
+    return tags
+
+
 def is_unlisted_error(value: Any) -> bool:
     message = str(value or "")
     return any(marker in message for marker in UNLISTED_ERROR_MARKERS)
@@ -311,7 +420,7 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "商品分类": category.get("name") or "未分类",
         "最低起购": limit_count if limit_count not in (None, "", 0) else 1,
         "联系方式": item.get("contact_format") or "任意",
-        "查询密码": "需要" if extend.get("query_password_status") == 1 else "不需要",
+        "查询密码": "需要" if _upstream_enabled(extend.get("query_password_status")) else "不需要",
         "店铺": seller.get("nickname") or "链动小铺",
     }
     return {
@@ -329,7 +438,8 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "specs": specs,
         "limit_count": int(limit_count) if str(limit_count or "").isdigit() else None,
         "contact_format": str(item.get("contact_format") or "any"),
-        "query_password_required": extend.get("query_password_status") == 1,
+        "query_password_required": _upstream_enabled(extend.get("query_password_status")),
+        "commerce_tags": commerce_tags_from_goods(item),
         "source_url": str(item.get("link") or f"https://{ALLOWED_HOST}/item/{goods_key}"),
         "raw_data": item,
     }
@@ -581,7 +691,7 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
         "商品类型": item.get("goods_type") or "未知",
         "商品分类": category.get("name") or item.get("category_name") or "未分类",
         "最低起购": limit_count if limit_count not in (None, "", 0) else 1,
-        "查询密码": "需要" if extend.get("query_password_status") == 1 else "未知",
+        "查询密码": "需要" if _upstream_enabled(extend.get("query_password_status")) else "未知",
         "店铺": seller.get("nickname") or shop_token,
         "店铺Token": shop_token,
     }
@@ -602,7 +712,8 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
         "specs": specs,
         "limit_count": int(limit_count) if str(limit_count or "").isdigit() else None,
         "contact_format": str(item.get("contact_format") or "any"),
-        "query_password_required": extend.get("query_password_status") == 1,
+        "query_password_required": _upstream_enabled(extend.get("query_password_status")),
+        "commerce_tags": commerce_tags_from_goods(item),
         "source_url": f"https://{ALLOWED_HOST}/item/{goods_key}",
         "raw_data": item,
     }
@@ -683,6 +794,15 @@ def serialize_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
         result["specs"]["最低起购"] = legacy_limit
     limit_value = result["specs"].get("最低起购")
     result["limit_count"] = int(limit_value) if str(limit_value).isdigit() else None
+    commerce_source = dict(result["raw_data"])
+    commerce_extend = commerce_source.get("extend") if isinstance(commerce_source.get("extend"), dict) else {}
+    commerce_extend = dict(commerce_extend)
+    if result["limit_count"] is not None:
+        commerce_extend.setdefault("limit_count", result["limit_count"])
+    if result["query_password_required"]:
+        commerce_extend.setdefault("query_password_status", 1)
+    commerce_source["extend"] = commerce_extend
+    result["commerce_tags"] = commerce_tags_from_goods(commerce_source)
     return result
 
 

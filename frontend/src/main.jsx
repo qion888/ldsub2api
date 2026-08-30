@@ -4,6 +4,7 @@ import {
   Activity,
   AlertCircle,
   ArrowUpRight,
+  BadgePercent,
   BellRing,
   BarChart3,
   CalendarDays,
@@ -575,6 +576,7 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
   const latest = item?.latest;
   const stock = itemStock(item);
   const specs = latest?.specs && typeof latest.specs === 'object' ? Object.entries(latest.specs) : [];
+  const commerceTags = Array.isArray(latest?.commerce_tags) ? latest.commerce_tags : [];
   const sourceUrl = latest?.source_url || item?.url;
   const currentPrice = itemPrice(item);
   const marketPriceValue = Number(latest?.market_price);
@@ -617,10 +619,23 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
               <div className="detail-hero-copy">
                 <span className="detail-kicker">{itemCategory(item)}</span>
                 <h3>{latest?.title || item.name || '等待商品数据'}</h3>
+                {!!commerceTags.length && <div className="detail-commerce-tags" aria-label="商品交易标签">
+                  {commerceTags.map(tag => <span className={`detail-commerce-tag ${tag.tone || 'neutral'}`} title={tag.detail || tag.label} key={tag.key}>{tag.label}</span>)}
+                </div>}
                 <div className="detail-hero-meta"><RadarStockPill item={item}/><span><Store size={13}/>{itemShopName(item)}</span><span><Package size={13}/>{latest?.goods_key || `商品 #${item.id}`}</span></div>
               </div>
               <div className="detail-hero-price"><span>当前报价</span><strong>{money(currentPrice)}</strong><small className={priceDelta > 0 ? 'negative' : priceDelta < 0 ? 'positive' : ''}>{priceChangeLabel}</small></div>
             </div>
+
+            {!!commerceTags.length && <section className="detail-commerce-summary" aria-label="交易权益">
+              <div className="detail-commerce-heading"><span><BadgePercent size={16}/></span><div><strong>交易权益</strong><small>链动小铺接口实时同步</small></div></div>
+              <div className="detail-commerce-list">
+                {commerceTags.map(tag => <div className="detail-commerce-item" key={tag.key}>
+                  <span className={`detail-commerce-tag ${tag.tone || 'neutral'}`}>{tag.label}</span>
+                  <small>{tag.detail || '以结算页面为准'}</small>
+                </div>)}
+              </div>
+            </section>}
 
             <div className="detail-price-board" aria-label="价格指标">
               <div><span><CircleDollarSign size={14}/>当前报价</span><strong>{money(currentPrice)}</strong><small>{lowestGap === null || !Number.isFinite(lowestGap) ? '暂无同类比较' : lowestGap <= 0 ? '当前同类最低' : `高于最低 ${money(lowestGap)}`}</small></div>
@@ -886,6 +901,8 @@ function App() {
     window.localStorage.setItem('ldxp-theme', theme);
   }, [theme]);
 
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+
   useEffect(() => {
     const syncTooltips = () => {
       const titleNodes = document.querySelectorAll('[title]');
@@ -933,9 +950,18 @@ function App() {
   }, [detailOpen, overviewOpen]);
 
   const notify = (message, type = 'info') => {
-    setToast({message, type});
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setToast({id, message, type});
     window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), 3200);
+    toastTimer.current = window.setTimeout(() => {
+      setToast(current => current?.id === id ? null : current);
+    }, 3200);
+  };
+
+  const dismissToast = () => {
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = null;
+    setToast(null);
   };
 
   const loadSub2ApiAutomation = async ({syncSettings = false, quiet = true} = {}) => {
@@ -2073,7 +2099,12 @@ function App() {
 
       {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
       {review && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setReview(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="购买确认"><div className="modal-head"><div><span>DIRECT CHECKOUT</span><h2>支付链接已准备</h2></div><IconButton label="关闭" onClick={() => setReview(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>{review.notice} 创建成功后会自动打开支付页面；下方仍保留“打开支付链接”入口，方便重复打开。</p></div><div className="review-list">{review.items.map(item => <div className="review-item" key={item.watch_id}><div><strong>{item.title}</strong><span>{money(item.unit_price)} × {item.quantity}</span><a className="payment-link" href={item.official_url} target="_blank" rel="noreferrer"><Link2 size={13}/>{item.official_url}</a></div><strong>{money(item.subtotal)}</strong><div className="review-actions"><button className="button secondary" onClick={() => copyPaymentLink(item)}><Clipboard size={15}/>复制商品链接</button></div></div>)}</div>{officialOrder && <div className="payment-order-result"><div><span>官方订单</span><strong>{officialOrder.trade_no}</strong></div><a href={officialOrder.payment_url} target="_blank" rel="noreferrer"><Link2 size={14}/>{officialOrder.payment_url}</a><small>{officialOrder.notice} 渠道：{officialOrder.channel === 'alipay' ? '支付宝' : '微信支付'}，金额：{money(officialOrder.amount)}</small><button className="button official" onClick={() => window.open(officialOrder.payment_url, '_blank', 'noopener,noreferrer')}><ArrowUpRight size={15}/>打开支付链接</button></div>}<div className="review-total"><span>清单合计</span><strong>{money(review.total)}</strong></div><div className="modal-foot"><span><ShieldCheck size={14}/>支付前请核对订单金额</span><div className="modal-foot-actions"><label className="payment-channel"><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><button className="button official auto-pay-button" onClick={createOfficialOrder} disabled={busy.officialOrder}><Package size={15}/>{busy.officialOrder ? '正在创建并跳转' : '创建订单并自动跳转'}</button><button className="button secondary" onClick={() => setReview(null)}>返回修改</button></div></div></div></div>}
-      {toast && <div className={`toast ${toast.type}`}><span>{toast.type === 'error' ? <AlertCircle size={17}/> : <Check size={17}/>}</span>{toast.message}</div>}
+      {toast && <div className={`toast ${toast.type}`} role={toast.type === 'error' ? 'alert' : 'status'} aria-live={toast.type === 'error' ? 'assertive' : 'polite'} aria-atomic="true" key={toast.id}>
+        <span className="toast-icon">{toast.type === 'error' ? <AlertCircle size={18}/> : <Check size={18}/>}</span>
+        <div className="toast-copy"><strong>{toast.type === 'error' ? '操作未完成' : '操作成功'}</strong><p>{toast.message}</p></div>
+        <button className="toast-close" type="button" onClick={dismissToast} aria-label="关闭提示" title="关闭提示"><X size={15}/></button>
+        <span className="toast-progress" aria-hidden="true"/>
+      </div>}
     </div>
   );
 }
