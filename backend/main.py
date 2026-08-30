@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 from monitor_settings import (
@@ -32,6 +32,14 @@ from monitor_settings import (
     update_shop_monitoring,
     update_watch_monitoring,
 )
+from sub2api import automation as sub2api_automation
+from sub2api import client as sub2api_client
+from sub2api import payloads as sub2api_payloads
+from sub2api import reclaim as sub2api_reclaim
+from sub2api import routes as sub2api_routes
+from sub2api import settings as sub2api_config
+from sub2api import worker as sub2api_worker
+from sub2api.constants import CODEX_FINGERPRINT_MODES, DEFAULT_AUTOMATION, DEFAULT_URL
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -49,15 +57,8 @@ VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
 WAF_MARKERS = (b"aliyunCaptcha", b"aliyunCaptcha-sliding-slider", b"waf_nc", b"u_atoken")
 UNLISTED_ERROR_MARKERS = ("商品未上架", "商品不存在", "已下架", "已不在店铺列表")
 DEFAULT_REDEEM_URL = "https://30d.team"
-DEFAULT_SUB2API_URL = "http://127.0.0.1:8080"
-DEFAULT_SUB2API_AUTOMATION = {
-    "enabled": False,
-    "interval_seconds": 300,
-    "auto_import": False,
-    "proxy_id": None,
-    "group_ids": [],
-    "codex_fingerprint_mode": "off",
-}
+DEFAULT_SUB2API_URL = DEFAULT_URL
+DEFAULT_SUB2API_AUTOMATION = DEFAULT_AUTOMATION
 MAX_EXTERNAL_JSON_BYTES = 8 * 1024 * 1024
 MAX_REQUEST_JSON_BYTES = 32 * 1024 * 1024
 
@@ -1205,72 +1206,19 @@ def redeem_settings() -> dict[str, Any]:
 
 
 def sub2api_settings(*, reveal: bool = False) -> dict[str, Any]:
-    value = _setting_json("sub2api", {"base_url": DEFAULT_SUB2API_URL, "admin_key": ""})
-    base_url = _normalize_service_url(value.get("base_url"), DEFAULT_SUB2API_URL)
-    admin_key = str(value.get("admin_key") or "").strip()
-    if reveal:
-        return {"base_url": base_url, "admin_key": admin_key}
-    masked = (admin_key[:4] + "..." + admin_key[-4:]) if len(admin_key) > 10 else ("*" * len(admin_key))
-    return {"base_url": base_url, "admin_key_set": bool(admin_key), "admin_key_mask": masked}
+    return sub2api_config.read_settings(
+        _setting_json,
+        _normalize_service_url,
+        reveal=reveal,
+    )
 
 
 def sub2api_automation_settings() -> dict[str, Any]:
-    value = _setting_json("sub2api_automation", DEFAULT_SUB2API_AUTOMATION)
-    try:
-        interval = min(max(int(value.get("interval_seconds") or 300), 10), 86400)
-    except (TypeError, ValueError):
-        interval = 300
-    proxy_id = value.get("proxy_id")
-    try:
-        proxy_id = int(proxy_id) if proxy_id not in (None, "") else None
-    except (TypeError, ValueError):
-        proxy_id = None
-    raw_groups = value.get("group_ids")
-    if not isinstance(raw_groups, list):
-        raw_groups = []
-    try:
-        group_ids = sorted({int(item) for item in raw_groups if int(item) > 0})
-    except (TypeError, ValueError):
-        group_ids = []
-    mode = str(value.get("codex_fingerprint_mode") or "off").strip().lower()
-    if mode not in SUB2API_CODEX_FINGERPRINT_MODES:
-        mode = "off"
-    return {
-        "enabled": bool(value.get("enabled", False)),
-        "interval_seconds": interval,
-        "auto_import": bool(value.get("auto_import", False)),
-        "proxy_id": proxy_id,
-        "group_ids": group_ids,
-        "codex_fingerprint_mode": mode,
-    }
+    return sub2api_config.read_automation_settings(_setting_json)
 
 
 def sub2api_automation_state() -> dict[str, Any]:
-    fallback = {
-        "last_run": None,
-        "last_error": "",
-        "last_result": None,
-        "pending_card_codes": [],
-        "imported_order_nos": [],
-        "run_history": [],
-    }
-    value = _setting_json("sub2api_automation_state", fallback)
-    if not isinstance(value, dict):
-        return fallback
-    pending = value.get("pending_card_codes")
-    value["pending_card_codes"] = pending if isinstance(pending, list) else []
-    imported = value.get("imported_order_nos")
-    value["imported_order_nos"] = imported if isinstance(imported, list) else []
-    history = value.get("run_history")
-    value["run_history"] = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
-    return {
-        "last_run": value.get("last_run"),
-        "last_error": str(value.get("last_error") or "")[:500],
-        "last_result": value.get("last_result") if isinstance(value.get("last_result"), dict) else None,
-        "pending_card_codes": value["pending_card_codes"][:100],
-        "imported_order_nos": value["imported_order_nos"][-500:],
-        "run_history": value["run_history"][-20:],
-    }
+    return sub2api_config.read_automation_state(_setting_json)
 
 
 def _store_sub2api_automation_state(value: dict[str, Any]) -> None:
@@ -1345,188 +1293,54 @@ def _dataclass_to_json(value: Any) -> Any:
     return value
 
 
+# Compatibility wrappers keep existing imports and runtime patches stable while
+# the implementation lives in focused Sub2API modules.
 def _validate_sub2api_data(data: Any) -> dict[str, Any]:
-    if not isinstance(data, dict):
-        raise ValueError("账号 JSON 必须是对象")
-    if data.get("type") not in (None, "sub2api-data", "sub2api-bundle"):
-        raise ValueError("账号 JSON type 必须是 sub2api-data 或 sub2api-bundle")
-    if data.get("version") not in (None, 1):
-        raise ValueError("账号 JSON version 必须为 1")
-    accounts = data.get("accounts")
-    proxies = data.get("proxies", [])
-    if not isinstance(accounts, list) or not accounts or len(accounts) > 5000:
-        raise ValueError("账号 JSON 至少包含 1 个 accounts，最多 5000 个")
-    if not isinstance(proxies, list) or len(proxies) > 5000:
-        raise ValueError("账号 JSON proxies 格式无效")
-    normalized_accounts = []
-    for index, account in enumerate(accounts):
-        if not isinstance(account, dict) or not isinstance(account.get("credentials"), dict) or not account.get("credentials"):
-            raise ValueError(f"第 {index + 1} 个账号缺少 credentials")
-        normalized_account = dict(account)
-        normalized_account["name"] = str(account.get("name") or f"导入账号 {index + 1}")[:200]
-        normalized_accounts.append(normalized_account)
-    normalized = dict(data)
-    normalized["type"] = data.get("type") or "sub2api-data"
-    normalized["version"] = 1
-    normalized["proxies"] = [dict(proxy) if isinstance(proxy, dict) else proxy for proxy in proxies]
-    normalized["accounts"] = normalized_accounts
-    return normalized
+    return sub2api_payloads.validate_data(data)
 
 
 def _merge_sub2api_data(data: Any) -> dict[str, Any]:
-    if isinstance(data, dict):
-        return _validate_sub2api_data(data)
-    if not isinstance(data, list) or not data or len(data) > 50:
-        raise ValueError("账号 JSON 必须是对象，或 1 到 50 个对象组成的数组")
-    accounts: list[dict[str, Any]] = []
-    proxies: list[dict[str, Any]] = []
-    for index, source in enumerate(data):
-        try:
-            normalized = _validate_sub2api_data(source)
-        except ValueError as exc:
-            raise ValueError(f"第 {index + 1} 个 JSON：{exc}") from exc
-        accounts.extend(normalized["accounts"])
-        proxies.extend(normalized["proxies"])
-        if len(accounts) > 5000 or len(proxies) > 5000:
-            raise ValueError("合并后的账号或代理数量不能超过 5000 个")
-    return {
-        "type": "sub2api-data",
-        "version": 1,
-        "accounts": accounts,
-        "proxies": proxies,
-    }
+    return sub2api_payloads.merge_data(data)
 
 
-SUB2API_CODEX_FINGERPRINT_MODES = {"off", "device", "session", "full"}
+SUB2API_CODEX_FINGERPRINT_MODES = CODEX_FINGERPRINT_MODES
 
 
 def _sub2api_apply_codex_fingerprint_mode(
     normalized: dict[str, Any], raw_mode: Any
 ) -> tuple[dict[str, Any], str | None, int]:
-    if raw_mode is None:
-        return normalized, None, 0
-    if not isinstance(raw_mode, str):
-        raise ValueError("Codex 指纹收敛模式无效")
-    mode = raw_mode.strip().lower()
-    if mode not in SUB2API_CODEX_FINGERPRINT_MODES:
-        raise ValueError("Codex 指纹收敛模式必须是 off、device、session 或 full")
-
-    result = dict(normalized)
-    accounts = []
-    codex_account_count = 0
-    for source in normalized["accounts"]:
-        account = dict(source)
-        if (
-            str(account.get("platform") or "").strip().lower() == "openai"
-            and str(account.get("type") or "").strip().lower() in ("oauth", "setup-token")
-        ):
-            extra = dict(account.get("extra")) if isinstance(account.get("extra"), dict) else {}
-            if mode == "off":
-                extra.pop("codex_fingerprint_mode", None)
-            else:
-                extra["codex_fingerprint_mode"] = mode
-            account["extra"] = extra
-            codex_account_count += 1
-        accounts.append(account)
-    result["accounts"] = accounts
-    return result, mode, codex_account_count
+    return sub2api_payloads.apply_codex_fingerprint_mode(normalized, raw_mode)
 
 
 def _sub2api_payload_data(payload: Any) -> Any:
-    if isinstance(payload, dict) and "data" in payload:
-        return payload["data"]
-    return payload
+    return sub2api_payloads.payload_data(payload)
 
 
 def _sub2api_list(payload: Any, *keys: str) -> list[dict[str, Any]]:
-    value = _sub2api_payload_data(payload)
-    if isinstance(value, dict):
-        for key in ("items", "list", *keys):
-            candidate = value.get(key)
-            if isinstance(candidate, list):
-                value = candidate
-                break
-    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    return sub2api_payloads.payload_list(payload, *keys)
 
 
 def _sub2api_upstream_error(status: int, payload: Any, raw: str) -> str:
-    if isinstance(payload, dict):
-        detail = payload.get("message") or payload.get("error") or payload.get("detail")
-        if detail:
-            return str(detail)[:500]
-    return raw[:500] or f"HTTP {status}"
+    return sub2api_payloads.upstream_error(status, payload, raw)
 
 
-def _sub2api_fetch_accounts(config: dict[str, Any], *, platform: str = "", account_type: str = "") -> list[dict[str, Any]]:
-    headers = {"x-api-key": config["admin_key"]}
-    accounts: list[dict[str, Any]] = []
-    page = 1
-    while page <= 200:
-        params = {
-            "page": page,
-            "page_size": 100,
-            "sort_by": "created_at",
-            "sort_order": "desc",
-        }
-        if platform:
-            params["platform"] = platform
-        if account_type:
-            params["type"] = account_type
-        status, payload, raw = _external_json_request(
-            "GET",
-            config["base_url"] + "/api/v1/admin/accounts?" + urlencode(params),
-            headers=headers,
-            timeout=30,
-        )
-        if not 200 <= status < 300:
-            detail = _sub2api_upstream_error(status, payload, raw)
-            raise RuntimeError(f"Sub2API accounts 返回 HTTP {status}: {detail}")
-        value = _sub2api_payload_data(payload)
-        items = _sub2api_list(payload, "accounts")
-        accounts.extend(items)
-        if not isinstance(value, dict):
-            break
-        try:
-            pages_value = value.get("pages")
-            if pages_value is not None:
-                pages = max(1, int(pages_value))
-            else:
-                total = max(0, int(value.get("total") or 0))
-                size = max(1, int(value.get("page_size") or params["page_size"]))
-                pages = max(1, (total + size - 1) // size)
-        except (TypeError, ValueError):
-            pages = 1
-        if page >= pages or not items:
-            break
-        page += 1
-    if page > 200:
-        raise RuntimeError("Sub2API 账号分页超过 200 页，请先缩小账号范围")
-    return accounts
+def _sub2api_fetch_accounts(
+    config: dict[str, Any], *, platform: str = "", account_type: str = ""
+) -> list[dict[str, Any]]:
+    return sub2api_client.fetch_accounts(
+        config,
+        request_json=_external_json_request,
+        platform=platform,
+        account_type=account_type,
+    )
 
 
 def _sub2api_codex_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
-    result = []
-    for account_type in ("oauth", "setup-token"):
-        result.extend(_sub2api_fetch_accounts(config, platform="openai", account_type=account_type))
-    return result
+    return sub2api_client.codex_accounts(config, accounts_loader=_sub2api_fetch_accounts)
 
 
 def _sub2api_created_account_ids(payload: Any) -> set[int]:
-    result = _sub2api_payload_data(payload)
-    rows = result.get("results") if isinstance(result, dict) else None
-    ids: set[int] = set()
-    if not isinstance(rows, list):
-        return ids
-    for row in rows:
-        if not isinstance(row, dict) or row.get("success") is False:
-            continue
-        try:
-            account_id = int(row.get("id"))
-        except (TypeError, ValueError):
-            continue
-        if account_id > 0:
-            ids.add(account_id)
-    return ids
+    return sub2api_payloads.created_account_ids(payload)
 
 
 def _sub2api_fingerprint_targets(
@@ -1534,36 +1348,7 @@ def _sub2api_fingerprint_targets(
     upstream_accounts: list[dict[str, Any]],
     created_ids: set[int],
 ) -> list[dict[str, Any]]:
-    expected: dict[tuple[str, str, str], int] = {}
-    for account in imported_accounts:
-        platform = str(account.get("platform") or "").strip().lower()
-        account_type = str(account.get("type") or "").strip().lower()
-        if platform != "openai" or account_type not in ("oauth", "setup-token"):
-            continue
-        key = (str(account.get("name") or ""), platform, account_type)
-        expected[key] = expected.get(key, 0) + 1
-
-    candidates: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for account in upstream_accounts:
-        try:
-            account_id = int(account.get("id"))
-        except (TypeError, ValueError):
-            continue
-        if created_ids and account_id not in created_ids:
-            continue
-        key = (
-            str(account.get("name") or ""),
-            str(account.get("platform") or "").strip().lower(),
-            str(account.get("type") or "").strip().lower(),
-        )
-        if key in expected:
-            candidates.setdefault(key, []).append(account)
-
-    targets = []
-    for key, count in expected.items():
-        rows = sorted(candidates.get(key, []), key=lambda item: int(item.get("id") or 0), reverse=True)
-        targets.extend(rows[:count])
-    return targets
+    return sub2api_payloads.fingerprint_targets(imported_accounts, upstream_accounts, created_ids)
 
 
 def _sub2api_reconcile_codex_fingerprint(
@@ -1572,238 +1357,64 @@ def _sub2api_reconcile_codex_fingerprint(
     mode: str | None,
     import_payload: Any,
 ) -> dict[str, Any]:
-    eligible = [
-        account for account in normalized["accounts"]
-        if str(account.get("platform") or "").strip().lower() == "openai"
-        and str(account.get("type") or "").strip().lower() in ("oauth", "setup-token")
-    ]
-    summary = {
-        "mode": mode,
-        "eligible": len(eligible),
-        "matched": 0,
-        "verified": 0,
-        "repaired": 0,
-        "unresolved": len(eligible),
-    }
-    if mode is None or not eligible:
-        return summary
-
-    upstream_accounts = _sub2api_codex_accounts(config)
-    created_ids = _sub2api_created_account_ids(import_payload)
-    targets = _sub2api_fingerprint_targets(eligible, upstream_accounts, created_ids)
-    summary["matched"] = len(targets)
-    expected_values = {None, "", "off"} if mode == "off" else {mode}
-    mismatched_ids = []
-    for account in targets:
-        extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
-        actual = str(extra.get("codex_fingerprint_mode") or "").strip().lower() or None
-        if actual in expected_values:
-            summary["verified"] += 1
-        else:
-            try:
-                mismatched_ids.append(int(account["id"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-
-    if mismatched_ids:
-        status, payload, raw = _external_json_request(
-            "POST",
-            config["base_url"] + "/api/v1/admin/accounts/bulk-update",
-            {"account_ids": mismatched_ids, "extra": {"codex_fingerprint_mode": mode}},
-            headers={"x-api-key": config["admin_key"]},
-            timeout=60,
-        )
-        if not 200 <= status < 300:
-            detail = _sub2api_upstream_error(status, payload, raw)
-            raise RuntimeError(f"Sub2API 指纹补写返回 HTTP {status}: {detail}")
-        result = _sub2api_payload_data(payload)
-        success_ids = result.get("success_ids") if isinstance(result, dict) else None
-        submitted_ids = {
-            int(account_id) for account_id in (success_ids if isinstance(success_ids, list) else mismatched_ids)
-            if str(account_id).isdigit() and int(account_id) > 0
-        }
-        refreshed = _sub2api_codex_accounts(config)
-        for account in refreshed:
-            try:
-                account_id = int(account.get("id"))
-            except (TypeError, ValueError):
-                continue
-            if account_id not in submitted_ids:
-                continue
-            extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
-            actual = str(extra.get("codex_fingerprint_mode") or "").strip().lower() or None
-            if actual in expected_values:
-                summary["repaired"] += 1
-        summary["verified"] += summary["repaired"]
-
-    summary["unresolved"] = max(0, summary["eligible"] - summary["verified"])
-    return summary
+    return sub2api_client.reconcile_codex_fingerprint(
+        config,
+        normalized,
+        mode,
+        import_payload,
+        request_json=_external_json_request,
+        codex_accounts_loader=_sub2api_codex_accounts,
+    )
 
 
-def _sub2api_fingerprint_verification_error(mode: str | None, eligible: int, error: Exception) -> dict[str, Any]:
-    return {
-        "mode": mode,
-        "eligible": eligible,
-        "matched": 0,
-        "verified": 0,
-        "repaired": 0,
-        "unresolved": eligible,
-        "error": str(error)[:500],
-    }
+def _sub2api_fingerprint_verification_error(
+    mode: str | None, eligible: int, error: Exception
+) -> dict[str, Any]:
+    return sub2api_payloads.fingerprint_verification_error(mode, eligible, error)
 
 
-SUB2API_401_TEXT_PATTERNS = (
-    re.compile(r"(?i)\bhttp(?:/[0-9.]+)?\s*401\b"),
-    re.compile(r"(?i)\b(?:oauth|status(?:_code|\s+code)?|code)\s*[:=()\[\]-]*\s*401\b"),
-    re.compile(r"(?i)\bunauthorized\s*[:=()\[\]-]*\s*401\b"),
-    re.compile(r"(?i)\b401\s*[:=()\[\]-]*\s*unauthorized\b"),
-    # Sub2API reports revoked OAuth credentials as `Token revoked (401)`.
-    re.compile(r"(?i)\b(?:token\s+revoked|invalid(?:ated)?\s+oauth\s+token)\b[^\r\n]{0,80}\(\s*401\s*\)"),
-)
+SUB2API_401_TEXT_PATTERNS = sub2api_reclaim.ERROR_401_TEXT_PATTERNS
 
 
 def _sub2api_error_text_is_401(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    return any(pattern.search(value) for pattern in SUB2API_401_TEXT_PATTERNS)
+    return sub2api_reclaim.error_text_is_401(value)
 
 
 def _sub2api_structured_error_is_401(value: Any, *, error_context: bool = False) -> bool:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            normalized_key = str(key).strip().lower()
-            child_context = error_context or any(token in normalized_key for token in ("error", "reason", "failure", "response"))
-            if normalized_key in ("status_code", "http_status", "http_status_code", "upstream_status"):
-                try:
-                    if int(child) == 401:
-                        return True
-                except (TypeError, ValueError):
-                    pass
-            if child_context and normalized_key in ("status", "code"):
-                try:
-                    if int(child) == 401:
-                        return True
-                except (TypeError, ValueError):
-                    pass
-            if child_context and _sub2api_error_text_is_401(child):
-                return True
-            if child_context and _sub2api_structured_error_is_401(child, error_context=True):
-                return True
-        return False
-    if isinstance(value, list):
-        return error_context and any(_sub2api_structured_error_is_401(item, error_context=True) for item in value)
-    return error_context and _sub2api_error_text_is_401(value)
+    return sub2api_reclaim.structured_error_is_401(value, error_context=error_context)
 
 
 def _sub2api_account_is_401(account: dict[str, Any]) -> bool:
-    for key in ("status_code", "http_status", "http_status_code", "upstream_status", "status"):
-        try:
-            if int(account.get(key)) == 401:
-                return True
-        except (TypeError, ValueError):
-            pass
-    for key in ("error_message", "temp_unschedulable_reason", "last_error", "error", "detail"):
-        value = account.get(key)
-        if _sub2api_error_text_is_401(value) or _sub2api_structured_error_is_401(value, error_context=True):
-            return True
-    extra = account.get("extra")
-    return _sub2api_structured_error_is_401(extra, error_context=False)
+    return sub2api_reclaim.account_is_401(account)
 
 
 def _download_reclaim_payloads(
     reclaim_result: dict[str, Any], client: Any, *, exclude_order_nos: list[str] | None = None
 ) -> list[dict[str, Any]]:
-    payloads: list[dict[str, Any]] = []
-    total_bytes = 0
-    excluded = {str(value) for value in (exclude_order_nos or []) if str(value)}
-    tasks = reclaim_result.get("all_tasks") if isinstance(reclaim_result, dict) else None
-    if not isinstance(tasks, list):
-        return payloads
-    for task in tasks[:100]:
-        if not isinstance(task, dict) or task.get("status") != "done":
-            continue
-        order_no = str(task.get("order_no") or "").strip()
-        token = str(task.get("download_token") or "").strip()
-        if not order_no or not token or order_no in excluded:
-            continue
-        try:
-            content = client.download(order_no, token)
-        except Exception:
-            continue
-        if not content or len(content) > MAX_EXTERNAL_JSON_BYTES or total_bytes + len(content) > 24 * 1024 * 1024:
-            continue
-        try:
-            parsed = json.loads(content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("accounts"), list) or not parsed["accounts"]:
-            continue
-        total_bytes += len(content)
-        payloads.append({
-            "task": task,
-            "filename": f"{order_no}.json",
-            "content_base64": base64.b64encode(content).decode("ascii"),
-            "data": parsed,
-        })
-    return payloads
+    return sub2api_reclaim.download_payloads(
+        reclaim_result,
+        client,
+        exclude_order_nos=exclude_order_nos,
+        max_payload_bytes=MAX_EXTERNAL_JSON_BYTES,
+    )
 
 
 def reclaim_sub2api_401_accounts(
     *, include_downloads: bool = True, exclude_order_nos: list[str] | None = None
 ) -> dict[str, Any]:
-    config = sub2api_settings(reveal=True)
-    if not config["admin_key"]:
-        raise ValueError("请先配置 Sub2API 管理员密钥")
-    accounts = _sub2api_fetch_accounts(config)
-    accounts_401 = [account for account in accounts if _sub2api_account_is_401(account)]
-    from redeem_api_sdk import extract_card_code_from_name
-
-    card_codes = []
-    missing = []
-    seen = set()
-    for account in accounts_401:
-        card_code = extract_card_code_from_name(str(account.get("name") or ""))
-        if not card_code or len(card_code) < 8 or "-" not in card_code:
-            missing.append({"id": account.get("id"), "name": str(account.get("name") or "")[:200]})
-            continue
-        if card_code not in seen:
-            seen.add(card_code)
-            card_codes.append(card_code)
-
-    reclaim_result = None
-    downloaded_payloads: list[dict[str, Any]] = []
-    if card_codes:
-        client = _redeem_client()
-        reclaim_result = _dataclass_to_json(client.batch_reclaim(card_codes, mode="401"))
-        if include_downloads and isinstance(reclaim_result, dict):
-            downloaded_payloads = _download_reclaim_payloads(
-                reclaim_result, client, exclude_order_nos=exclude_order_nos
-            )
-    return {
-        "ok": reclaim_result is None or bool(reclaim_result.get("ok", False)),
-        "scanned_accounts": len(accounts),
-        "accounts_401": len(accounts_401),
-        "card_code_count": len(card_codes),
-        "missing_card_code_count": len(missing),
-        "skipped_non_401": len(accounts) - len(accounts_401),
-        "submitted": bool(card_codes),
-        "missing_card_code_accounts": missing[:50],
-        "reclaim_card_codes": card_codes,
-        "downloaded_payloads": downloaded_payloads,
-        "result": reclaim_result,
-    }
+    return sub2api_reclaim.reclaim_401_accounts(
+        config=sub2api_settings(reveal=True),
+        accounts_loader=_sub2api_fetch_accounts,
+        redeem_client_factory=_redeem_client,
+        to_json=_dataclass_to_json,
+        max_payload_bytes=MAX_EXTERNAL_JSON_BYTES,
+        include_downloads=include_downloads,
+        exclude_order_nos=exclude_order_nos,
+    )
 
 
 def _sub2api_datetime(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    try:
-        if isinstance(value, (int, float)) or str(value).strip().replace(".", "", 1).isdigit():
-            return datetime.fromtimestamp(float(value), timezone.utc)
-        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-    except (TypeError, ValueError, OSError):
-        return None
+    return sub2api_payloads.datetime_value(value)
 
 
 def _sub2api_monitor_summary(
@@ -1813,225 +1424,28 @@ def _sub2api_monitor_summary(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    current = now or datetime.now(timezone.utc)
-    expiring_cutoff = current.timestamp() + (7 * 86400)
-    platform_counts: dict[str, dict[str, int]] = {}
-    recent_errors = []
-    active_accounts = 0
-    error_accounts = 0
-    schedulable_accounts = 0
-    rate_limited_accounts = 0
-    expiring_accounts = 0
-
-    for account in accounts:
-        status = str(account.get("status") or "unknown").strip().lower()
-        platform = str(account.get("platform") or "unknown").strip().lower() or "unknown"
-        bucket = platform_counts.setdefault(platform, {"count": 0, "errors": 0})
-        bucket["count"] += 1
-        if status == "active":
-            active_accounts += 1
-        if bool(account.get("schedulable", status == "active")):
-            schedulable_accounts += 1
-        error_message = str(account.get("error_message") or "").strip()
-        if status == "error" or error_message:
-            error_accounts += 1
-            bucket["errors"] += 1
-            recent_errors.append({
-                "id": account.get("id"),
-                "name": str(account.get("name") or f"账号 {account.get('id') or '-'}")[:160],
-                "platform": platform,
-                "status": status,
-                "error": error_message[:300] or "账号状态异常",
-                "updated_at": account.get("updated_at"),
-            })
-        account_expiry = _sub2api_datetime(account.get("expires_at"))
-        if account_expiry and current.timestamp() <= account_expiry.timestamp() <= expiring_cutoff:
-            expiring_accounts += 1
-        limited_until = max(
-            (
-                stamp.timestamp()
-                for stamp in (
-                    _sub2api_datetime(account.get("rate_limit_reset_at")),
-                    _sub2api_datetime(account.get("overload_until")),
-                    _sub2api_datetime(account.get("temp_unschedulable_until")),
-                )
-                if stamp is not None
-            ),
-            default=0,
-        )
-        if limited_until > current.timestamp():
-            rate_limited_accounts += 1
-
-    def error_sort_key(item: dict[str, Any]) -> float:
-        stamp = _sub2api_datetime(item.get("updated_at"))
-        return stamp.timestamp() if stamp else 0
-
-    recent_errors.sort(key=error_sort_key, reverse=True)
-    active_proxies = sum(1 for proxy in proxies if str(proxy.get("status") or "").lower() == "active")
-    unhealthy_proxies = sum(
-        1
-        for proxy in proxies
-        if str(proxy.get("status") or "").lower() not in ("", "active")
-        or str(proxy.get("latency_status") or "").lower() in {"error", "failed", "timeout", "unreachable"}
+    return sub2api_payloads.monitor_summary(
+        accounts,
+        proxies,
+        groups,
+        now=now,
+        now_iso=utc_now,
     )
-    expiring_proxies = sum(
-        1
-        for proxy in proxies
-        if (expiry := _sub2api_datetime(proxy.get("expires_at")))
-        and current.timestamp() <= expiry.timestamp() <= expiring_cutoff
-    )
-    inactive_groups = sum(1 for group in groups if str(group.get("status") or "").lower() not in ("", "active"))
-    platforms = [
-        {"platform": platform, **counts}
-        for platform, counts in sorted(platform_counts.items(), key=lambda item: (-item[1]["count"], item[0]))
-    ]
-    return {
-        "fetched_at": utc_now(),
-        "total_accounts": len(accounts),
-        "active_accounts": active_accounts,
-        "error_accounts": error_accounts,
-        "inactive_accounts": max(0, len(accounts) - active_accounts - error_accounts),
-        "schedulable_accounts": schedulable_accounts,
-        "unschedulable_accounts": max(0, len(accounts) - schedulable_accounts),
-        "rate_limited_accounts": rate_limited_accounts,
-        "expiring_accounts": expiring_accounts,
-        "active_proxies": active_proxies,
-        "unhealthy_proxies": unhealthy_proxies,
-        "expiring_proxies": expiring_proxies,
-        "inactive_groups": inactive_groups,
-        "platforms": platforms,
-        "recent_errors": recent_errors[:8],
-    }
 
 
 def fetch_sub2api_options() -> dict[str, Any]:
-    config = sub2api_settings(reveal=True)
-    if not config["admin_key"]:
-        raise ValueError("请先配置 Sub2API 管理员密钥")
-    headers = {"x-api-key": config["admin_key"]}
-    endpoints = {
-        "proxies": "/api/v1/admin/proxies/all?with_count=true",
-        "groups": "/api/v1/admin/groups/all",
-    }
-    responses: dict[str, Any] = {}
-    for key, endpoint in endpoints.items():
-        status, payload, raw = _external_json_request(
-            "GET", config["base_url"] + endpoint, headers=headers, timeout=20
-        )
-        if not 200 <= status < 300:
-            detail = _sub2api_upstream_error(status, payload, raw)
-            raise RuntimeError(f"Sub2API {key} 返回 HTTP {status}: {detail}")
-        responses[key] = payload
-
-    proxies = []
-    for item in _sub2api_list(responses["proxies"], "proxies"):
-        try:
-            proxy_id = int(item.get("id"))
-            port = int(item.get("port") or 0)
-            account_count = int(item.get("account_count") or 0)
-        except (TypeError, ValueError):
-            continue
-        if proxy_id < 1:
-            continue
-        proxies.append({
-            "id": proxy_id,
-            "name": str(item.get("name") or f"代理 {proxy_id}")[:160],
-            "protocol": str(item.get("protocol") or ""),
-            "host": str(item.get("host") or "")[:255],
-            "port": port,
-            "status": str(item.get("status") or ""),
-            "account_count": account_count,
-            "expires_at": item.get("expires_at"),
-            "fallback_mode": str(item.get("fallback_mode") or "none"),
-            "latency_ms": item.get("latency_ms"),
-            "latency_status": str(item.get("latency_status") or ""),
-            "quality_grade": str(item.get("quality_grade") or ""),
-            "quality_score": item.get("quality_score"),
-            "country_code": str(item.get("country_code") or ""),
-            "region": str(item.get("region") or "")[:120],
-        })
-
-    groups = []
-    for item in _sub2api_list(responses["groups"], "groups"):
-        try:
-            group_id = int(item.get("id"))
-            account_count = int(item.get("account_count") or 0)
-        except (TypeError, ValueError):
-            continue
-        if group_id < 1:
-            continue
-        groups.append({
-            "id": group_id,
-            "name": str(item.get("name") or f"分组 {group_id}")[:160],
-            "platform": str(item.get("platform") or ""),
-            "status": str(item.get("status") or ""),
-            "account_count": account_count,
-            "subscription_type": str(item.get("subscription_type") or ""),
-            "rate_multiplier": item.get("rate_multiplier"),
-        })
-
-    accounts = _sub2api_fetch_accounts(config)
-    return {
-        "ok": True,
-        "proxy_service_available": True,
-        "proxy_count": len(proxies),
-        "group_count": len(groups),
-        "proxies": proxies,
-        "groups": groups,
-        "monitor": _sub2api_monitor_summary(accounts, proxies, groups),
-    }
+    return sub2api_client.fetch_options(
+        sub2api_settings(reveal=True),
+        request_json=_external_json_request,
+        accounts_loader=_sub2api_fetch_accounts,
+        monitor_builder=_sub2api_monitor_summary,
+    )
 
 
 def _sub2api_assignment_payload(
     normalized: dict[str, Any], proxy_id: Any, raw_group_ids: Any
 ) -> tuple[dict[str, Any], int | None, list[int]]:
-    selected_proxy_id: int | None = None
-    if proxy_id not in (None, ""):
-        try:
-            selected_proxy_id = int(proxy_id)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Sub2API 代理编号无效") from exc
-        if selected_proxy_id < 1:
-            raise ValueError("Sub2API 代理编号无效")
-
-    if raw_group_ids is None:
-        raw_group_ids = []
-    if not isinstance(raw_group_ids, list) or len(raw_group_ids) > 100:
-        raise ValueError("Sub2API 分组必须是最多 100 项的数组")
-    try:
-        group_ids = sorted({int(value) for value in raw_group_ids})
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Sub2API 分组编号无效") from exc
-    if any(value < 1 for value in group_ids):
-        raise ValueError("Sub2API 分组编号无效")
-
-    accounts = []
-    for index, source in enumerate(normalized["accounts"]):
-        platform = str(source.get("platform") or "").strip()
-        account_type = str(source.get("type") or "").strip()
-        if not platform or not account_type:
-            raise ValueError(f"第 {index + 1} 个账号缺少 platform 或 type")
-        try:
-            concurrency = int(source.get("concurrency") or 0)
-            priority = int(source.get("priority") or 0)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"第 {index + 1} 个账号 concurrency 或 priority 无效") from exc
-        item: dict[str, Any] = {
-            "name": str(source.get("name") or f"导入账号 {index + 1}")[:200],
-            "platform": platform,
-            "type": account_type,
-            "credentials": source["credentials"],
-            "extra": source.get("extra") if isinstance(source.get("extra"), dict) else {},
-            "proxy_id": selected_proxy_id,
-            "concurrency": concurrency,
-            "priority": priority,
-            "group_ids": group_ids,
-        }
-        for key in ("notes", "rate_multiplier", "expires_at", "auto_pause_on_expired"):
-            if key in source:
-                item[key] = source[key]
-        accounts.append(item)
-    return {"accounts": accounts}, selected_proxy_id, group_ids
+    return sub2api_payloads.assignment_payload(normalized, proxy_id, raw_group_ids)
 
 
 def _sub2api_import_payload(
@@ -2043,188 +1457,56 @@ def _sub2api_import_payload(
     assign_existing: bool | None = None,
     endpoint: str | None = None,
 ) -> dict[str, Any]:
-    config = sub2api_settings(reveal=True)
-    if not config["admin_key"]:
-        raise ValueError("请先配置 Sub2API 管理员密钥")
-    normalized = _merge_sub2api_data(source)
-    normalized, fingerprint_mode, codex_account_count = _sub2api_apply_codex_fingerprint_mode(
-        normalized, codex_fingerprint_mode
+    return sub2api_client.import_payload(
+        source,
+        config=sub2api_settings(reveal=True),
+        request_json=_external_json_request,
+        fingerprint_reconciler=_sub2api_reconcile_codex_fingerprint,
+        proxy_id=proxy_id,
+        group_ids=group_ids,
+        codex_fingerprint_mode=codex_fingerprint_mode,
+        assign_existing=assign_existing,
+        endpoint=endpoint,
     )
-    if assign_existing is None:
-        assign_existing = proxy_id not in (None, "") or bool(group_ids)
-    if assign_existing:
-        request_payload, selected_proxy_id, selected_group_ids = _sub2api_assignment_payload(
-            normalized, proxy_id, group_ids
-        )
-        target_endpoint = config["base_url"] + "/api/v1/admin/accounts/batch"
-        mode = "assigned"
-    else:
-        selected_proxy_id, selected_group_ids = None, []
-        import_endpoint = endpoint or "/api/v1/admin/accounts/data"
-        if import_endpoint == "/api/v1/admin/accounts/data":
-            request_payload = {"data": normalized, "skip_default_group_bind": True}
-        elif import_endpoint == "/api/v1/admin/accounts/import/codex-session":
-            request_payload = {"content": json.dumps(normalized, ensure_ascii=False), "update_existing": True}
-        else:
-            raise ValueError("Sub2API 导入接口无效")
-        target_endpoint = config["base_url"] + import_endpoint
-        mode = "data"
-    status, payload, raw = _external_json_request(
-        "POST",
-        target_endpoint,
-        request_payload,
-        headers={"x-api-key": config["admin_key"]},
-        timeout=60,
+
+
+def test_sub2api_connection() -> dict[str, Any]:
+    return sub2api_client.test_connection(
+        sub2api_settings(reveal=True),
+        request_json=_external_json_request,
     )
-    if not 200 <= status < 300:
-        detail = _sub2api_upstream_error(status, payload, raw)
-        raise RuntimeError(f"Sub2API 返回 HTTP {status}: {detail}")
-    try:
-        fingerprint_verification = _sub2api_reconcile_codex_fingerprint(
-            config, normalized, fingerprint_mode, payload
-        )
-    except RuntimeError as exc:
-        fingerprint_verification = _sub2api_fingerprint_verification_error(
-            fingerprint_mode, codex_account_count, exc
-        )
-    return {
-        "ok": True,
-        "mode": mode,
-        "upstream_status": status,
-        "proxy_id": selected_proxy_id,
-        "group_ids": selected_group_ids,
-        "codex_fingerprint_mode": fingerprint_mode,
-        "codex_account_count": codex_account_count,
-        "fingerprint_verification": fingerprint_verification,
-        "result": _sub2api_payload_data(payload),
-    }
 
 
 def save_sub2api_automation_settings(data: dict[str, Any]) -> dict[str, Any]:
-    try:
-        interval = min(max(int(data.get("interval_seconds") or 300), 10), 86400)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("自动监控间隔必须是 10 到 86400 秒") from exc
-    mode = str(data.get("codex_fingerprint_mode") or "off").strip().lower()
-    if mode not in SUB2API_CODEX_FINGERPRINT_MODES:
-        raise ValueError("Codex 指纹收敛模式无效")
-    proxy_id = data.get("proxy_id")
-    try:
-        proxy_id = int(proxy_id) if proxy_id not in (None, "") else None
-    except (TypeError, ValueError) as exc:
-        raise ValueError("自动导入代理无效") from exc
-    raw_groups = data.get("group_ids") or []
-    if not isinstance(raw_groups, list) or len(raw_groups) > 100:
-        raise ValueError("自动导入分组无效")
-    try:
-        group_ids = sorted({int(item) for item in raw_groups})
-    except (TypeError, ValueError) as exc:
-        raise ValueError("自动导入分组无效") from exc
-    if any(item < 1 for item in group_ids):
-        raise ValueError("自动导入分组无效")
-    enabled = bool(data.get("enabled", False))
-    auto_import = bool(data.get("auto_import", False))
-    if enabled:
-        if not sub2api_settings(reveal=True)["admin_key"]:
-            raise ValueError("请先配置 Sub2API 管理员密钥")
-        if not auto_import:
-            raise ValueError("启用自动监控前必须勾选自动导入")
-        if proxy_id is None or not group_ids or mode == "off":
-            raise ValueError("启用自动监控前必须选择代理、至少一个分组和 Codex 指纹模式")
-    value = {
-        "enabled": enabled,
-        "interval_seconds": interval,
-        "auto_import": auto_import,
-        "proxy_id": proxy_id,
-        "group_ids": group_ids,
-        "codex_fingerprint_mode": mode,
-    }
-    _store_setting("sub2api_automation", value)
-    return value
+    return sub2api_config.save_automation_settings(
+        data,
+        has_admin_key=lambda: bool(sub2api_settings(reveal=True)["admin_key"]),
+        store_setting=_store_setting,
+    )
 
 
 def refresh_sub2api_reclaim(
     card_codes: list[str], *, exclude_order_nos: list[str] | None = None
 ) -> dict[str, Any]:
-    normalized = list(dict.fromkeys(str(code).strip() for code in card_codes if str(code).strip()))
-    if not normalized or len(normalized) > 100:
-        raise ValueError("卡密数量应为 1 到 100 个")
-    client = _redeem_client()
-    result = _dataclass_to_json(client.refresh_progress(normalized))
-    downloads = (
-        _download_reclaim_payloads(result, client, exclude_order_nos=exclude_order_nos)
-        if isinstance(result, dict)
-        else []
+    return sub2api_reclaim.refresh_reclaim(
+        card_codes,
+        redeem_client_factory=_redeem_client,
+        to_json=_dataclass_to_json,
+        max_payload_bytes=MAX_EXTERNAL_JSON_BYTES,
+        exclude_order_nos=exclude_order_nos,
     )
-    return {
-        "ok": bool(isinstance(result, dict) and result.get("ok", False)),
-        "reclaim_card_codes": normalized,
-        "downloaded_payloads": downloads,
-        "result": result,
-    }
 
 
 def run_sub2api_automation_cycle() -> dict[str, Any]:
-    settings = sub2api_automation_settings()
-    state = sub2api_automation_state()
-    if not settings["enabled"]:
-        return {"ok": True, "skipped": True, "reason": "disabled", "settings": settings, "state": state}
-    pending = state["pending_card_codes"]
-    imported_order_nos = state["imported_order_nos"] if pending else []
-    if pending:
-        reclaim = refresh_sub2api_reclaim(pending, exclude_order_nos=imported_order_nos)
-    else:
-        reclaim = reclaim_sub2api_401_accounts(
-            include_downloads=True, exclude_order_nos=imported_order_nos
-        )
-    if not reclaim.get("ok", False):
-        failure = reclaim.get("result") if isinstance(reclaim.get("result"), dict) else {}
-        raise RuntimeError(str(failure.get("error") or reclaim.get("error") or "401 找回服务返回失败")[:500])
-    result = reclaim.get("result") if isinstance(reclaim.get("result"), dict) else {}
-    downloads = reclaim.get("downloaded_payloads") if isinstance(reclaim.get("downloaded_payloads"), list) else []
-    card_codes = reclaim.get("reclaim_card_codes") if isinstance(reclaim.get("reclaim_card_codes"), list) else pending
-    import_result = None
-    if downloads:
-        import_result = _sub2api_import_payload(
-            [item["data"] for item in downloads if isinstance(item, dict) and isinstance(item.get("data"), dict)],
-            proxy_id=settings["proxy_id"],
-            group_ids=settings["group_ids"],
-            codex_fingerprint_mode=settings["codex_fingerprint_mode"],
-            assign_existing=True,
-        )
-        imported_order_nos = (
-            imported_order_nos
-            + [str(item.get("task", {}).get("order_no") or "") for item in downloads]
-        )[-500:]
-    if int(result.get("queued") or 0) + int(result.get("already_running") or 0) > 0:
-        pending = card_codes
-    else:
-        pending = []
-        imported_order_nos = []
-    summary = {
-        "ok": bool(reclaim.get("ok", False)),
-        "scanned_accounts": reclaim.get("scanned_accounts"),
-        "accounts_401": reclaim.get("accounts_401"),
-        "card_code_count": reclaim.get("card_code_count", len(card_codes or [])),
-        "queued": int(result.get("queued") or 0),
-        "done": int(result.get("done") or 0),
-        "downloaded": len(downloads),
-        "imported": bool(import_result),
-        "import_result": import_result,
-    }
-    state = {
-        "last_run": utc_now(),
-        "last_error": "",
-        "last_result": summary,
-        "pending_card_codes": pending,
-        "imported_order_nos": imported_order_nos,
-        "run_history": (
-            state.get("run_history", [])
-            + [{"run_at": utc_now(), "status": "success", **summary}]
-        )[-20:],
-    }
-    _store_sub2api_automation_state(state)
-    return {"ok": True, "settings": settings, "state": state, "result": summary}
+    return sub2api_automation.run_cycle(
+        settings_loader=sub2api_automation_settings,
+        state_loader=sub2api_automation_state,
+        refresh_reclaim=refresh_sub2api_reclaim,
+        reclaim_accounts=reclaim_sub2api_401_accounts,
+        import_payload=_sub2api_import_payload,
+        store_state=_store_sub2api_automation_state,
+        now=utc_now,
+    )
 
 
 def list_preorders() -> list[dict[str, Any]]:
@@ -2760,50 +2042,15 @@ class MonitorWorker(threading.Thread):
 WORKER = MonitorWorker()
 
 
-class Sub2ApiAutomationWorker(threading.Thread):
+class Sub2ApiAutomationWorker(sub2api_worker.Sub2ApiAutomationWorker):
     def __init__(self) -> None:
-        super().__init__(name="sub2api-401-automation", daemon=True)
-        self.stop_event = threading.Event()
-        self.run_lock = threading.Lock()
-
-    def run_once(self) -> dict[str, Any]:
-        if not self.run_lock.acquire(blocking=False):
-            return {"ok": True, "skipped": True, "reason": "busy"}
-        try:
-            return run_sub2api_automation_cycle()
-        except Exception as exc:
-            previous = sub2api_automation_state()
-            state = {
-                "last_run": utc_now(),
-                "last_error": str(exc)[:500],
-                "last_result": previous.get("last_result"),
-                "pending_card_codes": previous.get("pending_card_codes", []),
-                "imported_order_nos": previous.get("imported_order_nos", []),
-                "run_history": (
-                    previous.get("run_history", [])
-                    + [{"run_at": utc_now(), "status": "error", "error": str(exc)[:500]}]
-                )[-20:],
-            }
-            _store_sub2api_automation_state(state)
-            return {"ok": False, "detail": state["last_error"], "state": state}
-        finally:
-            self.run_lock.release()
-
-    def run(self) -> None:
-        while not self.stop_event.wait(1):
-            settings = sub2api_automation_settings()
-            if not settings["enabled"]:
-                continue
-            state = sub2api_automation_state()
-            last_run = 0.0
-            if state.get("last_run"):
-                try:
-                    last_run = datetime.fromisoformat(str(state["last_run"])).timestamp()
-                except ValueError:
-                    pass
-            interval = min(settings["interval_seconds"], 10) if state["pending_card_codes"] else settings["interval_seconds"]
-            if time.time() - last_run >= interval:
-                self.run_once()
+        super().__init__(
+            run_cycle=lambda: run_sub2api_automation_cycle(),
+            settings_loader=lambda: sub2api_automation_settings(),
+            state_loader=lambda: sub2api_automation_state(),
+            store_state=lambda value: _store_sub2api_automation_state(value),
+            now=lambda: utc_now(),
+        )
 
 
 AUTOMATION_WORKER = Sub2ApiAutomationWorker()
@@ -3081,21 +2328,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._send_json(checkout_settings())
         if path == "/api/redeem/config":
             return self._send_json(redeem_settings())
-        if path == "/api/sub2api/config":
-            return self._send_json(sub2api_settings())
-        if path == "/api/sub2api/automation":
-            return self._send_json({
-                "ok": True,
-                "settings": sub2api_automation_settings(),
-                "state": sub2api_automation_state(),
-            })
-        if path == "/api/sub2api/options":
-            try:
-                return self._send_json(fetch_sub2api_options())
-            except ValueError as exc:
-                return self._send_json({"detail": str(exc)}, 400)
-            except RuntimeError as exc:
-                return self._send_json({"detail": str(exc)}, 502)
+        if sub2api_routes.handle_get(
+            path,
+            send_json=self._send_json,
+            settings_loader=sub2api_settings,
+            automation_settings_loader=sub2api_automation_settings,
+            automation_state_loader=sub2api_automation_state,
+            options_loader=fetch_sub2api_options,
+        ):
+            return
         if path == "/api/pay/juuid":
             token = parse_qs(parsed.query).get("token", [""])[0]
             try:
@@ -3178,74 +2419,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "data": parsed,
             })
 
-        if path == "/api/sub2api/test":
-            config = sub2api_settings(reveal=True)
-            if not config["admin_key"]:
-                return self._send_json({"detail": "请先配置 Sub2API 管理员密钥"}, 400)
-            try:
-                status, payload, _ = _external_json_request(
-                    "GET",
-                    config["base_url"] + "/api/v1/admin/accounts",
-                    # Sub2API's admin middleware authenticates API keys via x-api-key.
-                    # Authorization: Bearer is reserved for admin JWTs.
-                    headers={"x-api-key": config["admin_key"]},
-                    timeout=15,
-                )
-            except (ValueError, RuntimeError) as exc:
-                return self._send_json({"detail": str(exc)}, 502)
-            accounts = payload.get("data") if isinstance(payload, dict) else payload
-            if isinstance(accounts, dict):
-                accounts = accounts.get("accounts") or accounts.get("items") or accounts.get("list")
-            count = len(accounts) if isinstance(accounts, list) else None
-            return self._send_json({"ok": 200 <= status < 300, "upstream_status": status, "account_count": count})
-
-        if path in ("/api/sub2api/reclaim-401", "/api/sub2api/reclaim401"):
-            try:
-                result = reclaim_sub2api_401_accounts()
-                if not isinstance(result, dict):
-                    return self._send_json({"detail": "401 找回返回格式无效"}, 502)
-                if not result.get("ok", False):
-                    failure = result.get("result") if isinstance(result.get("result"), dict) else {}
-                    detail = str(failure.get("error") or result.get("error") or "401 找回服务返回失败")[:240]
-                    result = {**result, "detail": detail}
-                return self._send_json(result, 200 if result.get("ok", False) else 502)
-            except ValueError as exc:
-                return self._send_json({"detail": str(exc)}, 400)
-            except RuntimeError as exc:
-                return self._send_json({"detail": str(exc)}, 502)
-
-        if path == "/api/sub2api/reclaim-progress":
-            raw_codes = data.get("card_codes")
-            if not isinstance(raw_codes, list):
-                return self._send_json({"detail": "请提供 card_codes 数组"}, 400)
-            try:
-                result = refresh_sub2api_reclaim(raw_codes)
-                return self._send_json(result, 200 if result["ok"] else 502)
-            except ValueError as exc:
-                return self._send_json({"detail": str(exc)}, 400)
-            except RuntimeError as exc:
-                return self._send_json({"detail": str(exc)}, 502)
-
-        if path == "/api/sub2api/automation/run":
-            result = AUTOMATION_WORKER.run_once()
-            return self._send_json(result, 200 if result.get("ok", False) else 502)
-
-        if path == "/api/sub2api/import":
-            try:
-                source = data.get("data") if "data" in data else data
-                result = _sub2api_import_payload(
-                    source,
-                    proxy_id=data.get("proxy_id"),
-                    group_ids=data.get("group_ids"),
-                    codex_fingerprint_mode=data.get("codex_fingerprint_mode") if "codex_fingerprint_mode" in data else None,
-                    assign_existing=data.get("assign_existing") if "assign_existing" in data else None,
-                    endpoint=str(data.get("endpoint") or "/api/v1/admin/accounts/data"),
-                )
-                return self._send_json(result)
-            except (TypeError, ValueError) as exc:
-                return self._send_json({"detail": str(exc)}, 400)
-            except RuntimeError as exc:
-                return self._send_json({"detail": str(exc)}, 502)
+        if sub2api_routes.handle_post(
+            path,
+            data,
+            send_json=self._send_json,
+            test_connection=test_sub2api_connection,
+            reclaim_accounts=reclaim_sub2api_401_accounts,
+            refresh_reclaim=refresh_sub2api_reclaim,
+            run_automation=AUTOMATION_WORKER.run_once,
+            import_payload=_sub2api_import_payload,
+        ):
+            return
 
         if path == "/api/watches/batch-delete":
             raw_ids = data.get("ids")
@@ -3632,28 +2816,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             _store_setting("redeem", {"base_url": base_url})
             return self._send_json({"base_url": base_url})
 
-        if path == "/api/sub2api/config":
-            try:
-                base_url = _normalize_service_url(data.get("base_url"), DEFAULT_SUB2API_URL)
-            except ValueError as exc:
-                return self._send_json({"detail": str(exc)}, 400)
-            supplied_key = data.get("admin_key")
-            current = sub2api_settings(reveal=True)
-            if supplied_key is None or str(supplied_key).strip() == "":
-                admin_key = current["admin_key"]
-            else:
-                admin_key = str(supplied_key).strip()
-            if len(admin_key) > 512:
-                return self._send_json({"detail": "管理员密钥过长"}, 400)
-            _store_setting("sub2api", {"base_url": base_url, "admin_key": admin_key})
-            return self._send_json(sub2api_settings())
-
-        if path == "/api/sub2api/automation":
-            try:
-                settings = save_sub2api_automation_settings(data)
-            except ValueError as exc:
-                return self._send_json({"detail": str(exc)}, 400)
-            return self._send_json({"ok": True, "settings": settings, "state": sub2api_automation_state()})
+        if sub2api_routes.handle_put(
+            path,
+            data,
+            send_json=self._send_json,
+            normalize_url=_normalize_service_url,
+            store_setting=_store_setting,
+            settings_loader=sub2api_settings,
+            save_automation_settings=save_sub2api_automation_settings,
+            automation_state_loader=sub2api_automation_state,
+        ):
+            return
 
         return self._send_json({"detail": "接口不存在"}, 404)
 
