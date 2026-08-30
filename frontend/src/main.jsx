@@ -53,6 +53,7 @@ import './style.css';
 
 const API = '/api';
 const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
+const ProductDetailPriceChart = React.lazy(() => import('./PriceHistoryChart.jsx').then(module => ({default: module.ProductDetailPriceChart})));
 const DEFAULT_SUB2API_AUTOMATION = {
   enabled: false,
   interval_seconds: 300,
@@ -123,30 +124,6 @@ function StatusPill({item}) {
   if (!item.latest) return <span className="pill neutral"><Clock3 size={12}/>等待数据</span>;
   if (item.latest.sale_status === 'on_sale') return <span className="pill live"><span className="dot"/>在售</span>;
   return <span className="pill neutral"><Clock3 size={12}/>状态未知</span>;
-}
-
-function PriceBars({history}) {
-  const points = history.filter(point => {
-    if (point.status !== 'success' || point.price === null || point.price === undefined || point.price === '') return false;
-    return Number.isFinite(Number(point.price));
-  });
-  if (!points.length) return <div className="chart-empty">完成两次抓取后显示价格走势</div>;
-  const values = points.map(point => Number(point.price));
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  return (
-    <div className="price-chart" aria-label="价格历史">
-      {points.slice(-24).map((point, index) => {
-        const value = Number(point.price);
-        const height = max === min ? 58 : 22 + ((value - min) / (max - min)) * 70;
-        return <Tooltip key={`${point.id}-${index}`} label={`${compactTime(point.fetched_at)} · ${money(value)}`} placement="top">
-          <div className="bar-wrap">
-            <span className="bar" style={{height: `${height}%`}}/>
-          </div>
-        </Tooltip>;
-      })}
-    </div>
-  );
 }
 
 function historyStockMeta(point) {
@@ -539,7 +516,7 @@ function ProductOverviewDrawer({id, open, items, shops, stableOrder, busy = {}, 
 }
 
 
-function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy = {}, onClose, onBuy, onAdd, onRefresh, onDirect}) {
+function ProductDetailDrawer({open, item, history, trend, historyTotal, priceDelta, lowestPrice, busy = {}, onClose, onBuy, onAdd, onRefresh, onDirect}) {
   const latest = item?.latest;
   const stock = itemStock(item);
   const specs = latest?.specs && typeof latest.specs === 'object' ? Object.entries(latest.specs) : [];
@@ -549,7 +526,8 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
   const marketPriceValue = Number(latest?.market_price);
   const marketPrice = Number.isFinite(marketPriceValue) && marketPriceValue > 0 ? marketPriceValue : null;
   const successfulHistory = history.filter(point => point.status === 'success');
-  const priceValues = successfulHistory
+  const successfulTrend = (trend || []).filter(point => point.status === 'success');
+  const priceValues = successfulTrend
     .map(point => Number(point.price))
     .filter(Number.isFinite);
   const priceMinimum = priceValues.length ? Math.min(...priceValues) : currentPrice;
@@ -558,7 +536,9 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
   const syncRate = history.length ? Math.round((successfulHistory.length / history.length) * 100) : null;
   const discountRate = currentPrice !== null && marketPrice !== null ? ((marketPrice - currentPrice) / marketPrice) * 100 : null;
   const lowestGap = currentPrice !== null && lowestPrice !== null && lowestPrice !== undefined ? currentPrice - Number(lowestPrice) : null;
-  const recentHistory = history.slice(-24);
+  const recentHistory = [...history]
+    .sort((left, right) => new Date(left.fetched_at).getTime() - new Date(right.fetched_at).getTime())
+    .slice(-24);
   const recentSlots = Array.from({length: 24}, (_, index) => recentHistory[index - (24 - recentHistory.length)] || null);
   const saleStatus = itemIsUnlisted(item) ? '未上架' : latest?.sale_status === 'on_sale' ? '在售' : '状态未知';
   const priceChangeLabel = priceDelta === null || priceDelta === undefined
@@ -650,9 +630,11 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
           </div>
 
           <section className="detail-information-panel detail-price-history detail-section-anchor" id="detail-price-history">
-            <div className="detail-panel-heading"><div><span className="drawer-kicker">PRICE HISTORY</span><h3>价格走势</h3></div><span>{history.length} 次监控记录</span></div>
+            <div className="detail-panel-heading"><div><span className="drawer-kicker">PRICE HISTORY</span><h3>价格走势</h3></div><span>{Number(historyTotal || trend?.length || history.length).toLocaleString('zh-CN')} 次监控记录</span></div>
             <div className="detail-history-summary"><div><span>历史最低</span><strong>{money(priceMinimum)}</strong></div><div><span>历史最高</span><strong>{money(priceMaximum)}</strong></div><div><span>历史均价</span><strong>{money(priceAverage)}</strong></div><div><span>最近变动</span><strong className={priceDelta > 0 ? 'negative' : priceDelta < 0 ? 'positive' : ''}>{priceChangeLabel}</strong></div></div>
-            <PriceBars history={history}/>
+            <React.Suspense fallback={<div className="detail-price-chart-loading"><RefreshCw size={17} className="spin"/><span>正在加载价格走势…</span></div>}>
+              <ProductDetailPriceChart points={trend}/>
+            </React.Suspense>
           </section>
 
           <section className="detail-product-information detail-section-anchor" id="detail-product-info">
@@ -2099,7 +2081,7 @@ function App() {
       </main>
 
       <ProductOverviewDrawer id="product-overview-drawer" open={overviewOpen} items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} shopFilter={shopFilter} onClose={() => setOverviewOpen(false)} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={fetchOne} onShopFilter={value => { setShopFilter(value); setCheckedIds([]); }}/>
-      <ProductDetailDrawer open={detailOpen} item={selected} history={history} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={fetchOne} onDirect={openDirectProduct}/>
+      <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={fetchOne} onDirect={openDirectProduct}/>
 
       {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
       {review && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setReview(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="购买确认"><div className="modal-head"><div><span>DIRECT CHECKOUT</span><h2>支付链接已准备</h2></div><IconButton label="关闭" onClick={() => setReview(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>{review.notice} 创建成功后会自动打开支付页面；下方仍保留“打开支付链接”入口，方便重复打开。</p></div><div className="review-list">{review.items.map(item => <div className="review-item" key={item.watch_id}><div><strong>{item.title}</strong><span>{money(item.unit_price)} × {item.quantity}</span><a className="payment-link" href={item.official_url} target="_blank" rel="noreferrer"><Link2 size={13}/>{item.official_url}</a></div><strong>{money(item.subtotal)}</strong><div className="review-actions"><button className="button secondary" onClick={() => copyPaymentLink(item)}><Clipboard size={15}/>复制商品链接</button></div></div>)}</div>{officialOrder && <div className="payment-order-result"><div><span>官方订单</span><strong>{officialOrder.trade_no}</strong></div><a href={officialOrder.payment_url} target="_blank" rel="noreferrer"><Link2 size={14}/>{officialOrder.payment_url}</a><small>{officialOrder.notice} 渠道：{officialOrder.channel === 'alipay' ? '支付宝' : '微信支付'}，金额：{money(officialOrder.amount)}</small><button className="button official" onClick={() => window.open(officialOrder.payment_url, '_blank', 'noopener,noreferrer')}><ArrowUpRight size={15}/>打开支付链接</button></div>}<div className="review-total"><span>清单合计</span><strong>{money(review.total)}</strong></div><div className="modal-foot"><span><ShieldCheck size={14}/>支付前请核对订单金额</span><div className="modal-foot-actions"><label className="payment-channel"><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><button className="button official auto-pay-button" onClick={createOfficialOrder} disabled={busy.officialOrder}><Package size={15}/>{busy.officialOrder ? '正在创建并跳转' : '创建订单并自动跳转'}</button><button className="button secondary" onClick={() => setReview(null)}>返回修改</button></div></div></div></div>}
