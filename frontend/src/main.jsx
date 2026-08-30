@@ -484,6 +484,26 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
   const stock = itemStock(item);
   const specs = latest?.specs && typeof latest.specs === 'object' ? Object.entries(latest.specs) : [];
   const sourceUrl = latest?.source_url || item?.url;
+  const currentPrice = itemPrice(item);
+  const marketPriceValue = Number(latest?.market_price);
+  const marketPrice = Number.isFinite(marketPriceValue) && marketPriceValue > 0 ? marketPriceValue : null;
+  const successfulHistory = history.filter(point => point.status === 'success');
+  const priceValues = successfulHistory
+    .map(point => Number(point.price))
+    .filter(Number.isFinite);
+  const priceMinimum = priceValues.length ? Math.min(...priceValues) : currentPrice;
+  const priceMaximum = priceValues.length ? Math.max(...priceValues) : currentPrice;
+  const priceAverage = priceValues.length ? priceValues.reduce((sum, value) => sum + value, 0) / priceValues.length : currentPrice;
+  const syncRate = history.length ? Math.round((successfulHistory.length / history.length) * 100) : null;
+  const discountRate = currentPrice !== null && marketPrice !== null ? ((marketPrice - currentPrice) / marketPrice) * 100 : null;
+  const lowestGap = currentPrice !== null && lowestPrice !== null && lowestPrice !== undefined ? currentPrice - Number(lowestPrice) : null;
+  const recentHistory = history.slice(-24);
+  const recentSlots = Array.from({length: 24}, (_, index) => recentHistory[index - (24 - recentHistory.length)] || null);
+  const saleStatus = itemIsUnlisted(item) ? '未上架' : latest?.sale_status === 'on_sale' ? '在售' : '状态未知';
+  const priceChangeLabel = priceDelta === null || priceDelta === undefined
+    ? '暂无对比'
+    : priceDelta === 0 ? '价格稳定' : `${priceDelta > 0 ? '+' : '-'}${money(Math.abs(priceDelta))}`;
+
   return <>
     <div className={`drawer-backdrop detail-backdrop ${open ? 'open' : ''}`} onClick={onClose} aria-hidden="true"/>
     <aside className={`product-detail-drawer ${open ? 'open' : ''}`} aria-label="商品详情" aria-hidden={!open} inert={!open ? true : undefined}>
@@ -491,17 +511,92 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
         <div><span className="drawer-kicker">PRODUCT DETAIL</span><h2>商品详情</h2><p>{item ? itemShopName(item) : '未选择商品'}</p></div>
         <IconButton label="关闭商品详情" onClick={onClose}><X size={17}/></IconButton>
       </div>
-      {!item ? <div className="drawer-empty"><Package size={30}/><strong>请选择商品</strong><span>从价格雷达或商品目录打开详情</span></div> : <div className="detail-drawer-body">
-        <div className="detail-drawer-hero"><ProductImage item={item} size="large"/><div><span className="detail-kicker">{itemCategory(item)}</span><h3>{latest?.title || item.name || '等待商品数据'}</h3><span className="detail-source">{itemShopName(item)}</span></div></div>
-        <div className="detail-drawer-actions"><button className="button primary" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15}/>{busy[`buy-${item.id}`] ? '正在准备' : '一键购买'}</button><button className="button secondary" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/>加入清单</button><button className="button secondary" onClick={() => onDirect(item)}><ArrowUpRight size={15}/>直达商品页</button><IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton></div>
-        <div className="detail-price-board"><div><span>当前报价</span><strong>{money(itemPrice(item))}</strong></div><div><span>同类最低</span><strong>{money(lowestPrice)}</strong></div><div><span>参考价</span><strong>{Number(latest?.market_price) > 0 ? money(latest.market_price) : '--'}</strong></div><div><span>价格变化</span><strong className={priceDelta > 0 ? 'negative' : priceDelta < 0 ? 'positive' : ''}>{priceDelta === null || priceDelta === undefined ? '--' : priceDelta === 0 ? '不变' : `${priceDelta > 0 ? '+' : '-'}${money(Math.abs(priceDelta))}`}</strong></div></div>
-        <div className="detail-state-grid"><div><span>库存状态</span><strong className={`state-text ${stock.key}`}>{itemStockLabel(item)}</strong></div><div><span>销售状态</span><strong>{itemIsUnlisted(item) ? '未上架' : latest?.sale_status === 'on_sale' ? '在售' : '状态未知'}</strong></div><div><span>最低起购</span><strong>{latest?.limit_count || 1} 件</strong></div><div><span>最近同步</span><strong>{compactTime(item.last_attempt?.fetched_at)}</strong></div></div>
-        <div className="detail-drawer-chart"><div className="drawer-section-head"><div><span className="drawer-kicker">PRICE HISTORY</span><h3>价格走势</h3></div><span>{history.length} 次记录</span></div><PriceBars history={history}/></div>
-        <div className="detail-description"><span className="drawer-kicker">DESCRIPTION</span><h3>商品信息</h3><p>{latest?.description || '暂无商品描述'}</p></div>
-        {specs.length > 0 && <div className="detail-drawer-specs"><span className="drawer-kicker">SPECIFICATIONS</span><h3>规格参数</h3><div>{specs.map(([key, value]) => <dl key={key}><dt>{key}</dt><dd>{String(value)}</dd></dl>)}</div></div>}
-        {item.last_attempt?.status === 'error' && <div className="inline-error"><AlertCircle size={16}/><span>{item.last_attempt.error}</span></div>}
-        <a className="detail-direct-link" href={sourceUrl} target="_blank" rel="noreferrer"><Link2 size={14}/>打开官方商品页面<ArrowUpRight size={14}/></a>
-      </div>}
+      {item && <nav className="detail-drawer-tabs" aria-label="商品详情分区">
+        <a href="#detail-overview">概览</a>
+        <a href="#detail-quality">监控质量</a>
+        <a href="#detail-price-history">价格走势</a>
+        <a href="#detail-product-info">商品信息</a>
+      </nav>}
+      {!item ? <div className="drawer-empty"><Package size={30}/><strong>请选择商品</strong><span>从价格雷达或商品目录打开详情</span></div> : <>
+        <div className="detail-drawer-body">
+          <section className="detail-section-anchor" id="detail-overview">
+            <div className="detail-drawer-hero">
+              <ProductImage item={item} size="large"/>
+              <div className="detail-hero-copy">
+                <span className="detail-kicker">{itemCategory(item)}</span>
+                <h3>{latest?.title || item.name || '等待商品数据'}</h3>
+                <div className="detail-hero-meta"><RadarStockPill item={item}/><span><Store size={13}/>{itemShopName(item)}</span><span><Package size={13}/>{latest?.goods_key || `商品 #${item.id}`}</span></div>
+              </div>
+              <div className="detail-hero-price"><span>当前报价</span><strong>{money(currentPrice)}</strong><small className={priceDelta > 0 ? 'negative' : priceDelta < 0 ? 'positive' : ''}>{priceChangeLabel}</small></div>
+            </div>
+
+            <div className="detail-price-board" aria-label="价格指标">
+              <div><span><CircleDollarSign size={14}/>当前报价</span><strong>{money(currentPrice)}</strong><small>{lowestGap === null || !Number.isFinite(lowestGap) ? '暂无同类比较' : lowestGap <= 0 ? '当前同类最低' : `高于最低 ${money(lowestGap)}`}</small></div>
+              <div><span><Tag size={14}/>同类最低</span><strong>{money(lowestPrice)}</strong><small>{itemCategory(item)} 分类</small></div>
+              <div><span><Activity size={14}/>参考价格</span><strong>{money(marketPrice)}</strong><small>{discountRate === null ? '未提供参考价' : discountRate >= 0 ? `较参考价低 ${Math.abs(discountRate).toFixed(1)}%` : `较参考价高 ${Math.abs(discountRate).toFixed(1)}%`}</small></div>
+              <div><span><History size={14}/>历史均价</span><strong>{money(priceAverage)}</strong><small>{priceValues.length} 个有效价格样本</small></div>
+            </div>
+
+            <div className="detail-state-grid" aria-label="库存与销售状态">
+              <div><span>库存状态</span><strong className={`state-text ${stock.key}`}>{itemStockLabel(item)}</strong></div>
+              <div><span>销售状态</span><strong>{saleStatus}</strong></div>
+              <div><span>最低起购</span><strong>{latest?.limit_count || 1} 件</strong></div>
+              <div><span>查询密码</span><strong>{latest?.query_password_required ? '下单时需要' : '无需密码'}</strong></div>
+              <div><span>自动监控</span><strong>{item.enabled ? `运行中 · ${intervalLabel(item.interval_seconds)}` : '已暂停'}</strong></div>
+              <div><span>最近同步</span><strong>{compactTime(item.last_attempt?.fetched_at)}</strong></div>
+            </div>
+          </section>
+
+          <div className="detail-information-grid detail-section-anchor" id="detail-quality">
+            <section className="detail-information-panel detail-quality-panel">
+              <div className="detail-panel-heading"><div><span className="drawer-kicker">MONITOR QUALITY</span><h3>监控质量</h3></div><ShieldCheck size={18}/></div>
+              <div className="detail-quality-overview">
+                <div className={`detail-quality-score ${syncRate !== null && syncRate < 80 ? 'warning' : ''}`}><strong>{syncRate === null ? '--' : `${syncRate}%`}</strong><span>抓取成功率</span></div>
+                <dl><div><dt>成功记录</dt><dd>{successfulHistory.length}</dd></div><div><dt>异常记录</dt><dd>{history.length - successfulHistory.length}</dd></div><div><dt>监控样本</dt><dd>{history.length}</dd></div><div><dt>首次记录</dt><dd>{compactTime(history[0]?.fetched_at)}</dd></div></dl>
+              </div>
+              <div className="detail-sync-header"><span>最近 24 次同步</span><small>由早到晚</small></div>
+              <div className="detail-sync-strip" aria-label="最近 24 次同步结果">
+                {recentSlots.map((point, index) => <span className={point ? point.status === 'success' ? 'success' : 'error' : 'empty'} title={point ? `${compactTime(point.fetched_at)} · ${point.status === 'success' ? '成功' : point.error || '失败'}` : '暂无记录'} key={`${point?.id || 'empty'}-${index}`}/>) }
+              </div>
+              <div className="detail-sync-legend"><span><i className="success"/>成功</span><span><i className="error"/>异常</span><span><i className="empty"/>无记录</span></div>
+            </section>
+
+            <section className="detail-information-panel">
+              <div className="detail-panel-heading"><div><span className="drawer-kicker">SOURCE & RULES</span><h3>来源与规则</h3></div><Store size={18}/></div>
+              <div className="detail-source-list">
+                <dl><dt>所属店铺</dt><dd>{itemShopName(item)}</dd></dl>
+                <dl><dt>商品标识</dt><dd>{latest?.goods_key || '--'}</dd></dl>
+                <dl><dt>商品分类</dt><dd>{itemCategory(item)}</dd></dl>
+                <dl><dt>数据来源</dt><dd>{item.shops?.length ? '店铺同步' : '独立监控'}</dd></dl>
+                <dl><dt>抓取状态</dt><dd className={item.last_attempt?.status === 'error' ? 'negative' : 'positive'}>{item.last_attempt?.status === 'error' ? '最近一次异常' : '最近一次成功'}</dd></dl>
+                <dl><dt>监控编号</dt><dd>#{item.id}</dd></dl>
+              </div>
+              <a className="detail-source-link" href={sourceUrl} target="_blank" rel="noreferrer"><Link2 size={14}/><span>{sourceUrl}</span><ArrowUpRight size={14}/></a>
+            </section>
+          </div>
+
+          <section className="detail-information-panel detail-price-history detail-section-anchor" id="detail-price-history">
+            <div className="detail-panel-heading"><div><span className="drawer-kicker">PRICE HISTORY</span><h3>价格走势</h3></div><span>{history.length} 次监控记录</span></div>
+            <div className="detail-history-summary"><div><span>历史最低</span><strong>{money(priceMinimum)}</strong></div><div><span>历史最高</span><strong>{money(priceMaximum)}</strong></div><div><span>历史均价</span><strong>{money(priceAverage)}</strong></div><div><span>最近变动</span><strong className={priceDelta > 0 ? 'negative' : priceDelta < 0 ? 'positive' : ''}>{priceChangeLabel}</strong></div></div>
+            <PriceBars history={history}/>
+          </section>
+
+          <section className="detail-product-information detail-section-anchor" id="detail-product-info">
+            <div className="detail-description"><span className="drawer-kicker">DESCRIPTION</span><h3>商品说明</h3><p>{latest?.description || '暂无商品描述'}</p></div>
+            <div className="detail-drawer-specs"><span className="drawer-kicker">SPECIFICATIONS</span><h3>规格参数</h3>{specs.length ? <div>{specs.map(([key, value]) => <dl key={key}><dt>{key}</dt><dd>{String(value)}</dd></dl>)}</div> : <p>暂无规格参数</p>}</div>
+          </section>
+
+          {item.last_attempt?.status === 'error' && <div className="inline-error detail-error"><AlertCircle size={16}/><span>{item.last_attempt.error}</span></div>}
+        </div>
+
+        <div className="detail-action-bar">
+          <div><span>当前商品</span><strong>{itemShopName(item)}</strong></div>
+          <button className="button secondary" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/>刷新</button>
+          <button className="button secondary" onClick={() => onDirect(item)}><ArrowUpRight size={15}/>商品页</button>
+          <button className="button secondary" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/>加入清单</button>
+          <button className="button primary" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15}/>{busy[`buy-${item.id}`] ? '正在准备' : '立即购买'}</button>
+        </div>
+      </>}
     </aside>
   </>;
 }
