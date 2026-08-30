@@ -1,17 +1,17 @@
 Sub2API 导入记录删除功能验收
 
 分支/字段
-- 分支：codex/sub2api-history-delete
+- 分支：main（由 codex/sub2api-history-delete 快进合并）
 - 数据表：sub2api_card_import_records.id
 - 单条接口：DELETE /api/sub2api/card-import-records/{id}
 - 批量接口：POST /api/sub2api/card-import-records/batch-delete，输入字段 ids，最多 500 条
 
 制品路径
-- MODIFIED_FILE: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/MODIFIED_FILE
-- DIFF_FILE: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/DIFF_FILE
-- VERIFICATION.txt: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/VERIFICATION.txt
-- ROLLBACK.sh: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/ROLLBACK.sh
-- ROLLBACK_BASELINE: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/ROLLBACK_BASELINE
+- MODIFIED_FILE: E:/soft/java/ldxp/artifacts/sub2api-history-delete/MODIFIED_FILE
+- DIFF_FILE: E:/soft/java/ldxp/artifacts/sub2api-history-delete/DIFF_FILE
+- VERIFICATION.txt: E:/soft/java/ldxp/artifacts/sub2api-history-delete/VERIFICATION.txt
+- ROLLBACK.sh: E:/soft/java/ldxp/artifacts/sub2api-history-delete/ROLLBACK.sh
+- ROLLBACK_BASELINE: E:/soft/java/ldxp/artifacts/sub2api-history-delete/ROLLBACK_BASELINE
 
 哈希
 - BASELINE frontend/src/main.jsx SHA256: 1EB6EA7C5CFE3C216D016814BAD13477E50DF1D9EB1814B3987B7CD4D170CAD5
@@ -44,6 +44,20 @@ MODIFIED
 - command: git diff --check
 - input: HEAD..working tree
 - literal result: no whitespace errors
+- exit status: 0
+
+FINAL MAIN
+- command: python -m unittest discover -s backend -q
+- input: main ae1adb9
+- literal output: Ran 97 tests in 2.020s; OK
+- exit status: 0
+- command: npm test
+- input: main/frontend
+- literal output: tests 10; pass 10; fail 0; duration_ms 122.0384
+- exit status: 0
+- command: npm run build
+- input: main/frontend
+- literal output: 2385 modules transformed; built in 505ms
 - exit status: 0
 
 HTTP/UI 验收
