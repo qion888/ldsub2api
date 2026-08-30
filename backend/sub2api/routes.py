@@ -78,7 +78,17 @@ def handle_post(
     test_account: Callable[[int], dict[str, Any]] | None = None,
     card_import_history_creator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     card_import_history_retry: Callable[[int], dict[str, Any]] | None = None,
+    card_import_history_batch_deleter: Callable[[list[int]], dict[str, Any]] | None = None,
 ) -> bool:
+    if path == "/api/sub2api/card-import-records/batch-delete":
+        if card_import_history_batch_deleter is None:
+            return False
+        try:
+            send_json(card_import_history_batch_deleter(data.get("ids")), 200)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        return True
+
     if path == "/api/sub2api/card-import-records":
         if card_import_history_creator is None:
             return False
@@ -206,7 +216,20 @@ def handle_delete(
     *,
     send_json: SendJson,
     delete_account: Callable[[int], dict[str, Any]] | None = None,
+    card_import_history_deleter: Callable[[int], dict[str, Any]] | None = None,
 ) -> bool:
+    card_import_match = re.fullmatch(r"/api/sub2api/card-import-records/(\d+)", path)
+    if card_import_match:
+        if card_import_history_deleter is None:
+            return False
+        try:
+            send_json(card_import_history_deleter(int(card_import_match.group(1))), 200)
+        except LookupError as exc:
+            send_json({"detail": str(exc)}, 404)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        return True
+
     account_match = re.fullmatch(r"/api/sub2api/accounts/(\d+)", path)
     if not account_match:
         return False

@@ -1,4 +1,4 @@
-import React, {useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {
   Activity,
   AlertCircle,
@@ -27,6 +27,7 @@ import {
   TriangleAlert,
   Upload,
   Wifi,
+  X,
 } from 'lucide-react';
 
 function compactTime(value) {
@@ -325,8 +326,9 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
   );
 }
 
-function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage, onPageSize, busy, actions, onRefresh, onRetry, onCopyCode}) {
+function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage, onPageSize, busy, actions, onRefresh, onRetry, onDelete, onCopyCode}) {
   const items = Array.isArray(data?.items) ? data.items : [];
+  const [selectedIds, setSelectedIds] = useState([]);
   const summary = data?.summary || {total: 0, success: 0, failed: 0, pending: 0, successful_accounts: 0, failed_accounts: 0};
   const filters = [
     {value: 'all', label: '全部', count: summary.total},
@@ -345,6 +347,18 @@ function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage,
   const total = Number(data?.total || 0);
   const pageStart = total ? ((currentPage - 1) * Number(data?.page_size || pageSize || 10)) + 1 : 0;
   const pageEnd = Math.min(total, currentPage * Number(data?.page_size || pageSize || 10));
+  const pageIds = items.map(record => Number(record.id)).filter(Number.isInteger);
+  const allSelected = pageIds.length > 0 && pageIds.every(recordId => selectedIds.includes(recordId));
+  const batchDeleting = actions?.batchDelete === 'delete';
+  useEffect(() => {
+    setSelectedIds(current => current.filter(recordId => pageIds.includes(recordId)));
+  }, [data]);
+  const toggleRecord = recordId => setSelectedIds(current => current.includes(recordId) ? current.filter(value => value !== recordId) : [...current, recordId]);
+  const togglePage = () => setSelectedIds(allSelected ? [] : pageIds);
+  const deleteRecords = async records => {
+    const deleted = await onDelete(records);
+    if (deleted) setSelectedIds([]);
+  };
   const recordDetail = record => {
     const accountIds = Array.isArray(record.details?.new_account_ids) ? record.details.new_account_ids : [];
     const missing = Array.isArray(record.details?.missing_accounts) ? record.details.missing_accounts : [];
@@ -369,25 +383,27 @@ function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage,
         <div className="card-history-filters" role="tablist" aria-label="导入记录状态筛选">
           {filters.map(item => <button type="button" role="tab" aria-selected={filter === item.value} className={filter === item.value ? 'active' : ''} onClick={() => onFilter(item.value)} key={item.value}>{item.label}<span>{item.count ?? 0}</span></button>)}
         </div>
-        <span>{total ? `当前 ${pageStart}-${pageEnd} / ${total} 条` : '当前没有记录'}</span>
+        <div className="card-history-toolbar-actions"><span>{selectedIds.length ? `已选 ${selectedIds.length} 条` : total ? `当前 ${pageStart}-${pageEnd} / ${total} 条` : '当前没有记录'}</span>{selectedIds.length > 0 && <button className="icon-button" type="button" onClick={() => setSelectedIds([])} disabled={busy || batchDeleting} title="取消选择" aria-label="取消选择"><X size={15}/></button>}<button className="button danger-button" type="button" onClick={() => deleteRecords(items.filter(record => selectedIds.includes(Number(record.id))))} disabled={busy || batchDeleting || !selectedIds.length}>{batchDeleting ? <RefreshCw size={14} className="spin"/> : <Trash2 size={14}/>}<span>{batchDeleting ? '正在删除' : '批量删除'}</span></button></div>
       </div>
       <div className={`card-history-table-wrap ${busy ? 'is-loading' : ''}`} role="region" tabIndex={0} aria-label="可横向滚动的卡密导入记录" aria-busy={busy}>
         <div className="card-history-table" role="table" aria-label="卡密导入记录">
-          <div className="card-history-row head" role="row"><span role="columnheader">状态</span><span role="columnheader">时间 / 模式</span><span role="columnheader">卡密</span><span role="columnheader">下载 / 账号</span><span role="columnheader">推送结果</span><span role="columnheader">详情</span><span role="columnheader">操作</span></div>
+          <div className="card-history-row head" role="row"><span role="columnheader" className="card-history-select"><input type="checkbox" checked={allSelected} onChange={togglePage} disabled={busy || !pageIds.length} aria-label="选择当前页全部导入记录" title="选择当前页全部导入记录"/></span><span role="columnheader">状态</span><span role="columnheader">时间 / 模式</span><span role="columnheader">卡密</span><span role="columnheader">下载 / 账号</span><span role="columnheader">推送结果</span><span role="columnheader">详情</span><span role="columnheader">操作</span></div>
           {items.length ? items.map(record => {
             const meta = statusMeta[record.status] || statusMeta.running;
             const StatusIcon = meta.icon;
             const cardCodes = Array.isArray(record.card_codes) ? record.card_codes : [];
             const retryVisible = ['failed', 'pending'].includes(record.status);
             const retryBusy = actions?.[record.id] === 'retry';
-            return <div className={`card-history-row ${record.status}`} role="row" key={record.id}>
+            const deleteBusy = actions?.[record.id] === 'delete';
+            return <div className={`card-history-row ${record.status} ${selectedIds.includes(Number(record.id)) ? 'selected' : ''}`} role="row" key={record.id}>
+              <span role="cell" className="card-history-select"><input type="checkbox" checked={selectedIds.includes(Number(record.id))} onChange={() => toggleRecord(Number(record.id))} disabled={busy || retryBusy || deleteBusy || batchDeleting} aria-label={`选择导入记录 #${record.id}`}/></span>
               <span role="cell" className={`card-history-status ${record.status}`}><StatusIcon size={14} className={record.status === 'running' ? 'spin' : ''}/><strong>{meta.label}</strong></span>
               <span role="cell"><strong>{compactTime(record.completed_at || record.updated_at || record.started_at)}</strong><small>{record.mode === 'auto' ? '自动推送' : '手动推送'} · #{record.id}</small></span>
               <span role="cell" className="card-history-codes">{cardCodes.length ? <span className="card-code-list">{cardCodes.map(code => <button type="button" onClick={() => onCopyCode(code)} title={`复制卡密 ${code}`} aria-label={`复制卡密 ${code}`} key={code}><code>{code}</code><Clipboard size={12}/></button>)}</span> : <small>旧记录未保存卡密</small>}</span>
               <span role="cell"><strong>{record.downloaded_files} 个文件 · {record.account_count} 个账号</strong><small>已核验 {record.verified_count} / {record.card_count} 张卡密</small></span>
               <span role="cell"><strong><em className="positive">{record.success_count}</em> 成功 · <em className={record.failed_count ? 'negative' : ''}>{record.failed_count}</em> 失败</strong><small>待推送 {Math.max(0, Number(record.account_count || 0) - Number(record.success_count || 0))}</small></span>
               <span role="cell" title={recordDetail(record)}><strong>{record.message || meta.label}</strong><small>{recordDetail(record)}</small></span>
-              <span role="cell" className="card-history-actions">{retryVisible ? <button className="button secondary" type="button" onClick={() => onRetry(record)} disabled={busy || retryBusy || !record.retryable} title={record.retryable ? '使用原导入参数重新推送' : '该记录尚未保存可重推的账号数据'}>{retryBusy ? <RefreshCw size={13} className="spin"/> : <Send size={13}/>}<span>{retryBusy ? '推送中' : '重新推送'}</span></button> : <small>无需操作</small>}</span>
+              <span role="cell" className="card-history-actions">{retryVisible && <button className="button secondary" type="button" onClick={() => onRetry(record)} disabled={busy || retryBusy || deleteBusy || batchDeleting || !record.retryable} title={record.retryable ? '使用原导入参数重新推送' : '该记录尚未保存可重推的账号数据'}>{retryBusy ? <RefreshCw size={13} className="spin"/> : <Send size={13}/>}<span>{retryBusy ? '推送中' : '重新推送'}</span></button>}<button className="icon-button danger-icon" type="button" onClick={() => deleteRecords(record)} disabled={busy || retryBusy || deleteBusy || batchDeleting} title={`删除导入记录 #${record.id}`} aria-label={`删除导入记录 #${record.id}`}>{deleteBusy ? <RefreshCw size={14} className="spin"/> : <Trash2 size={14}/>}</button></span>
             </div>;
           }) : <div className="card-history-empty">{busy ? <RefreshCw size={20} className="spin"/> : <History size={20}/>}<span>{busy ? '正在读取导入记录' : '当前筛选下暂无导入记录'}</span></div>}
         </div>
@@ -397,7 +413,7 @@ function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage,
   );
 }
 
-function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyPage, historyPageSize, onHistoryPage, onHistoryPageSize, historyBusy, historyActions, onRefreshHistory, onRetryHistory, onCopyCode}) {
+function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyPage, historyPageSize, onHistoryPage, onHistoryPageSize, historyBusy, historyActions, onRefreshHistory, onRetryHistory, onDeleteHistory, onCopyCode}) {
   const stageLabel = {
     idle: '等待输入',
     verify: '正在核验',
@@ -454,12 +470,12 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
           </div>
         </div>
       </div>
-      <CardImportHistoryPanel data={historyData} filter={historyFilter} onFilter={onHistoryFilter} page={historyPage} pageSize={historyPageSize} onPage={onHistoryPage} onPageSize={onHistoryPageSize} busy={historyBusy} actions={historyActions} onRefresh={onRefreshHistory} onRetry={onRetryHistory} onCopyCode={onCopyCode}/>
+      <CardImportHistoryPanel data={historyData} filter={historyFilter} onFilter={onHistoryFilter} page={historyPage} pageSize={historyPageSize} onPage={onHistoryPage} onPageSize={onHistoryPageSize} busy={historyBusy} actions={historyActions} onRefresh={onRefreshHistory} onRetry={onRetryHistory} onDelete={onDeleteHistory} onCopyCode={onCopyCode}/>
     </section>
   );
 }
 
-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -537,7 +553,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
         onRun={onRunCardImport} onPush={onPushCards}
         historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
         historyPage={cardHistoryPage} historyPageSize={cardHistoryPageSize} onHistoryPage={onCardHistoryPage} onHistoryPageSize={onCardHistoryPageSize}
-        historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onCopyCode={onCopyCardCode}
+        historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onDeleteHistory={onDeleteCardHistory} onCopyCode={onCopyCardCode}
       />
 
       <div className="automation-console">

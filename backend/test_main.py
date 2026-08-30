@@ -1327,10 +1327,33 @@ class GoodsParserTests(unittest.TestCase):
                 status, retried = self.request_api(
                     "POST", f"/api/sub2api/card-import-records/{created['id']}/retry", {}
                 )
-
-        self.assertEqual(status, 200)
-        self.assertTrue(retried["ok"])
-        self.assertEqual(retried["record"]["success_count"], 2)
+                self.assertEqual(status, 200)
+                self.assertTrue(retried["ok"])
+                self.assertEqual(retried["record"]["success_count"], 2)
+                status, deleted = self.request_api(
+                    "DELETE", f"/api/sub2api/card-import-records/{created['id']}", {}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(deleted["deleted_ids"], [created["id"]])
+                batch_ids = []
+                for code in ("CARD-C", "CARD-D"):
+                    create_status, record = self.request_api(
+                        "POST", "/api/sub2api/card-import-records", {
+                            "mode": "manual", "card_codes": [code],
+                        }
+                    )
+                    self.assertEqual(create_status, 201)
+                    batch_ids.append(record["id"])
+                status, batch_deleted = self.request_api(
+                    "POST", "/api/sub2api/card-import-records/batch-delete", {"ids": batch_ids}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(batch_deleted["deleted_count"], 2)
+                status, empty_records = self.request_api(
+                    "GET", "/api/sub2api/card-import-records?page=1&page_size=10", {}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(empty_records["total"], 0)
         self.assertEqual(records["page"], 1)
         self.assertEqual(records["pages"], 1)
         importer.assert_called_once()

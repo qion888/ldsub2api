@@ -373,6 +373,14 @@ def retry_sub2api_card_import_record(record_id: int) -> dict[str, Any]:
     )
 
 
+def delete_sub2api_card_import_record(record_id: int) -> dict[str, Any]:
+    return sub2api_card_history.delete_record(database, record_id)
+
+
+def delete_sub2api_card_import_records(record_ids: list[int]) -> dict[str, Any]:
+    return sub2api_card_history.delete_records(database, record_ids)
+
+
 def _sub2api_imported_order_nos() -> list[str]:
     try:
         value = sub2api_automation_state().get("imported_order_nos", [])
@@ -1082,6 +1090,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             test_account=test_sub2api_account,
             card_import_history_creator=create_sub2api_card_import_record,
             card_import_history_retry=retry_sub2api_card_import_record,
+            card_import_history_batch_deleter=delete_sub2api_card_import_records,
         ):
             return
 
@@ -1522,6 +1531,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             path,
             send_json=self._send_json,
             delete_account=delete_sub2api_account,
+            card_import_history_deleter=delete_sub2api_card_import_record,
         ):
             return
         preorder_match = re.fullmatch(r"/api/preorders/(\d+)", path)

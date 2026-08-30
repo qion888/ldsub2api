@@ -21,6 +21,7 @@ COUNT_FIELDS = (
 )
 RETRYABLE_STATUSES = {"pending", "failed"}
 MAX_RETRY_CONTEXT_BYTES = 8 * 1024 * 1024
+MAX_DELETE_RECORDS = 500
 
 
 class RecordNotFound(LookupError):
@@ -87,6 +88,22 @@ def _bounded_count(value: Any, name: str, *, maximum: int = 100000) -> int:
     if number < 0 or number > maximum:
         raise ValueError(f"{name} 超出允许范围")
     return number
+
+
+def _record_ids(value: Any) -> list[int]:
+    if not isinstance(value, list) or not value or len(value) > MAX_DELETE_RECORDS:
+        raise ValueError(f"请选择 1 到 {MAX_DELETE_RECORDS} 条导入记录")
+    record_ids: list[int] = []
+    for raw_id in value:
+        try:
+            record_id = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("导入记录编号无效") from exc
+        if record_id < 1:
+            raise ValueError("导入记录编号无效")
+        if record_id not in record_ids:
+            record_ids.append(record_id)
+    return record_ids
 
 
 def _details(value: Any) -> dict[str, Any]:
@@ -413,6 +430,40 @@ def list_records(
             for key in ("total", "success", "failed", "pending", "successful_accounts", "failed_accounts")
         },
     }
+
+
+def delete_records(
+    database_factory: DatabaseFactory,
+    record_ids: list[int],
+) -> dict[str, Any]:
+    normalized = _record_ids(record_ids)
+    placeholders = ",".join("?" for _ in normalized)
+    with database_factory() as connection:
+        rows = connection.execute(
+            f"SELECT id FROM sub2api_card_import_records WHERE id IN ({placeholders})",
+            tuple(normalized),
+        ).fetchall()
+        existing = {int(row["id"]) for row in rows}
+        deleted_ids = [record_id for record_id in normalized if record_id in existing]
+        if deleted_ids:
+            delete_placeholders = ",".join("?" for _ in deleted_ids)
+            connection.execute(
+                f"DELETE FROM sub2api_card_import_records WHERE id IN ({delete_placeholders})",
+                tuple(deleted_ids),
+            )
+    return {
+        "ok": True,
+        "requested_count": len(normalized),
+        "deleted_count": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+    }
+
+
+def delete_record(database_factory: DatabaseFactory, record_id: int) -> dict[str, Any]:
+    result = delete_records(database_factory, [record_id])
+    if result["deleted_count"] != 1:
+        raise RecordNotFound("卡密导入记录不存在")
+    return result
 
 
 def retry_record(

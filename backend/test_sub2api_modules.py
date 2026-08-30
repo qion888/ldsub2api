@@ -122,6 +122,40 @@ class Sub2ApiModuleTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["proxy_id"], 7)
         self.assertEqual(calls[0][1]["reclaim_order_nos"], ["ORDER-123"])
 
+    def test_card_import_history_deletes_single_and_multiple_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.db"
+
+            def database():
+                return monitor_database.create_database(path)
+
+            timestamps = iter(f"2026-08-30T09:{minute:02d}:00+00:00" for minute in range(4))
+            card_import_history.initialize(database)
+            records = [
+                card_import_history.create_record(
+                    database,
+                    {"mode": "manual", "card_codes": [f"DELETE-{index}"]},
+                    now=lambda: next(timestamps),
+                )
+                for index in range(3)
+            ]
+
+            single = card_import_history.delete_record(database, records[0]["id"])
+            batch = card_import_history.delete_records(
+                database, [records[1]["id"], records[2]["id"], records[2]["id"], 999]
+            )
+            remaining = card_import_history.list_records(database)
+            self.assertEqual(single["deleted_ids"], [records[0]["id"]])
+            self.assertEqual(batch["requested_count"], 3)
+            self.assertEqual(batch["deleted_count"], 2)
+            self.assertEqual(batch["deleted_ids"], [records[1]["id"], records[2]["id"]])
+            self.assertEqual(remaining["total"], 0)
+            with self.assertRaises(card_import_history.RecordNotFound):
+                card_import_history.delete_record(database, records[0]["id"])
+            for invalid in ([], [0], ["bad"], list(range(1, 502))):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    card_import_history.delete_records(database, invalid)
+
     def test_card_import_history_retry_failure_restores_failed_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.db"
@@ -556,6 +590,23 @@ class Sub2ApiModuleTests(unittest.TestCase):
             card_import_history_updater=lambda record_id, payload: {"id": record_id, **payload},
         ))
         self.assertEqual(responses[-1], (200, {"id": 7, "status": "success"}))
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/card-import-records/batch-delete",
+            {"ids": [7, 8]},
+            **common_write,
+            card_import_history_batch_deleter=lambda record_ids: {
+                "ok": True, "deleted_count": len(record_ids), "deleted_ids": record_ids,
+            },
+        ))
+        self.assertEqual(responses[-1][1]["deleted_ids"], [7, 8])
+        self.assertTrue(routes.handle_delete(
+            "/api/sub2api/card-import-records/7",
+            send_json=common_get["send_json"],
+            card_import_history_deleter=lambda record_id: {
+                "ok": True, "deleted_count": 1, "deleted_ids": [record_id],
+            },
+        ))
+        self.assertEqual(responses[-1][1]["deleted_ids"], [7])
         self.assertTrue(routes.handle_delete(
             "/api/sub2api/accounts/12",
             send_json=lambda payload, status=200: responses.append((status, payload)),

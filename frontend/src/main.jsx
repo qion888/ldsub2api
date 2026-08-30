@@ -2407,6 +2407,40 @@ function App() {
     }
   };
 
+  const deleteSub2ApiCardHistory = async records => {
+    const batch = Array.isArray(records);
+    const values = batch ? records : [records];
+    const recordIds = [...new Set(values
+      .map(record => Number(record?.id))
+      .filter(recordId => Number.isInteger(recordId) && recordId > 0))];
+    if (!recordIds.length) return false;
+    const prompt = batch
+      ? `确定删除选中的 ${recordIds.length} 条导入记录？删除后不可恢复。`
+      : `确定删除导入记录 #${recordIds[0]}？删除后不可恢复。`;
+    if (!window.confirm(prompt)) return false;
+
+    const actionKey = batch ? 'batchDelete' : recordIds[0];
+    setSub2apiCardHistoryActions(current => ({...current, [actionKey]: 'delete'}));
+    try {
+      const result = batch
+        ? await request('/sub2api/card-import-records/batch-delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ids: recordIds}),
+        })
+        : await request(`/sub2api/card-import-records/${recordIds[0]}`, {method: 'DELETE'});
+      await loadSub2ApiCardHistory({quiet: true});
+      notify(batch ? `已删除 ${result.deleted_count} 条导入记录` : `导入记录 #${recordIds[0]} 已删除`);
+      return true;
+    } catch (error) {
+      notify(error.message, 'error');
+      await loadSub2ApiCardHistory({quiet: true});
+      return false;
+    } finally {
+      setSub2apiCardHistoryActions(current => ({...current, [actionKey]: null}));
+    }
+  };
+
   const retrySub2ApiCardHistory = async record => {
     const recordId = Number(record?.id);
     if (!Number.isInteger(recordId) || recordId < 1 || !record?.retryable) return;
@@ -2787,7 +2821,7 @@ function App() {
             cardHistoryPage={sub2apiCardHistoryPage} cardHistoryPageSize={sub2apiCardHistoryPageSize}
             onCardHistoryPage={setSub2apiCardHistoryPage} onCardHistoryPageSize={value => { setSub2apiCardHistoryPage(1); setSub2apiCardHistoryPageSize(value); }}
             cardHistoryBusy={sub2apiCardHistoryBusy} cardHistoryActions={sub2apiCardHistoryActions} onRefreshCardHistory={() => loadSub2ApiCardHistory()}
-            onRetryCardHistory={retrySub2ApiCardHistory} onCopyCardCode={copySub2ApiCardCode}
+            onRetryCardHistory={retrySub2ApiCardHistory} onDeleteCardHistory={deleteSub2ApiCardHistory} onCopyCardCode={copySub2ApiCardCode}
             fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
             optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
             codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
