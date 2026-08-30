@@ -1,0 +1,1055 @@
+diff --git a/backend/main.py b/backend/main.py
+index dc80ec0..d6091e7 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -36,6 +36,7 @@ from monitor_core import storefront
+ from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
+ from monitor_core.workers import MonitorWorker as CoreMonitorWorker
+ from sub2api import automation as sub2api_automation
++from sub2api import card_import_history as sub2api_card_history
+ from sub2api import client as sub2api_client
+ from sub2api import payloads as sub2api_payloads
+ from sub2api import reclaim as sub2api_reclaim
+@@ -89,6 +90,7 @@ def init_database() -> None:
+         default_sub2api_url=DEFAULT_SUB2API_URL,
+         default_automation=DEFAULT_SUB2API_AUTOMATION,
+     )
++    sub2api_card_history.initialize(database)
+ 
+ 
+ DescriptionParser = storefront.DescriptionParser
+@@ -348,6 +350,18 @@ def sub2api_automation_state() -> dict[str, Any]:
+     return sub2api_config.read_automation_state(_setting_json)
+ 
+ 
++def list_sub2api_card_import_records(query_values: dict[str, list[str]]) -> dict[str, Any]:
++    return sub2api_card_history.list_records(database, query_values)
++
++
++def create_sub2api_card_import_record(payload: dict[str, Any]) -> dict[str, Any]:
++    return sub2api_card_history.create_record(database, payload, now=utc_now)
++
++
++def update_sub2api_card_import_record(record_id: int, payload: dict[str, Any]) -> dict[str, Any]:
++    return sub2api_card_history.update_record(database, record_id, payload, now=utc_now)
++
++
+ def _sub2api_imported_order_nos() -> list[str]:
+     try:
+         value = sub2api_automation_state().get("imported_order_nos", [])
+@@ -882,6 +896,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+                 "worker": WORKER.is_alive(),
+                 "sub2api_automation_worker": AUTOMATION_WORKER.is_alive(),
+                 "sub2api_accounts": True,
++                "sub2api_card_import_history": True,
+             })
+         if path == "/api/watches":
+             return self._send_json(list_watches())
+@@ -940,6 +955,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             automation_state_loader=sub2api_automation_state,
+             options_loader=fetch_sub2api_options,
+             account_loader=fetch_sub2api_account_page,
++            card_import_history_loader=list_sub2api_card_import_records,
+             query_values=parse_qs(parsed.query),
+         ):
+             return
+@@ -1035,6 +1051,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             run_automation=AUTOMATION_WORKER.run_once,
+             import_payload=_sub2api_import_payload,
+             test_account=test_sub2api_account,
++            card_import_history_creator=create_sub2api_card_import_record,
+         ):
+             return
+ 
+@@ -1463,6 +1480,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             settings_loader=sub2api_settings,
+             save_automation_settings=save_sub2api_automation_settings,
+             automation_state_loader=sub2api_automation_state,
++            card_import_history_updater=update_sub2api_card_import_record,
+         ):
+             return
+ 
+diff --git a/backend/sub2api/card_import_history.py b/backend/sub2api/card_import_history.py
+new file mode 100644
+index 0000000..fdf7dfd
+--- /dev/null
++++ b/backend/sub2api/card_import_history.py
+@@ -0,0 +1,262 @@
++"""Persistent audit records for direct card verification and Sub2API pushes."""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Callable
++
++
++DatabaseFactory = Callable[[], sqlite3.Connection]
++STATUSES = {"running", "pending", "success", "failed"}
++STAGES = {"verify", "reclaim", "download", "stage", "ready", "push", "done", "error"}
++COUNT_FIELDS = (
++    "card_count",
++    "verified_count",
++    "downloaded_files",
++    "account_count",
++    "success_count",
++    "failed_count",
++)
++
++
++class RecordNotFound(LookupError):
++    pass
++
++
++def initialize(database_factory: DatabaseFactory) -> None:
++    with database_factory() as connection:
++        connection.executescript(
++            """
++            CREATE TABLE IF NOT EXISTS sub2api_card_import_records (
++                id INTEGER PRIMARY KEY,
++                started_at TEXT NOT NULL,
++                updated_at TEXT NOT NULL,
++                completed_at TEXT,
++                mode TEXT NOT NULL,
++                status TEXT NOT NULL,
++                stage TEXT NOT NULL,
++                card_count INTEGER NOT NULL DEFAULT 0,
++                verified_count INTEGER NOT NULL DEFAULT 0,
++                downloaded_files INTEGER NOT NULL DEFAULT 0,
++                account_count INTEGER NOT NULL DEFAULT 0,
++                success_count INTEGER NOT NULL DEFAULT 0,
++                failed_count INTEGER NOT NULL DEFAULT 0,
++                filename TEXT NOT NULL DEFAULT '',
++                message TEXT NOT NULL DEFAULT '',
++                details_json TEXT NOT NULL DEFAULT '{}'
++            );
++            CREATE INDEX IF NOT EXISTS idx_sub2api_card_import_status_time
++                ON sub2api_card_import_records(status, id DESC);
++            """
++        )
++
++
++def _bounded_count(value: Any, name: str, *, maximum: int = 100000) -> int:
++    try:
++        number = int(value)
++    except (TypeError, ValueError) as exc:
++        raise ValueError(f"{name} 必须是整数") from exc
++    if number < 0 or number > maximum:
++        raise ValueError(f"{name} 超出允许范围")
++    return number
++
++
++def _details(value: Any) -> dict[str, Any]:
++    if not isinstance(value, dict):
++        return {}
++    account_ids = []
++    for raw_id in value.get("new_account_ids", []) if isinstance(value.get("new_account_ids"), list) else []:
++        try:
++            account_id = int(raw_id)
++        except (TypeError, ValueError):
++            continue
++        if account_id > 0 and account_id not in account_ids:
++            account_ids.append(account_id)
++    missing_accounts = []
++    raw_missing = value.get("missing_accounts")
++    if isinstance(raw_missing, list):
++        for item in raw_missing[:50]:
++            if not isinstance(item, dict):
++                continue
++            missing_accounts.append({
++                "name": str(item.get("name") or "")[:160],
++                "platform": str(item.get("platform") or "")[:80],
++                "type": str(item.get("type") or "")[:80],
++                "count": _bounded_count(item.get("count", 1), "缺失账号数量", maximum=1000),
++            })
++    return {"new_account_ids": account_ids[:100], "missing_accounts": missing_accounts}
++
++
++def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
++    try:
++        return row[key]
++    except (IndexError, KeyError):
++        return default
++
++
++def _record(row: sqlite3.Row) -> dict[str, Any]:
++    try:
++        details = json.loads(_row_value(row, "details_json", "{}") or "{}")
++    except (TypeError, json.JSONDecodeError):
++        details = {}
++    return {
++        "id": int(row["id"]),
++        "started_at": row["started_at"],
++        "updated_at": row["updated_at"],
++        "completed_at": row["completed_at"],
++        "mode": row["mode"],
++        "status": row["status"],
++        "stage": row["stage"],
++        **{field: int(_row_value(row, field, 0) or 0) for field in COUNT_FIELDS},
++        "filename": row["filename"],
++        "message": row["message"],
++        "details": details if isinstance(details, dict) else {},
++    }
++
++
++def create_record(
++    database_factory: DatabaseFactory,
++    payload: dict[str, Any],
++    *,
++    now: Callable[[], str],
++) -> dict[str, Any]:
++    mode = str(payload.get("mode") or "manual").strip().lower()
++    if mode not in {"manual", "auto"}:
++        raise ValueError("卡密推送模式无效")
++    card_count = _bounded_count(payload.get("card_count", 0), "卡密数量", maximum=100)
++    if card_count < 1:
++        raise ValueError("卡密数量应为 1 到 100 个")
++    timestamp = now()
++    with database_factory() as connection:
++        cursor = connection.execute(
++            """
++            INSERT INTO sub2api_card_import_records(
++                started_at, updated_at, mode, status, stage, card_count, message
++            ) VALUES(?, ?, ?, 'running', 'verify', ?, ?)
++            """,
++            (timestamp, timestamp, mode, card_count, str(payload.get("message") or "")[:500]),
++        )
++        record_id = int(cursor.lastrowid)
++        connection.execute(
++            """
++            DELETE FROM sub2api_card_import_records
++            WHERE id NOT IN (
++                SELECT id FROM sub2api_card_import_records ORDER BY id DESC LIMIT 500
++            )
++            """
++        )
++        row = connection.execute(
++            "SELECT * FROM sub2api_card_import_records WHERE id = ?", (record_id,)
++        ).fetchone()
++    return _record(row)
++
++
++def update_record(
++    database_factory: DatabaseFactory,
++    record_id: int,
++    payload: dict[str, Any],
++    *,
++    now: Callable[[], str],
++) -> dict[str, Any]:
++    with database_factory() as connection:
++        row = connection.execute(
++            "SELECT * FROM sub2api_card_import_records WHERE id = ?", (record_id,)
++        ).fetchone()
++        if row is None:
++            raise RecordNotFound("卡密导入记录不存在")
++
++        status = str(payload.get("status", row["status"])).strip().lower()
++        stage = str(payload.get("stage", row["stage"])).strip().lower()
++        if status not in STATUSES:
++            raise ValueError("卡密导入状态无效")
++        if stage not in STAGES:
++            raise ValueError("卡密导入阶段无效")
++        counts = {
++            field: _bounded_count(
++                payload.get(field, row[field]),
++                field,
++                maximum=100 if field in {"card_count", "verified_count"} else 100000,
++            )
++            for field in COUNT_FIELDS
++        }
++        timestamp = now()
++        completed_at = timestamp if status in {"success", "failed"} else None
++        details = _details(payload.get("details", json.loads(row["details_json"] or "{}")))
++        connection.execute(
++            """
++            UPDATE sub2api_card_import_records SET
++                updated_at = ?, completed_at = ?, status = ?, stage = ?,
++                card_count = ?, verified_count = ?, downloaded_files = ?,
++                account_count = ?, success_count = ?, failed_count = ?,
++                filename = ?, message = ?, details_json = ?
++            WHERE id = ?
++            """,
++            (
++                timestamp,
++                completed_at,
++                status,
++                stage,
++                *(counts[field] for field in COUNT_FIELDS),
++                str(payload.get("filename", row["filename"]) or "")[:240],
++                str(payload.get("message", row["message"]) or "")[:500],
++                json.dumps(details, ensure_ascii=False),
++                record_id,
++            ),
++        )
++        updated = connection.execute(
++            "SELECT * FROM sub2api_card_import_records WHERE id = ?", (record_id,)
++        ).fetchone()
++    return _record(updated)
++
++
++def list_records(
++    database_factory: DatabaseFactory,
++    query_values: dict[str, list[str]] | None = None,
++) -> dict[str, Any]:
++    query_values = query_values or {}
++    status = str(query_values.get("status", ["all"])[0] or "all").strip().lower()
++    if status not in STATUSES | {"all"}:
++        raise ValueError("卡密导入状态筛选无效")
++    try:
++        limit = max(1, min(100, int(query_values.get("limit", ["30"])[0])))
++    except (TypeError, ValueError) as exc:
++        raise ValueError("卡密导入记录数量无效") from exc
++    if status == "all":
++        where = ""
++        parameters: tuple[Any, ...] = ()
++    elif status == "pending":
++        where = "WHERE status IN ('running', 'pending')"
++        parameters = ()
++    else:
++        where = "WHERE status = ?"
++        parameters = (status,)
++    with database_factory() as connection:
++        rows = connection.execute(
++            f"SELECT * FROM sub2api_card_import_records {where} ORDER BY id DESC LIMIT ?",
++            (*parameters, limit),
++        ).fetchall()
++        filtered_total = connection.execute(
++            f"SELECT COUNT(*) FROM sub2api_card_import_records {where}", parameters
++        ).fetchone()[0]
++        summary = connection.execute(
++            """
++            SELECT
++                COUNT(*) AS total,
++                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
++                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
++                SUM(CASE WHEN status IN ('running', 'pending') THEN 1 ELSE 0 END) AS pending,
++                SUM(success_count) AS successful_accounts,
++                SUM(failed_count) AS failed_accounts
++            FROM sub2api_card_import_records
++            """
++        ).fetchone()
++    return {
++        "items": [_record(row) for row in rows],
++        "total": int(filtered_total or 0),
++        "status": status,
++        "summary": {
++            key: int(summary[key] or 0)
++            for key in ("total", "success", "failed", "pending", "successful_accounts", "failed_accounts")
++        },
++    }
+diff --git a/backend/sub2api/routes.py b/backend/sub2api/routes.py
+index f89c24e..aee3b63 100644
+--- a/backend/sub2api/routes.py
++++ b/backend/sub2api/routes.py
+@@ -19,6 +19,7 @@ def handle_get(
+     automation_state_loader: Callable[[], dict[str, Any]],
+     options_loader: Callable[[], dict[str, Any]],
+     account_loader: Callable[[dict[str, list[str]]], dict[str, Any]] | None = None,
++    card_import_history_loader: Callable[[dict[str, list[str]]], dict[str, Any]] | None = None,
+     query_values: dict[str, list[str]] | None = None,
+ ) -> bool:
+     if path == "/api/sub2api/config":
+@@ -52,6 +53,14 @@ def handle_get(
+         except RuntimeError as exc:
+             send_json({"detail": str(exc)}, 502)
+         return True
++    if path == "/api/sub2api/card-import-records":
++        if card_import_history_loader is None:
++            return False
++        try:
++            send_json(card_import_history_loader(query_values or {}), 200)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        return True
+     return False
+ 
+ 
+@@ -66,7 +75,17 @@ def handle_post(
+     run_automation: Callable[[], dict[str, Any]],
+     import_payload: Callable[..., dict[str, Any]],
+     test_account: Callable[[int], dict[str, Any]] | None = None,
++    card_import_history_creator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+ ) -> bool:
++    if path == "/api/sub2api/card-import-records":
++        if card_import_history_creator is None:
++            return False
++        try:
++            send_json(card_import_history_creator(data), 201)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        return True
++
+     if path == "/api/sub2api/test":
+         try:
+             send_json(test_connection(), 200)
+@@ -191,7 +210,20 @@ def handle_put(
+     settings_loader: Callable[..., dict[str, Any]],
+     save_automation_settings: Callable[[dict[str, Any]], dict[str, Any]],
+     automation_state_loader: Callable[[], dict[str, Any]],
++    card_import_history_updater: Callable[[int, dict[str, Any]], dict[str, Any]] | None = None,
+ ) -> bool:
++    card_import_match = re.fullmatch(r"/api/sub2api/card-import-records/(\d+)", path)
++    if card_import_match:
++        if card_import_history_updater is None:
++            return False
++        try:
++            send_json(card_import_history_updater(int(card_import_match.group(1)), data), 200)
++        except LookupError as exc:
++            send_json({"detail": str(exc)}, 404)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        return True
++
+     if path == "/api/sub2api/config":
+         try:
+             base_url = normalize_url(data.get("base_url"), DEFAULT_URL)
+diff --git a/backend/test_main.py b/backend/test_main.py
+index e55b905..148f26d 100644
+--- a/backend/test_main.py
++++ b/backend/test_main.py
+@@ -1277,6 +1277,38 @@ class GoodsParserTests(unittest.TestCase):
+         self.assertEqual(status, 200)
+         self.assertTrue(payload["sub2api_accounts"])
+ 
++    def test_sub2api_card_import_history_http_lifecycle(self):
++        with tempfile.TemporaryDirectory() as directory:
++            with patch.object(main, "DB_PATH", Path(directory) / "history.db"):
++                main.init_database()
++                status, created = self.request_api("POST", "/api/sub2api/card-import-records", {
++                    "mode": "auto",
++                    "card_count": 2,
++                })
++                self.assertEqual(status, 201)
++                status, updated = self.request_api(
++                    "PUT",
++                    f"/api/sub2api/card-import-records/{created['id']}",
++                    {
++                        "status": "success",
++                        "stage": "done",
++                        "verified_count": 2,
++                        "account_count": 2,
++                        "success_count": 2,
++                        "message": "推送并核验成功",
++                    },
++                )
++                self.assertEqual(status, 200)
++                self.assertEqual(updated["success_count"], 2)
++                status, records = self.request_api(
++                    "GET", "/api/sub2api/card-import-records?status=success&limit=10", {}
++                )
++
++        self.assertEqual(status, 200)
++        self.assertEqual(records["total"], 1)
++        self.assertEqual(records["items"][0]["status"], "success")
++        self.assertEqual(records["summary"]["successful_accounts"], 2)
++
+     def test_sub2api_401_text_recognizes_token_revoked_parenthesized_status(self):
+         self.assertTrue(main._sub2api_account_is_401({
+             "status": "error",
+diff --git a/backend/test_sub2api_modules.py b/backend/test_sub2api_modules.py
+index 9c3f86b..b52e966 100644
+--- a/backend/test_sub2api_modules.py
++++ b/backend/test_sub2api_modules.py
+@@ -1,12 +1,93 @@
+ from __future__ import annotations
+ 
++import tempfile
+ import unittest
++from pathlib import Path
+ 
+-from sub2api import automation, client, reclaim, routes, settings
++from monitor_core import database as monitor_database
++from sub2api import automation, card_import_history, client, reclaim, routes, settings
+ from sub2api.worker import Sub2ApiAutomationWorker
+ 
+ 
+ class Sub2ApiModuleTests(unittest.TestCase):
++    def test_card_import_history_tracks_pending_success_and_failure_totals(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "history.db"
++
++            def database():
++                return monitor_database.create_database(path)
++
++            timestamps = iter((
++                "2026-08-30T08:00:00+00:00",
++                "2026-08-30T08:01:00+00:00",
++                "2026-08-30T08:02:00+00:00",
++                "2026-08-30T08:03:00+00:00",
++                "2026-08-30T08:04:00+00:00",
++            ))
++            now = lambda: next(timestamps)
++            card_import_history.initialize(database)
++            successful = card_import_history.create_record(
++                database, {"mode": "auto", "card_count": 3}, now=now
++            )
++            running_result = card_import_history.list_records(database, {"status": ["pending"]})
++            card_import_history.update_record(
++                database,
++                successful["id"],
++                {
++                    "status": "pending",
++                    "stage": "ready",
++                    "verified_count": 3,
++                    "downloaded_files": 2,
++                    "account_count": 2,
++                },
++                now=now,
++            )
++            pending_result = card_import_history.list_records(database, {"status": ["pending"]})
++            completed = card_import_history.update_record(
++                database,
++                successful["id"],
++                {
++                    "status": "success",
++                    "stage": "done",
++                    "success_count": 2,
++                    "details": {"new_account_ids": [11, "12", -1]},
++                    "message": "推送并核验成功",
++                },
++                now=now,
++            )
++            failed = card_import_history.create_record(
++                database, {"mode": "manual", "card_count": 1}, now=now
++            )
++            card_import_history.update_record(
++                database,
++                failed["id"],
++                {
++                    "status": "failed",
++                    "stage": "error",
++                    "failed_count": 1,
++                    "message": "上游拒绝导入",
++                    "details": {"missing_accounts": [{"name": "account-a", "count": 1}]},
++                },
++                now=now,
++            )
++
++            result = card_import_history.list_records(database, {"limit": ["20"]})
++
++        self.assertEqual(running_result["items"][0]["status"], "running")
++        self.assertEqual(pending_result["total"], 1)
++        self.assertEqual(pending_result["items"][0]["status"], "pending")
++        self.assertEqual(completed["details"]["new_account_ids"], [11, 12])
++        self.assertEqual(result["summary"], {
++            "total": 2,
++            "success": 1,
++            "failed": 1,
++            "pending": 0,
++            "successful_accounts": 2,
++            "failed_accounts": 1,
++        })
++        self.assertEqual(result["items"][0]["message"], "上游拒绝导入")
++        self.assertEqual(result["items"][1]["status"], "success")
++
+     def test_settings_are_normalized_through_injected_storage(self) -> None:
+         stored = []
+         value = settings.save_automation_settings(
+@@ -244,6 +325,53 @@ class Sub2ApiModuleTests(unittest.TestCase):
+             test_account=lambda account_id: {"ok": True, "account_id": account_id},
+         ))
+         self.assertEqual(responses[-1], (200, {"ok": True, "account_id": 12}))
++
++    def test_card_import_history_routes_dispatch_create_update_and_list(self) -> None:
++        responses = []
++        common_get = {
++            "send_json": lambda payload, status=200: responses.append((status, payload)),
++            "settings_loader": lambda **kwargs: {},
++            "automation_settings_loader": lambda: {},
++            "automation_state_loader": lambda: {},
++            "options_loader": lambda: {},
++        }
++        self.assertTrue(routes.handle_get(
++            "/api/sub2api/card-import-records",
++            **common_get,
++            card_import_history_loader=lambda query: {"query": query},
++            query_values={"status": ["failed"]},
++        ))
++        self.assertEqual(responses[-1], (200, {"query": {"status": ["failed"]}}))
++
++        common_write = {
++            "send_json": common_get["send_json"],
++            "test_connection": lambda: {},
++            "reclaim_accounts": lambda **kwargs: {},
++            "refresh_reclaim": lambda *args, **kwargs: {},
++            "run_automation": lambda: {},
++            "import_payload": lambda *args, **kwargs: {},
++        }
++        self.assertTrue(routes.handle_post(
++            "/api/sub2api/card-import-records",
++            {"mode": "auto", "card_count": 2},
++            **common_write,
++            card_import_history_creator=lambda payload: {"id": 7, **payload},
++        ))
++        self.assertEqual(responses[-1][0], 201)
++        self.assertEqual(responses[-1][1]["id"], 7)
++
++        self.assertTrue(routes.handle_put(
++            "/api/sub2api/card-import-records/7",
++            {"status": "success"},
++            send_json=common_get["send_json"],
++            normalize_url=lambda value, default: default,
++            store_setting=lambda key, value: None,
++            settings_loader=lambda **kwargs: {},
++            save_automation_settings=lambda payload: payload,
++            automation_state_loader=lambda: {},
++            card_import_history_updater=lambda record_id, payload: {"id": record_id, **payload},
++        ))
++        self.assertEqual(responses[-1], (200, {"id": 7, "status": "success"}))
+         self.assertTrue(routes.handle_delete(
+             "/api/sub2api/accounts/12",
+             send_json=lambda payload, status=200: responses.append((status, payload)),
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 9c867a7..9741aea 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -62,6 +62,12 @@ const DEFAULT_SUB2API_AUTOMATION = {
+   interval_seconds: 300,
+   auto_import: false,
+ };
++const EMPTY_CARD_IMPORT_HISTORY = {
++  items: [],
++  total: 0,
++  status: 'all',
++  summary: {total: 0, success: 0, failed: 0, pending: 0, successful_accounts: 0, failed_accounts: 0},
++};
+ const MONITOR_INTERVAL_OPTIONS = [1, 3, 5, 10, 30, 60, 300, 900, 1800];
+ const SHOP_GOODS_TYPES = [
+   {value: 'card', label: '卡密商品'},
+@@ -113,6 +119,25 @@ function compactTime(value) {
+   }).format(date);
+ }
+ 
++function cardImportVerificationPatch(result) {
++  const verification = result?.import_verification || {};
++  const expected = Math.max(0, Number(verification.expected || 0));
++  const matched = Math.max(0, Number(verification.matched || 0));
++  const failed = Math.max(Number(verification.failed || 0), expected - matched, 0);
++  const confirmed = Boolean(verification.confirmed);
++  return {
++    status: confirmed ? 'success' : 'failed',
++    stage: confirmed ? 'done' : 'ready',
++    success_count: matched,
++    failed_count: failed,
++    message: confirmed ? `推送并核验成功，共 ${matched} 个账号` : `推送后仅核验 ${matched}/${expected} 个账号`,
++    details: {
++      new_account_ids: Array.isArray(verification.new_account_ids) ? verification.new_account_ids : [],
++      missing_accounts: Array.isArray(verification.missing) ? verification.missing : [],
++    },
++  };
++}
++
+ function intervalLabel(value) {
+   const seconds = Number(value || 0);
+   if (seconds < 60) return `${seconds}秒`;
+@@ -919,6 +944,10 @@ function App() {
+   const [sub2apiCardMode, setSub2apiCardMode] = useState('manual');
+   const [sub2apiCardBusy, setSub2apiCardBusy] = useState(false);
+   const [sub2apiCardFlow, setSub2apiCardFlow] = useState({stage: 'idle'});
++  const [sub2apiCardHistory, setSub2apiCardHistory] = useState(EMPTY_CARD_IMPORT_HISTORY);
++  const [sub2apiCardHistoryFilter, setSub2apiCardHistoryFilter] = useState('all');
++  const [sub2apiCardHistoryBusy, setSub2apiCardHistoryBusy] = useState(false);
++  const sub2apiCardHistoryFilterRef = useRef('all');
+   const [sub2apiAccounts, setSub2apiAccounts] = useState({items: [], total: 0, page: 1, page_size: 12, pages: 1, usage: {}, usage_errors: {}});
+   const [sub2apiAccountFilters, setSub2apiAccountFilters] = useState({search: '', status: '', platform: ''});
+   const [sub2apiAccountBusy, setSub2apiAccountBusy] = useState(false);
+@@ -1142,6 +1171,11 @@ function App() {
+     if (activeView === 'sub2api' && sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
+   }, [activeView, sub2apiConfig.base_url, sub2apiConfig.admin_key_set]);
+ 
++  useEffect(() => {
++    sub2apiCardHistoryFilterRef.current = sub2apiCardHistoryFilter;
++    if (activeView === 'sub2api') loadSub2ApiCardHistory({status: sub2apiCardHistoryFilter});
++  }, [activeView, sub2apiCardHistoryFilter]);
++
+   useEffect(() => {
+     if (activeView !== 'sub2api') return undefined;
+     loadSub2ApiAutomation();
+@@ -2162,7 +2196,7 @@ function App() {
+     }
+   };
+ 
+-  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos} = {}) => {
++  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos, throwOnError = false} = {}) => {
+     const payload = payloadOverride || sub2apiPayload || reclaimPayload;
+     if (!payload) {
+       notify('请先选择账号 JSON 文件或下载找回结果', 'error');
+@@ -2200,6 +2234,7 @@ function App() {
+       }
+       return result;
+     } catch (error) {
++      if (throwOnError) throw error;
+       notify(error.message, 'error');
+       return null;
+     } finally {
+@@ -2207,6 +2242,50 @@ function App() {
+     }
+   };
+ 
++  const loadSub2ApiCardHistory = async ({status = sub2apiCardHistoryFilterRef.current, quiet = false} = {}) => {
++    if (!quiet) setSub2apiCardHistoryBusy(true);
++    try {
++      const params = new URLSearchParams({status, limit: '50'});
++      const result = await request(`/sub2api/card-import-records?${params}`);
++      setSub2apiCardHistory(result);
++      return result;
++    } catch (error) {
++      if (!quiet) notify(error.message, 'error');
++      return null;
++    } finally {
++      if (!quiet) setSub2apiCardHistoryBusy(false);
++    }
++  };
++
++  const createSub2ApiCardHistory = async payload => {
++    try {
++      const record = await request('/sub2api/card-import-records', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify(payload),
++      });
++      await loadSub2ApiCardHistory({quiet: true});
++      return record;
++    } catch {
++      return null;
++    }
++  };
++
++  const updateSub2ApiCardHistory = async (recordId, payload) => {
++    if (!recordId) return null;
++    try {
++      const record = await request(`/sub2api/card-import-records/${recordId}`, {
++        method: 'PUT',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify(payload),
++      });
++      await loadSub2ApiCardHistory({quiet: true});
++      return record;
++    } catch {
++      return null;
++    }
++  };
++
+   const normalizedSub2ApiCardCodes = () => [...new Set(sub2apiCardCodes.split(/[\s,，]+/).map(value => value.trim()).filter(Boolean))];
+ 
+   const runSub2ApiCardImport = async () => {
+@@ -2216,7 +2295,10 @@ function App() {
+     if (sub2apiCardMode === 'auto' && !sub2apiConfig.admin_key_set) return notify('自动推送前请先保存 Sub2API 管理员密钥', 'error');
+ 
+     setSub2apiCardBusy(true);
+-    setSub2apiCardFlow({stage: 'verify', cardCount: codes.length, startedAt: new Date().toISOString()});
++    const historyRecord = await createSub2ApiCardHistory({mode: sub2apiCardMode, card_count: codes.length});
++    const recordId = historyRecord?.id || null;
++    let staged = null;
++    setSub2apiCardFlow({stage: 'verify', cardCount: codes.length, startedAt: new Date().toISOString(), recordId});
+     try {
+       const savedRedeem = await request('/redeem/config', {
+         method: 'PUT',
+@@ -2229,7 +2311,13 @@ function App() {
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({card_codes: codes}),
+       });
+-      setSub2apiCardFlow(current => ({...current, stage: 'reclaim', health}));
++      setSub2apiCardFlow(current => ({...current, stage: 'reclaim', health, recordId}));
++      await updateSub2ApiCardHistory(recordId, {
++        status: 'running',
++        stage: 'reclaim',
++        verified_count: Number(health.total ?? codes.length),
++        message: '卡密核验完成，正在找回账号文件',
++      });
+ 
+       const submitted = await request('/redeem/reclaim', {
+         method: 'POST',
+@@ -2264,25 +2352,49 @@ function App() {
+         if (activeTasks > 0 && attempts < 120) await new Promise(resolve => window.setTimeout(resolve, 5000));
+       } while (activeTasks > 0 && attempts < 120);
+ 
+-      const staged = stageRecoveredPayloads([...downloads.values()]);
++      staged = stageRecoveredPayloads([...downloads.values()]);
+       if (!staged) {
+         if (activeTasks > 0) throw new Error('卡密任务仍在处理，自动轮询已达到 10 分钟，请稍后重试');
+         throw new Error('卡密核验已完成，但服务未返回可下载的账号 JSON');
+       }
+ 
+       if (sub2apiCardMode === 'manual') {
+-        setSub2apiCardFlow(current => ({...current, stage: 'ready', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename}));
++        setSub2apiCardFlow(current => ({...current, stage: 'ready', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename, recordId}));
++        await updateSub2ApiCardHistory(recordId, {
++          status: 'pending',
++          stage: 'ready',
++          downloaded_files: staged.files,
++          account_count: staged.accounts,
++          filename: staged.filename,
++          message: '核验下载成功，等待手动推送',
++        });
+         notify(`已核验并下载 ${staged.accounts} 个账号，请确认后手动推送`);
+         return;
+       }
+ 
+-      setSub2apiCardFlow(current => ({...current, stage: 'push', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename}));
+-      const pushed = await importSub2Api(staged.payload, {reclaimOrderNos: staged.orderNos});
++      setSub2apiCardFlow(current => ({...current, stage: 'push', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename, recordId}));
++      await updateSub2ApiCardHistory(recordId, {
++        status: 'running',
++        stage: 'push',
++        downloaded_files: staged.files,
++        account_count: staged.accounts,
++        filename: staged.filename,
++        message: '账号文件已下载，正在自动推送',
++      });
++      const pushed = await importSub2Api(staged.payload, {reclaimOrderNos: staged.orderNos, throwOnError: true});
+       if (!pushed) throw new Error('账号 JSON 已下载，但自动推送未完成');
+       const confirmed = Boolean(pushed.import_verification?.confirmed);
+       setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
++      await updateSub2ApiCardHistory(recordId, cardImportVerificationPatch(pushed));
+     } catch (error) {
+       setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
++      await updateSub2ApiCardHistory(recordId, {
++        status: 'failed',
++        stage: 'error',
++        account_count: Number(staged?.accounts || 0),
++        failed_count: Number(staged?.accounts || 0),
++        message: error.message,
++      });
+       notify(error.message, 'error');
+     } finally {
+       setSub2apiCardBusy(false);
+@@ -2292,13 +2404,28 @@ function App() {
+   const pushStagedSub2ApiCards = async () => {
+     if (!sub2apiPayload) return notify('当前没有待推送的卡密账号 JSON', 'error');
+     setSub2apiCardFlow(current => ({...current, stage: 'push', error: ''}));
+-    const pushed = await importSub2Api();
+-    if (!pushed) {
+-      setSub2apiCardFlow(current => ({...current, stage: 'error', error: '手动推送未完成'}));
++    await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, {
++      status: 'running',
++      stage: 'push',
++      message: '正在手动推送账号文件',
++    });
++    let pushed;
++    try {
++      pushed = await importSub2Api(undefined, {throwOnError: true});
++    } catch (error) {
++      setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
++      await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, {
++        status: 'failed',
++        stage: 'error',
++        failed_count: Number(sub2apiCardFlow.accounts || 0),
++        message: error.message,
++      });
++      notify(error.message, 'error');
+       return;
+     }
+     const confirmed = Boolean(pushed.import_verification?.confirmed);
+     setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
++    await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, cardImportVerificationPatch(pushed));
+   };
+ 
+   const changeSub2ApiProxy = value => {
+@@ -2485,6 +2612,8 @@ function App() {
+             redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={saveRedeemConfig}
+             cardCodes={sub2apiCardCodes} onCardCodes={setSub2apiCardCodes} cardMode={sub2apiCardMode} onCardMode={setSub2apiCardMode}
+             cardBusy={sub2apiCardBusy} cardFlow={sub2apiCardFlow} onRunCardImport={runSub2ApiCardImport} onPushCards={pushStagedSub2ApiCards}
++            cardHistory={sub2apiCardHistory} cardHistoryFilter={sub2apiCardHistoryFilter} onCardHistoryFilter={setSub2apiCardHistoryFilter}
++            cardHistoryBusy={sub2apiCardHistoryBusy} onRefreshCardHistory={() => loadSub2ApiCardHistory()}
+             fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
+             optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
+             codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
+@@ -2715,7 +2844,68 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
+   );
+ }
+ 
+-function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush}) {
++function CardImportHistoryPanel({data, filter, onFilter, busy, onRefresh}) {
++  const items = Array.isArray(data?.items) ? data.items : [];
++  const summary = data?.summary || EMPTY_CARD_IMPORT_HISTORY.summary;
++  const filters = [
++    {value: 'all', label: '全部', count: summary.total},
++    {value: 'success', label: '成功', count: summary.success},
++    {value: 'failed', label: '失败', count: summary.failed},
++    {value: 'pending', label: '待推送', count: summary.pending},
++  ];
++  const statusMeta = {
++    success: {label: '推送成功', icon: Check},
++    failed: {label: '推送失败', icon: TriangleAlert},
++    pending: {label: '等待推送', icon: Clock3},
++    running: {label: '正在处理', icon: RefreshCw},
++  };
++  const recordDetail = record => {
++    const accountIds = Array.isArray(record.details?.new_account_ids) ? record.details.new_account_ids : [];
++    const missing = Array.isArray(record.details?.missing_accounts) ? record.details.missing_accounts : [];
++    if (record.status === 'success' && accountIds.length) return `新增账号 #${accountIds.slice(0, 6).join('、#')}`;
++    if (record.status === 'failed' && missing.length) return `未确认：${missing.slice(0, 3).map(item => item.name || item.platform || '账号').join('、')}`;
++    return record.message || '暂无补充信息';
++  };
++
++  return (
++    <div className="card-import-history" data-testid="card-import-history">
++      <div className="card-history-head">
++        <div><span className="detail-kicker">IMPORT AUDIT</span><h3><History size={17}/>导入记录</h3><p>保留最近 500 次核验与推送结果，不保存卡密原文</p></div>
++        <button className="icon-button" type="button" onClick={onRefresh} disabled={busy} title="刷新导入记录" aria-label="刷新导入记录"><RefreshCw size={15} className={busy ? 'spin' : ''}/></button>
++      </div>
++      <div className="card-history-summary">
++        <div><span>记录总数</span><strong>{summary.total ?? 0}</strong><small>最近 500 次</small></div>
++        <div><span>推送成功</span><strong className="positive">{summary.success ?? 0}</strong><small>{summary.successful_accounts ?? 0} 个账号</small></div>
++        <div><span>推送失败</span><strong className={summary.failed ? 'negative' : ''}>{summary.failed ?? 0}</strong><small>{summary.failed_accounts ?? 0} 个账号</small></div>
++        <div><span>处理中 / 待推送</span><strong>{summary.pending ?? 0}</strong><small>可继续手动推送</small></div>
++      </div>
++      <div className="card-history-toolbar">
++        <div className="card-history-filters" role="tablist" aria-label="导入记录状态筛选">
++          {filters.map(item => <button type="button" role="tab" aria-selected={filter === item.value} className={filter === item.value ? 'active' : ''} onClick={() => onFilter(item.value)} key={item.value}>{item.label}<span>{item.count ?? 0}</span></button>)}
++        </div>
++        <span>当前显示 {data?.total ?? 0} 条</span>
++      </div>
++      <div className="card-history-table-wrap" role="region" tabIndex={0} aria-label="可横向滚动的卡密导入记录">
++        <div className="card-history-table" role="table" aria-label="卡密导入记录">
++          <div className="card-history-row head" role="row"><span role="columnheader">状态</span><span role="columnheader">时间 / 模式</span><span role="columnheader">卡密 / 下载</span><span role="columnheader">推送账号</span><span role="columnheader">结果</span></div>
++          {items.length ? items.map(record => {
++            const meta = statusMeta[record.status] || statusMeta.running;
++            const StatusIcon = meta.icon;
++            return <div className={`card-history-row ${record.status}`} role="row" key={record.id}>
++              <span role="cell" className={`card-history-status ${record.status}`}><StatusIcon size={14} className={record.status === 'running' ? 'spin' : ''}/><strong>{meta.label}</strong></span>
++              <span role="cell"><strong>{compactTime(record.completed_at || record.updated_at || record.started_at)}</strong><small>{record.mode === 'auto' ? '自动推送' : '手动推送'} · #{record.id}</small></span>
++              <span role="cell"><strong>{record.card_count} 个 / {record.downloaded_files} 文件</strong><small>已核验 {record.verified_count}</small></span>
++              <span role="cell"><strong><em className="positive">{record.success_count}</em> 成功 · <em className={record.failed_count ? 'negative' : ''}>{record.failed_count}</em> 失败</strong><small>待推送 {Math.max(0, Number(record.account_count || 0) - Number(record.success_count || 0))}</small></span>
++              <span role="cell" title={recordDetail(record)}><strong>{record.message || meta.label}</strong><small>{recordDetail(record)}</small></span>
++            </div>;
++          }) : <div className="card-history-empty"><History size={20}/><span>{busy ? '正在读取导入记录' : '当前筛选下暂无导入记录'}</span></div>}
++        </div>
++      </div>
++    </div>
++  );
++}
++
++function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyBusy, onRefreshHistory}) {
+   const stageLabel = {
+     idle: '等待输入',
+     verify: '正在核验',
+@@ -2749,10 +2939,10 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
+             <button type="button" className={mode === 'manual' ? 'active' : ''} onClick={() => onMode('manual')} data-testid="card-mode-manual"><Download size={14}/>手动推送</button>
+             <button type="button" className={mode === 'auto' ? 'active' : ''} onClick={() => onMode('auto')} data-testid="card-mode-auto"><Send size={14}/>自动推送</button>
+           </div></div>
+-          <div className="card-flow-steps" aria-label="卡密直导进度">
+-            <div className={flow.health ? 'done' : flow.stage === 'verify' ? 'active' : ''}><span>1</span><strong>核验卡密</strong><small>{flow.health ? `${health.total ?? codesCount} 个已核验` : '30d.team'}</small></div>
+-            <div className={flow.downloaded ? 'done' : ['reclaim', 'download', 'stage'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.downloaded ? `${flow.downloaded} 个文件` : '账号 JSON'}</small></div>
+-            <div className={pushConfirmed ? 'done' : flow.stage === 'push' ? 'active' : ''}><span>3</span><strong>{mode === 'auto' ? '自动推送' : '手动推送'}</strong><small>{pushConfirmed ? 'Sub2API 已核验' : mode === 'auto' ? '下载后执行' : '确认后执行'}</small></div>
++          <div className="card-flow-steps" role="list" aria-label="卡密直导进度">
++            <div role="listitem" className={flow.health ? 'done' : flow.stage === 'verify' ? 'active' : ''}><span>1</span><strong>核验卡密</strong><small>{flow.health ? `${health.total ?? codesCount} 个已核验` : '30d.team'}</small></div>
++            <div role="listitem" className={flow.downloaded ? 'done' : ['reclaim', 'download', 'stage'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.downloaded ? `${flow.downloaded} 个文件` : '账号 JSON'}</small></div>
++            <div role="listitem" className={pushConfirmed ? 'done' : flow.stage === 'push' ? 'active' : ''}><span>3</span><strong>{mode === 'auto' ? '自动推送' : '手动推送'}</strong><small>{pushConfirmed ? 'Sub2API 已核验' : mode === 'auto' ? '下载后执行' : '确认后执行'}</small></div>
+           </div>
+           <div className="card-flow-summary">
+             <div><span>当前状态</span><strong className={flow.stage === 'error' ? 'negative' : ''}>{stageLabel}</strong></div>
+@@ -2767,11 +2957,12 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
+           </div>
+         </div>
+       </div>
++      <CardImportHistoryPanel data={historyData} filter={historyFilter} onFilter={onHistoryFilter} busy={historyBusy} onRefresh={onRefreshHistory}/>
+     </section>
+   );
+ }
+ 
+-function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
++function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryBusy, onRefreshCardHistory, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+   const [dragging, setDragging] = useState(false);
+   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
+   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
+@@ -2847,6 +3038,8 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, se
+         codes={cardCodes} onCodes={onCardCodes} mode={cardMode} onMode={onCardMode}
+         busy={cardBusy} importing={busy} flow={cardFlow} payload={payload} canAutoPush={Boolean(config.admin_key_set)}
+         onRun={onRunCardImport} onPush={onPushCards}
++        historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
++        historyBusy={cardHistoryBusy} onRefreshHistory={onRefreshCardHistory}
+       />
+ 
+       <div className="automation-console">
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index e64e82a..29e2442 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2019,6 +2019,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-import-console { min-width: 0; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; overflow: hidden; }
+ .card-import-head { min-height: 68px; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--ui-border); }
+ .card-import-head h2 { margin: 3px 0 0; color: var(--ui-text); font-size: 17px; }
++.card-import-head .detail-kicker { color: var(--ui-text-muted); }
+ .card-import-head p { margin: 5px 0 0; color: var(--ui-text-muted); font-size: 10px; }
+ .card-import-head > a { min-width: 0; max-width: 320px; display: inline-flex; align-items: center; gap: 7px; color: var(--ui-text-muted); font-size: 10px; text-decoration: none; }
+ .card-import-head > a:hover { color: var(--ui-text); }
+@@ -2030,7 +2031,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-import-inputs label { margin-top: 0; }
+ .card-import-inputs .code-field { margin-top: 11px; }
+ .card-import-inputs label > span, .card-mode-head > span { margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between; color: var(--ui-text-muted); font-size: 10px; }
+-.card-import-inputs label > span small { color: var(--ui-text-faint); font-size: 9px; }
++.card-import-inputs label > span small { color: var(--ui-text-muted); font-size: 9px; }
+ .card-service-field { display: grid; grid-template-columns: minmax(0, 1fr) 36px; gap: 7px; }
+ .card-service-field .icon-button { width: 36px; height: 36px; }
+ .card-import-inputs textarea { width: 100%; min-height: 104px; max-height: 210px; padding: 10px 11px; resize: vertical; color: var(--ui-text); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 3px; font: inherit; font-size: 11px; line-height: 1.55; }
+@@ -2063,6 +2064,46 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-flow-notice svg { flex: 0 0 auto; }
+ .card-import-actions { margin-top: auto; padding-top: 11px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+ .card-import-actions .button { min-height: 35px; }
++.card-import-history { border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
++.card-history-head { min-height: 68px; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--ui-border-soft); }
++.card-history-head h3 { margin: 4px 0 0; display: flex; align-items: center; gap: 7px; color: var(--ui-text); font-size: 15px; }
++.card-history-head h3 svg { color: var(--ui-text-muted); }
++.card-history-head .detail-kicker { color: var(--ui-text-muted); }
++.card-history-head p { margin: 5px 0 0; color: var(--ui-text-muted); font-size: 10px; }
++.card-history-head .icon-button { flex: 0 0 auto; }
++.card-history-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--ui-surface-muted); border-bottom: 1px solid var(--ui-border); }
++.card-history-summary > div { min-width: 0; min-height: 68px; padding: 10px 14px; border-right: 1px solid var(--ui-border-soft); }
++.card-history-summary > div:last-child { border-right: 0; }
++.card-history-summary span, .card-history-summary strong, .card-history-summary small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.card-history-summary span { color: var(--ui-text-muted); font-size: 10px; }
++.card-history-summary strong { margin-top: 5px; color: var(--ui-text); font-size: 18px; font-variant-numeric: tabular-nums; }
++.card-history-summary small { margin-top: 3px; color: var(--ui-text-muted); font-size: 9px; }
++.card-history-toolbar { min-height: 50px; padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--ui-border-soft); }
++.card-history-toolbar > span { color: var(--ui-text-muted); font-size: 10px; white-space: nowrap; }
++.card-history-filters { min-width: 0; display: inline-flex; align-items: center; background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
++.card-history-filters button { min-width: 78px; height: 32px; border: 0; border-right: 1px solid var(--ui-border-soft); padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-muted); background: transparent; font-size: 10px; }
++.card-history-filters button:last-child { border-right: 0; }
++.card-history-filters button:hover { color: var(--ui-text); background: var(--ui-control); }
++.card-history-filters button.active { color: #fff; background: var(--ui-black); }
++.card-history-filters button span { min-width: 19px; height: 18px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; color: inherit; background: color-mix(in srgb, currentColor 10%, transparent); border-radius: 3px; font-size: 9px; font-variant-numeric: tabular-nums; }
++.card-history-table-wrap { max-height: 360px; overflow: auto; }
++.card-history-table { min-width: 890px; }
++.card-history-row { min-height: 58px; display: grid; grid-template-columns: 130px 170px 145px 190px minmax(230px, 1fr); align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
++.card-history-row:last-child { border-bottom: 0; }
++.card-history-row.head { position: sticky; z-index: 2; top: 0; min-height: 35px; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 9px; font-weight: 700; }
++.card-history-row > span { min-width: 0; padding: 8px 12px; }
++.card-history-row > span + span { border-left: 1px solid var(--ui-border-soft); }
++.card-history-row strong, .card-history-row small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.card-history-row:not(.head) strong { color: var(--ui-text); font-size: 11px; }
++.card-history-row:not(.head) small { margin-top: 4px; color: var(--ui-text-muted); font-size: 9px; }
++.card-history-row em { font-style: normal; }
++.card-history-status { display: flex; align-items: center; gap: 7px; }
++.card-history-status svg { flex: 0 0 auto; }
++.card-history-status.success { color: var(--ui-success); }
++.card-history-status.failed { color: var(--ui-danger); }
++.card-history-status.pending { color: var(--ui-warning); }
++.card-history-status.running { color: var(--ui-text-muted); }
++.card-history-empty { min-height: 110px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--ui-text-faint); font-size: 11px; }
+ 
+ .automation-console { min-width: 0; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; overflow: hidden; }
+ .automation-console > .automation-head { min-height: 66px; padding: 11px 14px; }
+@@ -2367,6 +2408,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+   .sub2api-service-strip { grid-template-columns: minmax(220px, 1fr) repeat(3, 70px) 38px; }
+   .card-import-body { grid-template-columns: 1fr; }
+   .card-import-inputs { border-right: 0; border-bottom: 1px solid var(--ui-border); }
++  .card-history-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .card-history-summary > div:nth-child(2) { border-right: 0; }
++  .card-history-summary > div:nth-child(-n+2) { border-bottom: 1px solid var(--ui-border-soft); }
+   .sub2api-service-strip > div:nth-child(5) { display: none; }
+   .automation-head { align-items: flex-start; flex-direction: column; }
+   .automation-head-actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
+@@ -2384,6 +2428,11 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+   .sub2api-service-strip { grid-template-columns: minmax(0, 1fr) 58px 58px 38px; }
+   .card-import-head { align-items: flex-start; flex-direction: column; gap: 8px; }
+   .card-import-head > a { max-width: 100%; }
++  .card-history-head { align-items: flex-start; }
++  .card-history-toolbar { align-items: stretch; flex-direction: column; }
++  .card-history-filters { width: 100%; overflow-x: auto; }
++  .card-history-filters button { min-width: 72px; flex: 1; }
++  .card-history-toolbar > span { align-self: flex-end; }
+   .card-mode-head { align-items: stretch; flex-direction: column; gap: 7px; }
+   .card-mode-segment { width: 100%; }
+   .card-flow-steps { grid-template-columns: 1fr; }

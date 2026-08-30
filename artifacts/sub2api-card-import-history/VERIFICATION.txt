@@ -1,0 +1,74 @@
+Branch: codex/sub2api-card-import-history
+Changed field: persistent Sub2API card import status, stage, account counts, verification details, and responsive history filters
+
+Artifacts:
+- E:\soft\java\ldxp\artifacts\sub2api-card-import-history\MODIFIED_FILE
+- E:\soft\java\ldxp\artifacts\sub2api-card-import-history\DIFF_FILE
+- E:\soft\java\ldxp\artifacts\sub2api-card-import-history\VERIFICATION.txt
+- E:\soft\java\ldxp\artifacts\sub2api-card-import-history\ROLLBACK.sh
+
+BASELINE
+Command: python -m unittest discover -s backend -q
+Input: E:\soft\java\ldxp at ae96542 before card-import-history changes
+Literal output:
+----------------------------------------------------------------------
+Ran 72 tests in 1.673s
+
+OK
+Result: exit 0
+
+MODIFIED
+Command: python -m unittest discover -s backend -q
+Input: E:\soft\java\ldxp-sub2api-card-import-history after rebasing on ae96542
+Literal output:
+----------------------------------------------------------------------
+Ran 75 tests in 1.663s
+
+OK
+Result: exit 0
+
+MODIFIED FRONTEND TESTS
+Command: npm test
+Input: E:\soft\java\ldxp-sub2api-card-import-history\frontend
+Literal output: tests 2; pass 2; fail 0; duration_ms 80.3631
+Result: exit 0
+
+MODIFIED FRONTEND BUILD
+Command: npm run build
+Input: E:\soft\java\ldxp-sub2api-card-import-history\frontend
+Literal output: vite v8.2.2; 2379 modules transformed; built in 315ms
+Result: exit 0
+
+MODIFIED HTTP
+Command: PowerShell Invoke-RestMethod/Invoke-WebRequest GET /api/health and GET /api/sub2api/card-import-records through the Vite proxy
+Input: independent runtime at http://127.0.0.1:5181 with backend http://127.0.0.1:8008 and three seeded acceptance records
+Literal output:
+health_status=200
+history_capability=True
+proxy_status=200
+record_total=3
+success_records=1
+failed_records=1
+pending_records=1
+successful_accounts=3
+failed_accounts=1
+pending_filter_total=1
+card_secrets_exposed=False
+Result: exit 0
+
+MODIFIED UI
+Command: npx -y agent-browser a11y --selector '[data-testid="sub2api-card-import"]' --json
+Input: http://127.0.0.1:5181 Sub2API import view at 1440x1000 after desktop, dark, and 390x844 mobile screenshot checks
+Literal output: violations=0
+Result: exit 0
+
+ROLLBACK
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-main-jsx
+Input: E:\soft\java\ldxp-sub2api-card-import-history\artifacts\sub2api-card-import-history as the working directory
+Literal output:
+Restored E:\soft\java\ldxp-sub2api-card-import-history\artifacts\sub2api-card-import-history\rollback-test-main-jsx from ROLLBACK_BASELINE
+Result: exit 0
+Restored hash: 140070B9D8F93F0A42BBF95B091D2B689B06239C73ECC07416161F6E644D8FB1
+Baseline hash: 140070B9D8F93F0A42BBF95B091D2B689B06239C73ECC07416161F6E644D8FB1
+Modified artifact hash left changed: 9A01DBEBB0AD03D4DD4FD6BB20FC6BEB15DFD0C6B9C8C557ADB5A424FA252C7C
+Restored behavior/status: rollback-test-main-jsx matches the pre-change main.jsx byte-for-byte and has no card-import-history UI or lifecycle calls; MODIFIED_FILE retains the history workflow and interface.
