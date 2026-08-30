@@ -2160,6 +2160,7 @@ function App() {
   };
 
   const testSub2ApiAccount = async account => {
+    if (sub2apiAccountRefreshRef.current) return;
     const id = Number(account?.id);
     if (!Number.isInteger(id) || id < 1) return;
     setSub2apiAccountActions(current => ({...current, [id]: 'test'}));
@@ -2243,6 +2244,7 @@ function App() {
   };
 
   const deleteSub2ApiAccount = async account => {
+    if (sub2apiAccountRefreshRef.current) return;
     const id = Number(account?.id);
     if (!Number.isInteger(id) || id < 1) return;
     if (!window.confirm(`确定删除账号“${account.name || id}”？`)) return;
