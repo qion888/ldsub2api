@@ -487,7 +487,7 @@ function ComplaintHistoryDialog({
       </form>}
 
       {showError && <div className="order-history-state error" data-history-phase-focus tabIndex={-1} role="alert">
-        <TriangleAlert size={21}/><strong>{sessionExpired ? '查询会话已失效' : '售后记录暂时不可用'}</strong><span>{error || '售后记录读取失败，请重试'}</span>
+        <TriangleAlert size={21}/><strong>{sessionExpired ? '查询会话已失效' : error?.includes('接口') ? '售后记录接口不可用' : '售后记录暂时不可用'}</strong><span>{error || '售后记录读取失败，请重试'}</span>
         <div className="order-history-actions">{sessionExpired ? <button className="button primary" type="button" onClick={onRequery}><RefreshCw size={15}/>关闭并重新查询</button> : <button className="button secondary" type="button" onClick={onRetry}><RotateCcw size={15}/>重试</button>}<button className="button secondary" type="button" onClick={onClose}>关闭</button></div>
       </div>}
 

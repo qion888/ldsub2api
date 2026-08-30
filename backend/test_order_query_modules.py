@@ -331,6 +331,20 @@ class ClientTests(unittest.TestCase):
                         query_password="",
                     )
 
+    def test_complaint_history_maps_missing_upstream_endpoint_to_distinct_error(self) -> None:
+        opener = FakeOpener([self._json_response({
+            "code": 0,
+            "msg": "接口不存在",
+            "data": None,
+        })])
+        with self.assertRaises(UpstreamOrderError) as context:
+            OrderQueryClient(opener=opener).get_complaint_history(
+                trade_no="ORDER-1",
+                query_password="123456",
+            )
+        self.assertEqual(context.exception.code, "complaint_history_endpoint_unavailable")
+        self.assertEqual(context.exception.status, 503)
+
     def test_complaint_password_check_maps_human_verification_failure_to_expired_session(self) -> None:
         opener = FakeOpener([self._json_response({
             "code": 0,
@@ -1070,6 +1084,23 @@ class RouteTests(unittest.TestCase):
             "detail": "bad query",
             "code": "invalid_order_query",
             "retryable": False,
+        })])
+
+    def test_missing_history_operation_returns_distinct_service_error(self) -> None:
+        responses: list[tuple[int, Any]] = []
+        handled = routes.handle_post(
+            routes.ORDER_COMPLAINT_HISTORY_PATH,
+            {},
+            send_json=lambda value, status=200: responses.append((status, value)),
+            search=lambda data: {},
+            detail=lambda data: {},
+            complaint_preview=lambda data: {},
+        )
+        self.assertTrue(handled)
+        self.assertEqual(responses, [(503, {
+            "detail": "售后记录接口未启用，请重启后端服务",
+            "code": "order_complaint_history_unavailable",
+            "retryable": True,
         })])
 
     def test_detail_route_returns_a_specific_password_error(self) -> None:

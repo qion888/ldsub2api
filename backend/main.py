@@ -1058,6 +1058,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "sub2api_card_import_history_delete": True,
                 "order_query": True,
                 "order_complaint_submit": True,
+                "order_complaint_history": True,
             })
         if path == "/api/watches":
             return self._send_json(list_watches())

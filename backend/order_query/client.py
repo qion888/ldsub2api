@@ -610,6 +610,13 @@ class OrderQueryClient:
             raise OrderQuerySessionExpired()
         if any(token in message for token in ("订单不存在", "未找到订单", "订单号不存在")):
             raise OrderQueryDetailNotFound()
+        if any(token in message for token in ("接口不存在", "接口未找到", "路径不存在")):
+            raise UpstreamOrderError(
+                "官方售后记录接口暂不可用，请重启后端服务或稍后重试",
+                code="complaint_history_endpoint_unavailable",
+                status=503,
+                retryable=True,
+            )
         raise UpstreamOrderError(
             message or fallback,
             code=code,

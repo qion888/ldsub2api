@@ -161,15 +161,24 @@ test('normalizes empty complaint history and classifies password and expiry erro
     sessionExpired: false,
     passwordRequired: true,
     passwordInvalid: false,
+    endpointUnavailable: false,
     message: '请输入订单安全密码',
   });
   assert.deepEqual(complaintHistoryErrorState({status: 403, code: 'order_query_password_invalid', message: '密码错误'}), {
     sessionExpired: false,
     passwordRequired: false,
     passwordInvalid: true,
+    endpointUnavailable: false,
     message: '密码错误',
   });
   assert.equal(complaintHistoryErrorState({status: 410}).sessionExpired, true);
+  assert.deepEqual(complaintHistoryErrorState({status: 404, message: '接口不存在'}), {
+    sessionExpired: false,
+    passwordRequired: false,
+    passwordInvalid: false,
+    endpointUnavailable: true,
+    message: '售后记录接口未启用，请重启后端服务',
+  });
 });
 
 test('creates and normalizes the exact complaint submission payload', () => {

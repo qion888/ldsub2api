@@ -1299,6 +1299,7 @@ class GoodsParserTests(unittest.TestCase):
         self.assertTrue(payload["sub2api_card_import_history"])
         self.assertTrue(payload["sub2api_card_import_history_delete"])
         self.assertTrue(payload["order_complaint_submit"])
+        self.assertTrue(payload["order_complaint_history"])
 
     def test_sub2api_card_import_history_http_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

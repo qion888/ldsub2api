@@ -127,6 +127,16 @@ def handle_post(
     else:
         return False
     if operation is None:
+        if path == ORDER_COMPLAINT_HISTORY_PATH:
+            send_json(
+                {
+                    "detail": "售后记录接口未启用，请重启后端服务",
+                    "code": "order_complaint_history_unavailable",
+                    "retryable": True,
+                },
+                503,
+            )
+            return True
         return False
     try:
         send_json(operation(data), 200)
