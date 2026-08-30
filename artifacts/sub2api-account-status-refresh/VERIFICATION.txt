@@ -12,11 +12,11 @@ Artifacts:
 - ROLLBACK.sh: artifacts/sub2api-account-status-refresh/ROLLBACK.sh
 
 BASELINE command: git hash-object artifacts/sub2api-account-status-refresh/BASELINE_FILE
-BASELINE result: fa1236c1dae544b5a84f78cf72cfe82d7512df21 (exit 0)
-MODIFIED command: git hash-object artifacts/sub2api-account-status-refresh/MODIFIED_FILE
-MODIFIED result: 644cb0632a50e88c585ae7b1af981915252cf5f3 (exit 0)
+BASELINE result: dd91b50af19ea7deacca1d1a8b658313ff762603 (exit 0)
+MODIFIED command: git hash-object frontend/src/main.jsx
+MODIFIED result: e3c9cb2f7cb3ad41e8e79610922dde5de7b8c603 (exit 0)
 ROLLBACK command: Copy-Item artifacts/sub2api-account-status-refresh/BASELINE_FILE artifacts/sub2api-account-status-refresh/rollback-test-main.jsx; git hash-object artifacts/sub2api-account-status-refresh/rollback-test-main.jsx
-ROLLBACK result: fa1236c1dae544b5a84f78cf72cfe82d7512df21 (exit 0)
+ROLLBACK result: dd91b50af19ea7deacca1d1a8b658313ff762603 (exit 0)
 
 BASELINE test: $env:PYTHONPATH='backend'; python -m unittest discover -s backend -p 'test_*.py' -> 157 passed, exit 0.
 MODIFIED test: npm test -> 38 passed, exit 0.

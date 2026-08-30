@@ -1,5 +1,5 @@
 ﻿diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
-index 69cf20a..253d600 100644
+index 39c4835..f320817 100644
 --- a/frontend/src/Sub2ApiView.jsx
 +++ b/frontend/src/Sub2ApiView.jsx
 @@ -56,7 +56,12 @@ function intervalLabel(value) {
@@ -42,7 +42,7 @@ index 69cf20a..253d600 100644
    const [dragging, setDragging] = useState(false);
    const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
    const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
-@@ -701,7 +707,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
+@@ -702,7 +708,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
            error={accountError}
            actions={accountActions}
            tested={testedAccounts}
@@ -53,7 +53,7 @@ index 69cf20a..253d600 100644
            onDelete={onDeleteAccount}
            onCopyName={onCopyAccountName}
 diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
-index fa1236c..644cb06 100644
+index dd91b50..e3c9cb2 100644
 --- a/frontend/src/main.jsx
 +++ b/frontend/src/main.jsx
 @@ -987,6 +987,8 @@ function App() {
