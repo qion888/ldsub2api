@@ -23,6 +23,7 @@ class Sub2ApiModuleTests(unittest.TestCase):
                 "2026-08-30T08:02:00+00:00",
                 "2026-08-30T08:03:00+00:00",
                 "2026-08-30T08:04:00+00:00",
+                "2026-08-30T08:05:00+00:00",
             ))
             now = lambda: next(timestamps)
             card_import_history.initialize(database)
@@ -30,6 +31,12 @@ class Sub2ApiModuleTests(unittest.TestCase):
                 database, {"mode": "auto", "card_count": 3}, now=now
             )
             running_result = card_import_history.list_records(database, {"status": ["pending"]})
+            polling = card_import_history.update_record(
+                database,
+                successful["id"],
+                {"status": "running", "stage": "poll", "message": "等待账号 JSON"},
+                now=now,
+            )
             card_import_history.update_record(
                 database,
                 successful["id"],
@@ -74,6 +81,8 @@ class Sub2ApiModuleTests(unittest.TestCase):
             result = card_import_history.list_records(database, {"limit": ["20"]})
 
         self.assertEqual(running_result["items"][0]["status"], "running")
+        self.assertEqual(polling["stage"], "poll")
+        self.assertIn("waiting", card_import_history.STAGES)
         self.assertEqual(pending_result["total"], 1)
         self.assertEqual(pending_result["items"][0]["status"], "pending")
         self.assertEqual(completed["details"]["new_account_ids"], [11, 12])

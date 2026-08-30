@@ -45,6 +45,12 @@ import {
 } from 'lucide-react';
 import './style.css';
 import {buildSub2ApiImportNotice} from './sub2apiNotices.js';
+import {
+  CARD_RECLAIM_POLL_TIMEOUT_MS,
+  CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
+  pollForReclaimDownloads,
+  reclaimPollingFailureMessage,
+} from './sub2apiCardPolling.js';
 
 const API = '/api';
 const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
@@ -2189,41 +2195,29 @@ function App() {
         return;
       }
 
-      const downloads = new Map();
-      const rememberDownloads = values => (values || []).forEach(item => {
-        const orderNo = item?.task?.order_no || item?.filename;
-        if (orderNo && item?.data) downloads.set(orderNo, item);
-      });
-      rememberDownloads(initial.downloaded_payloads);
       const codes = Array.isArray(initial.reclaim_card_codes) ? initial.reclaim_card_codes : [];
-      let progressResult = initial.result || {};
-      let activeTasks = Number(progressResult.queued || 0) + Number(progressResult.already_running || 0);
-      let attempts = 0;
-      while (codes.length && activeTasks > 0 && attempts < 120) {
-        await new Promise(resolve => window.setTimeout(resolve, 5000));
-        const progress = await request('/sub2api/reclaim-progress', {
+      const polling = await pollForReclaimDownloads({
+        initialResponse: initial,
+        requestProgress: () => request('/sub2api/reclaim-progress', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({card_codes: codes}),
-        });
-        rememberDownloads(progress.downloaded_payloads);
-        progressResult = progress.result || {};
-        activeTasks = Number(progressResult.queued || 0) + Number(progressResult.already_running || 0);
-        attempts += 1;
-        setSub2apiReclaimResult({
-          ...initial,
-          result: progressResult,
-          downloaded_payloads: [...downloads.values()],
-        });
-      }
+        }),
+        onSnapshot: snapshot => {
+          setSub2apiReclaimResult({
+            ...initial,
+            result: snapshot.progress,
+            downloaded_payloads: snapshot.downloads,
+            polling: {attempts: snapshot.attempts, elapsed_ms: snapshot.elapsedMs, timeout_ms: CARD_RECLAIM_POLL_TIMEOUT_MS},
+          });
+        },
+      });
 
-      const staged = stageRecoveredPayloads([...downloads.values()]);
+      const staged = polling.completed ? stageRecoveredPayloads(polling.downloads) : null;
       if (staged) {
         notify(`找回完成并下载 JSON，${staged.accounts} 个账号已放入一键导入区`);
-      } else if (activeTasks > 0) {
-        notify('找回任务仍在处理，自动轮询已达到 10 分钟', 'error');
       } else {
-        notify('找回任务已结束，但没有生成可导入 JSON', 'error');
+        notify(reclaimPollingFailureMessage(polling), 'error');
       }
     } catch (error) {
       notify(error.message, 'error');
@@ -2405,38 +2399,37 @@ function App() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({card_codes: codes, mode: 'all'}),
       });
-      const downloads = new Map();
-      const rememberDownloads = values => (values || []).forEach(item => {
-        const orderNo = item?.task?.order_no || item?.filename;
-        if (orderNo && item?.data) downloads.set(String(orderNo), item);
+      await updateSub2ApiCardHistory(recordId, {
+        status: 'running',
+        stage: 'poll',
+        message: '找回任务已提交，正在轮询账号 JSON（最长 1 分钟）',
       });
-      let progressResult = submitted;
-      let activeTasks = Number(submitted.queued || 0) + Number(submitted.already_running || 0);
-      let attempts = 0;
-      do {
-        const progress = await request('/sub2api/reclaim-progress', {
+      const polling = await pollForReclaimDownloads({
+        initialResponse: {result: submitted},
+        requestProgress: () => request('/sub2api/reclaim-progress', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({card_codes: codes}),
-        });
-        rememberDownloads(progress.downloaded_payloads);
-        progressResult = progress.result || {};
-        activeTasks = Number(progressResult.queued || 0) + Number(progressResult.already_running || 0);
-        attempts += 1;
-        setSub2apiCardFlow(current => ({
-          ...current,
-          stage: activeTasks ? 'download' : 'stage',
-          health,
-          progress: progressResult,
-          downloaded: downloads.size,
-        }));
-        if (activeTasks > 0 && attempts < 120) await new Promise(resolve => window.setTimeout(resolve, 5000));
-      } while (activeTasks > 0 && attempts < 120);
+        }),
+        onSnapshot: snapshot => {
+          setSub2apiCardFlow(current => ({
+            ...current,
+            stage: snapshot.completed ? 'download' : 'poll',
+            health,
+            progress: snapshot.progress,
+            downloaded: snapshot.downloadedCount,
+            pollAttempts: snapshot.attempts,
+            pollElapsedSeconds: Math.min(CARD_RECLAIM_POLL_TIMEOUT_SECONDS, Math.ceil(snapshot.elapsedMs / 1000)),
+            pollTimeoutSeconds: CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
+          }));
+        },
+      });
 
-      staged = stageRecoveredPayloads([...downloads.values()]);
+      staged = polling.completed ? stageRecoveredPayloads(polling.downloads) : null;
       if (!staged) {
-        if (activeTasks > 0) throw new Error('卡密任务仍在处理，自动轮询已达到 10 分钟，请稍后重试');
-        throw new Error('卡密核验已完成，但服务未返回可下载的账号 JSON');
+        const pollingError = new Error(reclaimPollingFailureMessage(polling));
+        pollingError.pending = Boolean(polling.timedOut && !polling.terminal);
+        throw pollingError;
       }
 
       if (sub2apiCardMode === 'manual') {
@@ -2468,15 +2461,21 @@ function App() {
       setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
       await updateSub2ApiCardHistory(recordId, cardImportVerificationPatch(pushed));
     } catch (error) {
-      setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
+      const pending = Boolean(error.pending);
+      setSub2apiCardFlow(current => ({
+        ...current,
+        stage: pending ? 'waiting' : 'error',
+        error: pending ? '' : error.message,
+        notice: pending ? error.message : '',
+      }));
       await updateSub2ApiCardHistory(recordId, {
-        status: 'failed',
-        stage: 'error',
+        status: pending ? 'pending' : 'failed',
+        stage: pending ? 'waiting' : 'error',
         account_count: Number(staged?.accounts || 0),
-        failed_count: Number(staged?.accounts || 0),
+        failed_count: pending ? 0 : Number(staged?.accounts || 0),
         message: error.message,
       });
-      notify(error.message, 'error');
+      notify(error.message, pending ? 'info' : 'error');
     } finally {
       setSub2apiCardBusy(false);
     }

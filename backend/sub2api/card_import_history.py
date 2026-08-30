@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 DatabaseFactory = Callable[[], sqlite3.Connection]
 STATUSES = {"running", "pending", "success", "failed"}
-STAGES = {"verify", "reclaim", "download", "stage", "ready", "push", "done", "error"}
+STAGES = {"verify", "reclaim", "poll", "download", "stage", "ready", "waiting", "push", "done", "error"}
 COUNT_FIELDS = (
     "card_count",
     "verified_count",

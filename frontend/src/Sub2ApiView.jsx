@@ -363,8 +363,10 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
     idle: '等待输入',
     verify: '正在核验',
     reclaim: '正在提交',
+    poll: '正在轮询',
     download: '正在下载',
     stage: '正在整理',
+    waiting: '等待后续查询',
     ready: '等待推送',
     push: '正在推送',
     done: '推送完成',
@@ -394,15 +396,18 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
           </div></div>
           <div className="card-flow-steps" role="list" aria-label="卡密直导进度">
             <div role="listitem" className={flow.health ? 'done' : flow.stage === 'verify' ? 'active' : ''}><span>1</span><strong>核验卡密</strong><small>{flow.health ? `${health.total ?? codesCount} 个已核验` : '30d.team'}</small></div>
-            <div role="listitem" className={flow.downloaded ? 'done' : ['reclaim', 'download', 'stage'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.downloaded ? `${flow.downloaded} 个文件` : '账号 JSON'}</small></div>
+            <div role="listitem" className={flow.stage !== 'poll' && flow.downloaded ? 'done' : ['reclaim', 'poll', 'download', 'stage', 'waiting'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.stage === 'poll' ? `${flow.downloaded || 0} 文件 · ${flow.pollElapsedSeconds || 0}s / 60s` : flow.downloaded ? `${flow.downloaded} 个文件` : flow.stage === 'waiting' ? '可稍后重试' : '账号 JSON'}</small></div>
             <div role="listitem" className={pushConfirmed ? 'done' : flow.stage === 'push' ? 'active' : ''}><span>3</span><strong>{mode === 'auto' ? '自动推送' : '手动推送'}</strong><small>{pushConfirmed ? 'Sub2API 已核验' : mode === 'auto' ? '下载后执行' : '确认后执行'}</small></div>
           </div>
           <div className="card-flow-summary">
             <div><span>当前状态</span><strong className={flow.stage === 'error' ? 'negative' : ''}>{stageLabel}</strong></div>
             <div><span>核验总数</span><strong>{health.total ?? '--'}</strong></div>
+            <div><span>轮询等待</span><strong>{flow.pollElapsedSeconds == null ? '--' : `${flow.pollElapsedSeconds}s / ${flow.pollTimeoutSeconds || 60}s`}</strong></div>
             <div><span>账号数量</span><strong>{flow.accounts ?? '--'}</strong></div>
           </div>
           {mode === 'auto' && !canAutoPush && <div className="card-flow-notice"><AlertCircle size={14}/><span>自动推送需要先保存 Sub2API 管理员密钥</span></div>}
+          {flow.stage === 'poll' && <div className="card-flow-notice"><RefreshCw size={14} className="spin"/><span>每 5 秒查询一次；即使队列已清空，也会继续等待账号 JSON，最长 1 分钟</span></div>}
+          {flow.notice && <div className="card-flow-notice"><Clock3 size={14}/><span>{flow.notice}</span></div>}
           {flow.error && <div className="card-flow-notice error"><TriangleAlert size={14}/><span>{flow.error}</span></div>}
           <div className="card-import-actions">
             <button className="button primary" type="button" onClick={onRun} disabled={isActive || !codesCount || (mode === 'auto' && !canAutoPush)} data-testid="run-card-import">{busy ? <RefreshCw size={15} className="spin"/> : mode === 'auto' ? <Send size={15}/> : <Download size={15}/>} {busy ? stageLabel : mode === 'auto' ? '核验、下载并推送' : '核验并下载'}</button>
