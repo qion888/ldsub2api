@@ -1,0 +1,474 @@
+diff --git a/backend/sub2api/card_import_history.py b/backend/sub2api/card_import_history.py
+index fdf7dfd..8f3bab1 100644
+--- a/backend/sub2api/card_import_history.py
++++ b/backend/sub2api/card_import_history.py
+@@ -9,7 +9,7 @@ from typing import Any, Callable
+ 
+ DatabaseFactory = Callable[[], sqlite3.Connection]
+ STATUSES = {"running", "pending", "success", "failed"}
+-STAGES = {"verify", "reclaim", "download", "stage", "ready", "push", "done", "error"}
++STAGES = {"verify", "reclaim", "poll", "download", "stage", "ready", "waiting", "push", "done", "error"}
+ COUNT_FIELDS = (
+     "card_count",
+     "verified_count",
+diff --git a/backend/test_sub2api_modules.py b/backend/test_sub2api_modules.py
+index b52e966..9f43acb 100644
+--- a/backend/test_sub2api_modules.py
++++ b/backend/test_sub2api_modules.py
+@@ -23,6 +23,7 @@ class Sub2ApiModuleTests(unittest.TestCase):
+                 "2026-08-30T08:02:00+00:00",
+                 "2026-08-30T08:03:00+00:00",
+                 "2026-08-30T08:04:00+00:00",
++                "2026-08-30T08:05:00+00:00",
+             ))
+             now = lambda: next(timestamps)
+             card_import_history.initialize(database)
+@@ -30,6 +31,12 @@ class Sub2ApiModuleTests(unittest.TestCase):
+                 database, {"mode": "auto", "card_count": 3}, now=now
+             )
+             running_result = card_import_history.list_records(database, {"status": ["pending"]})
++            polling = card_import_history.update_record(
++                database,
++                successful["id"],
++                {"status": "running", "stage": "poll", "message": "等待账号 JSON"},
++                now=now,
++            )
+             card_import_history.update_record(
+                 database,
+                 successful["id"],
+@@ -74,6 +81,8 @@ class Sub2ApiModuleTests(unittest.TestCase):
+             result = card_import_history.list_records(database, {"limit": ["20"]})
+ 
+         self.assertEqual(running_result["items"][0]["status"], "running")
++        self.assertEqual(polling["stage"], "poll")
++        self.assertIn("waiting", card_import_history.STAGES)
+         self.assertEqual(pending_result["total"], 1)
+         self.assertEqual(pending_result["items"][0]["status"], "pending")
+         self.assertEqual(completed["details"]["new_account_ids"], [11, 12])
+diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
+index a088577..df2e284 100644
+--- a/frontend/src/Sub2ApiView.jsx
++++ b/frontend/src/Sub2ApiView.jsx
+@@ -363,8 +363,10 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
+     idle: '等待输入',
+     verify: '正在核验',
+     reclaim: '正在提交',
++    poll: '正在轮询',
+     download: '正在下载',
+     stage: '正在整理',
++    waiting: '等待后续查询',
+     ready: '等待推送',
+     push: '正在推送',
+     done: '推送完成',
+@@ -394,15 +396,18 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
+           </div></div>
+           <div className="card-flow-steps" role="list" aria-label="卡密直导进度">
+             <div role="listitem" className={flow.health ? 'done' : flow.stage === 'verify' ? 'active' : ''}><span>1</span><strong>核验卡密</strong><small>{flow.health ? `${health.total ?? codesCount} 个已核验` : '30d.team'}</small></div>
+-            <div role="listitem" className={flow.downloaded ? 'done' : ['reclaim', 'download', 'stage'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.downloaded ? `${flow.downloaded} 个文件` : '账号 JSON'}</small></div>
++            <div role="listitem" className={flow.stage !== 'poll' && flow.downloaded ? 'done' : ['reclaim', 'poll', 'download', 'stage', 'waiting'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.stage === 'poll' ? `${flow.downloaded || 0} 文件 · ${flow.pollElapsedSeconds || 0}s / 60s` : flow.downloaded ? `${flow.downloaded} 个文件` : flow.stage === 'waiting' ? '可稍后重试' : '账号 JSON'}</small></div>
+             <div role="listitem" className={pushConfirmed ? 'done' : flow.stage === 'push' ? 'active' : ''}><span>3</span><strong>{mode === 'auto' ? '自动推送' : '手动推送'}</strong><small>{pushConfirmed ? 'Sub2API 已核验' : mode === 'auto' ? '下载后执行' : '确认后执行'}</small></div>
+           </div>
+           <div className="card-flow-summary">
+             <div><span>当前状态</span><strong className={flow.stage === 'error' ? 'negative' : ''}>{stageLabel}</strong></div>
+             <div><span>核验总数</span><strong>{health.total ?? '--'}</strong></div>
++            <div><span>轮询等待</span><strong>{flow.pollElapsedSeconds == null ? '--' : `${flow.pollElapsedSeconds}s / ${flow.pollTimeoutSeconds || 60}s`}</strong></div>
+             <div><span>账号数量</span><strong>{flow.accounts ?? '--'}</strong></div>
+           </div>
+           {mode === 'auto' && !canAutoPush && <div className="card-flow-notice"><AlertCircle size={14}/><span>自动推送需要先保存 Sub2API 管理员密钥</span></div>}
++          {flow.stage === 'poll' && <div className="card-flow-notice"><RefreshCw size={14} className="spin"/><span>每 5 秒查询一次；即使队列已清空，也会继续等待账号 JSON，最长 1 分钟</span></div>}
++          {flow.notice && <div className="card-flow-notice"><Clock3 size={14}/><span>{flow.notice}</span></div>}
+           {flow.error && <div className="card-flow-notice error"><TriangleAlert size={14}/><span>{flow.error}</span></div>}
+           <div className="card-import-actions">
+             <button className="button primary" type="button" onClick={onRun} disabled={isActive || !codesCount || (mode === 'auto' && !canAutoPush)} data-testid="run-card-import">{busy ? <RefreshCw size={15} className="spin"/> : mode === 'auto' ? <Send size={15}/> : <Download size={15}/>} {busy ? stageLabel : mode === 'auto' ? '核验、下载并推送' : '核验并下载'}</button>
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index a8ab84c..3a06d66 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -45,6 +45,12 @@ import {
+ } from 'lucide-react';
+ import './style.css';
+ import {buildSub2ApiImportNotice} from './sub2apiNotices.js';
++import {
++  CARD_RECLAIM_POLL_TIMEOUT_MS,
++  CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
++  pollForReclaimDownloads,
++  reclaimPollingFailureMessage,
++} from './sub2apiCardPolling.js';
+ 
+ const API = '/api';
+ const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
+@@ -2189,41 +2195,29 @@ function App() {
+         return;
+       }
+ 
+-      const downloads = new Map();
+-      const rememberDownloads = values => (values || []).forEach(item => {
+-        const orderNo = item?.task?.order_no || item?.filename;
+-        if (orderNo && item?.data) downloads.set(orderNo, item);
+-      });
+-      rememberDownloads(initial.downloaded_payloads);
+       const codes = Array.isArray(initial.reclaim_card_codes) ? initial.reclaim_card_codes : [];
+-      let progressResult = initial.result || {};
+-      let activeTasks = Number(progressResult.queued || 0) + Number(progressResult.already_running || 0);
+-      let attempts = 0;
+-      while (codes.length && activeTasks > 0 && attempts < 120) {
+-        await new Promise(resolve => window.setTimeout(resolve, 5000));
+-        const progress = await request('/sub2api/reclaim-progress', {
++      const polling = await pollForReclaimDownloads({
++        initialResponse: initial,
++        requestProgress: () => request('/sub2api/reclaim-progress', {
+           method: 'POST',
+           headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify({card_codes: codes}),
+-        });
+-        rememberDownloads(progress.downloaded_payloads);
+-        progressResult = progress.result || {};
+-        activeTasks = Number(progressResult.queued || 0) + Number(progressResult.already_running || 0);
+-        attempts += 1;
+-        setSub2apiReclaimResult({
+-          ...initial,
+-          result: progressResult,
+-          downloaded_payloads: [...downloads.values()],
+-        });
+-      }
++        }),
++        onSnapshot: snapshot => {
++          setSub2apiReclaimResult({
++            ...initial,
++            result: snapshot.progress,
++            downloaded_payloads: snapshot.downloads,
++            polling: {attempts: snapshot.attempts, elapsed_ms: snapshot.elapsedMs, timeout_ms: CARD_RECLAIM_POLL_TIMEOUT_MS},
++          });
++        },
++      });
+ 
+-      const staged = stageRecoveredPayloads([...downloads.values()]);
++      const staged = polling.completed ? stageRecoveredPayloads(polling.downloads) : null;
+       if (staged) {
+         notify(`找回完成并下载 JSON，${staged.accounts} 个账号已放入一键导入区`);
+-      } else if (activeTasks > 0) {
+-        notify('找回任务仍在处理，自动轮询已达到 10 分钟', 'error');
+       } else {
+-        notify('找回任务已结束，但没有生成可导入 JSON', 'error');
++        notify(reclaimPollingFailureMessage(polling), 'error');
+       }
+     } catch (error) {
+       notify(error.message, 'error');
+@@ -2405,38 +2399,37 @@ function App() {
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({card_codes: codes, mode: 'all'}),
+       });
+-      const downloads = new Map();
+-      const rememberDownloads = values => (values || []).forEach(item => {
+-        const orderNo = item?.task?.order_no || item?.filename;
+-        if (orderNo && item?.data) downloads.set(String(orderNo), item);
++      await updateSub2ApiCardHistory(recordId, {
++        status: 'running',
++        stage: 'poll',
++        message: '找回任务已提交，正在轮询账号 JSON（最长 1 分钟）',
+       });
+-      let progressResult = submitted;
+-      let activeTasks = Number(submitted.queued || 0) + Number(submitted.already_running || 0);
+-      let attempts = 0;
+-      do {
+-        const progress = await request('/sub2api/reclaim-progress', {
++      const polling = await pollForReclaimDownloads({
++        initialResponse: {result: submitted},
++        requestProgress: () => request('/sub2api/reclaim-progress', {
+           method: 'POST',
+           headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify({card_codes: codes}),
+-        });
+-        rememberDownloads(progress.downloaded_payloads);
+-        progressResult = progress.result || {};
+-        activeTasks = Number(progressResult.queued || 0) + Number(progressResult.already_running || 0);
+-        attempts += 1;
+-        setSub2apiCardFlow(current => ({
+-          ...current,
+-          stage: activeTasks ? 'download' : 'stage',
+-          health,
+-          progress: progressResult,
+-          downloaded: downloads.size,
+-        }));
+-        if (activeTasks > 0 && attempts < 120) await new Promise(resolve => window.setTimeout(resolve, 5000));
+-      } while (activeTasks > 0 && attempts < 120);
+-
+-      staged = stageRecoveredPayloads([...downloads.values()]);
++        }),
++        onSnapshot: snapshot => {
++          setSub2apiCardFlow(current => ({
++            ...current,
++            stage: snapshot.completed ? 'download' : 'poll',
++            health,
++            progress: snapshot.progress,
++            downloaded: snapshot.downloadedCount,
++            pollAttempts: snapshot.attempts,
++            pollElapsedSeconds: Math.min(CARD_RECLAIM_POLL_TIMEOUT_SECONDS, Math.ceil(snapshot.elapsedMs / 1000)),
++            pollTimeoutSeconds: CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
++          }));
++        },
++      });
++
++      staged = polling.completed ? stageRecoveredPayloads(polling.downloads) : null;
+       if (!staged) {
+-        if (activeTasks > 0) throw new Error('卡密任务仍在处理，自动轮询已达到 10 分钟，请稍后重试');
+-        throw new Error('卡密核验已完成，但服务未返回可下载的账号 JSON');
++        const pollingError = new Error(reclaimPollingFailureMessage(polling));
++        pollingError.pending = Boolean(polling.timedOut && !polling.terminal);
++        throw pollingError;
+       }
+ 
+       if (sub2apiCardMode === 'manual') {
+@@ -2468,15 +2461,21 @@ function App() {
+       setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
+       await updateSub2ApiCardHistory(recordId, cardImportVerificationPatch(pushed));
+     } catch (error) {
+-      setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
++      const pending = Boolean(error.pending);
++      setSub2apiCardFlow(current => ({
++        ...current,
++        stage: pending ? 'waiting' : 'error',
++        error: pending ? '' : error.message,
++        notice: pending ? error.message : '',
++      }));
+       await updateSub2ApiCardHistory(recordId, {
+-        status: 'failed',
+-        stage: 'error',
++        status: pending ? 'pending' : 'failed',
++        stage: pending ? 'waiting' : 'error',
+         account_count: Number(staged?.accounts || 0),
+-        failed_count: Number(staged?.accounts || 0),
++        failed_count: pending ? 0 : Number(staged?.accounts || 0),
+         message: error.message,
+       });
+-      notify(error.message, 'error');
++      notify(error.message, pending ? 'info' : 'error');
+     } finally {
+       setSub2apiCardBusy(false);
+     }
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index f924a92..be882cd 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2052,7 +2052,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-flow-steps small { margin-top: 3px; color: var(--ui-text-muted); font-size: 8px; }
+ .card-flow-steps > div.active > span { color: #fff; background: var(--ui-warning); border-color: var(--ui-warning); }
+ .card-flow-steps > div.done > span { color: #fff; background: var(--ui-success); border-color: var(--ui-success); }
+-.card-flow-summary { margin-top: 9px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); }
++.card-flow-summary { margin-top: 9px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); }
+ .card-flow-summary > div { min-width: 0; min-height: 43px; padding: 7px 9px; border-right: 1px solid var(--ui-border-soft); }
+ .card-flow-summary > div:last-child { border-right: 0; }
+ .card-flow-summary span, .card-flow-summary strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@@ -2504,6 +2504,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+   .card-flow-steps { grid-template-columns: 1fr; }
+   .card-flow-steps > div { border-right: 0; border-bottom: 1px solid var(--ui-border-soft); }
+   .card-flow-steps > div:last-child { border-bottom: 0; }
++  .card-flow-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .card-flow-summary > div:nth-child(2) { border-right: 0; }
++  .card-flow-summary > div:nth-child(-n+2) { border-bottom: 1px solid var(--ui-border-soft); }
+   .card-import-actions { align-items: stretch; flex-direction: column; }
+   .card-import-actions .button { width: 100%; }
+   .sub2api-service-strip > div:nth-child(4), .sub2api-service-strip > div:nth-child(5) { display: none; }
+diff --git a/frontend/src/sub2apiCardPolling.js b/frontend/src/sub2apiCardPolling.js
+new file mode 100644
+index 0000000..85973d5
+--- /dev/null
++++ b/frontend/src/sub2apiCardPolling.js
+@@ -0,0 +1,105 @@
++export const CARD_RECLAIM_POLL_INTERVAL_MS = 5000;
++export const CARD_RECLAIM_POLL_TIMEOUT_MS = 60000;
++export const CARD_RECLAIM_POLL_TIMEOUT_SECONDS = CARD_RECLAIM_POLL_TIMEOUT_MS / 1000;
++
++const count = value => {
++  const number = Number(value || 0);
++  return Number.isFinite(number) && number > 0 ? number : 0;
++};
++
++const progressPayload = response => {
++  if (!response || typeof response !== 'object') return {};
++  return response.result && typeof response.result === 'object' ? response.result : response;
++};
++
++export function summarizeReclaimProgress(response, downloadedCount = 0) {
++  const progress = progressPayload(response);
++  const tasks = Array.isArray(progress.all_tasks) ? progress.all_tasks : [];
++  const activeTasks = count(progress.queued) + count(progress.already_running);
++  const doneTasks = Math.max(count(progress.done), tasks.filter(task => task?.status === 'done').length);
++  const terminalTasks = count(progress.failed) + count(progress.unreclaimable) + count(progress.not_owned) + count(progress.skipped);
++  const trackedTasks = Math.max(count(progress.tracked_tasks), tasks.length, activeTasks + doneTasks + terminalTasks);
++  return {
++    progress,
++    activeTasks,
++    doneTasks,
++    terminalTasks,
++    trackedTasks,
++    downloadedCount,
++    completed: activeTasks === 0 && downloadedCount > 0 && (doneTasks === 0 || downloadedCount >= doneTasks),
++    terminal: activeTasks === 0 && downloadedCount === 0 && doneTasks === 0 && terminalTasks > 0,
++  };
++}
++
++export async function pollForReclaimDownloads({
++  initialResponse,
++  requestProgress,
++  onSnapshot = () => {},
++  intervalMs = CARD_RECLAIM_POLL_INTERVAL_MS,
++  timeoutMs = CARD_RECLAIM_POLL_TIMEOUT_MS,
++  now = () => Date.now(),
++  sleep = milliseconds => new Promise(resolve => globalThis.setTimeout(resolve, milliseconds)),
++}) {
++  if (typeof requestProgress !== 'function') throw new TypeError('requestProgress 必须是函数');
++  const startedAt = now();
++  const downloads = new Map();
++  let response = initialResponse || {};
++  let attempts = 0;
++  let lastError = null;
++
++  const rememberDownloads = values => (Array.isArray(values) ? values : []).forEach(item => {
++    const orderNo = item?.task?.order_no || item?.filename;
++    if (orderNo && item?.data) downloads.set(String(orderNo), item);
++  });
++
++  rememberDownloads(response.downloaded_payloads);
++  while (true) {
++    const elapsedMs = Math.max(0, now() - startedAt);
++    const snapshot = {
++      ...summarizeReclaimProgress(response, downloads.size),
++      attempts,
++      elapsedMs,
++      downloads: [...downloads.values()],
++      lastError,
++    };
++    onSnapshot(snapshot);
++    if (snapshot.completed || snapshot.terminal) {
++      return {...snapshot, timedOut: false};
++    }
++    if (elapsedMs >= timeoutMs) {
++      return {...snapshot, timedOut: true};
++    }
++
++    await sleep(Math.min(intervalMs, timeoutMs - elapsedMs));
++    try {
++      response = await requestProgress();
++      attempts += 1;
++      lastError = null;
++      rememberDownloads(response?.downloaded_payloads);
++    } catch (error) {
++      attempts += 1;
++      lastError = error;
++    }
++  }
++}
++
++export function reclaimPollingFailureMessage(result) {
++  if (result?.terminal) {
++    const progress = result.progress || {};
++    const details = [
++      ['失败', progress.failed],
++      ['不可找回', progress.unreclaimable],
++      ['未归属', progress.not_owned],
++      ['已跳过', progress.skipped],
++    ].filter(([, value]) => count(value) > 0).map(([label, value]) => `${label} ${count(value)}`);
++    return `找回任务已结束，但没有生成可导入 JSON${details.length ? `（${details.join('、')}）` : ''}`;
++  }
++  if (result?.activeTasks > 0) {
++    return `找回处理超过 1 分钟，仍有 ${result.activeTasks} 个任务处理中，可稍后重试`;
++  }
++  if (result?.downloadedCount > 0 && result?.doneTasks > result.downloadedCount) {
++    return `已下载 ${result.downloadedCount}/${result.doneTasks} 个账号 JSON，等待剩余文件超过 1 分钟，可稍后重试`;
++  }
++  const lastError = result?.lastError?.message ? `，最近一次查询失败：${result.lastError.message}` : '';
++  return `卡密核验已完成，但等待可下载的账号 JSON 超过 1 分钟${lastError}`;
++}
+diff --git a/frontend/src/sub2apiCardPolling.test.js b/frontend/src/sub2apiCardPolling.test.js
+new file mode 100644
+index 0000000..c90e7c7
+--- /dev/null
++++ b/frontend/src/sub2apiCardPolling.test.js
+@@ -0,0 +1,86 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++
++import {
++  pollForReclaimDownloads,
++  reclaimPollingFailureMessage,
++  summarizeReclaimProgress,
++} from './sub2apiCardPolling.js';
++
++const payload = {
++  task: {order_no: 'ORDER-1'},
++  data: {accounts: [{name: 'Recovered'}]},
++};
++
++test('keeps polling when counters are settled but account JSON is not ready yet', async () => {
++  let clock = 0;
++  const responses = [
++    {result: {queued: 0, already_running: 0, done: 1}, downloaded_payloads: []},
++    {result: {queued: 0, already_running: 0, done: 1}, downloaded_payloads: [payload]},
++  ];
++  const snapshots = [];
++
++  const result = await pollForReclaimDownloads({
++    initialResponse: {result: {queued: 0, already_running: 0, done: 1}},
++    requestProgress: async () => responses.shift(),
++    onSnapshot: snapshot => snapshots.push(snapshot),
++    intervalMs: 5000,
++    timeoutMs: 60000,
++    now: () => clock,
++    sleep: async milliseconds => { clock += milliseconds; },
++  });
++
++  assert.equal(result.completed, true);
++  assert.equal(result.timedOut, false);
++  assert.equal(result.attempts, 2);
++  assert.equal(result.elapsedMs, 10000);
++  assert.deepEqual(result.downloads, [payload]);
++  assert.equal(snapshots[0].completed, false);
++});
++
++test('stops at the one minute deadline when a done task still has no JSON', async () => {
++  let clock = 0;
++  const result = await pollForReclaimDownloads({
++    initialResponse: {result: {queued: 0, already_running: 0, done: 1}},
++    requestProgress: async () => ({result: {queued: 0, already_running: 0, done: 1}}),
++    intervalMs: 5000,
++    timeoutMs: 60000,
++    now: () => clock,
++    sleep: async milliseconds => { clock += milliseconds; },
++  });
++
++  assert.equal(result.completed, false);
++  assert.equal(result.timedOut, true);
++  assert.equal(result.elapsedMs, 60000);
++  assert.equal(result.attempts, 12);
++  assert.match(reclaimPollingFailureMessage(result), /等待可下载的账号 JSON 超过 1 分钟/);
++});
++
++test('does not treat a partial set of account JSON files as complete', async () => {
++  let clock = 0;
++  const result = await pollForReclaimDownloads({
++    initialResponse: {result: {queued: 0, already_running: 0, done: 2}, downloaded_payloads: [payload]},
++    requestProgress: async () => ({result: {queued: 0, already_running: 0, done: 2}, downloaded_payloads: [payload]}),
++    intervalMs: 5000,
++    timeoutMs: 60000,
++    now: () => clock,
++    sleep: async milliseconds => { clock += milliseconds; },
++  });
++
++  assert.equal(result.completed, false);
++  assert.equal(result.timedOut, true);
++  assert.match(reclaimPollingFailureMessage(result), /已下载 1\/2 个账号 JSON/);
++});
++
++test('reports terminal upstream outcomes separately from a timeout', async () => {
++  const initialResponse = {result: {queued: 0, already_running: 0, done: 0, failed: 1, unreclaimable: 2}};
++  const summary = summarizeReclaimProgress(initialResponse);
++  const result = await pollForReclaimDownloads({
++    initialResponse,
++    requestProgress: async () => assert.fail('terminal state must not be polled again'),
++  });
++
++  assert.equal(summary.terminal, true);
++  assert.equal(result.timedOut, false);
++  assert.match(reclaimPollingFailureMessage(result), /失败 1、不可找回 2/);
++});
