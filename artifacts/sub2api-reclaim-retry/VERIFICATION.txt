@@ -1,0 +1,85 @@
+Branch: codex/task-10-reclaim-retry
+Changed field: Scheduled 401 recovery and automatic import now report separate outcomes; permanent failures expose their reason without a retry action, while transient failures expose a retry action limited to retryable card codes.
+Baseline commit: c096ce4f87bcaa78bcbdb0a42e1faff1158e0672
+Modified commit: ea523d860f0f51f5fc1c92e2ea5ab935fd7ce080
+
+Artifacts:
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-retry\MODIFIED_FILE
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-retry\DIFF_FILE
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-retry\VERIFICATION.txt
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-retry\ROLLBACK.sh
+
+Source copy:
+- Original input: E:\soft\java\ldxp\backend\sub2api\reclaim.py at main=c096ce4
+- Original SHA256: 314F6984CCADB8756DFD812707AF840943819A4B3FE8C17416DC55583EB4E287
+- Modified input: C:\Users\0\.codex\worktrees\0d29\ldxp\backend\sub2api\reclaim.py at ea523d8
+- Modified SHA256: 762004CD93D9E653E09AC83212C996F03E7716479281E6D9889CD7C320AB1FA6
+- MODIFIED_FILE status: left changed after rollback-copy verification
+
+BASELINE BACKEND
+Command: python -m unittest discover -s . -p "test_*.py"
+Input: E:\soft\java\ldxp\backend at main=c096ce4
+Literal output/result:
+........................................................................................................................
+----------------------------------------------------------------------
+Ran 120 tests in 2.101s
+
+OK
+Exit status: 0
+
+BASELINE FRONTEND
+Command: npm test
+Input: E:\soft\java\ldxp\frontend at main=c096ce4
+Literal output/result: tests 20; pass 20; fail 0; duration_ms 120.3826
+Exit status: 0
+
+BASELINE BUILD
+Command: npm run build
+Input: E:\soft\java\ldxp\frontend at main=c096ce4
+Literal output/result: vite v8.2.2; 2385 modules transformed; built in 480ms
+Exit status: 0
+
+MODIFIED BACKEND
+Command: python -m unittest discover -s . -p "test_*.py"
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\backend at ea523d8 rebased on main=c096ce4
+Literal output/result:
+..................................................................................................................................................
+----------------------------------------------------------------------
+Ran 146 tests in 2.016s
+
+OK
+Exit status: 0
+
+MODIFIED FRONTEND
+Command: npm test
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\frontend at ea523d8 rebased on main=c096ce4
+Literal output/result: tests 35; pass 35; fail 0; duration_ms 157.1854
+Exit status: 0
+
+MODIFIED BUILD
+Command: npm run build
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\frontend at ea523d8 rebased on main=c096ce4
+Literal output/result: vite v8.2.2; 2386 modules transformed; built in 502ms
+Exit status: 0
+
+MODIFIED CLASSIFICATION
+Command: python -c "from sub2api.reclaim import summarize_reclaim_result; r=summarize_reclaim_result({'ok':True,'all_tasks':[{'card_code':'CARD-403','status':'failed','provider_status':403,'reason':'account_deactivated'},{'card_code':'CARD-500','status':'failed','provider_status':500,'message':'timeout'}]},submitted_card_codes=['CARD-403','CARD-500']); print('outcome='+r['outcome']); print('unreclaimable='+str(r['reclaim_summary']['unreclaimable'])); print('failed='+str(r['reclaim_summary']['failed'])); print('retryable='+','.join(r['retryable_card_codes'])); print('permanent_retryable='+str(next(x['retryable'] for x in r['reclaim_failures'] if x['card_code']=='CARD-403'))); print('transient_retryable='+str(next(x['retryable'] for x in r['reclaim_failures'] if x['card_code']=='CARD-500')))"
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\backend
+Literal output/result:
+outcome=partial
+unreclaimable=1
+failed=1
+retryable=CARD-500
+permanent_retryable=False
+transient_retryable=True
+Exit status: 0
+
+ROLLBACK
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-reclaim.py
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-retry
+Literal output/result: Restored C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-retry\rollback-test-reclaim.py from ROLLBACK_BASELINE
+Exit status: 0
+Baseline hash: 314F6984CCADB8756DFD812707AF840943819A4B3FE8C17416DC55583EB4E287
+Restored hash: 314F6984CCADB8756DFD812707AF840943819A4B3FE8C17416DC55583EB4E287
+Modified artifact hash left changed: 762004CD93D9E653E09AC83212C996F03E7716479281E6D9889CD7C320AB1FA6
+Restored behavior/status: rollback-test-reclaim.py matches the pre-change reclaim implementation byte-for-byte; MODIFIED_FILE retains structured recovery outcomes, permanent-failure reasons, and retryable-card filtering.
