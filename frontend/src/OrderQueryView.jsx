@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   AlertCircle,
   ArrowUpRight,
@@ -6,22 +6,32 @@ import {
   ChevronLeft,
   ChevronRight,
   Clipboard,
-  Clock3,
   Database,
+  Eye,
+  EyeOff,
   ExternalLink,
   Image,
+  KeyRound,
+  Link2,
   Package,
   ReceiptText,
   RefreshCw,
   Search,
   ShieldCheck,
+  Store,
   TriangleAlert,
+  X,
 } from 'lucide-react';
 import {
   ORDER_STATUS_OPTIONS,
+  canOpenProtectedOrderDetail,
   formatOrderDateTime,
+  formatOrderCardsForCopy,
   formatOrderMoney,
+  normalizeOrderDetail,
   normalizeOrderResponse,
+  orderDeliveryKindLabel,
+  orderDetailErrorState,
   orderQueryContextChanged,
   summarizeOrders,
   verificationLabel,
@@ -73,7 +83,156 @@ function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaC
   </section>;
 }
 
-function OrderRow({order, onCopy}) {
+function SellerAvatar({seller}) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [seller.avatar]);
+  if (!seller.avatar || failed) return <span className="order-seller-avatar fallback"><Store size={18}/></span>;
+  return <img className="order-seller-avatar" src={seller.avatar} alt="" onError={() => setFailed(true)}/>;
+}
+
+function DetailCopyButton({label, value, onCopy}) {
+  return <QueryIconButton label={`复制${label}`} onClick={() => onCopy(value, label)} disabled={!value}><Clipboard size={13}/></QueryIconButton>;
+}
+
+function OrderDetailDialog({
+  order,
+  detail,
+  password,
+  passwordVisible,
+  busy,
+  error,
+  sessionExpired,
+  dialogRef,
+  passwordInputRef,
+  onPassword,
+  onTogglePassword,
+  onSubmit,
+  onClose,
+  onCopy,
+  onRequery,
+}) {
+  const showingDetail = Boolean(detail);
+  const dialogTitle = showingDetail ? '订单详情' : '安全密码验证';
+  const seller = detail?.seller || {};
+  const sellerContacts = detail ? [
+    {label: '卖家 QQ', value: seller.contact_qq},
+    {label: '卖家微信', value: seller.contact_wechat},
+    {label: '卖家手机', value: seller.contact_mobile},
+  ].filter(item => item.value) : [];
+  const hasSeller = Boolean(seller.nickname || seller.avatar || seller.shop_url || sellerContacts.length);
+  const delivery = detail?.delivery || {};
+  const hasDelivery = Boolean(delivery.cards?.length || delivery.content || delivery.message || delivery.links?.length);
+  const detailFacts = detail ? [
+    {label: '订单号', value: detail.trade_no || '--', copy: Boolean(detail.trade_no)},
+    {label: '下单时间', value: detail.created_at ? formatOrderDateTime(detail.created_at) : '--'},
+    {label: '支付时间', value: detail.success_at ? formatOrderDateTime(detail.success_at) : '--'},
+    {label: '购买数量', value: `${detail.quantity} 件`},
+    {label: '实付金额', value: formatOrderMoney(detail.total_amount)},
+    {label: '发货进度', value: detail.sendout === null ? '--' : `已发 ${detail.sendout} / ${detail.quantity} 件`},
+    {label: '买家联系方式', value: detail.contact || '--', copy: Boolean(detail.contact)},
+    {label: '售后服务', value: detail.can_complaint ? '支持申诉' : '暂不支持申诉'},
+  ] : [];
+
+  return <div className="modal-backdrop order-detail-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+    <div
+      className={`checkout-modal ${showingDetail ? 'order-detail-modal' : 'order-password-modal'}`}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="order-detail-dialog-title"
+      aria-describedby={showingDetail ? undefined : 'order-password-description'}
+      ref={dialogRef}
+      tabIndex={-1}
+    >
+      <div className="modal-head order-dialog-head">
+        <div><span>{showingDetail ? 'ORDER DETAIL' : 'SECURE ORDER'}</span><h2 id="order-detail-dialog-title">{dialogTitle}</h2></div>
+        <QueryIconButton label="关闭订单详情" onClick={onClose}><X size={17}/></QueryIconButton>
+      </div>
+
+      {!showingDetail ? <form className="order-password-form" onSubmit={onSubmit}>
+        <div className="order-password-context">
+          <span className="order-password-context-icon"><KeyRound size={20}/></span>
+          <div><strong>{order.goods_name}</strong><small>{order.trade_no}</small></div>
+          <span className={`order-status ${order.status_tone}`}>{order.status_label}</span>
+        </div>
+        <p id="order-password-description" className="order-password-description">此订单的交付内容受安全密码保护</p>
+        <label className="order-password-label" htmlFor="order-query-password">安全密码</label>
+        <div className={`order-password-control ${error ? 'invalid' : ''}`}>
+          <KeyRound size={16}/>
+          <input
+            id="order-query-password"
+            ref={passwordInputRef}
+            type={passwordVisible ? 'text' : 'password'}
+            value={password}
+            onChange={event => onPassword(event.target.value)}
+            placeholder="请输入安全密码"
+            autoComplete="off"
+            maxLength={128}
+            aria-invalid={Boolean(error)}
+            aria-describedby={error ? 'order-password-error' : 'order-password-description'}
+            disabled={busy || sessionExpired}
+          />
+          <QueryIconButton label={passwordVisible ? '隐藏安全密码' : '显示安全密码'} onClick={onTogglePassword} disabled={busy || sessionExpired}>{passwordVisible ? <EyeOff size={15}/> : <Eye size={15}/>}</QueryIconButton>
+        </div>
+        {error && <div className="order-password-error" id="order-password-error" role="alert"><TriangleAlert size={15}/><span>{error}</span></div>}
+        <div className="order-dialog-foot">
+          <span>{sessionExpired ? <TriangleAlert size={14}/> : <ShieldCheck size={14}/>} {sessionExpired ? '查询验证会话已失效' : '密码仅用于本次订单验证'}</span>
+          <div>
+            <button className="button secondary" type="button" onClick={onClose}>取消</button>
+            {sessionExpired
+              ? <button className="button primary" type="button" onClick={onRequery}><RefreshCw size={15}/>关闭并重新查询</button>
+              : <button className="button primary" type="submit" disabled={busy || !password.length}><ShieldCheck size={15}/>{busy ? '正在验证' : '验证并查看'}</button>}
+          </div>
+        </div>
+      </form> : <>
+        <div className="order-detail-scroll">
+          <section className="order-detail-identity">
+            <OrderImage order={order}/>
+            <div><span>{detail.goods_type_label}</span><strong>{detail.goods_name}</strong><small>{detail.trade_no}</small></div>
+            <span className={`order-status ${detail.status_tone}`}>{detail.status_label}</span>
+          </section>
+
+          <section className="order-detail-section">
+            <div className="order-detail-section-head"><div><span>ORDER INFORMATION</span><h3>订单信息</h3></div></div>
+            <dl className="order-detail-facts">
+              {detailFacts.map(item => <div key={item.label}><dt>{item.label}</dt><dd><span>{item.value}</span>{item.copy && <DetailCopyButton label={item.label} value={item.value} onCopy={onCopy}/>}</dd></div>)}
+            </dl>
+          </section>
+
+          {hasSeller && <section className="order-detail-section">
+            <div className="order-detail-section-head"><div><span>SELLER</span><h3>卖家信息</h3></div>{seller.shop_url && <a className="icon-button" href={seller.shop_url} target="_blank" rel="noreferrer" aria-label="打开卖家店铺" title="打开卖家店铺"><ExternalLink size={14}/></a>}</div>
+            <div className="order-seller-row"><SellerAvatar seller={seller}/><div><strong>{seller.nickname || '链动小铺卖家'}</strong><small>{sellerContacts.length ? '可通过以下方式联系卖家' : '卖家店铺信息'}</small></div></div>
+            {sellerContacts.length > 0 && <dl className="order-seller-contacts">{sellerContacts.map(item => <div key={item.label}><dt>{item.label}</dt><dd><span>{item.value}</span><DetailCopyButton label={item.label} value={item.value} onCopy={onCopy}/></dd></div>)}</dl>}
+          </section>}
+
+          {(detail.instructions.text || detail.instructions.links.length > 0) && <section className="order-detail-section">
+            <div className="order-detail-section-head"><div><span>INSTRUCTIONS</span><h3>使用说明</h3></div></div>
+            {detail.instructions.text && <p className="order-detail-rich-text">{detail.instructions.text}</p>}
+            {detail.instructions.links.length > 0 && <div className="order-detail-links">{detail.instructions.links.map((link, index) => <a href={link.url} target="_blank" rel="noreferrer" key={`${link.url}-${index}`}><Link2 size={14}/><span>{link.label}</span><ExternalLink size={12}/></a>)}</div>}
+          </section>}
+
+          <section className="order-detail-section order-delivery-section">
+            <div className="order-detail-section-head"><div><span>DELIVERY</span><h3>{orderDeliveryKindLabel(delivery.kind)}</h3></div><div className="order-detail-section-actions">
+              {delivery.api_status !== null && delivery.api_status !== undefined && <em>接口状态 {delivery.api_status}</em>}
+              {delivery.cards?.length > 0 && <button className="button secondary order-copy-all" type="button" onClick={() => onCopy(formatOrderCardsForCopy(delivery.cards), '全部卡密')}><Clipboard size={14}/>复制全部</button>}
+            </div></div>
+            {delivery.message && <div className="order-delivery-message"><ShieldCheck size={15}/><span>{delivery.message}</span></div>}
+            {delivery.cards?.length > 0 && <div className="order-card-list">{delivery.cards.map((card, index) => <div key={`${card}-${index}`}><span>卡密 {index + 1}</span><code>{card}</code><DetailCopyButton label={`卡密 ${index + 1}`} value={card} onCopy={onCopy}/></div>)}</div>}
+            {delivery.content && <p className="order-detail-rich-text delivery-content">{delivery.content}</p>}
+            {delivery.links?.length > 0 && <div className="order-detail-links">{delivery.links.map((link, index) => <a href={link.url} target="_blank" rel="noreferrer" key={`${link.url}-${index}`}><Link2 size={14}/><span>{link.label}</span><ExternalLink size={12}/></a>)}</div>}
+            {!hasDelivery && <div className="order-detail-empty"><ReceiptText size={20}/><strong>暂无可展示的交付内容</strong><span>订单详情已读取，但没有返回卡密、正文或资源链接</span></div>}
+            {delivery.truncated && <div className="order-detail-truncated"><TriangleAlert size={14}/><span>交付内容较长，当前仅显示部分结果</span></div>}
+          </section>
+        </div>
+        <div className="order-dialog-foot order-detail-foot">
+          <span><ShieldCheck size={14}/>安全密码已验证</span>
+          <button className="button primary" type="button" onClick={onClose}>关闭</button>
+        </div>
+      </>}
+    </div>
+  </div>;
+}
+
+function OrderRow({order, onCopy, onOpenProtectedDetail}) {
   return <tr>
     <td data-label="商品">
       <div className="order-product-cell"><OrderImage order={order}/><span><strong>{order.goods_name}</strong><small>{formatOrderDateTime(order.created_at)}</small></span></div>
@@ -84,6 +243,7 @@ function OrderRow({order, onCopy}) {
     <td data-label="商品类型"><div className="order-type"><strong>{order.goods_type_label}</strong>{order.need_query_password && <small><ShieldCheck size={11}/>权益需安全密码</small>}</div></td>
     <td data-label="操作"><div className="order-row-actions">
       {order.detail_url && <a className="icon-button" href={order.detail_url} target="_blank" rel="noreferrer" aria-label="打开官方订单详情" title="打开官方订单详情"><ExternalLink size={14}/></a>}
+      {canOpenProtectedOrderDetail(order) && <button className="button secondary order-result-link order-password-button" type="button" onClick={event => onOpenProtectedDetail(order, event.currentTarget)}><KeyRound size={14}/>安全密码</button>}
       {order.status === 1 && order.result_url && !order.need_query_password && <a className="button secondary order-result-link" href={order.result_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>{order.goods_action_label}</a>}
     </div></td>
   </tr>;
@@ -104,9 +264,45 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   const [error, setError] = useState('');
   const [hasQueried, setHasQueried] = useState(false);
   const [queriedAt, setQueriedAt] = useState(null);
+  const [detailOrder, setDetailOrder] = useState(null);
+  const [orderDetail, setOrderDetail] = useState(null);
+  const [detailPassword, setDetailPassword] = useState('');
+  const [detailPasswordVisible, setDetailPasswordVisible] = useState(false);
+  const [detailBusy, setDetailBusy] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const [detailSessionExpired, setDetailSessionExpired] = useState(false);
   const requestVersion = useRef(0);
+  const detailRequestVersion = useRef(0);
+  const detailAbortController = useRef(null);
+  const detailDialogRef = useRef(null);
+  const detailPasswordInputRef = useRef(null);
+  const detailTriggerRef = useRef(null);
   const resultContext = useRef({keywords: '', status: 999, pageSize: 10});
   const initialKeywordsApplied = useRef(false);
+
+  const closeOrderDetail = useCallback(() => {
+    detailRequestVersion.current += 1;
+    detailAbortController.current?.abort();
+    detailAbortController.current = null;
+    setDetailOrder(null);
+    setOrderDetail(null);
+    setDetailPassword('');
+    setDetailPasswordVisible(false);
+    setDetailBusy(false);
+    setDetailError('');
+    setDetailSessionExpired(false);
+    const trigger = detailTriggerRef.current;
+    detailTriggerRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (trigger?.isConnected) trigger.focus();
+    });
+  }, []);
+
+  useEffect(() => () => {
+    detailRequestVersion.current += 1;
+    detailAbortController.current?.abort();
+    detailAbortController.current = null;
+  }, []);
 
   useEffect(() => {
     if (initialKeywordsApplied.current || !initialKeywords) return;
@@ -114,8 +310,48 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     setKeywords(current => current || initialKeywords);
   }, [initialKeywords]);
 
+  useEffect(() => {
+    if (!detailOrder) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (orderDetail) detailDialogRef.current?.focus();
+      else detailPasswordInputRef.current?.focus();
+    });
+    const handleKeyDown = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeOrderDetail();
+        return;
+      }
+      if (event.key !== 'Tab' || !detailDialogRef.current) return;
+      const focusable = Array.from(detailDialogRef.current.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ));
+      if (!focusable.length) {
+        event.preventDefault();
+        detailDialogRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !detailDialogRef.current.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !detailDialogRef.current.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [closeOrderDetail, detailOrder, orderDetail]);
+
   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
-  const verified = verification?.status === 'verified';
   const manualRequired = verification?.status === 'manual_required';
 
   const sendSearch = async (payload, allowExpiredRetry = true) => {
@@ -242,6 +478,92 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     runSearch({manualCode: captchaCode.trim(), pageValue: 1});
   };
 
+  const openProtectedOrderDetail = (order, trigger) => {
+    const sessionAvailable = Boolean(sessionId && submittedKeywords);
+    detailRequestVersion.current += 1;
+    detailAbortController.current?.abort();
+    detailAbortController.current = null;
+    detailTriggerRef.current = trigger || document.activeElement;
+    setDetailOrder(order);
+    setOrderDetail(null);
+    setDetailPassword('');
+    setDetailPasswordVisible(false);
+    setDetailBusy(false);
+    setDetailError(sessionAvailable ? '' : '订单查询会话已失效，请重新查询订单后再验证');
+    setDetailSessionExpired(!sessionAvailable);
+  };
+
+  const submitOrderDetailPassword = async event => {
+    event.preventDefault();
+    if (!detailOrder || detailBusy || detailSessionExpired || !detailPassword.length) return;
+    if (!sessionId || !submittedKeywords) {
+      setSessionId('');
+      setVerification(null);
+      setExpiresIn(0);
+      setDetailPassword('');
+      setDetailPasswordVisible(false);
+      setDetailSessionExpired(true);
+      setDetailError('订单查询会话已失效，请重新查询订单后再验证');
+      return;
+    }
+
+    const version = detailRequestVersion.current + 1;
+    detailRequestVersion.current = version;
+    detailAbortController.current?.abort();
+    const controller = new AbortController();
+    detailAbortController.current = controller;
+    const password = detailPassword;
+    setDetailBusy(true);
+    setDetailError('');
+    try {
+      const response = await request('/order-query/detail', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          session_id: sessionId,
+          keywords: submittedKeywords,
+          trade_no: detailOrder.trade_no,
+          query_password: password,
+        }),
+        signal: controller.signal,
+      });
+      if (version !== detailRequestVersion.current) return;
+      if (!response.detail || typeof response.detail !== 'object') throw new Error('订单详情响应格式无效');
+      setSessionId(String(response.session_id || sessionId));
+      setExpiresIn(Number(response.expires_in || expiresIn));
+      setOrderDetail(normalizeOrderDetail(response, detailOrder));
+      setDetailPassword('');
+      setDetailPasswordVisible(false);
+      setDetailError('');
+      setDetailSessionExpired(false);
+    } catch (requestError) {
+      if (controller.signal.aborted || requestError?.name === 'AbortError') return;
+      if (version !== detailRequestVersion.current) return;
+      const errorState = orderDetailErrorState(requestError);
+      if (errorState.sessionExpired) {
+        setSessionId('');
+        setVerification(null);
+        setExpiresIn(0);
+      }
+      setOrderDetail(null);
+      setDetailPassword('');
+      setDetailPasswordVisible(false);
+      setDetailSessionExpired(errorState.sessionExpired);
+      setDetailError(errorState.message);
+      if (!errorState.sessionExpired) window.requestAnimationFrame(() => detailPasswordInputRef.current?.focus());
+    } finally {
+      if (detailAbortController.current === controller) detailAbortController.current = null;
+      if (version === detailRequestVersion.current) setDetailBusy(false);
+    }
+  };
+
+  const requeryAfterDetailExpiry = () => {
+    const keyword = submittedKeywords;
+    const page = result.pagination.page || 1;
+    closeOrderDetail();
+    if (keyword) runSearch({keywordValue: keyword, pageValue: page, reuseSession: false});
+  };
+
   const changeStatus = status => {
     setActiveStatus(status);
     if (submittedKeywords && !manualRequired) runSearch({statusValue: status, pageValue: 1, quiet: true});
@@ -258,14 +580,16 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     if (submittedKeywords && !manualRequired) runSearch({pageSizeValue: nextSize, pageValue: 1, quiet: true});
   };
 
-  const copyOrderNumber = async tradeNo => {
+  const copyDetailValue = async (value, label = '内容') => {
     try {
-      await navigator.clipboard.writeText(tradeNo);
-      notify(`已复制订单号：${tradeNo}`);
+      await navigator.clipboard.writeText(String(value));
+      notify({type: 'success', title: `${label}已复制`, message: '已写入剪贴板', duration: 2400});
     } catch {
       notify('无法访问剪贴板，请检查浏览器权限', 'error');
     }
   };
+
+  const copyOrderNumber = tradeNo => copyDetailValue(tradeNo, '订单号');
 
   const emptyMessage = busy && !result.orders.length
     ? {icon: <RefreshCw className="spin" size={22}/>, title: '正在自动验证并读取订单', detail: '结果返回后会显示在这里'}
@@ -321,7 +645,7 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
       <div className="order-table-wrap">
         <table className="order-query-table">
           <thead><tr><th>商品 / 下单时间</th><th>订单号</th><th>金额 / 数量</th><th>状态</th><th>商品类型</th><th>操作</th></tr></thead>
-          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
+          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
         </table>
       </div>
 
@@ -331,5 +655,25 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
       </div>
       {busy && result.orders.length > 0 && <div className="order-update-indicator"><RefreshCw className="spin" size={14}/>正在更新订单</div>}
     </section>
+    {detailOrder && <OrderDetailDialog
+      order={detailOrder}
+      detail={orderDetail}
+      password={detailPassword}
+      passwordVisible={detailPasswordVisible}
+      busy={detailBusy}
+      error={detailError}
+      sessionExpired={detailSessionExpired}
+      dialogRef={detailDialogRef}
+      passwordInputRef={detailPasswordInputRef}
+      onPassword={value => {
+        setDetailPassword(value);
+        if (detailError) setDetailError('');
+      }}
+      onTogglePassword={() => setDetailPasswordVisible(current => !current)}
+      onSubmit={submitOrderDetailPassword}
+      onClose={closeOrderDetail}
+      onCopy={copyDetailValue}
+      onRequery={requeryAfterDetailExpiry}
+    />}
   </section>;
 }

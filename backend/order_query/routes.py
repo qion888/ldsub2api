@@ -11,6 +11,8 @@ from .errors import OrderQueryError
 
 SendJson = Callable[[Any, int], Any]
 ORDER_QUERY_PATH = "/api/order-query/search"
+ORDER_DETAIL_PATH = "/api/order-query/detail"
+ORDER_QUERY_PATHS = {ORDER_QUERY_PATH, ORDER_DETAIL_PATH}
 LOCAL_DEVELOPMENT_HOSTS = {"127.0.0.1", "localhost"}
 
 
@@ -38,7 +40,7 @@ def request_rejection(
     frontend_url: str,
 ) -> tuple[int, dict[str, Any]] | None:
     """Reject browser requests that could make the local service perform cross-site work."""
-    if path != ORDER_QUERY_PATH:
+    if path not in ORDER_QUERY_PATHS:
         return None
 
     content_type = str(headers.get("Content-Type", "")).partition(";")[0].strip().lower()
@@ -82,11 +84,16 @@ def handle_post(
     *,
     send_json: SendJson,
     search: Callable[[dict[str, Any]], dict[str, Any]],
+    detail: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> bool:
-    if path != ORDER_QUERY_PATH:
+    if path == ORDER_QUERY_PATH:
+        operation = search
+    elif path == ORDER_DETAIL_PATH:
+        operation = detail
+    else:
         return False
     try:
-        send_json(search(data), 200)
+        send_json(operation(data), 200)
     except OrderQueryError as exc:
         send_json(
             {

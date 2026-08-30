@@ -14,6 +14,10 @@ from typing import Any, Callable
 from .client import CaptchaChallenge
 from .errors import OrderQueryInputError, OrderQuerySessionExpired
 
+MAX_AUTHORIZED_ORDERS = 500
+MAX_PASSWORD_FAILURES = 5
+PASSWORD_BACKOFF_SECONDS = 60
+
 
 @dataclass
 class OrderQuerySession:
@@ -26,6 +30,8 @@ class OrderQuerySession:
     captcha_image: bytes = b""
     captcha_mime: str = "image/png"
     cache: dict[tuple[int, int, int], tuple[float, dict[str, Any]]] = field(default_factory=dict)
+    authorized_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
+    password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def clear_verification(self) -> None:
@@ -33,6 +39,60 @@ class OrderQuerySession:
         self.challenge = None
         self.captcha_image = b""
         self.cache.clear()
+        self.authorized_orders.clear()
+        self.password_failures.clear()
+
+    def remember_orders(self, orders: list[Any]) -> None:
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            trade_no = str(order.get("trade_no") or "").strip()
+            if not trade_no:
+                continue
+            try:
+                status = int(order.get("status", -1))
+            except (TypeError, ValueError):
+                status = -1
+            self.authorized_orders.pop(trade_no, None)
+            self.authorized_orders[trade_no] = {
+                "status": status,
+                "need_query_password": order.get("need_query_password") is True,
+                "goods_type": str(order.get("goods_type") or "")[:30],
+            }
+            while len(self.authorized_orders) > MAX_AUTHORIZED_ORDERS:
+                oldest = next(iter(self.authorized_orders))
+                self.authorized_orders.pop(oldest)
+                self.password_failures.pop(oldest, None)
+
+    def authorized_order(self, trade_no: str) -> dict[str, Any] | None:
+        value = self.authorized_orders.get(trade_no)
+        return copy.deepcopy(value) if value is not None else None
+
+    def password_attempt_allowed(self, trade_no: str, now: float) -> bool:
+        failure = self.password_failures.get(trade_no)
+        if failure is None:
+            return True
+        _, blocked_until = failure
+        if blocked_until > now:
+            return False
+        if blocked_until:
+            self.password_failures.pop(trade_no, None)
+        return True
+
+    def record_password_failure(self, trade_no: str, now: float) -> bool:
+        count, blocked_until = self.password_failures.get(trade_no, (0, 0.0))
+        if blocked_until and blocked_until <= now:
+            count = 0
+        count += 1
+        blocked = count >= MAX_PASSWORD_FAILURES
+        self.password_failures[trade_no] = (
+            count,
+            now + PASSWORD_BACKOFF_SECONDS if blocked else 0.0,
+        )
+        return blocked
+
+    def clear_password_failure(self, trade_no: str) -> None:
+        self.password_failures.pop(trade_no, None)
 
     def cached(self, key: tuple[int, int, int], now: float) -> dict[str, Any] | None:
         entry = self.cache.get(key)

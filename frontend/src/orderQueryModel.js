@@ -46,6 +46,11 @@ export function orderGoodsActionLabel(value) {
   return GOODS_ACTION_LABELS[String(value || '').toLowerCase()] || '查看订单';
 }
 
+export function canOpenProtectedOrderDetail(order = {}) {
+  const passwordRequired = order.need_query_password === true || Number(order.need_query_password) === 1;
+  return Number(order.status) === 1 && passwordRequired && Boolean(String(order.trade_no || '').trim());
+}
+
 export function formatOrderMoney(value) {
   if (value === null || value === undefined || value === '') return '--';
   const number = Number(value);
@@ -80,6 +85,131 @@ export function safeOfficialOrderUrl(value, fallbackPath = '/order') {
   } catch {
     return '';
   }
+}
+
+export function safeOrderContentUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
+function plainText(value, fallback = '') {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return fallback;
+}
+
+function optionalNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeDetailLinks(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry, index) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const url = safeOrderContentUrl(entry.url);
+    if (!url) return [];
+    return [{label: plainText(entry.label, `链接 ${index + 1}`), url}];
+  });
+}
+
+export function orderDeliveryKindLabel(value) {
+  const labels = {
+    card: '卡密信息',
+    article: '文章内容',
+    resource: '资源信息',
+    equity: '权益信息',
+  };
+  return labels[String(value || '').toLowerCase()] || '交付内容';
+}
+
+export function formatOrderCardsForCopy(cards = []) {
+  if (!Array.isArray(cards)) return '';
+  return cards.filter(value => typeof value === 'string' && value.trim()).join('\n');
+}
+
+export function orderDetailErrorState(error = {}) {
+  const sessionExpired = Number(error?.status) === 410;
+  const message = plainText(error?.message);
+  return {
+    sessionExpired,
+    message: sessionExpired
+      ? '订单查询会话已失效，请重新查询订单后再验证'
+      : message || '订单详情读取失败，请重试',
+  };
+}
+
+export function normalizeOrderDetail(payload = {}, fallback = {}) {
+  const source = payload?.detail && typeof payload.detail === 'object' ? payload.detail : payload;
+  const safeSource = source && typeof source === 'object' ? source : {};
+  const safeFallback = fallback && typeof fallback === 'object' ? fallback : {};
+  const status = orderStatusMeta(
+    safeSource.status ?? safeFallback.status,
+    safeSource.status_label || safeFallback.status_label,
+  );
+  const goodsType = plainText(safeSource.goods_type || safeFallback.goods_type).toLowerCase();
+  const sellerSource = safeSource.seller && typeof safeSource.seller === 'object' ? safeSource.seller : {};
+  const instructionSource = safeSource.instructions && typeof safeSource.instructions === 'object'
+    ? safeSource.instructions
+    : {};
+  const legacyEquity = safeSource.equity && typeof safeSource.equity === 'object' ? safeSource.equity : {};
+  const deliverySource = safeSource.delivery && typeof safeSource.delivery === 'object'
+    ? safeSource.delivery
+    : {
+        kind: goodsType,
+        cards: safeSource.cards,
+        api_status: legacyEquity.status,
+        message: legacyEquity.message,
+        content: legacyEquity.content,
+      };
+  const cards = Array.isArray(deliverySource.cards)
+    ? deliverySource.cards.filter(value => typeof value === 'string' && value.trim())
+    : [];
+  const sendout = optionalNumber(safeSource.sendout);
+
+  return {
+    trade_no: plainText(safeSource.trade_no || safeFallback.trade_no),
+    goods_name: plainText(safeSource.goods_name || safeFallback.goods_name, '未命名商品'),
+    goods_type: goodsType,
+    goods_type_label: orderGoodsTypeLabel(goodsType),
+    status: status.key,
+    status_label: status.label,
+    status_tone: status.tone,
+    total_amount: safeSource.total_amount ?? safeFallback.total_amount ?? null,
+    quantity: Math.max(0, finiteNumber(safeSource.quantity ?? safeFallback.quantity, 0)),
+    created_at: safeSource.created_at ?? safeSource.create_time ?? safeFallback.created_at ?? null,
+    success_at: safeSource.success_at ?? safeSource.paid_at ?? safeSource.success_time ?? null,
+    sendout: sendout === null ? null : Math.max(0, Math.trunc(sendout)),
+    contact: plainText(safeSource.contact),
+    can_complaint: safeSource.can_complaint === true || Number(safeSource.can_complaint) === 1,
+    seller: {
+      nickname: plainText(sellerSource.nickname),
+      avatar: safeOrderContentUrl(sellerSource.avatar),
+      shop_url: safeOrderContentUrl(sellerSource.shop_url),
+      contact_qq: plainText(sellerSource.contact_qq ?? sellerSource.qq),
+      contact_mobile: plainText(sellerSource.contact_mobile ?? sellerSource.mobile),
+      contact_wechat: plainText(sellerSource.contact_wechat ?? sellerSource.wechat),
+    },
+    instructions: {
+      text: plainText(instructionSource.text, plainText(safeSource.instructions)),
+      links: normalizeDetailLinks(instructionSource.links),
+    },
+    delivery: {
+      kind: plainText(deliverySource.kind, goodsType).toLowerCase(),
+      cards,
+      api_status: optionalNumber(deliverySource.api_status),
+      message: plainText(deliverySource.message),
+      content: plainText(deliverySource.content),
+      links: normalizeDetailLinks(deliverySource.links),
+      truncated: deliverySource.truncated === true || Number(deliverySource.truncated) === 1,
+    },
+  };
 }
 
 export function normalizeOrder(raw = {}) {

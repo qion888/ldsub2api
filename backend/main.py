@@ -1018,6 +1018,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             data,
             send_json=self._send_json,
             search=ORDER_QUERY_SERVICE.search,
+            detail=ORDER_QUERY_SERVICE.detail,
         ):
             return
 

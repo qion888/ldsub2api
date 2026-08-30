@@ -13,12 +13,19 @@ from .errors import (
     CaptchaRecognizerUnavailable,
     CaptchaVerificationExpired,
     OrderQueryBusy,
+    OrderQueryDetailNotFound,
+    OrderQueryDetailUnavailable,
     OrderQueryInputError,
+    OrderQueryPasswordInvalid,
+    OrderQueryPasswordRateLimited,
+    OrderQueryPasswordRequired,
+    OrderQuerySessionExpired,
 )
 from .sessions import OrderQuerySession, OrderQuerySessionStore
 
 ALLOWED_STATUSES = {999, 0, 1, 2, 3}
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
+TRADE_NO_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,159}")
 
 
 class OrderQueryService:
@@ -83,6 +90,31 @@ class OrderQueryService:
         return self.sessions.create(request["keywords"], self.client_factory())
 
     @staticmethod
+    def _validated_detail_request(data: Any) -> dict[str, str]:
+        if not isinstance(data, dict):
+            raise OrderQueryInputError("订单详情参数必须是 JSON 对象")
+        keywords = str(data.get("keywords") or "").strip()
+        if not keywords or len(keywords) > 160:
+            raise OrderQueryInputError("订单详情缺少有效的查询内容")
+        session_id = str(data.get("session_id") or "").strip()
+        if not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise OrderQueryInputError("订单详情缺少有效的查询会话")
+        trade_no = str(data.get("trade_no") or "").strip()
+        if not TRADE_NO_PATTERN.fullmatch(trade_no):
+            raise OrderQueryInputError("订单号格式无效")
+        password_value = data.get("query_password", "")
+        if not isinstance(password_value, str):
+            raise OrderQueryInputError("订单安全密码必须是字符串")
+        if len(password_value) > 160 or any(char in password_value for char in "\x00\r\n"):
+            raise OrderQueryInputError("订单安全密码格式无效")
+        return {
+            "keywords": keywords,
+            "session_id": session_id,
+            "trade_no": trade_no,
+            "query_password": password_value,
+        }
+
+    @staticmethod
     def _image_data_url(image: bytes, mime_type: str) -> str:
         encoded = base64.b64encode(image).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
@@ -94,11 +126,10 @@ class OrderQueryService:
     ) -> tuple[CaptchaChallenge, bytes, str]:
         challenge = session.client.start_captcha(previous_code)
         image, mime_type = session.client.download_captcha(challenge)
+        session.clear_verification()
         session.challenge = challenge
         session.captcha_image = image
         session.captcha_mime = mime_type
-        session.ticket = ""
-        session.cache.clear()
         return challenge, image, mime_type
 
     def _manual_required(
@@ -177,6 +208,7 @@ class OrderQueryService:
                     cached,
                     now + self.sessions.cache_seconds,
                 )
+        session.remember_orders(cached["orders"])
         return {
             "session_id": session.session_id,
             "expires_in": self.sessions.remaining(session),
@@ -249,5 +281,48 @@ class OrderQueryService:
             raise OrderQueryBusy()
         try:
             return self._search(data)
+        finally:
+            self._slots.release()
+
+    def _detail(self, data: Any) -> dict[str, Any]:
+        request = self._validated_detail_request(data)
+        session = self.sessions.get(request["session_id"], request["keywords"])
+        with session.lock:
+            if not session.ticket:
+                raise OrderQuerySessionExpired()
+            access = session.authorized_order(request["trade_no"])
+            if access is None:
+                raise OrderQueryDetailNotFound()
+            if access["status"] != 1:
+                raise OrderQueryDetailUnavailable()
+            if access["need_query_password"] and not request["query_password"].strip():
+                raise OrderQueryPasswordRequired()
+            now = self.sessions.now()
+            if not session.password_attempt_allowed(request["trade_no"], now):
+                raise OrderQueryPasswordRateLimited()
+            try:
+                detail = session.client.get_order_detail(
+                    trade_no=request["trade_no"],
+                    query_password=request["query_password"],
+                )
+            except OrderQueryPasswordInvalid as exc:
+                if session.record_password_failure(request["trade_no"], now):
+                    raise OrderQueryPasswordRateLimited() from exc
+                raise
+            except OrderQuerySessionExpired:
+                session.clear_verification()
+                raise
+            session.clear_password_failure(request["trade_no"])
+            return {
+                "session_id": session.session_id,
+                "expires_in": self.sessions.remaining(session),
+                "detail": detail,
+            }
+
+    def detail(self, data: Any) -> dict[str, Any]:
+        if not self._slots.acquire(blocking=False):
+            raise OrderQueryBusy()
+        try:
+            return self._detail(data)
         finally:
             self._slots.release()

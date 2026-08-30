@@ -34,6 +34,53 @@ class OrderQuerySessionExpired(OrderQueryError):
         )
 
 
+class OrderQueryPasswordRequired(OrderQueryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "请输入订单安全密码",
+            code="order_query_password_required",
+            status=400,
+        )
+
+
+class OrderQueryPasswordInvalid(OrderQueryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "订单安全密码错误，请重新输入",
+            code="order_query_password_invalid",
+            status=403,
+        )
+
+
+class OrderQueryPasswordRateLimited(OrderQueryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "订单安全密码尝试次数过多，请稍后重试",
+            code="order_query_password_rate_limited",
+            status=429,
+            retryable=True,
+        )
+
+
+class OrderQueryDetailNotFound(OrderQueryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "当前查询结果中没有该订单",
+            code="order_query_detail_not_found",
+            status=404,
+        )
+
+
+class OrderQueryDetailUnavailable(OrderQueryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "订单尚未付款或发货信息暂不可用",
+            code="order_query_detail_unavailable",
+            status=409,
+            retryable=True,
+        )
+
+
 class OrderQueryBusy(OrderQueryError):
     def __init__(self) -> None:
         super().__init__(

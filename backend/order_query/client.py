@@ -19,11 +19,13 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired
 
 from .captcha import captcha_sign
+from .detail import normalize_order_detail
 from .errors import CaptchaVerificationExpired, UpstreamOrderError
 
 BASE_URL = f"https://{ALLOWED_HOST}"
 CAPTCHA_START_PATH = "/shopApi/Common/captchaStart"
 ORDER_LIST_PATH = "/shopApi/Order/list"
+ORDER_DETAIL_PATH = "/shopApi/Order/info"
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_CAPTCHA_BYTES = 512 * 1024
 STATUS_LABELS = {
@@ -329,3 +331,14 @@ class OrderQueryClient:
             },
         )
         return normalize_order_list(result, page=page, page_size=page_size)
+
+    def get_order_detail(self, *, trade_no: str, query_password: str) -> dict[str, Any]:
+        result = self._json_request(
+            f"{BASE_URL}{ORDER_DETAIL_PATH}",
+            {
+                "trade_no": trade_no,
+                "query_password": query_password,
+                "dump": 1,
+            },
+        )
+        return normalize_order_detail(result, expected_trade_no=trade_no)

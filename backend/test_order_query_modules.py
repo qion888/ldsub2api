@@ -12,7 +12,16 @@ import main
 from order_query import routes
 from order_query.captcha import CaptchaRecognizer, captcha_sign, normalize_captcha_code
 from order_query.client import CaptchaChallenge, OrderQueryClient
-from order_query.errors import CaptchaRecognizerUnavailable, OrderQueryInputError
+from order_query.detail import normalize_order_detail
+from order_query.errors import (
+    CaptchaRecognizerUnavailable,
+    OrderQueryDetailNotFound,
+    OrderQueryInputError,
+    OrderQueryPasswordInvalid,
+    OrderQueryPasswordRateLimited,
+    OrderQueryPasswordRequired,
+    OrderQuerySessionExpired,
+)
 from order_query.service import OrderQueryService
 from order_query.sessions import OrderQuerySessionStore
 
@@ -60,6 +69,8 @@ class FakeOrderClient:
         self.start_count = 0
         self.check_codes: list[str] = []
         self.list_calls: list[dict[str, Any]] = []
+        self.detail_calls: list[dict[str, Any]] = []
+        self.detail_error: Exception | None = None
         self.expire_next_list = False
 
     def start_captcha(self, previous_code: str = "") -> CaptchaChallenge:
@@ -85,13 +96,29 @@ class FakeOrderClient:
             self.expire_next_list = False
             raise CaptchaVerificationExpired()
         return {
-            "orders": [{"trade_no": "ORDER-1", "status": kwargs["status"]}],
+            "orders": [{
+                "trade_no": "ORDER-1",
+                "status": 1 if kwargs["status"] == 999 else kwargs["status"],
+                "need_query_password": True,
+                "goods_type": "card",
+            }],
             "pagination": {
                 "page": kwargs["page"],
                 "page_size": kwargs["page_size"],
                 "total": 1,
                 "pages": 1,
             },
+        }
+
+    def get_order_detail(self, **kwargs: Any) -> dict[str, Any]:
+        self.detail_calls.append(kwargs)
+        if self.detail_error is not None:
+            raise self.detail_error
+        return {
+            "trade_no": kwargs["trade_no"],
+            "goods_type": "card",
+            "status": 1,
+            "delivery": {"kind": "card", "cards": ["CARD-SECRET"]},
         }
 
 
@@ -242,6 +269,213 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "图片响应无效"):
             client.download_captcha(challenge)
 
+    def test_order_detail_uses_fixed_endpoint_and_returns_a_strict_allowlist(self) -> None:
+        upstream = {
+            "code": 1,
+            "msg": "success",
+            "data": {
+                "trade_no": "LD-DETAIL-1001",
+                "transaction_id": "must-not-leak-transaction",
+                "goods_name": "测试卡密商品",
+                "quantity": 2,
+                "sendout": 1,
+                "total_amount": "46.13",
+                "status": 1,
+                "create_time": 1788056008,
+                "success_time": 1788056027,
+                "use_coupon": 1,
+                "coupon_price": "2.5",
+                "need_query_password": 1,
+                "can_complaint": 1,
+                "contact": "buyer@example.test",
+                "private_contact": "must-not-leak-private",
+                "user": {
+                    "nickname": "测试商家",
+                    "avatar": "https://pay.ldxp.cn/static/images/avatar.png",
+                    "link": "https://pay.ldxp.cn/shop/SHOP123",
+                    "contact_qq": "987654321",
+                    "contact_mobile": "",
+                    "contact_wechat": "merchant-wechat",
+                    "token": "must-not-leak-token",
+                },
+                "goods": {
+                    "goods_key": "GOODS1",
+                    "goods_type": "card",
+                    "link": "https://pay.ldxp.cn/item/GOODS1",
+                    "extend": {
+                        "instructions": (
+                            '<p>使用 <a href="https://docs.example.com/start">文档</a>'
+                            ' 和 [指南](https://guide.example.org/read)'
+                            '、[危险](javascript:bad)</p>'
+                            '<script>must-not-leak-script</script>'
+                            '<a href="javascript:alert(1)">bad</a>'
+                        ),
+                    },
+                },
+                "response": {
+                    "cards": ["CARD-A", "CARD-B"],
+                    "export_cards_url": (
+                        "https://pay.ldxp.cn/shopApi/Order/exportCards?trade_no=LD-DETAIL-1001"
+                    ),
+                    "api_status": 2,
+                    "api_msg": "已发货",
+                    "api_data": (
+                        '<p>打开 [权益页](https://benefit.example.net/start)</p>'
+                    ),
+                },
+            },
+        }
+        opener = FakeOpener([self._json_response(upstream)])
+        client = OrderQueryClient(opener=opener)
+
+        detail = client.get_order_detail(
+            trade_no="LD-DETAIL-1001",
+            query_password="test-password",
+        )
+
+        self.assertEqual(opener.requests[0].full_url, "https://pay.ldxp.cn/shopApi/Order/info")
+        self.assertEqual(json.loads(opener.requests[0].data.decode("utf-8")), {
+            "trade_no": "LD-DETAIL-1001",
+            "query_password": "test-password",
+            "dump": 1,
+        })
+        self.assertEqual(detail["total_amount"], "46.13")
+        self.assertEqual(detail["success_at"], "2026-08-30T02:13:47+00:00")
+        self.assertEqual(detail["contact"], "buyer@example.test")
+        self.assertEqual(detail["seller"], {
+            "nickname": "测试商家",
+            "avatar": "https://pay.ldxp.cn/static/images/avatar.png",
+            "shop_url": "https://pay.ldxp.cn/shop/SHOP123",
+            "contact_qq": "987654321",
+            "contact_mobile": "",
+            "contact_wechat": "merchant-wechat",
+        })
+        self.assertEqual(detail["instructions"], {
+            "text": "使用 文档 和 指南、危险\nbad",
+            "links": [
+                {"label": "文档", "url": "https://docs.example.com/start"},
+                {"label": "指南", "url": "https://guide.example.org/read"},
+            ],
+        })
+        self.assertEqual(detail["delivery"], {
+            "kind": "card",
+            "cards": ["CARD-A", "CARD-B"],
+            "api_status": 2,
+            "message": "已发货",
+            "content": "打开 权益页",
+            "links": [
+                {"label": "权益页", "url": "https://benefit.example.net/start"},
+            ],
+            "truncated": False,
+        })
+        serialized = json.dumps(detail, ensure_ascii=False)
+        for secret in (
+            "must-not-leak-transaction",
+            "must-not-leak-private",
+            "must-not-leak-token",
+            "must-not-leak-script",
+            "exportCards",
+            "javascript:",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_order_detail_maps_password_and_session_errors_before_data_parsing(self) -> None:
+        with self.assertRaises(OrderQueryPasswordInvalid):
+            normalize_order_detail(
+                {"code": 0, "msg": "安全密码错误，请使用联系方式重新查询后操作"},
+                expected_trade_no="LD-DETAIL-1001",
+            )
+        with self.assertRaises(OrderQuerySessionExpired):
+            normalize_order_detail(
+                {"code": 0, "msg": "请使用联系方式重新查询后操作"},
+                expected_trade_no="LD-DETAIL-1001",
+            )
+
+    def test_order_detail_rejects_a_mismatched_trade_number(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "不匹配"):
+            normalize_order_detail(
+                {"code": 1, "data": {"trade_no": "OTHER-ORDER", "status": 1}},
+                expected_trade_no="LD-DETAIL-1001",
+            )
+
+    def test_equity_detail_flattens_bounded_structured_delivery_data(self) -> None:
+        detail = normalize_order_detail(
+            {
+                "code": 1,
+                "data": {
+                    "trade_no": "LD-EQUITY-100",
+                    "status": 1,
+                    "goods": {
+                        "goods_key": "EQUITY1",
+                        "goods_type": "equity",
+                        "extend": {},
+                    },
+                    "response": {
+                        "api_status": 2,
+                        "api_msg": "权益已发放",
+                        "api_data": {
+                            "account": {
+                                "name": "buyer",
+                                "portal": "[打开](https://benefit.example.net/account)",
+                            },
+                            "steps": [
+                                "第一步",
+                                '<a href="https://docs.example.com/equity">第二步</a>',
+                            ],
+                        },
+                    },
+                },
+            },
+            expected_trade_no="LD-EQUITY-100",
+        )
+
+        self.assertEqual(
+            detail["delivery"]["content"],
+            "account: name: buyer\n  portal: 打开\nsteps: 1: 第一步\n  2: 第二步",
+        )
+        self.assertEqual(detail["delivery"]["links"], [
+            {"label": "打开", "url": "https://benefit.example.net/account"},
+            {"label": "第二步", "url": "https://docs.example.com/equity"},
+        ])
+        self.assertFalse(detail["delivery"]["truncated"])
+
+    def test_detail_links_reject_non_https_and_non_public_targets(self) -> None:
+        detail = normalize_order_detail(
+            {
+                "code": 1,
+                "data": {
+                    "trade_no": "LD-DETAIL-LINKS",
+                    "status": 1,
+                    "user": {
+                        "avatar": "https://cdn.example.com/avatar.png",
+                        "link": "https://pay.ldxp.cn/shop/SHOP123",
+                    },
+                    "goods": {
+                        "goods_type": "card",
+                        "extend": {
+                            "instructions": (
+                                "[公开](https://docs.example.com/start) "
+                                "[本机](https://127.0.0.1/admin) "
+                                "[私网](https://10.0.0.8/secret) "
+                                "[链路本地](https://169.254.169.254/latest) "
+                                "[明文](http://docs.example.com/unsafe)"
+                            ),
+                        },
+                    },
+                    "response": {"cards": []},
+                },
+            },
+            expected_trade_no="LD-DETAIL-LINKS",
+        )
+
+        self.assertEqual(detail["seller"]["avatar"], "")
+        self.assertEqual(detail["seller"]["shop_url"], "https://pay.ldxp.cn/shop/SHOP123")
+        self.assertEqual(detail["instructions"]["links"], [
+            {"label": "公开", "url": "https://docs.example.com/start"},
+        ])
+        self.assertNotIn("127.0.0.1", json.dumps(detail, ensure_ascii=False))
+        self.assertNotIn("169.254.169.254", json.dumps(detail, ensure_ascii=False))
+
 
 class ServiceTests(unittest.TestCase):
     @staticmethod
@@ -372,6 +606,167 @@ class ServiceTests(unittest.TestCase):
                 "captcha_code": "123",
             })
 
+    def test_detail_reuses_verified_cookie_client_and_does_not_cache_password(self) -> None:
+        client = FakeOrderClient()
+        service = self.service(client, FakeRecognizer(["AB12"]))
+        search = service.search({
+            "keywords": "buyer",
+            "status": 999,
+            "page": 1,
+            "page_size": 10,
+        })
+
+        result = service.detail({
+            "keywords": "buyer",
+            "session_id": search["session_id"],
+            "trade_no": "ORDER-1",
+            "query_password": "secret-password",
+        })
+
+        self.assertEqual(result["detail"]["trade_no"], "ORDER-1")
+        self.assertEqual(client.detail_calls, [{
+            "trade_no": "ORDER-1",
+            "query_password": "secret-password",
+        }])
+        session = service.sessions.get(search["session_id"], "buyer")
+        self.assertNotIn("query_password", session.__dict__)
+        self.assertNotIn("secret-password", repr(session.cache))
+
+    def test_detail_requires_password_and_rejects_orders_not_seen_in_the_session(self) -> None:
+        client = FakeOrderClient()
+        service = self.service(client, FakeRecognizer(["AB12"]))
+        search = service.search({
+            "keywords": "buyer",
+            "status": 999,
+            "page": 1,
+            "page_size": 10,
+        })
+        base = {
+            "keywords": "buyer",
+            "session_id": search["session_id"],
+            "query_password": "",
+        }
+
+        with self.assertRaises(OrderQueryPasswordRequired):
+            service.detail({**base, "trade_no": "ORDER-1"})
+        with self.assertRaises(OrderQueryDetailNotFound):
+            service.detail({
+                **base,
+                "trade_no": "OTHER-ORDER",
+                "query_password": "secret-password",
+            })
+        self.assertEqual(client.detail_calls, [])
+
+    def test_upstream_detail_session_expiry_clears_local_authorization(self) -> None:
+        client = FakeOrderClient()
+        service = self.service(client, FakeRecognizer(["AB12"]))
+        search = service.search({
+            "keywords": "buyer",
+            "status": 999,
+            "page": 1,
+            "page_size": 10,
+        })
+        client.detail_error = OrderQuerySessionExpired()
+
+        with self.assertRaises(OrderQuerySessionExpired):
+            service.detail({
+                "keywords": "buyer",
+                "session_id": search["session_id"],
+                "trade_no": "ORDER-1",
+                "query_password": "secret-password",
+            })
+
+        session = service.sessions.get(search["session_id"], "buyer")
+        self.assertEqual(session.ticket, "")
+        self.assertEqual(session.authorized_orders, {})
+
+    def test_five_invalid_passwords_apply_per_order_backoff(self) -> None:
+        client = FakeOrderClient()
+        service = self.service(client, FakeRecognizer(["AB12"]))
+        search = service.search({
+            "keywords": "buyer",
+            "status": 999,
+            "page": 1,
+            "page_size": 10,
+        })
+        client.detail_error = OrderQueryPasswordInvalid()
+        request = {
+            "keywords": "buyer",
+            "session_id": search["session_id"],
+            "trade_no": "ORDER-1",
+            "query_password": "wrong-password",
+        }
+
+        for _ in range(4):
+            with self.assertRaises(OrderQueryPasswordInvalid):
+                service.detail(request)
+        with self.assertRaises(OrderQueryPasswordRateLimited):
+            service.detail(request)
+        with self.assertRaises(OrderQueryPasswordRateLimited):
+            service.detail(request)
+
+        self.assertEqual(len(client.detail_calls), 5)
+        session = service.sessions.get(search["session_id"], "buyer")
+        self.assertEqual(session.password_failures["ORDER-1"][0], 5)
+
+    def test_successful_password_clears_previous_failure_count(self) -> None:
+        client = FakeOrderClient()
+        service = self.service(client, FakeRecognizer(["AB12"]))
+        search = service.search({
+            "keywords": "buyer",
+            "status": 999,
+            "page": 1,
+            "page_size": 10,
+        })
+        request = {
+            "keywords": "buyer",
+            "session_id": search["session_id"],
+            "trade_no": "ORDER-1",
+            "query_password": "password",
+        }
+        client.detail_error = OrderQueryPasswordInvalid()
+        with self.assertRaises(OrderQueryPasswordInvalid):
+            service.detail(request)
+        session = service.sessions.get(search["session_id"], "buyer")
+        self.assertEqual(session.password_failures["ORDER-1"][0], 1)
+
+        client.detail_error = None
+        service.detail(request)
+
+        self.assertNotIn("ORDER-1", session.password_failures)
+
+    def test_password_backoff_expires_and_verification_clear_removes_failures(self) -> None:
+        clock = [100.0]
+        store = OrderQuerySessionStore(
+            ttl_seconds=120,
+            cache_seconds=0,
+            clock=lambda: clock[0],
+        )
+        session = store.create("buyer", FakeOrderClient())
+        for _ in range(4):
+            self.assertFalse(session.record_password_failure("ORDER-1", store.now()))
+        self.assertTrue(session.record_password_failure("ORDER-1", store.now()))
+        self.assertFalse(session.password_attempt_allowed("ORDER-1", store.now()))
+
+        clock[0] += 61
+        self.assertTrue(session.password_attempt_allowed("ORDER-1", store.now()))
+        self.assertNotIn("ORDER-1", session.password_failures)
+
+        session.record_password_failure("ORDER-1", store.now())
+        session.clear_verification()
+        self.assertEqual(session.password_failures, {})
+
+    def test_detail_rejects_non_string_or_control_character_passwords(self) -> None:
+        for password in (987654, "secret\npassword", "x" * 161):
+            with self.subTest(password_type=type(password).__name__):
+                with self.assertRaises(OrderQueryInputError):
+                    OrderQueryService._validated_detail_request({
+                        "keywords": "buyer",
+                        "session_id": "abcdefghijklmnop",
+                        "trade_no": "ORDER-1",
+                        "query_password": password,
+                    })
+
 
 class RouteTests(unittest.TestCase):
     def test_manual_required_is_a_successful_route_result(self) -> None:
@@ -387,6 +782,7 @@ class RouteTests(unittest.TestCase):
             {"keywords": "buyer"},
             send_json=lambda value, status=200: responses.append((status, value)),
             search=lambda data: payload,
+            detail=lambda data: {},
         )
         self.assertTrue(handled)
         self.assertEqual(responses, [(200, payload)])
@@ -402,10 +798,32 @@ class RouteTests(unittest.TestCase):
             {},
             send_json=lambda value, status=200: responses.append((status, value)),
             search=fail,
+            detail=lambda data: {},
         )
         self.assertEqual(responses, [(400, {
             "detail": "bad query",
             "code": "invalid_order_query",
+            "retryable": False,
+        })])
+
+    def test_detail_route_returns_a_specific_password_error(self) -> None:
+        responses: list[tuple[int, Any]] = []
+
+        def fail(data: dict[str, Any]) -> dict[str, Any]:
+            raise OrderQueryPasswordInvalid()
+
+        handled = routes.handle_post(
+            "/api/order-query/detail",
+            {"trade_no": "ORDER-1"},
+            send_json=lambda value, status=200: responses.append((status, value)),
+            search=lambda data: {},
+            detail=fail,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(responses, [(403, {
+            "detail": "订单安全密码错误，请重新输入",
+            "code": "order_query_password_invalid",
             "retryable": False,
         })])
 
@@ -439,13 +857,47 @@ class RouteTests(unittest.TestCase):
                 handler.rfile = BytesIO(body)
                 responses: list[tuple[int, Any]] = []
                 handler._send_json = lambda value, status=200: responses.append((status, value))
-                service = SimpleNamespace(search=lambda data: expected)
+                service = SimpleNamespace(search=lambda data: expected, detail=lambda data: {})
 
                 with patch.object(main, "FRONTEND_URL", frontend_url), \
                      patch.object(main, "ORDER_QUERY_SERVICE", service):
                     handler.do_POST()
 
                 self.assertEqual(responses, [(200, expected)])
+
+    def test_main_http_handler_mounts_order_detail_route(self) -> None:
+        body = json.dumps({
+            "keywords": "buyer",
+            "session_id": "abcdefghijklmnop",
+            "trade_no": "ORDER-1",
+            "query_password": "secret-password",
+        }).encode("utf-8")
+        expected = {
+            "session_id": "abcdefghijklmnop",
+            "expires_in": 120,
+            "detail": {"trade_no": "ORDER-1", "delivery": {"cards": ["CARD"]}},
+        }
+        handler = object.__new__(main.ApiHandler)
+        handler.path = "/api/order-query/detail"
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "Content-Type": "application/json",
+            "Origin": "http://127.0.0.1:5173",
+        }
+        handler.rfile = BytesIO(body)
+        responses: list[tuple[int, Any]] = []
+        handler._send_json = lambda value, status=200: responses.append((status, value))
+        calls: list[dict[str, Any]] = []
+        service = SimpleNamespace(
+            search=lambda data: {},
+            detail=lambda data: calls.append(data) or expected,
+        )
+
+        with patch.object(main, "ORDER_QUERY_SERVICE", service):
+            handler.do_POST()
+
+        self.assertEqual(calls, [json.loads(body)])
+        self.assertEqual(responses, [(200, expected)])
 
     def test_order_query_request_guard_does_not_apply_to_other_routes(self) -> None:
         rejection = routes.request_rejection(
@@ -454,6 +906,21 @@ class RouteTests(unittest.TestCase):
             frontend_url="http://127.0.0.1:5173/",
         )
         self.assertIsNone(rejection)
+
+    def test_order_detail_request_guard_requires_json_and_a_trusted_origin(self) -> None:
+        unsupported = routes.request_rejection(
+            "/api/order-query/detail",
+            {"Content-Type": "text/plain", "Origin": "http://127.0.0.1:5173"},
+            frontend_url="http://127.0.0.1:5173/",
+        )
+        untrusted = routes.request_rejection(
+            "/api/order-query/detail",
+            {"Content-Type": "application/json", "Origin": "https://untrusted.example"},
+            frontend_url="http://127.0.0.1:5173/",
+        )
+
+        self.assertEqual(unsupported[0], 415)
+        self.assertEqual(untrusted[0], 403)
 
     def test_main_http_handler_rejects_order_query_with_wrong_content_type(self) -> None:
         body = json.dumps({"keywords": "buyer"}).encode("utf-8")
@@ -469,7 +936,11 @@ class RouteTests(unittest.TestCase):
         handler._send_json = lambda value, status=200: responses.append((status, value))
         calls: list[dict[str, Any]] = []
 
-        with patch.object(main, "ORDER_QUERY_SERVICE", SimpleNamespace(search=calls.append)):
+        with patch.object(
+            main,
+            "ORDER_QUERY_SERVICE",
+            SimpleNamespace(search=calls.append, detail=calls.append),
+        ):
             handler.do_POST()
 
         self.assertEqual(calls, [])
@@ -493,7 +964,11 @@ class RouteTests(unittest.TestCase):
         handler._send_json = lambda value, status=200: responses.append((status, value))
         calls: list[dict[str, Any]] = []
 
-        with patch.object(main, "ORDER_QUERY_SERVICE", SimpleNamespace(search=calls.append)):
+        with patch.object(
+            main,
+            "ORDER_QUERY_SERVICE",
+            SimpleNamespace(search=calls.append, detail=calls.append),
+        ):
             handler.do_POST()
 
         self.assertEqual(calls, [])
