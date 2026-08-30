@@ -321,6 +321,16 @@ class ClientTests(unittest.TestCase):
                     OrderQueryClient(opener=opener).check_need_complaint_password(trade_no="ORDER-1")
                 self.assertEqual(context.exception.code, "invalid_complaint_history_password_response")
 
+    def test_complaint_history_maps_human_verification_failure_to_expired_session(self) -> None:
+        for message in ("\u4eba\u673a\u9a8c\u8bc1\u5931\u8d25", "human verification failed"):
+            with self.subTest(message=message):
+                opener = FakeOpener([self._json_response({"code": 0, "msg": message, "data": None})])
+                with self.assertRaises(OrderQuerySessionExpired):
+                    OrderQueryClient(opener=opener).get_complaint_history(
+                        trade_no="ORDER-1",
+                        query_password="",
+                    )
+
     def test_order_detail_uses_fixed_endpoint_and_returns_a_strict_allowlist(self) -> None:
         upstream = {
             "code": 1,

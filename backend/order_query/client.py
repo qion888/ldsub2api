@@ -596,7 +596,12 @@ class OrderQueryClient:
         message = _safe_text(result.get("msg") or result.get("message"), 240)
         if any(token in message for token in ("安全密码", "查询密码", "密码错误", "密码不正确")):
             raise OrderQueryPasswordInvalid()
-        if any(token in message for token in ("重新查询", "会话已过期", "验证码已过期")):
+        message_lower = message.lower()
+        if (
+            any(token in message for token in ("重新查询", "会话已过期", "验证码已过期", "验证已过期", "人机验证", "人机校验"))
+            or "human verification" in message_lower
+            or ("captcha" in message_lower and any(token in message_lower for token in ("fail", "invalid", "expired")))
+        ):
             raise OrderQuerySessionExpired()
         if any(token in message for token in ("订单不存在", "未找到订单", "订单号不存在")):
             raise OrderQueryDetailNotFound()
