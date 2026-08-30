@@ -267,13 +267,15 @@ function Sub2ApiUsageStack({account, usage, usageError}) {
   return <div className="account-usage-stack upstream">
     <div className="account-usage-stack-meta">
       <span className={`account-usage-source-tag ${source.tone}`}><Activity size={13}/>{source.label}</span>
-      {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
+      <div className="account-usage-meta-tail">
+        {usageError && <Tooltip label={usageError}><span className="account-usage-alert" tabIndex={0} aria-label={`上游用量采样异常：${usageError}`}><AlertCircle size={12}/>采样异常</span></Tooltip>}
+        {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
+      </div>
     </div>
     <div className="account-usage-windows">
       <Sub2ApiUsageWindow label="5 小时窗口" window={fiveHour} tone="five-hour" testId={`usage-5h-${account.id}`}/>
       <Sub2ApiUsageWindow label="7 天窗口" window={sevenDay} tone="seven-day" testId={`usage-7d-${account.id}`}/>
     </div>
-    {usageError && <small className="account-usage-error"><AlertCircle size={13}/>{usageError}</small>}
   </div>;
 }
 
@@ -325,7 +327,7 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
                   <div className="account-concurrency"><span>并发</span><strong>{concurrency}</strong></div>
                 </div>
               </td>
-              <td className="account-state-cell" data-label="调度状态"><div className="account-state-block"><span className={`account-status ${state.tone}`}>{state.label}</span><small className="account-status-detail" title={state.detail}>{state.detail}</small></div></td>
+              <td className="account-state-cell" data-label="调度状态"><div className="account-state-block"><div className="account-status-rail"><span className={`account-status ${state.tone}`}>{state.label}</span></div><small className="account-status-detail" title={state.detail}>{state.detail}</small></div></td>
               <td className="account-quota-cell" data-label="本地额度"><Sub2ApiQuotaStack account={account}/></td>
               <td className="account-usage-cell" data-label="上游用量"><Sub2ApiUsageStack account={account} usage={usage} usageError={usageError}/></td>
               <td className="account-routing-cell" data-label="路由归属"><div className="account-routing"><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></div></td>
