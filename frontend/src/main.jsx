@@ -62,6 +62,12 @@ const DEFAULT_SUB2API_AUTOMATION = {
   interval_seconds: 300,
   auto_import: false,
 };
+const EMPTY_CARD_IMPORT_HISTORY = {
+  items: [],
+  total: 0,
+  status: 'all',
+  summary: {total: 0, success: 0, failed: 0, pending: 0, successful_accounts: 0, failed_accounts: 0},
+};
 const MONITOR_INTERVAL_OPTIONS = [1, 3, 5, 10, 30, 60, 300, 900, 1800];
 const SHOP_GOODS_TYPES = [
   {value: 'card', label: '卡密商品'},
@@ -111,6 +117,25 @@ function compactTime(value) {
     second: '2-digit',
     hour12: false,
   }).format(date);
+}
+
+function cardImportVerificationPatch(result) {
+  const verification = result?.import_verification || {};
+  const expected = Math.max(0, Number(verification.expected || 0));
+  const matched = Math.max(0, Number(verification.matched || 0));
+  const failed = Math.max(Number(verification.failed || 0), expected - matched, 0);
+  const confirmed = Boolean(verification.confirmed);
+  return {
+    status: confirmed ? 'success' : 'failed',
+    stage: confirmed ? 'done' : 'ready',
+    success_count: matched,
+    failed_count: failed,
+    message: confirmed ? `推送并核验成功，共 ${matched} 个账号` : `推送后仅核验 ${matched}/${expected} 个账号`,
+    details: {
+      new_account_ids: Array.isArray(verification.new_account_ids) ? verification.new_account_ids : [],
+      missing_accounts: Array.isArray(verification.missing) ? verification.missing : [],
+    },
+  };
 }
 
 function intervalLabel(value) {
@@ -919,6 +944,10 @@ function App() {
   const [sub2apiCardMode, setSub2apiCardMode] = useState('manual');
   const [sub2apiCardBusy, setSub2apiCardBusy] = useState(false);
   const [sub2apiCardFlow, setSub2apiCardFlow] = useState({stage: 'idle'});
+  const [sub2apiCardHistory, setSub2apiCardHistory] = useState(EMPTY_CARD_IMPORT_HISTORY);
+  const [sub2apiCardHistoryFilter, setSub2apiCardHistoryFilter] = useState('all');
+  const [sub2apiCardHistoryBusy, setSub2apiCardHistoryBusy] = useState(false);
+  const sub2apiCardHistoryFilterRef = useRef('all');
   const [sub2apiAccounts, setSub2apiAccounts] = useState({items: [], total: 0, page: 1, page_size: 12, pages: 1, usage: {}, usage_errors: {}});
   const [sub2apiAccountFilters, setSub2apiAccountFilters] = useState({search: '', status: '', platform: ''});
   const [sub2apiAccountBusy, setSub2apiAccountBusy] = useState(false);
@@ -1141,6 +1170,11 @@ function App() {
   useEffect(() => {
     if (activeView === 'sub2api' && sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
   }, [activeView, sub2apiConfig.base_url, sub2apiConfig.admin_key_set]);
+
+  useEffect(() => {
+    sub2apiCardHistoryFilterRef.current = sub2apiCardHistoryFilter;
+    if (activeView === 'sub2api') loadSub2ApiCardHistory({status: sub2apiCardHistoryFilter});
+  }, [activeView, sub2apiCardHistoryFilter]);
 
   useEffect(() => {
     if (activeView !== 'sub2api') return undefined;
@@ -2162,7 +2196,7 @@ function App() {
     }
   };
 
-  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos} = {}) => {
+  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos, throwOnError = false} = {}) => {
     const payload = payloadOverride || sub2apiPayload || reclaimPayload;
     if (!payload) {
       notify('请先选择账号 JSON 文件或下载找回结果', 'error');
@@ -2200,10 +2234,55 @@ function App() {
       }
       return result;
     } catch (error) {
+      if (throwOnError) throw error;
       notify(error.message, 'error');
       return null;
     } finally {
       setSub2apiBusy(false);
+    }
+  };
+
+  const loadSub2ApiCardHistory = async ({status = sub2apiCardHistoryFilterRef.current, quiet = false} = {}) => {
+    if (!quiet) setSub2apiCardHistoryBusy(true);
+    try {
+      const params = new URLSearchParams({status, limit: '50'});
+      const result = await request(`/sub2api/card-import-records?${params}`);
+      setSub2apiCardHistory(result);
+      return result;
+    } catch (error) {
+      if (!quiet) notify(error.message, 'error');
+      return null;
+    } finally {
+      if (!quiet) setSub2apiCardHistoryBusy(false);
+    }
+  };
+
+  const createSub2ApiCardHistory = async payload => {
+    try {
+      const record = await request('/sub2api/card-import-records', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      await loadSub2ApiCardHistory({quiet: true});
+      return record;
+    } catch {
+      return null;
+    }
+  };
+
+  const updateSub2ApiCardHistory = async (recordId, payload) => {
+    if (!recordId) return null;
+    try {
+      const record = await request(`/sub2api/card-import-records/${recordId}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      await loadSub2ApiCardHistory({quiet: true});
+      return record;
+    } catch {
+      return null;
     }
   };
 
@@ -2216,7 +2295,10 @@ function App() {
     if (sub2apiCardMode === 'auto' && !sub2apiConfig.admin_key_set) return notify('自动推送前请先保存 Sub2API 管理员密钥', 'error');
 
     setSub2apiCardBusy(true);
-    setSub2apiCardFlow({stage: 'verify', cardCount: codes.length, startedAt: new Date().toISOString()});
+    const historyRecord = await createSub2ApiCardHistory({mode: sub2apiCardMode, card_count: codes.length});
+    const recordId = historyRecord?.id || null;
+    let staged = null;
+    setSub2apiCardFlow({stage: 'verify', cardCount: codes.length, startedAt: new Date().toISOString(), recordId});
     try {
       const savedRedeem = await request('/redeem/config', {
         method: 'PUT',
@@ -2229,7 +2311,13 @@ function App() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({card_codes: codes}),
       });
-      setSub2apiCardFlow(current => ({...current, stage: 'reclaim', health}));
+      setSub2apiCardFlow(current => ({...current, stage: 'reclaim', health, recordId}));
+      await updateSub2ApiCardHistory(recordId, {
+        status: 'running',
+        stage: 'reclaim',
+        verified_count: Number(health.total ?? codes.length),
+        message: '卡密核验完成，正在找回账号文件',
+      });
 
       const submitted = await request('/redeem/reclaim', {
         method: 'POST',
@@ -2264,25 +2352,49 @@ function App() {
         if (activeTasks > 0 && attempts < 120) await new Promise(resolve => window.setTimeout(resolve, 5000));
       } while (activeTasks > 0 && attempts < 120);
 
-      const staged = stageRecoveredPayloads([...downloads.values()]);
+      staged = stageRecoveredPayloads([...downloads.values()]);
       if (!staged) {
         if (activeTasks > 0) throw new Error('卡密任务仍在处理，自动轮询已达到 10 分钟，请稍后重试');
         throw new Error('卡密核验已完成，但服务未返回可下载的账号 JSON');
       }
 
       if (sub2apiCardMode === 'manual') {
-        setSub2apiCardFlow(current => ({...current, stage: 'ready', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename}));
+        setSub2apiCardFlow(current => ({...current, stage: 'ready', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename, recordId}));
+        await updateSub2ApiCardHistory(recordId, {
+          status: 'pending',
+          stage: 'ready',
+          downloaded_files: staged.files,
+          account_count: staged.accounts,
+          filename: staged.filename,
+          message: '核验下载成功，等待手动推送',
+        });
         notify(`已核验并下载 ${staged.accounts} 个账号，请确认后手动推送`);
         return;
       }
 
-      setSub2apiCardFlow(current => ({...current, stage: 'push', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename}));
-      const pushed = await importSub2Api(staged.payload, {reclaimOrderNos: staged.orderNos});
+      setSub2apiCardFlow(current => ({...current, stage: 'push', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename, recordId}));
+      await updateSub2ApiCardHistory(recordId, {
+        status: 'running',
+        stage: 'push',
+        downloaded_files: staged.files,
+        account_count: staged.accounts,
+        filename: staged.filename,
+        message: '账号文件已下载，正在自动推送',
+      });
+      const pushed = await importSub2Api(staged.payload, {reclaimOrderNos: staged.orderNos, throwOnError: true});
       if (!pushed) throw new Error('账号 JSON 已下载，但自动推送未完成');
       const confirmed = Boolean(pushed.import_verification?.confirmed);
       setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
+      await updateSub2ApiCardHistory(recordId, cardImportVerificationPatch(pushed));
     } catch (error) {
       setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
+      await updateSub2ApiCardHistory(recordId, {
+        status: 'failed',
+        stage: 'error',
+        account_count: Number(staged?.accounts || 0),
+        failed_count: Number(staged?.accounts || 0),
+        message: error.message,
+      });
       notify(error.message, 'error');
     } finally {
       setSub2apiCardBusy(false);
@@ -2292,13 +2404,28 @@ function App() {
   const pushStagedSub2ApiCards = async () => {
     if (!sub2apiPayload) return notify('当前没有待推送的卡密账号 JSON', 'error');
     setSub2apiCardFlow(current => ({...current, stage: 'push', error: ''}));
-    const pushed = await importSub2Api();
-    if (!pushed) {
-      setSub2apiCardFlow(current => ({...current, stage: 'error', error: '手动推送未完成'}));
+    await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, {
+      status: 'running',
+      stage: 'push',
+      message: '正在手动推送账号文件',
+    });
+    let pushed;
+    try {
+      pushed = await importSub2Api(undefined, {throwOnError: true});
+    } catch (error) {
+      setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
+      await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, {
+        status: 'failed',
+        stage: 'error',
+        failed_count: Number(sub2apiCardFlow.accounts || 0),
+        message: error.message,
+      });
+      notify(error.message, 'error');
       return;
     }
     const confirmed = Boolean(pushed.import_verification?.confirmed);
     setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
+    await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, cardImportVerificationPatch(pushed));
   };
 
   const changeSub2ApiProxy = value => {
@@ -2485,6 +2612,8 @@ function App() {
             redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={saveRedeemConfig}
             cardCodes={sub2apiCardCodes} onCardCodes={setSub2apiCardCodes} cardMode={sub2apiCardMode} onCardMode={setSub2apiCardMode}
             cardBusy={sub2apiCardBusy} cardFlow={sub2apiCardFlow} onRunCardImport={runSub2ApiCardImport} onPushCards={pushStagedSub2ApiCards}
+            cardHistory={sub2apiCardHistory} cardHistoryFilter={sub2apiCardHistoryFilter} onCardHistoryFilter={setSub2apiCardHistoryFilter}
+            cardHistoryBusy={sub2apiCardHistoryBusy} onRefreshCardHistory={() => loadSub2ApiCardHistory()}
             fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
             optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
             codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
@@ -2715,7 +2844,68 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
   );
 }
 
-function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush}) {
+function CardImportHistoryPanel({data, filter, onFilter, busy, onRefresh}) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const summary = data?.summary || EMPTY_CARD_IMPORT_HISTORY.summary;
+  const filters = [
+    {value: 'all', label: '全部', count: summary.total},
+    {value: 'success', label: '成功', count: summary.success},
+    {value: 'failed', label: '失败', count: summary.failed},
+    {value: 'pending', label: '待推送', count: summary.pending},
+  ];
+  const statusMeta = {
+    success: {label: '推送成功', icon: Check},
+    failed: {label: '推送失败', icon: TriangleAlert},
+    pending: {label: '等待推送', icon: Clock3},
+    running: {label: '正在处理', icon: RefreshCw},
+  };
+  const recordDetail = record => {
+    const accountIds = Array.isArray(record.details?.new_account_ids) ? record.details.new_account_ids : [];
+    const missing = Array.isArray(record.details?.missing_accounts) ? record.details.missing_accounts : [];
+    if (record.status === 'success' && accountIds.length) return `新增账号 #${accountIds.slice(0, 6).join('、#')}`;
+    if (record.status === 'failed' && missing.length) return `未确认：${missing.slice(0, 3).map(item => item.name || item.platform || '账号').join('、')}`;
+    return record.message || '暂无补充信息';
+  };
+
+  return (
+    <div className="card-import-history" data-testid="card-import-history">
+      <div className="card-history-head">
+        <div><span className="detail-kicker">IMPORT AUDIT</span><h3><History size={17}/>导入记录</h3><p>保留最近 500 次核验与推送结果，不保存卡密原文</p></div>
+        <button className="icon-button" type="button" onClick={onRefresh} disabled={busy} title="刷新导入记录" aria-label="刷新导入记录"><RefreshCw size={15} className={busy ? 'spin' : ''}/></button>
+      </div>
+      <div className="card-history-summary">
+        <div><span>记录总数</span><strong>{summary.total ?? 0}</strong><small>最近 500 次</small></div>
+        <div><span>推送成功</span><strong className="positive">{summary.success ?? 0}</strong><small>{summary.successful_accounts ?? 0} 个账号</small></div>
+        <div><span>推送失败</span><strong className={summary.failed ? 'negative' : ''}>{summary.failed ?? 0}</strong><small>{summary.failed_accounts ?? 0} 个账号</small></div>
+        <div><span>处理中 / 待推送</span><strong>{summary.pending ?? 0}</strong><small>可继续手动推送</small></div>
+      </div>
+      <div className="card-history-toolbar">
+        <div className="card-history-filters" role="tablist" aria-label="导入记录状态筛选">
+          {filters.map(item => <button type="button" role="tab" aria-selected={filter === item.value} className={filter === item.value ? 'active' : ''} onClick={() => onFilter(item.value)} key={item.value}>{item.label}<span>{item.count ?? 0}</span></button>)}
+        </div>
+        <span>当前显示 {data?.total ?? 0} 条</span>
+      </div>
+      <div className="card-history-table-wrap" role="region" tabIndex={0} aria-label="可横向滚动的卡密导入记录">
+        <div className="card-history-table" role="table" aria-label="卡密导入记录">
+          <div className="card-history-row head" role="row"><span role="columnheader">状态</span><span role="columnheader">时间 / 模式</span><span role="columnheader">卡密 / 下载</span><span role="columnheader">推送账号</span><span role="columnheader">结果</span></div>
+          {items.length ? items.map(record => {
+            const meta = statusMeta[record.status] || statusMeta.running;
+            const StatusIcon = meta.icon;
+            return <div className={`card-history-row ${record.status}`} role="row" key={record.id}>
+              <span role="cell" className={`card-history-status ${record.status}`}><StatusIcon size={14} className={record.status === 'running' ? 'spin' : ''}/><strong>{meta.label}</strong></span>
+              <span role="cell"><strong>{compactTime(record.completed_at || record.updated_at || record.started_at)}</strong><small>{record.mode === 'auto' ? '自动推送' : '手动推送'} · #{record.id}</small></span>
+              <span role="cell"><strong>{record.card_count} 个 / {record.downloaded_files} 文件</strong><small>已核验 {record.verified_count}</small></span>
+              <span role="cell"><strong><em className="positive">{record.success_count}</em> 成功 · <em className={record.failed_count ? 'negative' : ''}>{record.failed_count}</em> 失败</strong><small>待推送 {Math.max(0, Number(record.account_count || 0) - Number(record.success_count || 0))}</small></span>
+              <span role="cell" title={recordDetail(record)}><strong>{record.message || meta.label}</strong><small>{recordDetail(record)}</small></span>
+            </div>;
+          }) : <div className="card-history-empty"><History size={20}/><span>{busy ? '正在读取导入记录' : '当前筛选下暂无导入记录'}</span></div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyBusy, onRefreshHistory}) {
   const stageLabel = {
     idle: '等待输入',
     verify: '正在核验',
@@ -2749,10 +2939,10 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
             <button type="button" className={mode === 'manual' ? 'active' : ''} onClick={() => onMode('manual')} data-testid="card-mode-manual"><Download size={14}/>手动推送</button>
             <button type="button" className={mode === 'auto' ? 'active' : ''} onClick={() => onMode('auto')} data-testid="card-mode-auto"><Send size={14}/>自动推送</button>
           </div></div>
-          <div className="card-flow-steps" aria-label="卡密直导进度">
-            <div className={flow.health ? 'done' : flow.stage === 'verify' ? 'active' : ''}><span>1</span><strong>核验卡密</strong><small>{flow.health ? `${health.total ?? codesCount} 个已核验` : '30d.team'}</small></div>
-            <div className={flow.downloaded ? 'done' : ['reclaim', 'download', 'stage'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.downloaded ? `${flow.downloaded} 个文件` : '账号 JSON'}</small></div>
-            <div className={pushConfirmed ? 'done' : flow.stage === 'push' ? 'active' : ''}><span>3</span><strong>{mode === 'auto' ? '自动推送' : '手动推送'}</strong><small>{pushConfirmed ? 'Sub2API 已核验' : mode === 'auto' ? '下载后执行' : '确认后执行'}</small></div>
+          <div className="card-flow-steps" role="list" aria-label="卡密直导进度">
+            <div role="listitem" className={flow.health ? 'done' : flow.stage === 'verify' ? 'active' : ''}><span>1</span><strong>核验卡密</strong><small>{flow.health ? `${health.total ?? codesCount} 个已核验` : '30d.team'}</small></div>
+            <div role="listitem" className={flow.downloaded ? 'done' : ['reclaim', 'download', 'stage'].includes(flow.stage) ? 'active' : ''}><span>2</span><strong>找回下载</strong><small>{flow.downloaded ? `${flow.downloaded} 个文件` : '账号 JSON'}</small></div>
+            <div role="listitem" className={pushConfirmed ? 'done' : flow.stage === 'push' ? 'active' : ''}><span>3</span><strong>{mode === 'auto' ? '自动推送' : '手动推送'}</strong><small>{pushConfirmed ? 'Sub2API 已核验' : mode === 'auto' ? '下载后执行' : '确认后执行'}</small></div>
           </div>
           <div className="card-flow-summary">
             <div><span>当前状态</span><strong className={flow.stage === 'error' ? 'negative' : ''}>{stageLabel}</strong></div>
@@ -2767,11 +2957,12 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
           </div>
         </div>
       </div>
+      <CardImportHistoryPanel data={historyData} filter={historyFilter} onFilter={onHistoryFilter} busy={historyBusy} onRefresh={onRefreshHistory}/>
     </section>
   );
 }
 
-function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryBusy, onRefreshCardHistory, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -2847,6 +3038,8 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, se
         codes={cardCodes} onCodes={onCardCodes} mode={cardMode} onMode={onCardMode}
         busy={cardBusy} importing={busy} flow={cardFlow} payload={payload} canAutoPush={Boolean(config.admin_key_set)}
         onRun={onRunCardImport} onPush={onPushCards}
+        historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
+        historyBusy={cardHistoryBusy} onRefreshHistory={onRefreshCardHistory}
       />
 
       <div className="automation-console">

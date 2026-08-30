@@ -36,6 +36,7 @@ from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
 from monitor_core.workers import MonitorWorker as CoreMonitorWorker
 from sub2api import automation as sub2api_automation
+from sub2api import card_import_history as sub2api_card_history
 from sub2api import client as sub2api_client
 from sub2api import payloads as sub2api_payloads
 from sub2api import reclaim as sub2api_reclaim
@@ -89,6 +90,7 @@ def init_database() -> None:
         default_sub2api_url=DEFAULT_SUB2API_URL,
         default_automation=DEFAULT_SUB2API_AUTOMATION,
     )
+    sub2api_card_history.initialize(database)
 
 
 DescriptionParser = storefront.DescriptionParser
@@ -346,6 +348,18 @@ def sub2api_automation_settings() -> dict[str, Any]:
 
 def sub2api_automation_state() -> dict[str, Any]:
     return sub2api_config.read_automation_state(_setting_json)
+
+
+def list_sub2api_card_import_records(query_values: dict[str, list[str]]) -> dict[str, Any]:
+    return sub2api_card_history.list_records(database, query_values)
+
+
+def create_sub2api_card_import_record(payload: dict[str, Any]) -> dict[str, Any]:
+    return sub2api_card_history.create_record(database, payload, now=utc_now)
+
+
+def update_sub2api_card_import_record(record_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    return sub2api_card_history.update_record(database, record_id, payload, now=utc_now)
 
 
 def _sub2api_imported_order_nos() -> list[str]:
@@ -882,6 +896,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "worker": WORKER.is_alive(),
                 "sub2api_automation_worker": AUTOMATION_WORKER.is_alive(),
                 "sub2api_accounts": True,
+                "sub2api_card_import_history": True,
             })
         if path == "/api/watches":
             return self._send_json(list_watches())
@@ -940,6 +955,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             automation_state_loader=sub2api_automation_state,
             options_loader=fetch_sub2api_options,
             account_loader=fetch_sub2api_account_page,
+            card_import_history_loader=list_sub2api_card_import_records,
             query_values=parse_qs(parsed.query),
         ):
             return
@@ -1035,6 +1051,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             run_automation=AUTOMATION_WORKER.run_once,
             import_payload=_sub2api_import_payload,
             test_account=test_sub2api_account,
+            card_import_history_creator=create_sub2api_card_import_record,
         ):
             return
 
@@ -1463,6 +1480,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             settings_loader=sub2api_settings,
             save_automation_settings=save_sub2api_automation_settings,
             automation_state_loader=sub2api_automation_state,
+            card_import_history_updater=update_sub2api_card_import_record,
         ):
             return
 

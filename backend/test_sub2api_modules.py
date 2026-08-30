@@ -1,12 +1,93 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
-from sub2api import automation, client, reclaim, routes, settings
+from monitor_core import database as monitor_database
+from sub2api import automation, card_import_history, client, reclaim, routes, settings
 from sub2api.worker import Sub2ApiAutomationWorker
 
 
 class Sub2ApiModuleTests(unittest.TestCase):
+    def test_card_import_history_tracks_pending_success_and_failure_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.db"
+
+            def database():
+                return monitor_database.create_database(path)
+
+            timestamps = iter((
+                "2026-08-30T08:00:00+00:00",
+                "2026-08-30T08:01:00+00:00",
+                "2026-08-30T08:02:00+00:00",
+                "2026-08-30T08:03:00+00:00",
+                "2026-08-30T08:04:00+00:00",
+            ))
+            now = lambda: next(timestamps)
+            card_import_history.initialize(database)
+            successful = card_import_history.create_record(
+                database, {"mode": "auto", "card_count": 3}, now=now
+            )
+            running_result = card_import_history.list_records(database, {"status": ["pending"]})
+            card_import_history.update_record(
+                database,
+                successful["id"],
+                {
+                    "status": "pending",
+                    "stage": "ready",
+                    "verified_count": 3,
+                    "downloaded_files": 2,
+                    "account_count": 2,
+                },
+                now=now,
+            )
+            pending_result = card_import_history.list_records(database, {"status": ["pending"]})
+            completed = card_import_history.update_record(
+                database,
+                successful["id"],
+                {
+                    "status": "success",
+                    "stage": "done",
+                    "success_count": 2,
+                    "details": {"new_account_ids": [11, "12", -1]},
+                    "message": "推送并核验成功",
+                },
+                now=now,
+            )
+            failed = card_import_history.create_record(
+                database, {"mode": "manual", "card_count": 1}, now=now
+            )
+            card_import_history.update_record(
+                database,
+                failed["id"],
+                {
+                    "status": "failed",
+                    "stage": "error",
+                    "failed_count": 1,
+                    "message": "上游拒绝导入",
+                    "details": {"missing_accounts": [{"name": "account-a", "count": 1}]},
+                },
+                now=now,
+            )
+
+            result = card_import_history.list_records(database, {"limit": ["20"]})
+
+        self.assertEqual(running_result["items"][0]["status"], "running")
+        self.assertEqual(pending_result["total"], 1)
+        self.assertEqual(pending_result["items"][0]["status"], "pending")
+        self.assertEqual(completed["details"]["new_account_ids"], [11, 12])
+        self.assertEqual(result["summary"], {
+            "total": 2,
+            "success": 1,
+            "failed": 1,
+            "pending": 0,
+            "successful_accounts": 2,
+            "failed_accounts": 1,
+        })
+        self.assertEqual(result["items"][0]["message"], "上游拒绝导入")
+        self.assertEqual(result["items"][1]["status"], "success")
+
     def test_settings_are_normalized_through_injected_storage(self) -> None:
         stored = []
         value = settings.save_automation_settings(
@@ -244,6 +325,53 @@ class Sub2ApiModuleTests(unittest.TestCase):
             test_account=lambda account_id: {"ok": True, "account_id": account_id},
         ))
         self.assertEqual(responses[-1], (200, {"ok": True, "account_id": 12}))
+
+    def test_card_import_history_routes_dispatch_create_update_and_list(self) -> None:
+        responses = []
+        common_get = {
+            "send_json": lambda payload, status=200: responses.append((status, payload)),
+            "settings_loader": lambda **kwargs: {},
+            "automation_settings_loader": lambda: {},
+            "automation_state_loader": lambda: {},
+            "options_loader": lambda: {},
+        }
+        self.assertTrue(routes.handle_get(
+            "/api/sub2api/card-import-records",
+            **common_get,
+            card_import_history_loader=lambda query: {"query": query},
+            query_values={"status": ["failed"]},
+        ))
+        self.assertEqual(responses[-1], (200, {"query": {"status": ["failed"]}}))
+
+        common_write = {
+            "send_json": common_get["send_json"],
+            "test_connection": lambda: {},
+            "reclaim_accounts": lambda **kwargs: {},
+            "refresh_reclaim": lambda *args, **kwargs: {},
+            "run_automation": lambda: {},
+            "import_payload": lambda *args, **kwargs: {},
+        }
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/card-import-records",
+            {"mode": "auto", "card_count": 2},
+            **common_write,
+            card_import_history_creator=lambda payload: {"id": 7, **payload},
+        ))
+        self.assertEqual(responses[-1][0], 201)
+        self.assertEqual(responses[-1][1]["id"], 7)
+
+        self.assertTrue(routes.handle_put(
+            "/api/sub2api/card-import-records/7",
+            {"status": "success"},
+            send_json=common_get["send_json"],
+            normalize_url=lambda value, default: default,
+            store_setting=lambda key, value: None,
+            settings_loader=lambda **kwargs: {},
+            save_automation_settings=lambda payload: payload,
+            automation_state_loader=lambda: {},
+            card_import_history_updater=lambda record_id, payload: {"id": record_id, **payload},
+        ))
+        self.assertEqual(responses[-1], (200, {"id": 7, "status": "success"}))
         self.assertTrue(routes.handle_delete(
             "/api/sub2api/accounts/12",
             send_json=lambda payload, status=200: responses.append((status, payload)),

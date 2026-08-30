@@ -19,6 +19,7 @@ def handle_get(
     automation_state_loader: Callable[[], dict[str, Any]],
     options_loader: Callable[[], dict[str, Any]],
     account_loader: Callable[[dict[str, list[str]]], dict[str, Any]] | None = None,
+    card_import_history_loader: Callable[[dict[str, list[str]]], dict[str, Any]] | None = None,
     query_values: dict[str, list[str]] | None = None,
 ) -> bool:
     if path == "/api/sub2api/config":
@@ -52,6 +53,14 @@ def handle_get(
         except RuntimeError as exc:
             send_json({"detail": str(exc)}, 502)
         return True
+    if path == "/api/sub2api/card-import-records":
+        if card_import_history_loader is None:
+            return False
+        try:
+            send_json(card_import_history_loader(query_values or {}), 200)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        return True
     return False
 
 
@@ -66,7 +75,17 @@ def handle_post(
     run_automation: Callable[[], dict[str, Any]],
     import_payload: Callable[..., dict[str, Any]],
     test_account: Callable[[int], dict[str, Any]] | None = None,
+    card_import_history_creator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> bool:
+    if path == "/api/sub2api/card-import-records":
+        if card_import_history_creator is None:
+            return False
+        try:
+            send_json(card_import_history_creator(data), 201)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        return True
+
     if path == "/api/sub2api/test":
         try:
             send_json(test_connection(), 200)
@@ -191,7 +210,20 @@ def handle_put(
     settings_loader: Callable[..., dict[str, Any]],
     save_automation_settings: Callable[[dict[str, Any]], dict[str, Any]],
     automation_state_loader: Callable[[], dict[str, Any]],
+    card_import_history_updater: Callable[[int, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> bool:
+    card_import_match = re.fullmatch(r"/api/sub2api/card-import-records/(\d+)", path)
+    if card_import_match:
+        if card_import_history_updater is None:
+            return False
+        try:
+            send_json(card_import_history_updater(int(card_import_match.group(1)), data), 200)
+        except LookupError as exc:
+            send_json({"detail": str(exc)}, 404)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        return True
+
     if path == "/api/sub2api/config":
         try:
             base_url = normalize_url(data.get("base_url"), DEFAULT_URL)

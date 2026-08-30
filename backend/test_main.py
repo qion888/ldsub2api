@@ -1277,6 +1277,38 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["sub2api_accounts"])
 
+    def test_sub2api_card_import_history_http_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(main, "DB_PATH", Path(directory) / "history.db"):
+                main.init_database()
+                status, created = self.request_api("POST", "/api/sub2api/card-import-records", {
+                    "mode": "auto",
+                    "card_count": 2,
+                })
+                self.assertEqual(status, 201)
+                status, updated = self.request_api(
+                    "PUT",
+                    f"/api/sub2api/card-import-records/{created['id']}",
+                    {
+                        "status": "success",
+                        "stage": "done",
+                        "verified_count": 2,
+                        "account_count": 2,
+                        "success_count": 2,
+                        "message": "推送并核验成功",
+                    },
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(updated["success_count"], 2)
+                status, records = self.request_api(
+                    "GET", "/api/sub2api/card-import-records?status=success&limit=10", {}
+                )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(records["total"], 1)
+        self.assertEqual(records["items"][0]["status"], "success")
+        self.assertEqual(records["summary"]["successful_accounts"], 2)
+
     def test_sub2api_401_text_recognizes_token_revoked_parenthesized_status(self):
         self.assertTrue(main._sub2api_account_is_401({
             "status": "error",
