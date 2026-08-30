@@ -8,11 +8,14 @@ import {
   ChevronRight,
   Clock3,
   Clipboard,
+  CircleCheck,
+  CircleX,
   Database,
   Download,
   FileUp,
   Gauge,
   History,
+  Info,
   KeyRound,
   Layers3,
   Network,
@@ -29,6 +32,7 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
+import {normalizeSub2ApiRecoveryResult} from './sub2apiRecoveryModel.js';
 
 function compactTime(value) {
   if (!value) return '尚未抓取';
@@ -491,7 +495,61 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
   );
 }
 
-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+function recoveryCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0;
+}
+
+function recoveryFailureSubject(failure, index) {
+  return failure.card_code || failure.order_no || failure.name || `项目 ${index + 1}`;
+}
+
+function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false, testId = 'sub2api-recovery-result'}) {
+  if (!result) return null;
+  const model = normalizeSub2ApiRecoveryResult(result);
+  const {summary, failures, retryCodes, retryAvailable, outcomeMeta, importMeta} = model;
+  const unrecoverable = recoveryCount(summary.unreclaimable) + recoveryCount(summary.not_owned) + recoveryCount(summary.skipped);
+  const failed = recoveryCount(summary.failed);
+  const downloaded = recoveryCount(summary.downloaded);
+  const statusTone = outcomeMeta.tone || 'neutral';
+  const importMessage = model.importError ? `${importMeta.label}：${model.importError}` : importMeta.label;
+  return (
+    <section className={`sub2api-recovery-result tone-${statusTone} ${compact ? 'compact' : ''}`} data-testid={testId}>
+      <div className="recovery-result-head">
+        <div className="recovery-result-title">
+          {statusTone === 'success' ? <CircleCheck size={17}/> : statusTone === 'danger' ? <CircleX size={17}/> : statusTone === 'warning' ? <AlertCircle size={17}/> : <Info size={17}/>}
+          <div><span className="detail-kicker">401 RECOVERY RESULT</span><h3>{outcomeMeta.label}</h3><p>{model.recoveryMessage}</p></div>
+        </div>
+        {retryAvailable && onRetry && <button className="button secondary recovery-retry-button" type="button" onClick={onRetry} disabled={busy} title={`仅重新提交 ${retryCodes.length} 个可重试项目`}>
+          <RefreshCw size={14} className={busy ? 'spin' : ''}/>{busy ? '重新找回中' : `重新找回${retryCodes.length ? `（${retryCodes.length}）` : ''}`}
+        </button>}
+      </div>
+      <div className="recovery-result-metrics">
+        <div className="success"><span>已更新</span><strong>{model.updated}</strong></div>
+        <div><span>本来正常</span><strong>{model.noAction}</strong></div>
+        <div className={unrecoverable ? 'danger' : ''}><span>无法找回</span><strong>{unrecoverable}</strong></div>
+        <div className={retryCodes.length || failed ? 'warning' : ''}><span>失败</span><strong>{failed || retryCodes.length}</strong></div>
+        <div><span>已下载</span><strong>{downloaded}</strong></div>
+      </div>
+      <div className="recovery-result-status-grid">
+        <div className={`recovery-status-item ${statusTone}`}><KeyRound size={14}/><span><strong>找回状态</strong><small>{model.recoveryMessage}</small></span></div>
+        <div className={`recovery-status-item ${importMeta.tone || 'neutral'}`}><Upload size={14}/><span><strong>自动导入</strong><small>{importMessage}</small></span></div>
+      </div>
+      {failures.length ? <div className="recovery-failure-list">
+        <div className="recovery-failure-head"><strong>无法自动处理的项目</strong><span>{failures.length} 条明细</span></div>
+        <div className="recovery-failure-items">{failures.slice(0, 20).map((failure, index) => {
+          const retryable = Boolean(failure.retryable);
+          return <div className={`recovery-failure-item ${retryable ? 'retryable' : 'permanent'}`} key={`${recoveryFailureSubject(failure, index)}-${index}`}>
+            {retryable ? <RefreshCw size={13}/> : <TriangleAlert size={13}/>}<span><strong>{recoveryFailureSubject(failure, index)}</strong><small>{failure.reason || failure.message || '未返回具体原因'}{failure.provider_status ? ` · HTTP ${failure.provider_status}` : ''}</small></span><em>{retryable ? '可重试' : '无法找回'}</em>
+          </div>;
+        })}</div>
+        {failures.length > 20 && <small className="recovery-failure-more">仅显示前 20 条明细</small>}
+      </div> : <div className="recovery-no-failures"><CircleCheck size={14}/>没有需要人工处理的找回项目</div>}
+    </section>
+  );
+}
+
+export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -499,8 +557,12 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
   const selectedProxy = options.proxies.find(proxy => `proxy:${proxy.id}` === proxyChoice);
   const selectedGroups = options.groups.filter(group => groupIds.includes(group.id));
   const activeGroups = options.groups.filter(group => !group.status || group.status === 'active');
-  const automationReady = Boolean(config.admin_key_set && proxyChoice.startsWith('proxy:') && groupIds.length && codexFingerprintMode !== 'off' && automation.auto_import);
+  const monitorReady = Boolean(config.admin_key_set);
+  const importReady = Boolean(monitorReady && selectedProxy && groupIds.length && codexFingerprintMode !== 'off' && automation.auto_import);
+  const automationReady = monitorReady;
   const automationResult = automationState?.last_result;
+  const automationDisplayResult = automationRetryResult || automationResult;
+  const automationRecovery = normalizeSub2ApiRecoveryResult(automationDisplayResult);
   const runHistory = Array.isArray(automationState?.run_history) ? [...automationState.run_history].reverse() : [];
   const recentErrors = Array.isArray(monitor.recent_errors) ? monitor.recent_errors : [];
   const platforms = Array.isArray(monitor.platforms) ? monitor.platforms : [];
@@ -519,6 +581,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
     {label: '导入分组', ready: groupIds.length > 0},
     {label: '指纹策略', ready: codexFingerprintMode !== 'off'},
   ];
+  const importMissingCount = readiness.filter(item => !item.ready).length;
   const proxyLabel = proxyChoice === 'json' ? `JSON 自带（${jsonProxyCount}）` : selectedProxy?.name || '不绑定代理';
   const fingerprintLabel = fingerprintModes.find(mode => mode.value === codexFingerprintMode)?.label || '透传';
   const maxPlatformCount = Math.max(1, ...platforms.map(item => Number(item.count || 0)));
@@ -545,9 +608,12 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
             <label><span>服务地址</span><input value={config.base_url} onChange={event => setConfig({...config, base_url: event.target.value})} placeholder="http://127.0.0.1:8080"/></label>
             <label><span>管理员密钥 {config.admin_key_set && <small>{config.admin_key_mask}</small>}</span><input type="password" value={adminKey} onChange={event => setAdminKey(event.target.value)} placeholder={config.admin_key_set ? '留空保留现有密钥' : '输入管理员密钥'} autoComplete="off"/></label>
           </div>
-          <div className="tool-actions compact-actions"><button className="button primary" onClick={onSave}><Save size={15}/>保存</button><button className="button secondary" onClick={onTest} disabled={busy}><Activity size={15}/>测试</button><button className="button secondary" onClick={onReclaim401} disabled={reclaimBusy || busy}><KeyRound size={15}/>{reclaimBusy ? '扫描中' : '扫描并找回 401'}</button></div>
+          <div className="tool-actions compact-actions"><button className="button primary" onClick={onSave}><Save size={15}/>保存</button><button className="button secondary" onClick={onTest} disabled={busy || retryBusy}><Activity size={15}/>测试</button><button className="button secondary" onClick={onReclaim401} disabled={reclaimBusy || retryBusy || busy}><KeyRound size={15}/>{reclaimBusy ? '扫描中' : retryBusy ? '重新找回中' : '扫描并找回 401'}</button></div>
           {result && !result.mode && <div className={`connection-result ${result.ok ? 'ok' : 'bad'}`}>{result.ok ? `连接成功${result.account_count == null ? '' : ` · ${result.account_count} 个账号`}` : (result.detail || `上游 HTTP ${result.upstream_status}`)}</div>}
-          {reclaimResult && <div className={`connection-result ${reclaimResult.ok ? 'ok' : 'bad'}`}>扫描 {reclaimResult.scanned_accounts} · 401 {reclaimResult.accounts_401} · 提交 {reclaimResult.card_code_count} · 跳过 {reclaimResult.skipped_non_401}</div>}
+          {reclaimResult && <>
+            <div className={`connection-result ${reclaimResult.ok !== false ? 'ok' : 'bad'}`}>扫描 {reclaimResult.scanned_accounts ?? '--'} · 401 {reclaimResult.accounts_401 ?? '--'} · 提交 {reclaimResult.card_code_count ?? '--'} · 跳过 {reclaimResult.skipped_non_401 ?? 0}</div>
+            <Sub2ApiRecoveryResult result={reclaimResult} busy={reclaimBusy || retryBusy} onRetry={onRetry401}/>
+          </>}
           <div className="sub2api-capability-grid"><div><span className={config.admin_key_set ? 'ready' : ''}/><small>管理认证</small><strong>{config.admin_key_set ? '已保存' : '待配置'}</strong></div><div><span className={options.loaded ? 'ready' : ''}/><small>账号读取</small><strong>{options.loaded ? '正常' : '待同步'}</strong></div><div><span className={options.proxy_service_available ? 'ready' : ''}/><small>代理资源</small><strong>{options.proxy_service_available ? `${options.proxy_count} 个` : '待同步'}</strong></div><div><span className={automationState ? 'ready' : ''}/><small>自动化状态</small><strong>{automationState ? '已连接' : '待同步'}</strong></div></div>
         </div>
         <div className="tool-panel sub2api-import-panel">
@@ -575,7 +641,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
       <div className="automation-console">
         <div className="automation-head">
           <div><span className="detail-kicker">401 AUTOMATION CONTROL</span><h2>定时找回与自动导入</h2><p>账号健康、找回队列与导入策略</p></div>
-          <div className="automation-head-actions"><span className={`automation-readiness ${automationReady ? 'ready' : ''}`}><ShieldCheck size={15}/>{automationReady ? '自动化就绪' : `${readiness.filter(item => !item.ready).length} 项待配置`}</span><button className="button secondary" onClick={onRunAutomation} disabled={automationBusy || !automation.enabled}><RefreshCw size={15} className={automationBusy ? 'spin' : ''}/>立即检查</button><button className="button primary" onClick={onSaveAutomation} disabled={automationBusy}><Save size={15}/>{automationBusy ? '处理中' : '保存策略'}</button></div>
+          <div className="automation-head-actions"><span className={`automation-readiness ${monitorReady ? 'ready' : ''}`}><ShieldCheck size={15}/>401 监控 {monitorReady ? '就绪' : '待配置'}</span><span className={`automation-readiness ${importReady ? 'ready' : ''}`}><Upload size={15}/>自动导入 {automation.auto_import ? (importReady ? '就绪' : `${importMissingCount} 项待配置`) : '已关闭'}</span><button className="button secondary" onClick={onRunAutomation} disabled={automationBusy || !automation.enabled}><RefreshCw size={15} className={automationBusy ? 'spin' : ''}/>立即检查</button><button className="button primary" onClick={onSaveAutomation} disabled={automationBusy}><Save size={15}/>{automationBusy ? '处理中' : '保存策略'}</button></div>
         </div>
 
         <div className="automation-metrics">
@@ -584,14 +650,16 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           <div><span>账号异常</span><strong className={monitor.error_accounts ? 'negative' : ''}>{monitor.error_accounts ?? '--'}</strong><small>{monitor.expiring_accounts ?? 0} 个 7 日内到期</small></div>
           <div><span>限流 / 过载</span><strong className={monitor.rate_limited_accounts ? 'warning' : ''}>{monitor.rate_limited_accounts ?? '--'}</strong><small>含临时不可调度</small></div>
           <div><span>代理异常</span><strong className={monitor.unhealthy_proxies ? 'negative' : ''}>{monitor.unhealthy_proxies ?? '--'}</strong><small>{monitor.active_proxies ?? 0} 个活跃</small></div>
-          <div><span>找回队列</span><strong>{automationState?.pending_card_codes?.length ?? 0}</strong><small>{automationResult?.downloaded ?? 0} 个最近下载</small></div>
+          <div><span>找回队列</span><strong>{automationState?.pending_card_codes?.length ?? 0}</strong><small>{automationRecovery.summary.downloaded ?? 0} 个最近下载</small></div>
         </div>
+
+        {automationDisplayResult && <Sub2ApiRecoveryResult result={automationDisplayResult} compact busy={automationBusy || retryBusy} onRetry={onRetryAutomation} testId="sub2api-automation-result"/>}
 
         <div className="automation-workspace">
           <section className="automation-setting-card">
             <div className="automation-card-head"><TimerReset size={17}/><span><strong>运行计划</strong><small>{automation.enabled ? '自动执行中' : '自动执行已关闭'}</small></span></div>
             <div className="automation-toggle-row"><span><strong>401 定时监控</strong><small>明确授权错误进入找回队列</small></span><button className={`switch ${automation.enabled ? 'on' : ''}`} role="switch" aria-checked={automation.enabled} title={automation.enabled ? '关闭自动监控' : '开启自动监控'} disabled={!automation.enabled && !automationReady} onClick={() => onAutomationChange(current => ({...current, enabled: !current.enabled}))}><span/></button></div>
-            <label className="automation-check-row"><input type="checkbox" checked={automation.auto_import} onChange={event => onAutomationChange(current => ({...current, auto_import: event.target.checked}))}/><span><strong>找回后自动导入</strong><small>应用右侧固定分配策略</small></span></label>
+            <label className="automation-check-row"><input type="checkbox" checked={automation.auto_import} disabled={!monitorReady} onChange={event => onAutomationChange(current => ({...current, auto_import: event.target.checked}))}/><span><strong>找回后自动导入</strong><small>{monitorReady ? '应用右侧固定分配策略' : '先保存 Sub2API 管理员密钥'}</small></span></label>
             <label className="automation-interval"><span>检查间隔</span><div><input type="number" min="10" max="86400" value={automation.interval_seconds} onChange={event => onAutomationChange(current => ({...current, interval_seconds: Math.max(10, Math.min(86400, Number(event.target.value) || 10))}))} inputMode="numeric"/><span>秒</span></div></label>
             <div className="interval-presets">{[60, 300, 900, 3600].map(seconds => <button className={Number(automation.interval_seconds) === seconds ? 'active' : ''} key={seconds} onClick={() => onAutomationChange(current => ({...current, interval_seconds: seconds}))}>{intervalLabel(seconds)}</button>)}</div>
             <div className="automation-readiness-grid">{readiness.map(item => <span className={item.ready ? 'ready' : ''} key={item.label}>{item.ready ? <Check size={13}/> : <AlertCircle size={13}/>} {item.label}</span>)}</div>
@@ -606,9 +674,9 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           </section>
 
           <section className="automation-setting-card runtime-card">
-            <div className="automation-card-head"><Gauge size={17}/><span><strong>运行状态</strong><small>{automationState?.last_error ? '最近执行异常' : automationResult ? '最近执行完成' : '等待首次执行'}</small></span></div>
-            <div className={`runtime-state ${automationState?.last_error ? 'bad' : automationResult ? 'ok' : ''}`}><span className="runtime-dot"/><strong>{automationState?.last_error ? '执行失败' : automation.enabled ? '监控运行中' : '监控已暂停'}</strong></div>
-            <dl className="runtime-details"><div><dt>最近运行</dt><dd>{automationState?.last_run ? compactTime(automationState.last_run) : '--'}</dd></div><div><dt>下次运行</dt><dd>{nextRun && !Number.isNaN(nextRun.getTime()) ? compactTime(nextRun) : '--'}</dd></div><div><dt>扫描账号</dt><dd>{automationResult?.scanned_accounts ?? 0}</dd></div><div><dt>发现 401</dt><dd>{automationResult?.accounts_401 ?? 0}</dd></div><div><dt>完成下载</dt><dd>{automationResult?.downloaded ?? 0}</dd></div><div><dt>自动导入</dt><dd>{automationResult?.imported ? '已完成' : '无'}</dd></div></dl>
+            <div className="automation-card-head"><Gauge size={17}/><span><strong>运行状态</strong><small>{automationState?.last_error ? '最近执行异常' : automationDisplayResult ? automationRecovery.outcomeMeta.label : '等待首次执行'}</small></span></div>
+            <div className={`runtime-state ${automationState?.last_error || ['failed', 'error'].includes(automationRecovery.outcome) ? 'bad' : automationDisplayResult ? automationRecovery.outcome === 'recovered' || automationRecovery.outcome === 'no_401' ? 'ok' : 'pending' : ''}`}><span className="runtime-dot"/><strong>{automationState?.last_error ? '执行失败' : automationDisplayResult ? automationRecovery.outcomeMeta.label : automation.enabled ? '监控运行中' : '监控已暂停'}</strong></div>
+            <dl className="runtime-details"><div><dt>最近运行</dt><dd>{automationState?.last_run ? compactTime(automationState.last_run) : '--'}</dd></div><div><dt>下次运行</dt><dd>{nextRun && !Number.isNaN(nextRun.getTime()) ? compactTime(nextRun) : '--'}</dd></div><div><dt>扫描账号</dt><dd>{automationRecovery.source?.scanned_accounts ?? 0}</dd></div><div><dt>发现 401</dt><dd>{automationRecovery.source?.accounts_401 ?? 0}</dd></div><div><dt>完成下载</dt><dd>{automationRecovery.summary.downloaded ?? 0}</dd></div><div><dt>自动导入</dt><dd>{automationDisplayResult ? automationRecovery.importMeta.label : '--'}</dd></div></dl>
             {automationState?.last_error && <div className="runtime-error"><TriangleAlert size={14}/><span>{automationState.last_error}</span></div>}
             <div className="platform-health"><span>平台分布</span>{platforms.length ? platforms.slice(0, 5).map(item => <div key={item.platform}><strong>{item.platform}</strong><span><i style={{width: `${Math.max(5, (Number(item.count || 0) / maxPlatformCount) * 100)}%`}}/></span><em>{item.count}{item.errors ? ` / ${item.errors} 异常` : ''}</em></div>) : <small>暂无账号数据</small>}</div>
           </section>
@@ -617,7 +685,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
         <div className="automation-activity-grid">
           <section className="automation-activity-panel">
             <div className="activity-panel-head"><div><span className="detail-kicker">RECENT RUNS</span><h3>运行记录</h3></div><span>{runHistory.length} 条</span></div>
-            <div className="automation-run-list">{runHistory.length ? runHistory.slice(0, 6).map((entry, index) => <div className={entry.status === 'error' ? 'bad' : ''} key={`${entry.run_at}-${index}`}><span>{compactTime(entry.run_at)}</span><strong>{entry.status === 'error' ? '失败' : entry.imported ? '找回并导入' : '检查完成'}</strong><small>{entry.status === 'error' ? entry.error : `扫描 ${entry.scanned_accounts ?? 0} · 401 ${entry.accounts_401 ?? 0} · 下载 ${entry.downloaded ?? 0}`}</small></div>) : <div className="compact-empty"><Clock3 size={16}/>暂无运行记录</div>}</div>
+            <div className="automation-run-list">{runHistory.length ? runHistory.slice(0, 6).map((entry, index) => { const entryRecovery = normalizeSub2ApiRecoveryResult(entry); const bad = entry.status === 'error' || ['failed', 'error'].includes(entryRecovery.outcome); return <div className={bad ? 'bad' : entryRecovery.outcome === 'pending' || entryRecovery.outcome === 'partial' ? 'pending' : ''} key={`${entry.run_at}-${index}`}><span>{compactTime(entry.run_at)}</span><strong>{entry.status === 'error' ? '执行失败' : entryRecovery.outcomeMeta.label}</strong><small>{entry.status === 'error' ? entry.error || entryRecovery.recoveryMessage : `${entryRecovery.importMeta.label} · 扫描 ${entry.scanned_accounts ?? 0} · 401 ${entry.accounts_401 ?? 0} · 下载 ${entryRecovery.summary.downloaded}`}</small></div>; }) : <div className="compact-empty"><Clock3 size={16}/>暂无运行记录</div>}</div>
           </section>
           <section className="automation-activity-panel">
             <div className="activity-panel-head"><div><span className="detail-kicker">ACCOUNT ALERTS</span><h3>最近账号异常</h3></div><span>{monitor.error_accounts ?? 0} 个</span></div>

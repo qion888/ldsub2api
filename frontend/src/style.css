@@ -2168,6 +2168,52 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .automation-readiness-grid > span:nth-last-child(-n+2) { border-bottom: 0; }
 .automation-readiness-grid > span.ready { color: var(--ui-success); }
 
+/* Recovery outcomes stay separate from import outcomes. */
+.sub2api-recovery-result { min-width: 0; margin-top: 10px; padding: 11px 12px 12px; background: var(--ui-surface); border: 1px solid var(--ui-border); }
+.sub2api-recovery-result.compact { margin: 0; border-inline: 0; border-radius: 0; }
+.recovery-result-head { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.recovery-result-title { min-width: 0; display: flex; align-items: flex-start; gap: 8px; color: var(--ui-text-muted); }
+.recovery-result-title > svg { flex: 0 0 auto; margin-top: 2px; }
+.tone-success .recovery-result-title > svg, .recovery-status-item.success svg, .recovery-no-failures { color: var(--ui-success); }
+.tone-warning .recovery-result-title > svg, .recovery-status-item.warning { color: var(--ui-warning); }
+.tone-danger .recovery-result-title > svg, .recovery-status-item.danger { color: var(--ui-danger); }
+.recovery-result-title > div { min-width: 0; }
+.recovery-result-title h3 { margin: 3px 0 0; color: var(--ui-text); font-size: 13px; }
+.recovery-result-title p { margin: 4px 0 0; color: var(--ui-text-muted); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.recovery-retry-button { min-height: 31px !important; flex: 0 0 auto; padding-inline: 9px !important; font-size: 10px !important; }
+.recovery-result-metrics { margin-top: 10px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border: 1px solid var(--ui-border-soft); background: var(--ui-surface-muted); }
+.recovery-result-metrics > div { min-width: 0; min-height: 52px; padding: 7px 8px; border-right: 1px solid var(--ui-border-soft); }
+.recovery-result-metrics > div:last-child { border-right: 0; }
+.recovery-result-metrics span, .recovery-result-metrics strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recovery-result-metrics span { color: var(--ui-text-muted); font-size: 8px; }
+.recovery-result-metrics strong { margin-top: 4px; color: var(--ui-text); font-size: 17px; font-variant-numeric: tabular-nums; }
+.recovery-result-metrics .success strong { color: var(--ui-success); }
+.recovery-result-metrics .warning strong { color: var(--ui-warning); }
+.recovery-result-metrics .danger strong { color: var(--ui-danger); }
+.recovery-result-status-grid { margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.recovery-status-item { min-width: 0; min-height: 38px; padding: 7px 8px; display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 6px; align-items: start; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); }
+.recovery-status-item svg { margin-top: 1px; flex: 0 0 auto; }
+.recovery-status-item > span { min-width: 0; }
+.recovery-status-item strong, .recovery-status-item small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recovery-status-item strong { color: var(--ui-text); font-size: 9px; }
+.recovery-status-item small { margin-top: 3px; color: var(--ui-text-muted); font-size: 8px; }
+.recovery-failure-list { margin-top: 8px; border-top: 1px solid var(--ui-border-soft); }
+.recovery-failure-head { min-height: 29px; padding-top: 7px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.recovery-failure-head strong { color: var(--ui-text); font-size: 9px; }
+.recovery-failure-head span, .recovery-failure-more { color: var(--ui-text-muted); font-size: 8px; }
+.recovery-failure-items { max-height: 178px; overflow-y: auto; }
+.recovery-failure-item { min-width: 0; min-height: 34px; padding: 6px 2px; display: grid; grid-template-columns: 15px minmax(0, 1fr) auto; gap: 6px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
+.recovery-failure-item > svg { color: var(--ui-danger); }
+.recovery-failure-item.retryable > svg { color: var(--ui-warning); }
+.recovery-failure-item > span { min-width: 0; }
+.recovery-failure-item strong, .recovery-failure-item small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recovery-failure-item strong { color: var(--ui-text); font-size: 9px; }
+.recovery-failure-item small { margin-top: 2px; color: var(--ui-text-muted); font-size: 8px; }
+.recovery-failure-item em { color: var(--ui-danger); font-size: 8px; font-style: normal; white-space: nowrap; }
+.recovery-failure-item.retryable em { color: var(--ui-warning); }
+.recovery-failure-more { display: block; padding-top: 6px; }
+.recovery-no-failures { min-height: 29px; margin-top: 8px; display: flex; align-items: center; gap: 6px; color: var(--ui-success); font-size: 8px; }
+
 .assignment-card > label { display: block; margin-top: 9px; }
 .assignment-card > label > span, .fingerprint-field > span { display: block; margin-bottom: 5px; color: var(--ui-text-muted); font-size: 9px; font-weight: 600; }
 .selected-proxy-meta { min-height: 27px; padding: 5px 7px; display: flex; align-items: center; justify-content: space-between; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-top: 0; font-size: 8px; }
@@ -2197,6 +2243,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .runtime-state { min-height: 38px; margin-top: 9px; padding: 8px 9px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); }
 .runtime-state.ok { color: var(--ui-success); }
 .runtime-state.bad { color: var(--ui-danger); }
+.runtime-state.pending { color: var(--ui-warning); }
 .runtime-state strong { font-size: 10px; }
 .runtime-dot { width: 7px; height: 7px; flex: 0 0 auto; background: currentColor; border-radius: 50%; }
 .runtime-details { margin: 8px 0 0; display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--ui-border-soft); }
@@ -2550,6 +2597,20 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .platform-health strong, .platform-health em { font-size: 11px; }
 .platform-health > small { font-size: 11px; }
 
+.sub2api-recovery-result { padding: 12px 13px 13px; }
+.recovery-result-title h3 { font-size: 15px; }
+.recovery-result-title p { font-size: 11px; }
+.recovery-retry-button { min-height: 34px !important; font-size: 11px !important; }
+.recovery-result-metrics span { font-size: 10px; }
+.recovery-result-metrics strong { font-size: 19px; }
+.recovery-status-item { min-height: 43px; }
+.recovery-status-item strong { font-size: 11px; }
+.recovery-status-item small { font-size: 10px; }
+.recovery-failure-head strong { font-size: 11px; }
+.recovery-failure-head span, .recovery-failure-more { font-size: 10px; }
+.recovery-failure-item strong { font-size: 11px; }
+.recovery-failure-item small, .recovery-failure-item em, .recovery-no-failures { font-size: 10px; }
+
 .automation-activity-panel { padding: 12px 15px 13px; }
 .activity-panel-head { min-height: 34px; }
 .activity-panel-head h3 { font-size: 14px; }
@@ -2591,6 +2652,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .automation-workspace .runtime-card { grid-column: auto; border-top: 0; border-bottom: 0; }
   .runtime-card { display: block; }
   .runtime-card .runtime-details { margin-top: 8px; }
+  .recovery-result-status-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 620px) {
@@ -2630,6 +2692,12 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .automation-activity-panel:first-child { border-right: 0; border-bottom: 1px solid var(--ui-border); }
   .automation-run-list > div { grid-template-columns: 92px 70px minmax(0, 1fr); gap: 5px; }
   .fingerprint-segment button { font-size: 8px; }
+  .recovery-result-head { flex-direction: column; }
+  .recovery-retry-button { align-self: stretch; justify-content: center; }
+  .recovery-result-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .recovery-result-metrics > div:nth-child(even) { border-right: 0; }
+  .recovery-result-metrics > div:nth-child(-n+4) { border-bottom: 1px solid var(--ui-border-soft); }
+  .recovery-result-metrics > div:last-child { border-right: 0; }
 }
 
 /* Price records: shared dashboard tokens, dual-axis analytics, and compact controls. */

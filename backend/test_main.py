@@ -1433,7 +1433,6 @@ class GoodsParserTests(unittest.TestCase):
                     "codex_fingerprint_mode": "session",
                 }
                 invalid = [
-                    {**base, "auto_import": False},
                     {**base, "proxy_id": None},
                     {**base, "group_ids": []},
                     {**base, "codex_fingerprint_mode": "off"},
@@ -1441,6 +1440,18 @@ class GoodsParserTests(unittest.TestCase):
                 for payload in invalid:
                     with self.subTest(payload=payload), self.assertRaises(ValueError):
                         main.save_sub2api_automation_settings(payload)
+
+                monitor_only = main.save_sub2api_automation_settings({
+                    "enabled": True,
+                    "interval_seconds": 30,
+                    "auto_import": False,
+                    "proxy_id": None,
+                    "group_ids": [],
+                    "codex_fingerprint_mode": "off",
+                })
+                self.assertTrue(monitor_only["enabled"])
+                self.assertFalse(monitor_only["auto_import"])
+                self.assertIsNone(monitor_only["proxy_id"])
 
                 saved = main.save_sub2api_automation_settings({**base, "group_ids": [9, 3, 3]})
                 self.assertTrue(saved["enabled"])

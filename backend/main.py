@@ -711,7 +711,8 @@ def save_sub2api_automation_settings(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def refresh_sub2api_reclaim(
-    card_codes: list[str], *, exclude_order_nos: list[str] | None = None
+    card_codes: list[str], *, exclude_order_nos: list[str] | None = None,
+    include_downloads: bool = True,
 ) -> dict[str, Any]:
     if exclude_order_nos is None:
         exclude_order_nos = _sub2api_imported_order_nos()
@@ -721,7 +722,143 @@ def refresh_sub2api_reclaim(
         to_json=_dataclass_to_json,
         max_payload_bytes=MAX_EXTERNAL_JSON_BYTES,
         exclude_order_nos=exclude_order_nos,
+        include_downloads=include_downloads,
     )
+
+
+def retry_sub2api_401_accounts(
+    card_codes: list[str], *, exclude_order_nos: list[str] | None = None,
+    include_downloads: bool = True,
+) -> dict[str, Any]:
+    if exclude_order_nos is None:
+        exclude_order_nos = _sub2api_imported_order_nos()
+    return sub2api_reclaim.retry_reclaim(
+        card_codes,
+        redeem_client_factory=_redeem_client,
+        to_json=_dataclass_to_json,
+        max_payload_bytes=MAX_EXTERNAL_JSON_BYTES,
+        exclude_order_nos=exclude_order_nos,
+        include_downloads=include_downloads,
+    )
+
+
+def persist_sub2api_automation_retry(result: dict[str, Any]) -> dict[str, Any]:
+    """Persist an explicit automation retry without storing downloaded blobs."""
+    if not isinstance(result, dict):
+        return result
+    state = sub2api_automation_state()
+    reclaim_summary = result.get("reclaim_summary")
+    reclaim_summary = reclaim_summary if isinstance(reclaim_summary, dict) else {}
+    raw_retry_codes = result.get("retryable_card_codes")
+    raw_retry_codes = raw_retry_codes if isinstance(raw_retry_codes, list) else []
+    raw_permanent_codes = []
+    for key in (
+        "permanent_card_codes",
+        "unrecoverable_card_codes",
+        "non_retryable_card_codes",
+        "not_owned_card_codes",
+        "skipped_card_codes",
+    ):
+        values = result.get(key)
+        if isinstance(values, list):
+            raw_permanent_codes.extend(values)
+    permanent_codes = {
+        str(value).strip() for value in raw_permanent_codes if str(value).strip()
+    }
+    retry_codes = [
+        str(value).strip()
+        for value in raw_retry_codes
+        if str(value).strip() and str(value).strip() not in permanent_codes
+    ][:100]
+    raw_submitted_codes = result.get("reclaim_card_codes")
+    raw_submitted_codes = raw_submitted_codes if isinstance(raw_submitted_codes, list) else []
+    submitted_codes = [
+        str(value).strip()
+        for value in raw_submitted_codes
+        if str(value).strip()
+    ][:100]
+    raw_active_codes = result.get("active_card_codes")
+    raw_active_codes = raw_active_codes if isinstance(raw_active_codes, list) else []
+    active_codes = [
+        str(value).strip()
+        for value in raw_active_codes
+        if str(value).strip() and str(value).strip() not in permanent_codes
+    ][:100]
+    def _reclaim_count(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    active = _reclaim_count(reclaim_summary.get("active"))
+    outcome = str(result.get("outcome") or result.get("recovery_status") or "error")
+    pending = list(dict.fromkeys(active_codes + retry_codes)) if active > 0 else retry_codes
+    permanent_count = sum(
+        _reclaim_count(reclaim_summary.get(key))
+        for key in ("unreclaimable", "not_owned", "skipped")
+    )
+    if active > 0 and not pending and not permanent_count:
+        pending = submitted_codes
+    downloads = result.get("downloaded_payloads")
+    if isinstance(downloads, list):
+        download_count = len(downloads)
+    else:
+        try:
+            download_count = max(0, int(result.get("downloaded") or 0))
+        except (TypeError, ValueError):
+            download_count = 0
+    compact_result = {
+        "ok": bool(result.get("ok", False)),
+        "outcome": outcome,
+        "recovery_status": result.get("recovery_status", outcome),
+        "recovery_ok": bool(result.get("recovery_ok", outcome in {"recovered", "no_401"})),
+        "recovery_message": str(result.get("recovery_message") or result.get("detail") or result.get("error") or "")[:500],
+        "downloads_requested": bool(result.get("downloads_requested", True)),
+        "scanned_accounts": result.get("scanned_accounts"),
+        "accounts_401": result.get("accounts_401"),
+        "card_code_count": result.get("card_code_count", len(submitted_codes)),
+        "queued": reclaim_summary.get("queued", 0),
+        "already_running": reclaim_summary.get("already_running", 0),
+        "active": active,
+        "active_card_codes": active_codes,
+        "done": reclaim_summary.get("done", 0),
+        "failed": reclaim_summary.get("failed", result.get("failed", 0)),
+        "unreclaimable": reclaim_summary.get("unreclaimable", result.get("unreclaimable", 0)),
+        "not_owned": reclaim_summary.get("not_owned", result.get("not_owned", 0)),
+        "skipped": reclaim_summary.get("skipped", result.get("skipped", 0)),
+        "downloaded": download_count,
+        "download_failed": reclaim_summary.get("download_failed", result.get("download_failed", 0)),
+        "download_skipped": reclaim_summary.get("download_skipped", result.get("download_skipped", 0)),
+        "reclaim_summary": reclaim_summary,
+        "reclaim_failures": result.get("reclaim_failures") if isinstance(result.get("reclaim_failures"), list) else [],
+        "retryable_card_codes": retry_codes,
+        "retry_available": bool(result.get("retry_available", retry_codes)),
+        "import_status": result.get("import_status", "not_attempted"),
+        "import_error": str(result.get("import_error") or "")[:500],
+        "import_attempted": bool(result.get("import_attempted", False)),
+        "imported": bool(result.get("imported", False)),
+        "import_result": result.get("import_result") if isinstance(result.get("import_result"), dict) else None,
+    }
+    state = {
+        **state,
+        "last_run": utc_now(),
+        "last_error": "" if compact_result["ok"] else compact_result["recovery_message"],
+        "last_result": compact_result,
+        "pending_card_codes": pending,
+        "retryable_card_codes": retry_codes,
+        "run_history": (
+            state.get("run_history", [])
+            + [{
+                "run_at": utc_now(),
+                "status": "error" if not compact_result["ok"] else (
+                    "success" if outcome in {"recovered", "no_401"} else "partial"
+                ),
+                **compact_result,
+            }]
+        )[-20:],
+    }
+    _store_sub2api_automation_state(state)
+    return result
 
 
 def run_sub2api_automation_cycle() -> dict[str, Any]:
@@ -1096,6 +1233,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             card_import_history_retry=retry_sub2api_card_import_record,
             card_import_history_deleter=delete_sub2api_card_import_record,
             card_import_history_batch_deleter=delete_sub2api_card_import_records,
+            retry_reclaim=retry_sub2api_401_accounts,
+            persist_automation_retry=persist_sub2api_automation_retry,
         ):
             return
 

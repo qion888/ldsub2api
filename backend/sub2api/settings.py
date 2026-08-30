@@ -63,6 +63,7 @@ def read_automation_state(read_setting: ReadSetting) -> dict[str, Any]:
         "last_error": "",
         "last_result": None,
         "pending_card_codes": [],
+        "retryable_card_codes": [],
         "imported_order_nos": [],
         "run_history": [],
     }
@@ -70,9 +71,11 @@ def read_automation_state(read_setting: ReadSetting) -> dict[str, Any]:
     if not isinstance(value, dict):
         return fallback
     pending = value.get("pending_card_codes")
+    retryable = value.get("retryable_card_codes")
     imported = value.get("imported_order_nos")
     history = value.get("run_history")
     pending = pending if isinstance(pending, list) else []
+    retryable = retryable if isinstance(retryable, list) else []
     imported = imported if isinstance(imported, list) else []
     history = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
     return {
@@ -80,6 +83,7 @@ def read_automation_state(read_setting: ReadSetting) -> dict[str, Any]:
         "last_error": str(value.get("last_error") or "")[:500],
         "last_result": value.get("last_result") if isinstance(value.get("last_result"), dict) else None,
         "pending_card_codes": pending[:100],
+        "retryable_card_codes": retryable[:100],
         "imported_order_nos": imported[-500:],
         "run_history": history[-20:],
     }
@@ -117,9 +121,7 @@ def save_automation_settings(
     if enabled:
         if not has_admin_key():
             raise ValueError("请先配置 Sub2API 管理员密钥")
-        if not auto_import:
-            raise ValueError("启用自动监控前必须勾选自动导入")
-        if proxy_id is None or not group_ids or mode == "off":
+        if auto_import and (proxy_id is None or not group_ids or mode == "off"):
             raise ValueError("启用自动监控前必须选择代理、至少一个分组和 Codex 指纹模式")
     value = {
         "enabled": enabled,

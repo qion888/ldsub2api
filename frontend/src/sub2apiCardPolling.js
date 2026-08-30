@@ -12,12 +12,24 @@ const progressPayload = response => {
   return response.result && typeof response.result === 'object' ? response.result : response;
 };
 
+const asObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const statusSet = {
+  active: new Set(['queued', 'running', 'pending', 'processing', 'already_running', 'submitted']),
+  done: new Set(['done', 'completed', 'success']),
+  terminal: new Set(['failed', 'error', 'timeout', 'expired', 'unreclaimable', 'not_owned', 'skipped', 'permanent']),
+};
+
 export function summarizeReclaimProgress(response, downloadedCount = 0) {
   const progress = progressPayload(response);
   const tasks = Array.isArray(progress.all_tasks) ? progress.all_tasks : [];
-  const activeTasks = count(progress.queued) + count(progress.already_running);
-  const doneTasks = Math.max(count(progress.done), tasks.filter(task => task?.status === 'done').length);
-  const terminalTasks = count(progress.failed) + count(progress.unreclaimable) + count(progress.not_owned) + count(progress.skipped);
+  const taskCount = status => tasks.filter(task => status.has(String(task?.status || '').trim().toLowerCase())).length;
+  const activeTasks = Math.max(count(progress.queued) + count(progress.already_running), taskCount(statusSet.active));
+  const doneTasks = Math.max(count(progress.done), taskCount(statusSet.done));
+  const terminalTasks = Math.max(
+    count(progress.failed) + count(progress.unreclaimable) + count(progress.not_owned) + count(progress.skipped),
+    taskCount(statusSet.terminal),
+  );
   const trackedTasks = Math.max(count(progress.tracked_tasks), tasks.length, activeTasks + doneTasks + terminalTasks);
   return {
     progress,
@@ -55,8 +67,17 @@ export async function pollForReclaimDownloads({
   rememberDownloads(response.downloaded_payloads);
   while (true) {
     const elapsedMs = Math.max(0, now() - startedAt);
+    const visibleResponse = asObject(lastError?.payload)
+      ? {
+        ...response,
+        ...lastError.payload,
+        result: asObject(lastError.payload.result) ? lastError.payload.result : response?.result,
+        ok: false,
+      }
+      : response;
     const snapshot = {
-      ...summarizeReclaimProgress(response, downloads.size),
+      ...summarizeReclaimProgress(visibleResponse, downloads.size),
+      response: visibleResponse,
       attempts,
       elapsedMs,
       downloads: [...downloads.values()],
@@ -72,7 +93,8 @@ export async function pollForReclaimDownloads({
 
     await sleep(Math.min(intervalMs, timeoutMs - elapsedMs));
     try {
-      response = await requestProgress();
+      const nextResponse = await requestProgress();
+      response = asObject(nextResponse) ? nextResponse : {ok: false, error: '401 进度返回格式无效'};
       attempts += 1;
       lastError = null;
       rememberDownloads(response?.downloaded_payloads);

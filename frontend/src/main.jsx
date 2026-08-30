@@ -53,6 +53,10 @@ import {
   pollForReclaimDownloads,
   reclaimPollingFailureMessage,
 } from './sub2apiCardPolling.js';
+import {
+  normalizeSub2ApiRecoveryResult,
+  recoveryResultForProgress,
+} from './sub2apiRecoveryModel.js';
 
 const API = '/api';
 const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
@@ -104,6 +108,7 @@ async function request(path, options) {
   if (!response.ok) {
     const error = new Error(payload.detail || '请求失败');
     error.status = response.status;
+    error.payload = payload;
     throw error;
   }
   return payload;
@@ -958,6 +963,8 @@ function App() {
   const [sub2apiCodexFingerprintMode, setSub2apiCodexFingerprintMode] = useState('off');
   const [sub2apiReclaimBusy, setSub2apiReclaimBusy] = useState(false);
   const [sub2apiReclaimResult, setSub2apiReclaimResult] = useState(null);
+  const [sub2apiRetryBusy, setSub2apiRetryBusy] = useState(false);
+  const [sub2apiAutomationRetryResult, setSub2apiAutomationRetryResult] = useState(null);
   const [sub2apiReclaimOrderNos, setSub2apiReclaimOrderNos] = useState([]);
   const [sub2apiCardCodes, setSub2apiCardCodes] = useState('');
   const [sub2apiCardMode, setSub2apiCardMode] = useState('manual');
@@ -1952,8 +1959,10 @@ function App() {
 
   const normalizedCardCodes = () => [...new Set(cardCodes.split(/[\s,，]+/).map(value => value.trim()).filter(Boolean))];
 
-  const runReclaim = async action => {
-    const codes = normalizedCardCodes();
+  const runReclaim = async (action, overrideCodes = null) => {
+    const codes = Array.isArray(overrideCodes)
+      ? [...new Set(overrideCodes.map(value => String(value).trim()).filter(Boolean))]
+      : normalizedCardCodes();
     if (!codes.length) return notify('请先输入卡密，每行一个', 'error');
     if (codes.length > 100) return notify('一次最多检测 100 个卡密', 'error');
     setReclaimBusy(true);
@@ -1964,12 +1973,17 @@ function App() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({card_codes: codes, mode: '401'}),
       });
-      setReclaimResult(result);
+      setReclaimResult({...result, reclaim_action: action});
       if (action === 'reclaim') notify('401 找回任务已提交');
       else if (action === 'progress') notify('找回进度已刷新');
       else notify(`检测完成：${result.need_reclaim || 0} 个需要找回`);
     } catch (error) {
-      notify(error.message, 'error');
+      const failed = {
+        ...reclaimErrorResult(error, action === 'reclaim' ? reclaimResult || {} : {}),
+        reclaim_action: action,
+      };
+      setReclaimResult(failed);
+      notify(failed.recovery_message, 'error');
     } finally {
       setReclaimBusy(false);
     }
@@ -2198,51 +2212,188 @@ function App() {
     }
   };
 
+  const reclaimErrorResult = (error, previous = {}) => {
+    const payload = error?.payload && typeof error.payload === 'object' ? error.payload : {};
+    const message = payload.recovery_message || payload.detail || error?.message || '401 找回请求失败';
+    return {
+      ...previous,
+      ...payload,
+      ok: false,
+      outcome: 'error',
+      recovery_status: 'error',
+      recovery_ok: false,
+      recovery_message: message,
+      detail: message,
+      retryable_card_codes: Array.isArray(payload.retryable_card_codes)
+        ? payload.retryable_card_codes
+        : Array.isArray(previous.retryable_card_codes) ? previous.retryable_card_codes : [],
+      retry_available: typeof payload.retry_available === 'boolean'
+        ? payload.retry_available
+        : Array.isArray(payload.retryable_card_codes)
+          ? payload.retryable_card_codes.length > 0
+          : Boolean(previous.retry_available),
+    };
+  };
+
+  const retryLegacyReclaim = async sourceResult => {
+    const model = sourceResult && Array.isArray(sourceResult.retryCodes)
+      ? sourceResult
+      : normalizeSub2ApiRecoveryResult(sourceResult || reclaimResult);
+    if (!model.retryAvailable || !model.retryCodes.length) {
+      notify('当前没有可重新找回的项目', 'info');
+      return;
+    }
+    await runReclaim('reclaim', model.retryCodes);
+  };
+
+  const pollSub2ApiReclaim = async (initial, codes, {excludeOrderNos = [], onResult = () => {}} = {}) => {
+    const progressBody = {card_codes: codes};
+    if (Array.isArray(excludeOrderNos) && excludeOrderNos.length) progressBody.exclude_order_nos = excludeOrderNos;
+    const polling = await pollForReclaimDownloads({
+      initialResponse: initial,
+      requestProgress: () => request('/sub2api/reclaim-progress', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(progressBody),
+      }),
+      onSnapshot: snapshot => {
+        const merged = recoveryResultForProgress(initial, snapshot.response || snapshot.progress, snapshot);
+        onResult(merged);
+      },
+    });
+    const final = recoveryResultForProgress(initial, polling.response || polling.progress, {
+      ...polling,
+      downloads: polling.downloads,
+      timeoutMs: CARD_RECLAIM_POLL_TIMEOUT_MS,
+    });
+    return {polling, final};
+  };
+
   const reclaimSub2Api401 = async () => {
     setSub2apiReclaimBusy(true);
     setSub2apiReclaimResult(null);
     try {
       const initial = await request('/sub2api/reclaim-401', {method: 'POST'});
       setSub2apiReclaimResult(initial);
+      const initialModel = normalizeSub2ApiRecoveryResult(initial);
+      const allCodes = Array.isArray(initial.reclaim_card_codes)
+        ? [...new Set(initial.reclaim_card_codes.map(value => String(value).trim()).filter(Boolean))]
+        : [];
+      const active = Number(initialModel.summary.active || 0);
+      const needsDownload = Number(initialModel.summary.done || 0) > Number(initialModel.summary.downloaded || 0);
+      const codes = active > 0
+        ? allCodes
+        : initialModel.retryCodes.length
+          ? initialModel.retryCodes
+            : needsDownload
+              ? allCodes
+              : [];
+      const initialDownloads = Array.isArray(initial.downloaded_payloads) ? initial.downloaded_payloads : [];
       if (!initial.accounts_401) {
-        notify('扫描完成，没有发现明确的 401 账号');
+        notify(initialModel.recoveryMessage || '扫描完成，没有发现明确的 401 账号', initialModel.outcome === 'error' ? 'error' : 'info');
         return;
       }
-      if (!initial.card_code_count) {
-        notify(`发现 ${initial.accounts_401} 个 401 账号，但名称末尾没有可用卡密`, 'error');
+      if (!codes.length) {
+        const staged = stageRecoveredPayloads(initialDownloads);
+        if (staged) {
+          notify(`找回完成并下载 JSON，${staged.accounts} 个账号已放入一键导入区`);
+          return;
+        }
+        notify(initialModel.recoveryMessage || `发现 ${initial.accounts_401} 个 401 账号，但没有可用卡密`, 'error');
         return;
       }
 
-      const codes = Array.isArray(initial.reclaim_card_codes) ? initial.reclaim_card_codes : [];
-      const polling = await pollForReclaimDownloads({
-        initialResponse: initial,
-        requestProgress: () => request('/sub2api/reclaim-progress', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({card_codes: codes}),
-        }),
-        onSnapshot: snapshot => {
-          setSub2apiReclaimResult({
-            ...initial,
-            result: snapshot.progress,
-            downloaded_payloads: snapshot.downloads,
-            polling: {attempts: snapshot.attempts, elapsed_ms: snapshot.elapsedMs, timeout_ms: CARD_RECLAIM_POLL_TIMEOUT_MS},
-          });
-        },
+      const {polling, final} = await pollSub2ApiReclaim(initial, codes, {
+        excludeOrderNos: sub2apiReclaimOrderNos,
+        onResult: setSub2apiReclaimResult,
       });
-
+      setSub2apiReclaimResult(final);
       const staged = polling.completed ? stageRecoveredPayloads(polling.downloads) : null;
       if (staged) {
         notify(`找回完成并下载 JSON，${staged.accounts} 个账号已放入一键导入区`);
       } else {
-        notify(reclaimPollingFailureMessage(polling), 'error');
+        const finalModel = normalizeSub2ApiRecoveryResult(final);
+        notify(finalModel.recoveryMessage || reclaimPollingFailureMessage(polling), finalModel.retryAvailable ? 'error' : 'info');
       }
     } catch (error) {
-      notify(error.message, 'error');
+      const failed = reclaimErrorResult(error);
+      setSub2apiReclaimResult(failed);
+      notify(failed.recovery_message, 'error');
     } finally {
       setSub2apiReclaimBusy(false);
     }
   };
+
+  const retrySub2ApiReclaim = async (sourceResult, target = 'direct') => {
+    const model = normalizeSub2ApiRecoveryResult(sourceResult);
+    if (!model.retryAvailable || !model.retryCodes.length) {
+      notify('当前没有可重新找回的项目', 'info');
+      return;
+    }
+    setSub2apiRetryBusy(true);
+    const setResult = target === 'automation' ? setSub2apiAutomationRetryResult : setSub2apiReclaimResult;
+    try {
+      const body = {card_codes: model.retryCodes};
+      if (target === 'automation') body.persist_automation = true;
+      if (sub2apiReclaimOrderNos.length) body.exclude_order_nos = sub2apiReclaimOrderNos;
+      const initial = await request('/sub2api/reclaim-401/retry', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      setResult(initial);
+      const {polling, final} = await pollSub2ApiReclaim(initial, model.retryCodes, {
+        excludeOrderNos: sub2apiReclaimOrderNos,
+        onResult: setResult,
+      });
+      let completed = final;
+      const staged = polling.completed ? stageRecoveredPayloads(polling.downloads) : null;
+      if (staged && target === 'automation' && sub2apiAutomation.auto_import) {
+        try {
+          const imported = await importSub2Api(staged.payload, {
+            reclaimOrderNos: staged.orderNos,
+            throwOnError: true,
+          });
+          const verification = imported?.import_verification;
+          completed = {
+            ...completed,
+            import_status: verification?.confirmed ? 'confirmed' : 'unconfirmed',
+            import_attempted: Boolean(imported),
+            imported: Boolean(verification?.confirmed),
+            import_result: imported || null,
+            import_error: verification?.confirmed ? '' : 'Sub2API 未完全确认导入结果',
+          };
+        } catch (importError) {
+          completed = {
+            ...completed,
+            import_status: 'failed',
+            import_attempted: true,
+            imported: false,
+            import_error: importError.message,
+          };
+        }
+      }
+      setResult(completed);
+      const completedModel = normalizeSub2ApiRecoveryResult(completed);
+      const importSuffix = completedModel.importStatus === 'failed'
+        ? `；${completedModel.importMeta.label}${completedModel.importError ? `：${completedModel.importError}` : ''}`
+        : completedModel.importStatus === 'unconfirmed' ? '；自动导入未完全确认' : '';
+      notify(staged
+        ? `${target === 'automation' && sub2apiAutomation.auto_import ? '重新找回完成' : '重新找回完成'}，${staged.accounts} 个账号已准备就绪${importSuffix}`
+        : completedModel.recoveryMessage || reclaimPollingFailureMessage(polling),
+      staged && completedModel.importStatus !== 'failed' ? 'info' : completedModel.retryAvailable || completedModel.importStatus === 'failed' ? 'error' : 'info');
+      if (target === 'automation') await loadSub2ApiAutomation({quiet: true});
+    } catch (error) {
+      const failed = reclaimErrorResult(error, sourceResult);
+      setResult(failed);
+      notify(failed.recovery_message, 'error');
+    } finally {
+      setSub2apiRetryBusy(false);
+    }
+  };
+
+  const retrySub2Api401 = () => retrySub2ApiReclaim(sub2apiReclaimResult, 'direct');
+  const retrySub2ApiAutomation = () => retrySub2ApiReclaim(sub2apiAutomationRetryResult || sub2apiAutomationState?.last_result, 'automation');
 
   const saveSub2ApiAutomation = async () => {
     setSub2apiAutomationBusy(true);
@@ -2270,17 +2421,21 @@ function App() {
 
   const runSub2ApiAutomation = async () => {
     setSub2apiAutomationBusy(true);
+    setSub2apiAutomationRetryResult(null);
     try {
       const result = await request('/sub2api/automation/run', {method: 'POST'});
       setSub2apiAutomationState(result.state || null);
       const summary = result.result || result.state?.last_result;
+      const summaryModel = normalizeSub2ApiRecoveryResult(summary);
       const verification = summary?.import_result?.import_verification;
-      if (summary?.imported && verification && !verification.confirmed) {
-        notify(`自动导入未完全确认：${verification.matched}/${verification.expected} 个账号，请检查列表`, 'error');
+      if (summaryModel.importStatus === 'failed' || (summaryModel.importStatus === 'unconfirmed' && verification)) {
+        notify(`${summaryModel.recoveryMessage}；${summaryModel.importMeta.label}${summaryModel.importError ? `：${summaryModel.importError}` : ''}`, 'error');
+      } else if (summaryModel.outcome === 'partial' || summaryModel.outcome === 'unrecoverable' || summaryModel.outcome === 'failed' || summaryModel.outcome === 'error') {
+        notify(summaryModel.recoveryMessage, summaryModel.retryAvailable ? 'error' : 'info');
       } else {
-        notify(summary?.imported ? '自动找回完成，账号已导入 Sub2API' : '401 自动监控已执行');
+        notify(summaryModel.importStatus === 'confirmed' ? '自动找回完成，账号已导入 Sub2API' : summaryModel.recoveryMessage || '401 自动监控已执行');
       }
-      if (summary?.imported) await loadSub2ApiAccounts({page: 1, quiet: true});
+      if (summaryModel.importStatus === 'confirmed') await loadSub2ApiAccounts({page: 1, quiet: true});
     } catch (error) {
       notify(error.message, 'error');
       await loadSub2ApiAutomation();
@@ -2810,7 +2965,7 @@ function App() {
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
         ) : (
           <React.Suspense fallback={<FeatureLoadingState feature="401 找回界面" state={{status: 'loading'}}/>}>
-            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
+            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onRetry={retryLegacyReclaim} onDownload={downloadReclaimed} onImport={() => { switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
           </React.Suspense>
         ) : featureLoadState.sub2api.status !== 'ready' ? (
           <FeatureLoadingState feature="Sub2API" state={featureLoadState.sub2api} onRetry={() => retryFeature('sub2api')}/>
@@ -2829,9 +2984,9 @@ function App() {
             fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
             optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
             codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
-            reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401}
-            automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy}
-            onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation}
+             reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} onRetry401={retrySub2Api401} retryBusy={sub2apiRetryBusy}
+             automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationRetryResult={sub2apiAutomationRetryResult} automationBusy={sub2apiAutomationBusy}
+             onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onRetryAutomation={retrySub2ApiAutomation}
             onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy}
             onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}
             accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters}

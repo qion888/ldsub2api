@@ -80,6 +80,8 @@ def handle_post(
     card_import_history_retry: Callable[[int], dict[str, Any]] | None = None,
     card_import_history_deleter: Callable[[int], dict[str, Any]] | None = None,
     card_import_history_batch_deleter: Callable[[list[int]], dict[str, Any]] | None = None,
+    retry_reclaim: Callable[..., dict[str, Any]] | None = None,
+    persist_automation_retry: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> bool:
     if path == "/api/sub2api/card-import-records/delete":
         if card_import_history_deleter is None:
@@ -150,6 +152,47 @@ def handle_post(
             send_json({"detail": str(exc)}, 502)
         return True
 
+    if path in ("/api/sub2api/reclaim-401/retry", "/api/sub2api/reclaim401/retry"):
+        if retry_reclaim is None:
+            return False
+        raw_codes = data.get("card_codes")
+        if not isinstance(raw_codes, list) or not any(str(code).strip() for code in raw_codes):
+            send_json({"detail": "请提供需要重新找回的 card_codes 数组"}, 400)
+            return True
+        if len(raw_codes) > 100:
+            send_json({"detail": "一次最多重新找回 100 个卡密"}, 400)
+            return True
+        try:
+            exclude_order_nos = data.get("exclude_order_nos")
+            result = (
+                retry_reclaim(raw_codes, exclude_order_nos=exclude_order_nos)
+                if isinstance(exclude_order_nos, list)
+                else retry_reclaim(raw_codes)
+            )
+            if not isinstance(result, dict):
+                send_json({"detail": "401 重试返回格式无效"}, 502)
+                return True
+            if data.get("persist_automation") and persist_automation_retry is not None:
+                persisted = persist_automation_retry(result)
+                if isinstance(persisted, dict):
+                    result = persisted
+            if not result.get("ok", False):
+                failure = result.get("result") if isinstance(result.get("result"), dict) else {}
+                result = {
+                    **result,
+                    "detail": str(
+                        failure.get("error") or result.get("error") or "401 找回服务请求失败"
+                    )[:240],
+                }
+            send_json(result, 200 if result.get("ok", False) else 502)
+        except ValueError as exc:
+            send_json({"detail": str(exc)}, 400)
+        except RuntimeError as exc:
+            send_json({"detail": str(exc)}, 502)
+        except Exception as exc:
+            send_json({"detail": str(exc)[:240]}, 502)
+        return True
+
     if path in ("/api/sub2api/reclaim-401", "/api/sub2api/reclaim401"):
         try:
             exclude_order_nos = data.get("exclude_order_nos")
@@ -176,8 +219,11 @@ def handle_post(
 
     if path == "/api/sub2api/reclaim-progress":
         raw_codes = data.get("card_codes")
-        if not isinstance(raw_codes, list):
-            send_json({"detail": "请提供 card_codes 数组"}, 400)
+        if not isinstance(raw_codes, list) or not any(str(code).strip() for code in raw_codes):
+            send_json({"detail": "请提供需要查询的 card_codes 数组"}, 400)
+            return True
+        if len(raw_codes) > 100:
+            send_json({"detail": "一次最多查询 100 个卡密"}, 400)
             return True
         try:
             exclude_order_nos = data.get("exclude_order_nos")
@@ -186,11 +232,16 @@ def handle_post(
                 if isinstance(exclude_order_nos, list)
                 else refresh_reclaim(raw_codes)
             )
-            send_json(result, 200 if result["ok"] else 502)
+            if not isinstance(result, dict):
+                send_json({"detail": "401 进度返回格式无效"}, 502)
+            else:
+                send_json(result, 200 if result.get("ok", False) else 502)
         except ValueError as exc:
             send_json({"detail": str(exc)}, 400)
         except RuntimeError as exc:
             send_json({"detail": str(exc)}, 502)
+        except Exception as exc:
+            send_json({"detail": str(exc)[:240]}, 502)
         return True
 
     if path == "/api/sub2api/automation/run":

@@ -319,6 +319,570 @@ class Sub2ApiModuleTests(unittest.TestCase):
             )
         )
 
+    def test_reclaim_summary_separates_permanent_and_retryable_tasks(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "failed": 2,
+                "all_tasks": [
+                    {
+                        "card_code": "CARD-403",
+                        "status": "failed",
+                        "permanent": True,
+                        "error_code": "account_deactivated",
+                        "provider_status": 403,
+                    },
+                    {
+                        "card_code": "CARD-500",
+                        "status": "failed",
+                        "provider_status": 500,
+                        "message": "temporary upstream failure",
+                    },
+                ],
+            },
+            submitted_card_codes=["CARD-403", "CARD-500"],
+        )
+
+        self.assertEqual(summary["outcome"], "partial")
+        self.assertEqual(summary["reclaim_summary"]["unreclaimable"], 1)
+        self.assertEqual(summary["reclaim_summary"]["failed"], 1)
+        self.assertEqual(summary["retryable_card_codes"], ["CARD-500"])
+        self.assertTrue(summary["retry_available"])
+        failures = {item["card_code"]: item for item in summary["reclaim_failures"]}
+        self.assertFalse(failures["CARD-403"]["retryable"])
+        self.assertEqual(failures["CARD-403"]["provider_status"], 403)
+
+    def test_reclaim_summary_treats_no_action_and_excluded_download_as_recovered(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "done": 2,
+                "all_tasks": [
+                    {"card_code": "CARD-1", "status": "done", "no_action": True},
+                    {"card_code": "CARD-2", "status": "done", "order_no": "ORDER-2"},
+                ],
+            },
+            submitted_card_codes=["CARD-1", "CARD-2"],
+            exclude_order_nos=["ORDER-2"],
+        )
+
+        self.assertEqual(summary["outcome"], "recovered")
+        self.assertEqual(summary["reclaim_summary"]["download_failed"], 0)
+        self.assertEqual(summary["reclaim_summary"]["download_skipped"], 1)
+        self.assertEqual(summary["retryable_card_codes"], [])
+
+    def test_reclaim_summary_does_not_guess_mixed_aggregate_retry_codes(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "failed": 1,
+                "unreclaimable": 1,
+            },
+            submitted_card_codes=["CARD-403", "CARD-500"],
+        )
+
+        self.assertEqual(summary["outcome"], "partial")
+        self.assertEqual(summary["retryable_card_codes"], [])
+        self.assertFalse(summary["retry_available"])
+
+    def test_reclaim_summary_keeps_submitted_codes_for_transport_retry(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {"ok": False, "error": "gateway timeout"},
+            submitted_card_codes=["CARD-1", "CARD-2"],
+        )
+
+        self.assertEqual(summary["outcome"], "error")
+        self.assertEqual(summary["retryable_card_codes"], ["CARD-1", "CARD-2"])
+        self.assertTrue(summary["retry_available"])
+
+    def test_reclaim_summary_adds_details_for_aggregate_only_failures(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "failed": 1,
+                "unreclaimable": 1,
+                "error": "provider rejected one task",
+            },
+            submitted_card_codes=["CARD-403", "CARD-500"],
+        )
+
+        self.assertEqual(len(summary["reclaim_failures"]), 2)
+        self.assertEqual(
+            {item["category"] for item in summary["reclaim_failures"]},
+            {"retryable", "unrecoverable"},
+        )
+        self.assertFalse(summary["retry_available"])
+
+    def test_reclaim_summary_does_not_duplicate_permanent_task_detail(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "failed": 1,
+                "unreclaimable": 1,
+                "all_tasks": [{
+                    "card_code": "CARD-403",
+                    "status": "failed",
+                    "permanent": True,
+                    "provider_status": 403,
+                    "error_code": "account_deactivated",
+                }],
+            },
+            submitted_card_codes=["CARD-403"],
+        )
+
+        self.assertEqual(len(summary["reclaim_failures"]), 1)
+        self.assertEqual(summary["reclaim_failures"][0]["failure_bucket"], "unreclaimable")
+        self.assertFalse(summary["retry_available"])
+
+    def test_reclaim_summary_accepts_completed_status_and_payload_count(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "all_tasks": [{
+                    "card_code": "CARD-1",
+                    "status": "completed",
+                    "order_no": "ORDER-1",
+                    "download_token": "TOKEN-1",
+                }],
+            },
+            submitted_card_codes=["CARD-1"],
+            downloaded_payloads=[{"task": {"order_no": "ORDER-1"}, "data": {"accounts": [{"id": 1}]}}],
+        )
+
+        self.assertEqual(summary["outcome"], "recovered")
+        self.assertEqual(summary["reclaim_summary"]["done"], 1)
+        self.assertEqual(summary["downloaded"], 1)
+
+    def test_reclaim_summary_excludes_permanent_done_tasks_from_download_expectations(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                # These aggregate values are intentionally stale and include
+                # the permanent task; task categories must take precedence.
+                "downloaded": 99,
+                "download_failed": 99,
+                "all_tasks": [
+                    {
+                        "card_code": "CARD-403",
+                        "status": "completed",
+                        "permanent": True,
+                        "provider_status": 403,
+                        "order_no": "ORDER-403",
+                        "download_token": "TOKEN-403",
+                    },
+                    {
+                        "card_code": "CARD-200",
+                        "status": "completed",
+                        "order_no": "ORDER-200",
+                        "download_token": "TOKEN-200",
+                    },
+                ],
+            },
+            submitted_card_codes=["CARD-403", "CARD-200"],
+            downloaded_payloads=[
+                {"task": {"order_no": "ORDER-200"}, "data": {"accounts": [{"id": 2}]}}
+            ],
+        )
+
+        self.assertEqual(summary["reclaim_summary"]["done"], 1)
+        self.assertEqual(summary["reclaim_summary"]["unreclaimable"], 1)
+        self.assertEqual(summary["downloaded"], 1)
+        self.assertEqual(summary["download_failed"], 0)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["outcome"], "partial")
+        permanent_failure = next(
+            item for item in summary["reclaim_failures"] if item["card_code"] == "CARD-403"
+        )
+        self.assertIn("HTTP 403", permanent_failure["reason"])
+        self.assertEqual(permanent_failure["download_error"], "")
+
+    def test_reclaim_summary_uses_payload_count_and_task_download_failures(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "downloaded": 7,
+                "download_failed": 7,
+                "all_tasks": [{
+                    "card_code": "CARD-1",
+                    "status": "done",
+                    "order_no": "ORDER-1",
+                    "download_token": "TOKEN-1",
+                }],
+            },
+            submitted_card_codes=["CARD-1"],
+            downloaded_payloads=[],
+        )
+
+        self.assertEqual(summary["downloaded"], 0)
+        self.assertEqual(summary["download_failed"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["retryable_card_codes"], ["CARD-1"])
+
+    def test_reclaim_summary_partitions_explicit_permanent_and_retry_codes(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "failed": 2,
+                "retryable_card_codes": ["CARD-500"],
+                "permanent_card_codes": ["CARD-403"],
+            },
+            submitted_card_codes=["CARD-403", "CARD-500"],
+        )
+
+        self.assertEqual(summary["reclaim_summary"]["unreclaimable"], 1)
+        self.assertEqual(summary["reclaim_summary"]["failed"], 1)
+        self.assertEqual(summary["retryable_card_codes"], ["CARD-500"])
+        self.assertEqual(summary["permanent_card_codes"], ["CARD-403"])
+        self.assertEqual(
+            {(item["card_code"], item["category"]) for item in summary["reclaim_failures"]},
+            {("CARD-403", "unrecoverable"), ("CARD-500", "retryable")},
+        )
+
+    def test_explicit_permanent_code_overrides_stale_task_status(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "permanent_card_codes": ["CARD-403"],
+                "all_tasks": [{
+                    "card_code": "CARD-403",
+                    "status": "queued",
+                }],
+            },
+            submitted_card_codes=["CARD-403"],
+        )
+
+        self.assertEqual(summary["outcome"], "unrecoverable")
+        self.assertEqual(summary["reclaim_summary"]["active"], 0)
+        self.assertEqual(summary["retryable_card_codes"], [])
+        self.assertEqual(summary["permanent_card_codes"], ["CARD-403"])
+
+    def test_reclaim_summary_reads_reason_as_permanent_marker(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "all_tasks": [{
+                    "card_code": "CARD-DISABLED",
+                    "status": "failed",
+                    "reason": "account_deactivated",
+                }],
+            },
+            submitted_card_codes=["CARD-DISABLED"],
+        )
+
+        self.assertEqual(summary["reclaim_summary"]["unreclaimable"], 1)
+        self.assertEqual(summary["retryable_card_codes"], [])
+        self.assertEqual(summary["reclaim_failures"][0]["category"], "unrecoverable")
+
+    def test_reclaim_summary_counts_explicit_permanent_buckets_on_task_details(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "not_owned_card_codes": ["CARD-NOT-OWNED"],
+                "skipped_card_codes": ["CARD-SKIPPED"],
+                "all_tasks": [
+                    {"card_code": "CARD-NOT-OWNED", "status": "failed"},
+                    {"card_code": "CARD-SKIPPED", "status": "failed"},
+                ],
+            },
+            submitted_card_codes=["CARD-NOT-OWNED", "CARD-SKIPPED"],
+        )
+
+        self.assertEqual(summary["reclaim_summary"]["unreclaimable"], 0)
+        self.assertEqual(summary["reclaim_summary"]["not_owned"], 1)
+        self.assertEqual(summary["reclaim_summary"]["skipped"], 1)
+        self.assertEqual(
+            {item["failure_bucket"] for item in summary["reclaim_failures"]},
+            {"not_owned", "skipped"},
+        )
+
+    def test_task_bucket_status_wins_over_generic_permanent_code_list(self) -> None:
+        summary = reclaim.summarize_reclaim_result(
+            {
+                "ok": True,
+                "permanent_card_codes": ["CARD-NOT-OWNED"],
+                "all_tasks": [{
+                    "card_code": "CARD-NOT-OWNED",
+                    "status": "not_owned",
+                }],
+            },
+            submitted_card_codes=["CARD-NOT-OWNED"],
+        )
+
+        self.assertEqual(summary["reclaim_summary"]["unreclaimable"], 0)
+        self.assertEqual(summary["reclaim_summary"]["not_owned"], 1)
+        self.assertEqual(summary["reclaim_failures"][0]["failure_bucket"], "not_owned")
+
+    def test_download_payloads_skips_permanent_completed_tasks(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def download(self, order_no, token):
+                self.calls.append((order_no, token))
+                return b'{"accounts":[{"id":1}]}'
+
+        client = FakeClient()
+        payloads = reclaim.download_payloads(
+            {
+                "all_tasks": [{
+                    "card_code": "CARD-403",
+                    "status": "completed",
+                    "permanent": True,
+                    "provider_status": 403,
+                    "order_no": "ORDER-403",
+                    "download_token": "TOKEN-403",
+                }]
+            },
+            client,
+            max_payload_bytes=1024,
+        )
+
+        self.assertEqual(payloads, [])
+        self.assertEqual(client.calls, [])
+
+    def test_download_payloads_honors_provider_permanent_code_list(self) -> None:
+        class FakeClient:
+            def download(self, order_no, token):
+                raise AssertionError("permanent code must not be downloaded")
+
+        payloads = reclaim.download_payloads(
+            {
+                "permanent_card_codes": ["CARD-403"],
+                "all_tasks": [{
+                    "card_code": "CARD-403",
+                    "status": "done",
+                    "order_no": "ORDER-403",
+                    "download_token": "TOKEN-403",
+                }],
+            },
+            FakeClient(),
+            max_payload_bytes=1024,
+        )
+
+        self.assertEqual(payloads, [])
+
+    def test_download_payloads_honors_specific_permanent_code_lists(self) -> None:
+        class FakeClient:
+            def download(self, order_no, token):
+                raise AssertionError("specific permanent code must not be downloaded")
+
+        for field in ("not_owned_card_codes", "skipped_card_codes"):
+            with self.subTest(field=field):
+                payloads = reclaim.download_payloads(
+                    {
+                        field: ["CARD-PERM"],
+                        "all_tasks": [{
+                            "card_code": "CARD-PERM",
+                            "status": "done",
+                            "order_no": "ORDER-PERM",
+                            "download_token": "TOKEN-PERM",
+                        }],
+                    },
+                    FakeClient(),
+                    max_payload_bytes=1024,
+                )
+                self.assertEqual(payloads, [])
+
+    def test_refresh_reclaim_normalizes_malformed_provider_result(self) -> None:
+        class FakeClient:
+            def refresh_progress(self, card_codes):
+                return ["malformed"]
+
+        result = reclaim.refresh_reclaim(
+            ["CARD-1"],
+            redeem_client_factory=FakeClient,
+            to_json=lambda value: value,
+            max_payload_bytes=1024,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["result"], {"ok": False, "error": "401 进度返回格式无效"})
+        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["retryable_card_codes"], ["CARD-1"])
+
+    def test_refresh_reclaim_rejects_empty_provider_result(self) -> None:
+        class FakeClient:
+            def refresh_progress(self, card_codes):
+                return {}
+
+        result = reclaim.refresh_reclaim(
+            ["CARD-1"],
+            redeem_client_factory=FakeClient,
+            to_json=lambda value: value,
+            max_payload_bytes=1024,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["result"]["ok"], False)
+        self.assertTrue(result["retry_available"])
+
+    def test_automation_does_not_requeue_permanent_failure(self) -> None:
+        stored = []
+        import_calls = []
+        result = automation.run_cycle(
+            settings_loader=lambda: {
+                "enabled": True,
+                "auto_import": True,
+                "proxy_id": 7,
+                "group_ids": [3],
+                "codex_fingerprint_mode": "device",
+            },
+            state_loader=lambda: {"pending_card_codes": [], "imported_order_nos": [], "run_history": []},
+            reclaim_accounts=lambda **kwargs: {
+                "ok": True,
+                "reclaim_card_codes": ["CARD-403"],
+                "downloaded_payloads": [],
+                "result": {
+                    "ok": True,
+                    "failed": 1,
+                    "all_tasks": [{
+                        "card_code": "CARD-403",
+                        "status": "failed",
+                        "permanent": True,
+                        "error_code": "account_deactivated",
+                        "provider_status": 403,
+                    }],
+                },
+            },
+            refresh_reclaim=lambda *args, **kwargs: self.fail("initial scan should be used"),
+            import_payload=lambda *args, **kwargs: import_calls.append(args),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["outcome"], "unrecoverable")
+        self.assertEqual(result["result"]["retryable_card_codes"], [])
+        self.assertFalse(result["result"]["retry_available"])
+        self.assertEqual(stored[-1]["pending_card_codes"], [])
+        self.assertEqual(import_calls, [])
+
+    def test_automation_transport_failure_keeps_retry_context_and_import_fields(self) -> None:
+        stored = []
+        result = automation.run_cycle(
+            settings_loader=lambda: {"enabled": True, "auto_import": True},
+            state_loader=lambda: {"pending_card_codes": [], "imported_order_nos": [], "run_history": []},
+            reclaim_accounts=lambda **kwargs: {
+                "ok": False,
+                "reclaim_card_codes": ["CARD-1", "CARD-2"],
+                "downloaded_payloads": [],
+                "result": {"ok": False, "error": "gateway timeout"},
+            },
+            refresh_reclaim=lambda *args, **kwargs: self.fail("initial scan should be used"),
+            import_payload=lambda *args, **kwargs: self.fail("transport failure must not import"),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["result"]["retryable_card_codes"], ["CARD-1", "CARD-2"])
+        self.assertTrue(result["result"]["retry_available"])
+        self.assertEqual(result["result"]["import_status"], "not_attempted")
+        self.assertEqual(result["result"]["import_error"], "")
+        self.assertEqual(stored[-1]["pending_card_codes"], ["CARD-1", "CARD-2"])
+
+    def test_automation_transport_mixed_permanent_failure_does_not_requeue_all_codes(self) -> None:
+        stored = []
+        result = automation.run_cycle(
+            settings_loader=lambda: {"enabled": True, "auto_import": True},
+            state_loader=lambda: {"pending_card_codes": [], "imported_order_nos": [], "run_history": []},
+            reclaim_accounts=lambda **kwargs: {
+                "ok": False,
+                "reclaim_card_codes": ["CARD-403", "CARD-500"],
+                "downloaded_payloads": [],
+                "result": {
+                    "ok": False,
+                    "error": "partial provider response",
+                    "failed": 1,
+                    "unreclaimable": 1,
+                },
+            },
+            refresh_reclaim=lambda *args, **kwargs: self.fail("initial scan should be used"),
+            import_payload=lambda *args, **kwargs: self.fail("transport failure must not import"),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["result"]["retryable_card_codes"], [])
+        self.assertFalse(result["result"]["retry_available"])
+        self.assertEqual(stored[-1]["pending_card_codes"], [])
+
+    def test_automation_active_queue_excludes_permanent_task_codes(self) -> None:
+        stored = []
+        result = automation.run_cycle(
+            settings_loader=lambda: {"enabled": True, "auto_import": False},
+            state_loader=lambda: {"pending_card_codes": [], "imported_order_nos": [], "run_history": []},
+            reclaim_accounts=lambda **kwargs: {
+                "ok": True,
+                "reclaim_card_codes": ["CARD-ACTIVE", "CARD-403"],
+                "downloaded_payloads": [],
+                "result": {
+                    "ok": True,
+                    "queued": 1,
+                    "unreclaimable": 1,
+                    "all_tasks": [
+                        {"card_code": "CARD-ACTIVE", "status": "queued"},
+                        {"card_code": "CARD-403", "status": "failed", "provider_status": 403},
+                    ],
+                },
+            },
+            refresh_reclaim=lambda *args, **kwargs: self.fail("initial scan should be used"),
+            import_payload=lambda *args, **kwargs: self.fail("auto import is disabled"),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+
+        self.assertEqual(result["result"]["outcome"], "pending")
+        self.assertEqual(stored[-1]["pending_card_codes"], ["CARD-ACTIVE"])
+        self.assertNotIn("CARD-403", stored[-1]["pending_card_codes"])
+
+    def test_automation_active_fallback_does_not_requeue_not_owned_codes(self) -> None:
+        stored = []
+        automation.run_cycle(
+            settings_loader=lambda: {"enabled": True, "auto_import": False},
+            state_loader=lambda: {"pending_card_codes": [], "imported_order_nos": [], "run_history": []},
+            reclaim_accounts=lambda **kwargs: {
+                "ok": True,
+                "reclaim_card_codes": ["CARD-UNKNOWN", "CARD-NOT-OWNED"],
+                "downloaded_payloads": [],
+                "result": {
+                    "ok": True,
+                    "active": 1,
+                    "not_owned": 1,
+                },
+            },
+            refresh_reclaim=lambda *args, **kwargs: self.fail("initial scan should be used"),
+            import_payload=lambda *args, **kwargs: self.fail("auto import is disabled"),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+
+        self.assertEqual(stored[-1]["pending_card_codes"], [])
+
+    def test_automation_filters_conflicting_raw_retryable_and_permanent_codes(self) -> None:
+        stored = []
+        result = automation.run_cycle(
+            settings_loader=lambda: {"enabled": True, "auto_import": False},
+            state_loader=lambda: {"pending_card_codes": [], "imported_order_nos": [], "run_history": []},
+            reclaim_accounts=lambda **kwargs: {
+                "ok": True,
+                "reclaim_card_codes": ["CARD-PERM", "CARD-RETRY"],
+                "retryable_card_codes": ["CARD-PERM", "CARD-RETRY"],
+                "permanent_card_codes": ["CARD-PERM"],
+                "downloaded_payloads": [],
+                "result": {"ok": True, "failed": 2},
+            },
+            refresh_reclaim=lambda *args, **kwargs: self.fail("initial scan should be used"),
+            import_payload=lambda *args, **kwargs: self.fail("auto import is disabled"),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+
+        self.assertEqual(result["result"]["retryable_card_codes"], ["CARD-RETRY"])
+        self.assertEqual(stored[-1]["pending_card_codes"], ["CARD-RETRY"])
+
     def test_automation_cycle_uses_injected_operations(self) -> None:
         stored = []
         imported = []
@@ -525,6 +1089,52 @@ class Sub2ApiModuleTests(unittest.TestCase):
             test_account=lambda account_id: {"ok": True, "account_id": account_id},
         ))
         self.assertEqual(responses[-1], (200, {"ok": True, "account_id": 12}))
+
+    def test_reclaim_retry_route_validates_codes_and_dispatches_explicit_retry(self) -> None:
+        responses = []
+        persisted = []
+        common = {
+            "send_json": lambda payload, status=200: responses.append((status, payload)),
+            "test_connection": lambda: {},
+            "reclaim_accounts": lambda **kwargs: {},
+            "refresh_reclaim": lambda *args, **kwargs: {},
+            "run_automation": lambda: {},
+            "import_payload": lambda *args, **kwargs: {},
+        }
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/reclaim-401/retry",
+            {"card_codes": ["CARD-1", "CARD-1"], "exclude_order_nos": ["ORDER-1"]},
+            **common,
+            retry_reclaim=lambda codes, **kwargs: {"ok": True, "codes": codes, "kwargs": kwargs},
+        ))
+        self.assertEqual(responses[-1], (200, {
+            "ok": True,
+            "codes": ["CARD-1", "CARD-1"],
+            "kwargs": {"exclude_order_nos": ["ORDER-1"]},
+        }))
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/reclaim-401/retry",
+            {"card_codes": ["CARD-2"], "persist_automation": True},
+            **common,
+            retry_reclaim=lambda codes, **kwargs: {"ok": True, "codes": codes},
+            persist_automation_retry=lambda result: persisted.append(result) or {**result, "persisted": True},
+        ))
+        self.assertEqual(persisted, [{"ok": True, "codes": ["CARD-2"]}])
+        self.assertEqual(responses[-1], (200, {"ok": True, "codes": ["CARD-2"], "persisted": True}))
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/reclaim401/retry",
+            {"card_codes": []},
+            **common,
+            retry_reclaim=lambda codes, **kwargs: self.fail("empty retry must be rejected"),
+        ))
+        self.assertEqual(responses[-1][0], 400)
+
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/reclaim-progress",
+            {"card_codes": []},
+            **common,
+        ))
+        self.assertEqual(responses[-1][0], 400)
 
     def test_card_import_history_routes_dispatch_create_update_and_list(self) -> None:
         responses = []

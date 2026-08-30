@@ -78,6 +78,602 @@ def account_is_401(account: dict[str, Any]) -> bool:
     return structured_error_is_401(account.get("extra"), error_context=False)
 
 
+_ACTIVE_TASK_STATUSES = {
+    "queued",
+    "running",
+    "pending",
+    "processing",
+    "already_running",
+    "submitted",
+}
+_DONE_TASK_STATUSES = {"done", "completed", "success"}
+_FAILED_TASK_STATUSES = {"failed", "error", "timeout", "expired"}
+_UNRECOVERABLE_TASK_STATUSES = {"unreclaimable", "not_owned", "skipped", "permanent"}
+_PERMANENT_MARKERS = (
+    "account_deactivated",
+    "account-deactivated",
+    "account deactivated",
+    "unreclaimable",
+    "not_owned",
+    "not-owned",
+    "not owned",
+    "permanent",
+    "disabled",
+    "forbidden",
+    "revoked_permanently",
+)
+MAX_FAILURE_DETAILS = 50
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value is not None and hasattr(value, "__dict__"):
+        return dict(vars(value))
+    return {}
+
+
+def _count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _text(value: Any, maximum: int = 500) -> str:
+    return str(value or "").strip()[:maximum]
+
+
+def _code_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(
+        _text(item, 160) for item in value if _text(item, 160)
+    ))[:MAX_RECLAIM_CODES]
+
+
+def _task_list(reclaim_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    value = _mapping(reclaim_result)
+    raw_tasks = value.get("all_tasks")
+    if not isinstance(raw_tasks, list):
+        raw_tasks = []
+        cards = value.get("cards")
+        if isinstance(cards, list):
+            for card in cards:
+                card_value = _mapping(card)
+                card_code = _text(card_value.get("card_code"), 160)
+                tasks = card_value.get("tasks")
+                if not isinstance(tasks, list):
+                    continue
+                for task in tasks:
+                    task_value = _mapping(task)
+                    if card_code and not task_value.get("card_code"):
+                        task_value = {**task_value, "card_code": card_code}
+                    raw_tasks.append(task_value)
+    return [_mapping(task) for task in raw_tasks if _mapping(task)]
+
+
+def _task_detail(
+    task: dict[str, Any], *, downloads_requested: bool = True
+) -> tuple[dict[str, Any], str]:
+    status = _text(task.get("status"), 80).lower() or "unknown"
+    card_code = _text(task.get("card_code"), 160)
+    order_no = _text(task.get("order_no"), 160)
+    message = _text(task.get("message"), 500)
+    task_reason = _text(task.get("reason") or task.get("failure_reason"), 500)
+    error_code = _text(task.get("error_code"), 120)
+    failure_class = _text(task.get("failure_class"), 120)
+    download_error = _text(task.get("download_error"), 500)
+    no_action = _bool(task.get("no_action"))
+    try:
+        provider_status = int(task.get("provider_status") or 0)
+    except (TypeError, ValueError):
+        provider_status = 0
+    marker_text = " ".join(
+        (status, error_code, failure_class, message, task_reason, download_error)
+    ).lower()
+    permanent_flag = _bool(task.get("permanent"))
+    permanent = (
+        permanent_flag
+        or provider_status in {403, 404}
+        or status in _UNRECOVERABLE_TASK_STATUSES
+        or any(marker in marker_text for marker in _PERMANENT_MARKERS)
+    )
+    if no_action and status in _DONE_TASK_STATUSES:
+        category = "recovered"
+    elif permanent:
+        category = "unrecoverable"
+    elif status in _ACTIVE_TASK_STATUSES:
+        category = "active"
+    elif status in _FAILED_TASK_STATUSES or (
+        downloads_requested
+        and status in _DONE_TASK_STATUSES
+        and not task.get("download_skipped")
+        and (download_error or not _text(task.get("download_token"), 512) or not order_no)
+    ):
+        category = "retryable"
+    elif status in _DONE_TASK_STATUSES:
+        category = "recovered"
+    else:
+        category = "retryable" if message or error_code or failure_class else "active"
+    failure_bucket = category
+    if category == "unrecoverable":
+        failure_bucket = status if status in {"unreclaimable", "not_owned", "skipped"} else "unreclaimable"
+    # Permanent classification must retain its account/provider reason even
+    # when the download pass attached a generic missing-file error later.
+    if category == "unrecoverable":
+        reason = message or task_reason or failure_class or error_code
+    else:
+        reason = message or task_reason or download_error or failure_class or error_code
+    if not reason and provider_status:
+        reason = f"上游 HTTP {provider_status}"
+    if not reason:
+        reason = {
+            "unrecoverable": "上游标记为无法找回",
+            "retryable": "找回失败，可重新提交",
+            "active": "找回处理中",
+            "recovered": "找回完成",
+        }.get(category, "找回状态未知")
+    return {
+        "card_code": card_code,
+        "order_no": order_no,
+        "status": status,
+        "message": message,
+        "reason": reason[:500],
+        "error_code": error_code,
+        "provider_status": provider_status or None,
+        "failure_class": failure_class,
+        "permanent": permanent,
+        "download_error": download_error,
+        "no_action": no_action,
+        "retryable": category == "retryable",
+        "category": category,
+        "failure_bucket": failure_bucket,
+    }, category
+
+
+def summarize_reclaim_result(
+    reclaim_result: dict[str, Any] | None,
+    *,
+    submitted_card_codes: list[str] | None = None,
+    downloaded_payloads: list[dict[str, Any]] | None = None,
+    missing_card_code_accounts: list[dict[str, Any]] | None = None,
+    exclude_order_nos: list[str] | None = None,
+    downloads_requested: bool = True,
+) -> dict[str, Any]:
+    """Project raw redeem output into stable scan/recovery/import-friendly fields."""
+    raw = _mapping(reclaim_result)
+    submitted = list(dict.fromkeys(
+        _text(value, 160) for value in (submitted_card_codes or []) if _text(value, 160)
+    ))[:MAX_RECLAIM_CODES]
+    downloads = downloaded_payloads if isinstance(downloaded_payloads, list) else []
+    tasks = _task_list(raw)
+    excluded_orders = {
+        _text(value, 160) for value in (exclude_order_nos or []) if _text(value, 160)
+    }
+    details: list[dict[str, Any]] = []
+    provided_retry_codes = _code_list(raw.get("retryable_card_codes"))
+    active_codes: list[str] = _code_list(raw.get("active_card_codes"))
+    general_permanent_codes = (
+        _code_list(raw.get("permanent_card_codes"))
+        + _code_list(raw.get("unrecoverable_card_codes"))
+        + _code_list(raw.get("non_retryable_card_codes"))
+    )
+    permanent_code_buckets: dict[str, list[str]] = {
+        "unreclaimable": [],
+        "not_owned": _code_list(raw.get("not_owned_card_codes")),
+        "skipped": _code_list(raw.get("skipped_card_codes")),
+    }
+    # Specific buckets win over a generic permanent list when a provider sends
+    # both forms for the same card.
+    assigned_permanent_codes: set[str] = set()
+    for bucket in ("not_owned", "skipped"):
+        unique_codes = []
+        for code in permanent_code_buckets[bucket]:
+            if code and code not in assigned_permanent_codes:
+                unique_codes.append(code)
+                assigned_permanent_codes.add(code)
+        permanent_code_buckets[bucket] = unique_codes
+    for code in general_permanent_codes:
+        if code and code not in assigned_permanent_codes:
+            permanent_code_buckets["unreclaimable"].append(code)
+            assigned_permanent_codes.add(code)
+    provided_permanent_codes = [
+        code
+        for bucket in ("unreclaimable", "not_owned", "skipped")
+        for code in permanent_code_buckets[bucket]
+    ]
+    permanent_codes = list(provided_permanent_codes)
+    explicit_permanent_codes = set(provided_permanent_codes)
+    # A provider may echo a code in both lists while resolving a task.  The
+    # permanent classification wins and the code must never be queued again.
+    retry_codes: list[str] = [
+        code for code in provided_retry_codes
+        if code not in explicit_permanent_codes
+    ]
+    downloaded_orders = {
+        _text(_mapping(item.get("task")).get("order_no") or item.get("filename"), 160)
+        for item in downloads
+        if isinstance(item, dict)
+    }
+    task_counts = {
+        "queued": 0,
+        "already_running": 0,
+        "done": 0,
+        "unreclaimable": 0,
+        "not_owned": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+    download_error_tasks = 0
+    download_skipped = 0
+    task_records: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    for task in tasks:
+        task_card_code = _text(task.get("card_code"), 160)
+        if task_card_code in explicit_permanent_codes and not task.get("no_action"):
+            # Prefer an explicit provider bucket over a stale task status from
+            # the submission response (for example, queued + permanent).
+            task["permanent"] = True
+        task_order_no = _text(task.get("order_no"), 160)
+        if task_order_no and task_order_no in excluded_orders:
+            task["download_skipped"] = True
+        _, provisional_category = _task_detail(
+            task, downloads_requested=downloads_requested
+        )
+        if downloads_requested and provisional_category != "unrecoverable" and (
+            _text(task.get("status"), 80).lower() in _DONE_TASK_STATUSES
+            and not task.get("no_action")
+            and not task.get("download_skipped")
+            and _text(task.get("download_token"), 512)
+            and _text(task.get("order_no"), 160)
+            and _text(task.get("order_no"), 160) not in downloaded_orders
+            and not _text(task.get("download_error"), 500)
+        ):
+            task["download_error"] = "找回文件尚未成功下载"
+        detail, category = _task_detail(task, downloads_requested=downloads_requested)
+        if category == "unrecoverable" and detail["card_code"]:
+            # Preserve a concrete task status (not_owned/skipped) over a
+            # generic permanent-card list; use the provider list only when
+            # the task itself does not identify a specific bucket.
+            if detail["status"] not in {"not_owned", "skipped", "unreclaimable"}:
+                for bucket, codes in permanent_code_buckets.items():
+                    if detail["card_code"] in codes:
+                        detail["failure_bucket"] = bucket
+                        break
+        status = detail["status"]
+        if task.get("download_skipped"):
+            download_skipped += 1
+        if category == "retryable" and (
+            detail["download_error"]
+            or (status in _DONE_TASK_STATUSES and not detail["no_action"] and not task.get("download_skipped"))
+        ):
+            download_error_tasks += 1
+        task_records.append((task, detail, category))
+        # Category takes precedence over the raw status.  Upstream providers
+        # commonly report permanent 403/account_deactivated work as
+        # ``status=failed``; those entries must never become retryable.
+        if category == "active":
+            if status == "already_running":
+                task_counts["already_running"] += 1
+            else:
+                task_counts["queued"] += 1
+            if detail["card_code"] and detail["card_code"] not in active_codes:
+                active_codes.append(detail["card_code"])
+        elif category == "recovered":
+            task_counts["done"] += 1
+        elif category == "unrecoverable":
+            bucket = detail.get("failure_bucket")
+            if bucket not in {"unreclaimable", "not_owned", "skipped"}:
+                bucket = status if status in {"unreclaimable", "not_owned", "skipped"} else "unreclaimable"
+            task_counts[bucket] += 1
+        elif category == "retryable":
+            task_counts["failed"] += 1
+        if category not in {"active", "recovered"}:
+            details.append(detail)
+        if category == "retryable" and detail["card_code"] and detail["card_code"] not in retry_codes:
+            retry_codes.append(detail["card_code"])
+        if category == "unrecoverable" and detail["card_code"]:
+            explicit_permanent_codes.add(detail["card_code"])
+            if detail["card_code"] not in permanent_codes:
+                permanent_codes.append(detail["card_code"])
+
+    raw_counts = {key: _count(raw.get(key)) for key in task_counts}
+    # ``all_tasks`` is bounded by the same 100-card request limit, so it is a
+    # more accurate source than aggregate counters when status and permanent
+    # flags disagree.  Fall back to provider counters only when no task
+    # details were returned at all.
+    if tasks:
+        # Task details are authoritative.  Providers often leave aggregate
+        # counters from the initial submission in a later progress response.
+        counts = dict(task_counts)
+        task_codes = {
+            detail["card_code"] for _, detail, _ in task_records if detail["card_code"]
+        }
+        task_retry_codes = {
+            detail["card_code"]
+            for _, detail, category in task_records
+            if category == "retryable" and detail["card_code"]
+        }
+        # Explicit code lists may include work omitted from ``all_tasks``.
+        # Count those entries once, while retaining task-level precedence for
+        # codes already represented in the detail list.
+        for bucket, codes in permanent_code_buckets.items():
+            counts[bucket] += sum(1 for code in codes if code not in task_codes)
+        counts["failed"] += sum(
+            1 for code in provided_retry_codes
+            if code not in explicit_permanent_codes and code not in task_retry_codes
+        )
+    else:
+        counts = dict(raw_counts)
+        # Without task details, an explicit permanent list is the only
+        # unambiguous per-card classification.  Add codes not represented by
+        # aggregate permanent buckets and split ``failed`` when the provider
+        # appears to have counted permanent work in that bucket.
+        for bucket, codes in permanent_code_buckets.items():
+            counts[bucket] = max(counts[bucket], len(codes))
+        known_retry_count = len(retry_codes)
+        raw_failed_count = raw_counts["failed"]
+        if provided_permanent_codes and raw_failed_count >= known_retry_count + len(provided_permanent_codes):
+            counts["failed"] = max(known_retry_count, raw_failed_count - len(provided_permanent_codes))
+        else:
+            counts["failed"] = max(known_retry_count, raw_failed_count)
+
+    # ``downloaded`` is an import-facing count.  Only payloads present in this
+    # response are safe to report as downloaded; a stale provider counter must
+    # not make the UI claim that an importable file exists.
+    downloaded_count = len(downloads)
+    done_without_download = sum(
+        1 for task, detail, category in task_records
+        if category == "retryable"
+        and detail["status"] in _DONE_TASK_STATUSES
+        and not detail["no_action"]
+        and not task.get("download_skipped")
+    )
+    expected_downloads = (
+        sum(
+            1 for task, detail, category in task_records
+            if downloads_requested
+            and category in {"recovered", "retryable"}
+            and detail["status"] in _DONE_TASK_STATUSES
+            and not detail["no_action"]
+            and not task.get("download_skipped")
+        )
+        if tasks
+        else counts["done"]
+    )
+    if downloads_requested:
+        download_failed_candidates = [
+            done_without_download,
+            expected_downloads - downloaded_count,
+        ]
+        # With task details, the task-derived values above supersede stale
+        # aggregate fields.  Aggregate-only responses still need the provider
+        # counter for backwards compatibility.
+        if not tasks:
+            download_failed_candidates.append(_count(raw.get("download_failed")))
+        download_failed = max(*download_failed_candidates, 0)
+    else:
+        download_failed = 0
+    active = (
+        counts["queued"] + counts["already_running"]
+        if tasks
+        else max(counts["queued"] + counts["already_running"], _count(raw.get("active")))
+    )
+    missing_count = len(missing_card_code_accounts or [])
+    unrecoverable_count = counts["unreclaimable"] + counts["not_owned"] + counts["skipped"] + missing_count
+    missing = []
+    for account in (missing_card_code_accounts or [])[:MAX_FAILURE_DETAILS]:
+        value = _mapping(account)
+        missing.append({
+            "id": value.get("id"),
+            "name": _text(value.get("name"), 200),
+            "status": "unrecoverable",
+            "reason": "401 账号名称中没有可用卡密",
+            "retryable": False,
+            "permanent": True,
+            "category": "unrecoverable",
+            "failure_bucket": "unreclaimable",
+        })
+    details.extend(missing)
+    # When the provider omits task-level details, submitted codes are the only
+    # retry context available.  Preserve them for a transport failure or a
+    # homogeneous transient result, but never guess when a permanent bucket
+    # is present: aggregate counters cannot identify which card is permanent.
+    raw_ok = _bool(raw.get("ok"), True) if reclaim_result is not None else True
+    if not retry_codes and (
+        counts["failed"] > 0
+        or download_failed > 0
+        or (reclaim_result is not None and not raw_ok)
+    ) and not unrecoverable_count:
+        retry_codes = list(submitted)
+    retry_codes = [
+        code for code in list(dict.fromkeys(retry_codes))
+        if code and code not in explicit_permanent_codes
+    ][:MAX_RECLAIM_CODES]
+    active_codes = [
+        code for code in list(dict.fromkeys(active_codes))
+        if code and code not in explicit_permanent_codes
+    ][:MAX_RECLAIM_CODES]
+    unrecoverable_count = counts["unreclaimable"] + counts["not_owned"] + counts["skipped"] + missing_count
+    # A done task carrying ``download_error`` is already represented in the
+    # retryable task count.  Add only download gaps that are not represented by
+    # such a task to avoid double-counting one failure in the outcome text.
+    failed_count = counts["failed"] + max(0, download_failed - download_error_tasks)
+
+    # Aggregate-only provider responses still need actionable detail rows.  A
+    # count without a task list cannot identify individual card codes, so use
+    # an explicit generic reason and keep retry codes empty unless the provider
+    # supplied an unambiguous code list.
+    def add_aggregate_details(
+        count: int,
+        *,
+        status: str,
+        reason: str,
+        retryable: bool,
+        codes: list[str] | None = None,
+    ) -> None:
+        if count <= 0:
+            return
+        expected_bucket = "retryable" if retryable else status
+        existing = 0
+        for item in details:
+            if item.get("category") != ("retryable" if retryable else "unrecoverable"):
+                continue
+            item_bucket = item.get("failure_bucket")
+            if not item_bucket:
+                item_status = _text(item.get("status"), 80).lower()
+                item_bucket = (
+                    item_status
+                    if not retryable and item_status in {"unreclaimable", "not_owned", "skipped"}
+                    else "retryable" if retryable else "unreclaimable"
+                )
+            if item_bucket == expected_bucket:
+                existing += 1
+        remaining = max(0, count - existing)
+        code_values = list(codes or [])
+        for index in range(remaining):
+            code = code_values[index] if index < len(code_values) else ""
+            details.append({
+                "card_code": code,
+                "order_no": "",
+                "status": status,
+                "message": reason,
+                "reason": reason,
+                "error_code": "",
+                "provider_status": None,
+                "failure_class": "",
+                "permanent": not retryable,
+                "download_error": "",
+                "no_action": False,
+                "retryable": retryable,
+                "category": "retryable" if retryable else "unrecoverable",
+                "failure_bucket": expected_bucket,
+                "aggregate": True,
+            })
+
+    raw_error = _text(raw.get("error"), 500)
+    task_permanent_codes_by_bucket = {
+        bucket: {
+            detail["card_code"]
+            for _, detail, category in task_records
+            if category == "unrecoverable"
+            and detail["failure_bucket"] == bucket
+            and detail["card_code"]
+        }
+        for bucket in ("unreclaimable", "not_owned", "skipped")
+    }
+    add_aggregate_details(
+        counts["unreclaimable"],
+        status="unreclaimable",
+        reason=_text(raw.get("unreclaimable_reason"), 500) or raw_error or "上游返回无法找回",
+        retryable=False,
+        codes=[
+            code for code in permanent_code_buckets["unreclaimable"]
+            if code not in task_permanent_codes_by_bucket["unreclaimable"]
+        ],
+    )
+    add_aggregate_details(
+        counts["not_owned"],
+        status="not_owned",
+        reason=_text(raw.get("not_owned_reason"), 500) or "该卡密不属于当前账号",
+        retryable=False,
+        codes=[
+            code for code in permanent_code_buckets["not_owned"]
+            if code not in task_permanent_codes_by_bucket["not_owned"]
+        ],
+    )
+    add_aggregate_details(
+        counts["skipped"],
+        status="skipped",
+        reason=_text(raw.get("skipped_reason"), 500) or "上游跳过该项目",
+        retryable=False,
+        codes=[
+            code for code in permanent_code_buckets["skipped"]
+            if code not in task_permanent_codes_by_bucket["skipped"]
+        ],
+    )
+    add_aggregate_details(
+        failed_count,
+        status="failed",
+        reason=raw_error or "找回失败，可重新提交",
+        retryable=True,
+        codes=retry_codes,
+    )
+    if reclaim_result is not None and not raw_ok:
+        outcome = "error"
+    elif not submitted:
+        outcome = "unrecoverable" if missing else "no_401"
+    elif active > 0:
+        outcome = "pending"
+    elif unrecoverable_count and (counts["done"] or downloaded_count or failed_count):
+        outcome = "partial"
+    elif unrecoverable_count:
+        outcome = "unrecoverable"
+    elif failed_count:
+        outcome = "partial" if downloaded_count else "failed"
+    elif counts["done"] and (not downloads_requested or downloaded_count >= expected_downloads):
+        outcome = "recovered"
+    elif counts["done"] and downloaded_count:
+        outcome = "partial"
+    else:
+        outcome = "pending" if submitted else "no_401"
+    retry_available = bool(retry_codes) and active == 0 and outcome in {"failed", "partial", "error"}
+    if outcome == "error":
+        recovery_message = raw_error or "401 找回服务请求失败"
+    elif outcome == "no_401":
+        recovery_message = "未发现明确的 401 账号"
+    elif outcome == "pending":
+        recovery_message = f"已提交 {len(submitted)} 个卡密，仍有 {active} 个找回任务处理中"
+    elif outcome == "recovered":
+        recovery_message = f"找回完成，已完成 {counts['done']} 个任务"
+    elif outcome == "unrecoverable":
+        recovery_message = f"发现 401，但有 {unrecoverable_count} 个项目无法找回"
+    elif outcome == "failed":
+        recovery_message = f"找回失败 {failed_count} 个项目，可重新找回"
+    else:
+        recovery_message = f"找回部分完成：已下载 {downloaded_count}，失败或无法找回 {unrecoverable_count + failed_count}"
+    unreclaimable_total = counts["unreclaimable"] + missing_count
+    return {
+        "outcome": outcome,
+        "recovery_status": outcome,
+        "recovery_ok": outcome in {"recovered", "no_401"},
+        "recovery_message": recovery_message[:500],
+        "downloads_requested": downloads_requested,
+        "reclaim_summary": {
+            **counts,
+            "unreclaimable": unreclaimable_total,
+            "failed": failed_count,
+            "downloaded": downloaded_count,
+            "download_failed": download_failed,
+            "download_skipped": download_skipped,
+            "active": active,
+            "submitted": len(submitted),
+        },
+        "reclaim_failures": details[:MAX_FAILURE_DETAILS],
+        "retryable_card_codes": retry_codes[:MAX_RECLAIM_CODES],
+        "permanent_card_codes": permanent_codes[:MAX_RECLAIM_CODES],
+        "active_card_codes": active_codes[:MAX_RECLAIM_CODES],
+        "retry_available": retry_available,
+        "downloaded": downloaded_count,
+        "download_failed": download_failed,
+        "download_skipped": download_skipped,
+        "failed": failed_count,
+        "unreclaimable": unreclaimable_total,
+        "not_owned": counts["not_owned"],
+        "skipped": counts["skipped"],
+    }
+
+
 def download_payloads(
     reclaim_result: dict[str, Any],
     client: Any,
@@ -87,32 +683,55 @@ def download_payloads(
 ) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     total_bytes = 0
-    excluded = {str(value) for value in (exclude_order_nos or []) if str(value)}
+    excluded = {str(value).strip() for value in (exclude_order_nos or []) if str(value).strip()}
     tasks = reclaim_result.get("all_tasks") if isinstance(reclaim_result, dict) else None
+    permanent_codes = set(
+        _code_list(reclaim_result.get("permanent_card_codes"))
+        + _code_list(reclaim_result.get("unrecoverable_card_codes"))
+        + _code_list(reclaim_result.get("non_retryable_card_codes"))
+        + _code_list(reclaim_result.get("not_owned_card_codes"))
+        + _code_list(reclaim_result.get("skipped_card_codes"))
+    ) if isinstance(reclaim_result, dict) else set()
     if not isinstance(tasks, list):
         return payloads
     for task in tasks[:MAX_RECLAIM_CODES]:
-        if not isinstance(task, dict) or task.get("status") != "done":
+        if not isinstance(task, dict) or _text(task.get("status"), 80).lower() not in _DONE_TASK_STATUSES:
+            continue
+        if _text(task.get("card_code"), 160) in permanent_codes:
+            continue
+        task_detail, task_category = _task_detail(task, downloads_requested=True)
+        if task_category == "unrecoverable" or task_detail["no_action"]:
+            # A provider can return a download token alongside a permanent or
+            # no-op task.  Such a token must never turn an unrecoverable item
+            # into an importable account payload.
             continue
         order_no = str(task.get("order_no") or "").strip()
         token = str(task.get("download_token") or "").strip()
         if not order_no or not token or order_no in excluded:
+            if order_no in excluded:
+                task["download_skipped"] = True
             continue
         try:
             content = client.download(order_no, token)
-        except Exception:
+        except Exception as exc:
+            task["download_error"] = _text(exc, 500) or "下载请求失败"
             continue
-        if (
-            not content
-            or len(content) > max_payload_bytes
-            or total_bytes + len(content) > 24 * 1024 * 1024
-        ):
+        if not content:
+            task["download_error"] = "找回文件为空或令牌已失效"
+            continue
+        if len(content) > max_payload_bytes:
+            task["download_error"] = "找回文件超过单文件大小限制"
+            continue
+        if total_bytes + len(content) > 24 * 1024 * 1024:
+            task["download_error"] = "找回文件超过总大小限制"
             continue
         try:
             parsed = json.loads(content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            task["download_error"] = f"找回文件不是有效 JSON：{_text(exc, 360)}"
             continue
         if not isinstance(parsed, dict) or not isinstance(parsed.get("accounts"), list) or not parsed["accounts"]:
+            task["download_error"] = "找回文件不包含可导入账号"
             continue
         total_bytes += len(content)
         payloads.append(
@@ -159,7 +778,12 @@ def reclaim_401_accounts(
     downloaded_payloads: list[dict[str, Any]] = []
     if card_codes:
         client = redeem_client_factory()
-        reclaim_result = to_json(client.batch_reclaim(card_codes, mode="401"))
+        raw_reclaim_result = to_json(client.batch_reclaim(card_codes, mode="401"))
+        reclaim_result = (
+            raw_reclaim_result
+            if isinstance(raw_reclaim_result, dict) and raw_reclaim_result
+            else {"ok": False, "error": "401 找回服务返回格式无效"}
+        )
         if include_downloads and isinstance(reclaim_result, dict):
             downloaded_payloads = download_payloads(
                 reclaim_result,
@@ -167,8 +791,16 @@ def reclaim_401_accounts(
                 exclude_order_nos=exclude_order_nos,
                 max_payload_bytes=max_payload_bytes,
             )
+    metadata = summarize_reclaim_result(
+        reclaim_result,
+        submitted_card_codes=card_codes,
+        downloaded_payloads=downloaded_payloads,
+        missing_card_code_accounts=missing,
+        exclude_order_nos=exclude_order_nos,
+        downloads_requested=include_downloads,
+    )
     return {
-        "ok": reclaim_result is None or bool(reclaim_result.get("ok", False)),
+        "ok": reclaim_result is None or _bool(reclaim_result.get("ok"), True),
         "scanned_accounts": len(accounts),
         "accounts_401": len(accounts_401),
         "card_code_count": len(card_codes),
@@ -178,6 +810,56 @@ def reclaim_401_accounts(
         "missing_card_code_accounts": missing[:50],
         "reclaim_card_codes": card_codes,
         "downloaded_payloads": downloaded_payloads,
+        **metadata,
+        "result": reclaim_result,
+    }
+
+
+def retry_reclaim(
+    card_codes: list[str],
+    *,
+    redeem_client_factory: Callable[[], Any],
+    to_json: Callable[[Any], Any],
+    max_payload_bytes: int,
+    exclude_order_nos: list[str] | None = None,
+    include_downloads: bool = True,
+) -> dict[str, Any]:
+    """Submit an explicit retry without rescanning the Sub2API account list."""
+    normalized = list(dict.fromkeys(
+        _text(code, 160) for code in card_codes if _text(code, 160)
+    ))
+    if not normalized or len(normalized) > MAX_RECLAIM_CODES:
+        raise ValueError(f"卡密数量应为 1 到 {MAX_RECLAIM_CODES} 个")
+    client = redeem_client_factory()
+    raw_reclaim_result = to_json(client.batch_reclaim(normalized, mode="401"))
+    reclaim_result = (
+        raw_reclaim_result
+        if isinstance(raw_reclaim_result, dict) and raw_reclaim_result
+        else {"ok": False, "error": "401 找回服务返回格式无效"}
+    )
+    downloaded_payloads = (
+        download_payloads(
+            reclaim_result,
+            client,
+            exclude_order_nos=exclude_order_nos,
+            max_payload_bytes=max_payload_bytes,
+        )
+        if include_downloads and isinstance(reclaim_result, dict)
+        else []
+    )
+    metadata = summarize_reclaim_result(
+        reclaim_result,
+        submitted_card_codes=normalized,
+        downloaded_payloads=downloaded_payloads,
+        exclude_order_nos=exclude_order_nos,
+        downloads_requested=include_downloads,
+    )
+    return {
+        "ok": bool(isinstance(reclaim_result, dict) and _bool(reclaim_result.get("ok"), True)),
+        "retry": True,
+        "reclaim_card_codes": normalized,
+        "downloaded_payloads": downloaded_payloads,
+        **metadata,
         "result": reclaim_result,
     }
 
@@ -189,12 +871,18 @@ def refresh_reclaim(
     to_json: Callable[[Any], Any],
     max_payload_bytes: int,
     exclude_order_nos: list[str] | None = None,
+    include_downloads: bool = True,
 ) -> dict[str, Any]:
     normalized = list(dict.fromkeys(str(code).strip() for code in card_codes if str(code).strip()))
     if not normalized or len(normalized) > MAX_RECLAIM_CODES:
         raise ValueError(f"卡密数量应为 1 到 {MAX_RECLAIM_CODES} 个")
     client = redeem_client_factory()
-    result = to_json(client.refresh_progress(normalized))
+    raw_result = to_json(client.refresh_progress(normalized))
+    result = (
+        raw_result
+        if isinstance(raw_result, dict) and raw_result
+        else {"ok": False, "error": "401 进度返回格式无效"}
+    )
     downloads = (
         download_payloads(
             result,
@@ -202,12 +890,21 @@ def refresh_reclaim(
             exclude_order_nos=exclude_order_nos,
             max_payload_bytes=max_payload_bytes,
         )
-        if isinstance(result, dict)
+        if include_downloads and isinstance(result, dict)
         else []
     )
+    metadata = summarize_reclaim_result(
+        result,
+        submitted_card_codes=normalized,
+        downloaded_payloads=downloads,
+        exclude_order_nos=exclude_order_nos,
+        downloads_requested=include_downloads,
+    )
     return {
-        "ok": bool(isinstance(result, dict) and result.get("ok", False)),
+        "ok": bool(isinstance(result, dict) and _bool(result.get("ok"), True)),
         "reclaim_card_codes": normalized,
+        "card_code_count": len(normalized),
         "downloaded_payloads": downloads,
+        **metadata,
         "result": result,
     }
