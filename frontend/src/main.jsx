@@ -987,6 +987,8 @@ function App() {
   const [sub2apiAccountError, setSub2apiAccountError] = useState('');
   const [sub2apiAccountActions, setSub2apiAccountActions] = useState({});
   const [sub2apiTestedAccounts, setSub2apiTestedAccounts] = useState({});
+  const [sub2apiAccountRefresh, setSub2apiAccountRefresh] = useState({running: false, phase: 'idle', completed: 0, total: 0, failed: 0});
+  const sub2apiAccountRefreshRef = useRef(false);
   const [sub2apiAutomation, setSub2apiAutomation] = useState(DEFAULT_SUB2API_AUTOMATION);
   const [sub2apiAutomationState, setSub2apiAutomationState] = useState(null);
   const [sub2apiAutomationBusy, setSub2apiAutomationBusy] = useState(false);
@@ -1098,9 +1100,12 @@ function App() {
 
   const notify = (content, type = 'info') => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const notice = typeof content === 'string'
-      ? {message: content, type, duration: 3200}
-      : {...content, type: content?.type || type, duration: content?.duration || 6000};
+    const normalizedContent = typeof content === 'string'
+      ? content.replace(/娴嬭瘯/g, '刷新状态').replace(/閫氳繃/g, '成功').replace(/澶辫触/g, '失败')
+      : content;
+    const notice = typeof normalizedContent === 'string'
+      ? {message: normalizedContent, type, duration: 3200}
+      : {...normalizedContent, type: normalizedContent?.type || type, duration: normalizedContent?.duration || 6000};
     setToast({id, ...notice});
     window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => {
@@ -2150,7 +2155,7 @@ function App() {
       if (!quiet) notify(message, 'error');
       return null;
     } finally {
-      setSub2apiAccountBusy(false);
+      if (!sub2apiAccountRefreshRef.current) setSub2apiAccountBusy(false);
     }
   };
 
@@ -2171,6 +2176,59 @@ function App() {
     } finally {
       await loadSub2ApiAccounts({page: sub2apiAccounts.page, quiet: true});
       setSub2apiAccountActions(current => ({...current, [id]: null}));
+    }
+  };
+
+  const refreshAllSub2ApiAccounts = async () => {
+    if (!sub2apiConfig.admin_key_set || sub2apiAccountRefreshRef.current) return;
+    sub2apiAccountRefreshRef.current = true;
+    const currentPage = sub2apiAccounts.page || 1;
+    setSub2apiAccountRefresh({running: true, phase: 'collecting', completed: 0, total: 0, failed: 0});
+    setSub2apiAccountBusy(true);
+    setSub2apiAccountError('');
+    try {
+      const accountIds = new Set();
+      let page = 1;
+      let pages = 1;
+      while (page <= pages) {
+        const params = new URLSearchParams({page: String(page), page_size: '100'});
+        const result = await request(`/sub2api/accounts?${params.toString()}`);
+        (Array.isArray(result?.items) ? result.items : []).forEach(account => {
+          const id = Number(account?.id);
+          if (Number.isInteger(id) && id > 0) accountIds.add(id);
+        });
+        pages = Math.max(1, Number(result?.pages) || 1);
+        page += 1;
+      }
+      const ids = [...accountIds];
+      let completed = 0;
+      let failed = 0;
+      setSub2apiAccountRefresh({running: true, phase: 'refreshing', completed: 0, total: ids.length, failed: 0});
+      for (const id of ids) {
+        setSub2apiAccountActions(current => ({...current, [id]: 'test'}));
+        try {
+          const tested = await request(`/sub2api/accounts/${id}/test`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+          setSub2apiTestedAccounts(current => ({...current, [id]: {...tested, tested_at: new Date().toISOString()}}));
+          if (!tested.ok) failed += 1;
+        } catch (error) {
+          failed += 1;
+          setSub2apiTestedAccounts(current => ({...current, [id]: {ok: false, message: error.message, tested_at: new Date().toISOString()}}));
+        }
+        setSub2apiAccountActions(current => ({...current, [id]: null}));
+        completed += 1;
+        setSub2apiAccountRefresh({running: true, phase: 'refreshing', completed, total: ids.length, failed});
+        if (completed < ids.length) await new Promise(resolve => window.setTimeout(resolve, 120));
+      }
+      await loadSub2ApiAccounts({page: currentPage, quiet: true});
+      setSub2apiAccountRefresh({running: false, phase: 'complete', completed, total: ids.length, failed});
+      notify(ids.length ? `已刷新 ${ids.length} 个账号状态${failed ? `，${failed} 个失败` : ''}` : '暂无可刷新的账号');
+    } catch (error) {
+      setSub2apiAccountRefresh({running: false, phase: 'error', completed: 0, total: 0, failed: 0});
+      setSub2apiAccountError(error.message);
+      notify(error.message, 'error');
+    } finally {
+      sub2apiAccountRefreshRef.current = false;
+      setSub2apiAccountBusy(false);
     }
   };
 
@@ -2992,8 +3050,8 @@ function App() {
             onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy}
             onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}
             accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters}
-            accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts}
-            onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount} onCopyAccountName={copySub2ApiAccountName}
+            accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} accountRefresh={sub2apiAccountRefresh}
+            onLoadAccounts={loadSub2ApiAccounts} onRefreshAllAccounts={refreshAllSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount} onCopyAccountName={copySub2ApiAccountName}
             />
           </React.Suspense>
         )}

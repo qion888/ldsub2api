@@ -56,7 +56,12 @@ function intervalLabel(value) {
 }
 
 function IconButton({label, children, tone = '', ...props}) {
-  return <button className={`icon-button ${tone}`} aria-label={label} title={label} {...props}>{children}</button>;
+  const displayLabel = typeof label === 'string' && /(账号|璐﹀彿)/.test(label) && /(测试|娴嬭瘯)/.test(label)
+    ? '刷新状态'
+    : typeof label === 'string' && /(刷新账号列表|鍒锋柊璐﹀彿鍒楄〃)/.test(label)
+      ? '刷新全部账号状态'
+      : label;
+  return <button className={`icon-button ${tone}`} aria-label={displayLabel} title={displayLabel} {...props}>{children}</button>;
 }
 
 function Tooltip({label, children}) {
@@ -283,7 +288,7 @@ function Sub2ApiUsageStack({account, usage, usageError}) {
   </div>;
 }
 
-function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, actions, tested, onRefresh, onTest, onDelete, onCopyName, onPage}) {
+function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, actions, tested, refreshProgress, onRefresh, onTest, onDelete, onCopyName, onPage}) {
   const items = Array.isArray(data?.items) ? data.items : [];
   const usage = data?.usage && typeof data.usage === 'object' ? data.usage : {};
   const usageErrors = data?.usage_errors && typeof data.usage_errors === 'object' ? data.usage_errors : {};
@@ -293,6 +298,7 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
         <div><span className="detail-kicker">SUB2API ACCOUNTS</span><h3>账号列表</h3><p>账号费用、上游窗口与实时调度状态</p></div>
         <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
       </div>
+      {refreshProgress?.running && <div className="account-refresh-progress account-refresh-progress-banner" aria-live="polite">{refreshProgress.phase === 'collecting' ? '正在读取账号...' : `刷新状态 ${refreshProgress.completed}/${refreshProgress.total}`}{refreshProgress.failed ? ` · 失败 ${refreshProgress.failed}` : ''}</div>}
       <div className="account-table-wrap">
         <table className="account-table">
           <colgroup>
@@ -549,7 +555,7 @@ function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false, 
   );
 }
 
-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -702,7 +708,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           error={accountError}
           actions={accountActions}
           tested={testedAccounts}
-          onRefresh={onLoadAccounts}
+          refreshProgress={accountRefresh}
+          onRefresh={onRefreshAllAccounts || onLoadAccounts}
           onTest={onTestAccount}
           onDelete={onDeleteAccount}
           onCopyName={onCopyAccountName}
