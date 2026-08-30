@@ -1,0 +1,127 @@
+Branch: codex/order-query; source commit bbb0b513d67365cf2d02a812409782a4209db8ab; rebased onto main 0953c9962e7cef5347beaa43695d9463171f105f
+Changed branch/field: backend/order_query performs the LinkDong captcha challenge, up to three ddddocr attempts, signed verification, session-ticket reuse, normalized order-list proxying, TTL isolation, and manual captcha fallback; backend/main.py mounts the guarded JSON-only route; frontend/src/main.jsx adds the top-level Order Query navigation and lazy view; frontend/src/OrderQueryView.jsx and orderQuery.css provide the responsive search, verification, status-filter, summary, order-list, detail/resource and pagination UI; start.ps1 creates an isolated .runtime/python environment when a compatible PEP 668-managed interpreter rejects direct dependency installation.
+
+Artifacts after merge:
+- E:\soft\java\ldxp\artifacts\order-query\MODIFIED_FILE
+- E:\soft\java\ldxp\artifacts\order-query\DIFF_FILE
+- E:\soft\java\ldxp\artifacts\order-query\VERIFICATION.txt
+- E:\soft\java\ldxp\artifacts\order-query\ROLLBACK.sh
+Supporting rollback baseline:
+- E:\soft\java\ldxp\artifacts\order-query\ROLLBACK_BASELINE
+
+SOURCE HASHES
+Original input: main 0953c9962e7cef5347beaa43695d9463171f105f
+Original backend/main.py SHA256: E6728803A0D3982D69EA0A20EF7D043091BB43E90E052F36C23E216C13719CD8
+Original backend/requirements.txt SHA256: 02AC48FF17DE5F3A76F8EDE14BDCEE6D9010FD263CE40AE24A36486FC8C2C1AD
+Original frontend/src/main.jsx SHA256: 60570C3A34F5E6E8473CF527E05A939EC14EF8C38E2734B52257A49504DEE4E8
+Original frontend/src/style.css SHA256: CF73AF2B5188903BF0267CDCCE7E213812A075EF8163A92355A35A58753FD4FC
+Original start.ps1 SHA256: 1E915B5F29B51C98B42A5FEE2904B9F9DD0447CDA6518CCF0DAF892FB1D09A03
+MODIFIED_FILE SHA256: 767A468BACF225C1452E26721527375ADA57BCB0AB78A22F8F4AF255B23A208D
+DIFF_FILE SHA256: 2619B3EBF108599F2A9E78A05C933C6DA31F35DD53936BE428944126AD2BEECE
+ROLLBACK_BASELINE SHA256: B645F04521398E205413BE60E1E80D222E109090A63C1BB637896A9F949A0216
+ROLLBACK.sh SHA256: E9F27EDC8F059A499A22B2232FDD3F5471C70666BAD2447B000D185D635710B2
+
+BASELINE BACKEND
+Command: python -m unittest discover -s backend -p "test*.py" -q
+Input: E:\soft\java\ldxp at main 0953c9962e7cef5347beaa43695d9463171f105f; Python 3.12.14
+Literal output:
+----------------------------------------------------------------------
+Ran 78 tests in 1.765s
+
+OK
+Result: exit 0
+
+BASELINE FRONTEND
+Command: npm test; npm run build
+Input: E:\soft\java\ldxp\frontend at main 0953c9962e7cef5347beaa43695d9463171f105f
+Literal output/result:
+tests 6; pass 6; fail 0; duration_ms 96.9718
+vite v8.2.2; 2382 modules transformed; built in 333ms
+Sub2ApiView-CnqcoSe4.js 47.55 kB; index-BO8Z3QHY.css 172.96 kB
+Result: exit 0
+
+MODIFIED DIFF CHECK
+Command: git diff --check main...HEAD
+Input: E:\soft\java\ldxp-order-query at source commit bbb0b513d67365cf2d02a812409782a4209db8ab
+Literal output: empty
+Result: exit 0
+
+MODIFIED BACKEND
+Command: E:\soft\java\ldxp-order-query\.runtime\python\Scripts\python.exe -m unittest discover -s backend -p "test*.py" -q
+Input: E:\soft\java\ldxp-order-query at source commit bbb0b513d67365cf2d02a812409782a4209db8ab; Python 3.12.14 with ddddocr 1.6.1
+Literal output:
+----------------------------------------------------------------------
+Ran 96 tests in 2.175s
+
+OK
+Result: exit 0
+
+MODIFIED FRONTEND
+Command: npm test; npm run build
+Input: E:\soft\java\ldxp-order-query\frontend at source commit bbb0b513d67365cf2d02a812409782a4209db8ab
+Literal output/result:
+tests 10; pass 10; fail 0; duration_ms 122.534
+vite v8.2.2; 2385 modules transformed; built in 422ms
+OrderQueryView-B89eJi_P.js 17.14 kB; OrderQueryView-DLos39hU.css 13.34 kB
+Result: exit 0
+
+MODIFIED STATIC CHECKS
+Command: python -X pycache_prefix=C:\Users\0\AppData\Local\Temp\ldxp-order-query-final-pycache -m compileall -q backend; PowerShell AST parse start.ps1
+Input: E:\soft\java\ldxp-order-query at source commit bbb0b513d67365cf2d02a812409782a4209db8ab
+Literal output/result: compileall emitted no output; PowerShell syntax OK
+Result: exit 0
+
+MODIFIED LIVE OCR
+Command: OrderQueryService().search({keywords: "codex-acceptance-20260830", status: 999, page: 1, page_size: 10})
+Input: pay.ldxp.cn live captcha and order APIs; isolated Python 3.12 runtime with ddddocr 1.6.1
+Literal output/result:
+{"verification":{"status":"verified","mode":"ocr","attempts":1},"orders_count":0,"pagination":{"page":1,"page_size":10,"total":0,"pages":1},"expires_in":297,"captcha_fallback":false,"elapsed_seconds":2.09}
+Result: exit 0
+
+MODIFIED SESSION REUSE
+Command: query status 999, then query status 3 with the returned session_id
+Input: pay.ldxp.cn live captcha and order APIs; keywords codex-session-20260830
+Literal output/result:
+{"first":{"status":"verified","mode":"ocr","attempts":3},"second":{"status":"verified","mode":"session","attempts":0},"second_status_total":0,"same_session":true}
+Result: exit 0
+
+MODIFIED BROWSER
+Command: Playwright Chromium acceptance against http://127.0.0.1:5188/ and backend http://127.0.0.1:8018
+Input: 1440x1000 and 390x844; live UI query keywords codex-ui-acceptance-20260830
+Literal output/result:
+desktop title=链动小铺订单查询; nav=[商品总览,监控面板,价格记录,订单查询,401 找回,Sub2API 导入]; tabs=[全部,待付款,已付款,已关闭,已退款]; verification=自动识别通过; manualFallback=false; pageOverflow=false
+mobile viewport=390x844; pageScrollWidth=390; pageOverflow=false; navClientWidth=369; navScrollWidth=399; navButtonWidths=[64,64,64,64,64,64]; formWidth=364; statusTabsVisible=5
+failedResponses=[]; functional console errors=[]; favicon.ico alone returned 404
+Result: exit 0
+Screenshots reopened and visually inspected:
+- E:\soft\java\ldxp\artifacts\order-query\desktop-order-query.png
+- E:\soft\java\ldxp\artifacts\order-query\mobile-order-query.png
+
+ROLLBACK
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script E:\soft\java\ldxp-order-query\.runtime\rollback-order-query-bbb0b51
+Input: complete source commit bbb0b513d67365cf2d02a812409782a4209db8ab copy; command run from E:\soft\java\ldxp-order-query\artifacts\order-query
+Literal output:
+Restored E:\soft\java\ldxp-order-query\.runtime\rollback-order-query-bbb0b51 to main baseline; backend/main.py=E6728803A0D3982D69EA0A20EF7D043091BB43E90E052F36C23E216C13719CD8; backend/requirements.txt=02AC48FF17DE5F3A76F8EDE14BDCEE6D9010FD263CE40AE24A36486FC8C2C1AD; frontend/src/main.jsx=60570C3A34F5E6E8473CF527E05A939EC14EF8C38E2734B52257A49504DEE4E8; frontend/src/style.css=CF73AF2B5188903BF0267CDCCE7E213812A075EF8163A92355A35A58753FD4FC; start.ps1=1E915B5F29B51C98B42A5FEE2904B9F9DD0447CDA6518CCF0DAF892FB1D09A03; order query files removed
+Result: exit 0
+
+ROLLBACK BACKEND
+Command: python -m unittest discover -s backend -p "test*.py" -q
+Input: E:\soft\java\ldxp-order-query\.runtime\rollback-order-query-bbb0b51 after ROLLBACK.sh; Python 3.12.14
+Literal output:
+----------------------------------------------------------------------
+Ran 78 tests in 1.638s
+
+OK
+Result: exit 0
+
+ROLLBACK FRONTEND
+Command: npm ci; npm test; npm run build
+Input: E:\soft\java\ldxp-order-query\.runtime\rollback-order-query-bbb0b51\frontend after ROLLBACK.sh
+Literal output/result:
+added 61 packages in 7s
+tests 6; pass 6; fail 0; duration_ms 89.5248
+vite v8.2.2; 2382 modules transformed; built in 4.62s
+Sub2ApiView-CnqcoSe4.js 47.55 kB; index-BO8Z3QHY.css 172.96 kB
+Result: exit 0
+
+Restored behavior/status: the rollback copy matches main 0953c9962e7cef5347beaa43695d9463171f105f byte-for-byte for all five modified baseline files, removes all six order-query added paths, passes the 78-test backend baseline and six-test frontend baseline, retains Sub2API import-history pagination/retry, and no longer exposes the Order Query route or navigation. The source branch and MODIFIED_FILE remain changed with live OCR verification, session reuse, manual fallback, order filtering and responsive UI intact.

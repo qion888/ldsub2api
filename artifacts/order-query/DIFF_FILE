@@ -1,0 +1,2581 @@
+diff --git a/backend/main.py b/backend/main.py
+index b5848037ac1df9d873720c887ec33bc637aacd95..06cbccbab67fd951c0f0013c79fe0442e96d8153 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -35,6 +35,8 @@ from monitor_core import settings as monitor_setting_store
+ from monitor_core import storefront
+ from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
+ from monitor_core.workers import MonitorWorker as CoreMonitorWorker
++from order_query import routes as order_query_routes
++from order_query.service import OrderQueryService
+ from sub2api import automation as sub2api_automation
+ from sub2api import card_import_history as sub2api_card_history
+ from sub2api import client as sub2api_client
+@@ -847,6 +849,7 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
+ 
+ 
+ BROWSER_VERIFICATION = BrowserVerificationManager()
++ORDER_QUERY_SERVICE = OrderQueryService()
+ 
+ 
+ class ApiHandler(BaseHTTPRequestHandler):
+@@ -906,6 +909,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+                 "sub2api_automation_worker": AUTOMATION_WORKER.is_alive(),
+                 "sub2api_accounts": True,
+                 "sub2api_card_import_history": True,
++                "order_query": True,
+             })
+         if path == "/api/watches":
+             return self._send_json(list_watches())
+@@ -988,11 +992,27 @@ class ApiHandler(BaseHTTPRequestHandler):
+ 
+     def do_POST(self) -> None:
+         path = urlparse(self.path).path.rstrip("/")
++        rejection = order_query_routes.request_rejection(
++            path,
++            self.headers,
++            frontend_url=FRONTEND_URL,
++        )
++        if rejection is not None:
++            status, payload = rejection
++            return self._send_json(payload, status)
+         try:
+             data = self._read_json()
+         except ValueError as exc:
+             return self._send_json({"detail": str(exc)}, 400)
+ 
++        if order_query_routes.handle_post(
++            path,
++            data,
++            send_json=self._send_json,
++            search=ORDER_QUERY_SERVICE.search,
++        ):
++            return
++
+         if path == "/api/preorders":
+             try:
+                 result = create_preorders(data)
+@@ -1547,6 +1567,7 @@ def run() -> None:
+         WORKER.stop_event.set()
+         AUTOMATION_WORKER.stop_event.set()
+         BROWSER_VERIFICATION._close()
++        ORDER_QUERY_SERVICE.sessions.clear()
+         server.server_close()
+ 
+ 
+diff --git a/backend/order_query/__init__.py b/backend/order_query/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ade5d9c95f451b8c57e31984339afbc17e9f2b7
+--- /dev/null
++++ b/backend/order_query/__init__.py
+@@ -0,0 +1,5 @@
++"""LinkDong order lookup integration."""
++
++from .service import OrderQueryService
++
++__all__ = ["OrderQueryService"]
+diff --git a/backend/order_query/captcha.py b/backend/order_query/captcha.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63ce6678f9afe25ea2dae011eb027a7e33dd0728
+--- /dev/null
++++ b/backend/order_query/captcha.py
+@@ -0,0 +1,58 @@
++"""Captcha signing and local OCR support."""
++
++from __future__ import annotations
++
++import hashlib
++import re
++import threading
++from typing import Any, Callable
++
++from .errors import CaptchaRecognizerUnavailable
++
++CAPTCHA_CODE_PATTERN = re.compile(r"[A-Za-z0-9]{4}")
++
++
++def captcha_sign(code: str, ip: str) -> str:
++    inner = hashlib.md5(f"{code}{ip}".encode("utf-8")).hexdigest()
++    return hashlib.md5(f"{inner}JING".encode("utf-8")).hexdigest()
++
++
++def normalize_captcha_code(value: Any) -> str:
++    code = re.sub(r"\s+", "", str(value or ""))
++    return code if CAPTCHA_CODE_PATTERN.fullmatch(code) else ""
++
++
++class CaptchaRecognizer:
++    """Load the OCR model on first use and serialize model inference."""
++
++    def __init__(self, classifier_factory: Callable[[], Any] | None = None) -> None:
++        self._classifier_factory = classifier_factory
++        self._classifier: Any = None
++        self._lock = threading.Lock()
++
++    def _load(self) -> Any:
++        if self._classifier is not None:
++            return self._classifier
++        try:
++            if self._classifier_factory is not None:
++                classifier = self._classifier_factory()
++            else:
++                import ddddocr
++
++                classifier = ddddocr.DdddOcr(show_ad=False)
++        except Exception as exc:
++            raise CaptchaRecognizerUnavailable("本地验证码识别组件未就绪") from exc
++        self._classifier = classifier
++        return classifier
++
++    def recognize(self, image: bytes) -> str:
++        if not image:
++            return ""
++        with self._lock:
++            try:
++                value = self._load().classification(image)
++            except CaptchaRecognizerUnavailable:
++                raise
++            except Exception:
++                return ""
++        return normalize_captcha_code(value)
+diff --git a/backend/order_query/client.py b/backend/order_query/client.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..16ddfd4b063709f7a5d0279745c412403ce93acf
+--- /dev/null
++++ b/backend/order_query/client.py
+@@ -0,0 +1,331 @@
++"""Cookie-aware HTTP client for the LinkDong order lookup API."""
++
++from __future__ import annotations
++
++import json
++import math
++import re
++import secrets
++import socket
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from decimal import Decimal, InvalidOperation
++from http.cookiejar import CookieJar
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlparse
++from urllib.request import HTTPCookieProcessor, Request, build_opener
++
++from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired
++
++from .captcha import captcha_sign
++from .errors import CaptchaVerificationExpired, UpstreamOrderError
++
++BASE_URL = f"https://{ALLOWED_HOST}"
++CAPTCHA_START_PATH = "/shopApi/Common/captchaStart"
++ORDER_LIST_PATH = "/shopApi/Order/list"
++MAX_JSON_BYTES = 2 * 1024 * 1024
++MAX_CAPTCHA_BYTES = 512 * 1024
++STATUS_LABELS = {
++    0: "待付款",
++    1: "已付款",
++    2: "已关闭",
++    3: "已退款",
++}
++ALLOWED_CAPTCHA_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
++
++
++@dataclass(frozen=True)
++class CaptchaChallenge:
++    image_url: str
++    check_url: str
++    ip: str
++
++
++def _safe_text(value: Any, limit: int = 240) -> str:
++    return str(value or "").strip()[:limit]
++
++
++def _integer(value: Any, fallback: int = 0) -> int:
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return fallback
++
++
++def _money(value: Any) -> str:
++    try:
++        return f"{Decimal(str(value)):.2f}"
++    except (InvalidOperation, TypeError, ValueError):
++        return "0.00"
++
++
++def _created_at(value: Any) -> str:
++    text = _safe_text(value, 80)
++    if not text:
++        return ""
++    try:
++        stamp = int(text)
++        if stamp < 1:
++            return ""
++        if stamp > 10_000_000_000:
++            stamp //= 1000
++        return datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="seconds")
++    except (OverflowError, OSError, TypeError, ValueError):
++        pass
++    try:
++        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
++        if parsed.tzinfo is None:
++            return parsed.isoformat(timespec="seconds")
++        return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
++    except ValueError:
++        return text
++
++
++def _public_image_url(value: Any) -> str:
++    text = _safe_text(value, 1000)
++    parsed = urlparse(text)
++    return text if parsed.scheme in {"http", "https"} and parsed.netloc else ""
++
++
++def normalize_order(item: Any) -> dict[str, Any] | None:
++    if not isinstance(item, dict):
++        return None
++    trade_no = _safe_text(item.get("trade_no"), 160)
++    if not trade_no:
++        return None
++    goods = item.get("goods") if isinstance(item.get("goods"), dict) else {}
++    goods_key = _safe_text(goods.get("goods_key") or item.get("goods_key"), 80)
++    goods_type = _safe_text(goods.get("goods_type") or item.get("goods_type"), 30)
++    status = _integer(item.get("status"), -1)
++    complaint = item.get("complaint") if isinstance(item.get("complaint"), dict) else {}
++    complaint_status = complaint.get("status")
++    try:
++        complaint_status = int(complaint_status) if complaint_status is not None else None
++    except (TypeError, ValueError):
++        complaint_status = None
++    encoded_trade = quote(trade_no, safe="")
++    encoded_goods = quote(goods_key, safe="")
++    return {
++        "trade_no": trade_no,
++        "goods_name": _safe_text(item.get("goods_name") or goods.get("name"), 200),
++        "goods_key": goods_key,
++        "goods_type": goods_type,
++        "goods_image": _public_image_url(goods.get("image") or goods.get("cover")),
++        "created_at": _created_at(item.get("create_time")),
++        "total_amount": _money(item.get("total_amount")),
++        "quantity": max(0, _integer(item.get("quantity"))),
++        "status": status,
++        "status_label": STATUS_LABELS.get(status, "未知状态"),
++        "need_query_password": _integer(item.get("need_query_password")) == 1,
++        "can_complaint": _integer(item.get("can_complaint")) == 1,
++        "complaint_status": complaint_status,
++        "detail_url": f"{BASE_URL}/order/info/{encoded_trade}",
++        "result_url": f"{BASE_URL}/order/result/{encoded_trade}",
++        "goods_url": f"{BASE_URL}/item/{encoded_goods}" if goods_key else "",
++    }
++
++
++def normalize_order_list(payload: Any, *, page: int, page_size: int) -> dict[str, Any]:
++    if not isinstance(payload, dict):
++        raise UpstreamOrderError("订单接口响应格式无效", code="invalid_order_response")
++    if payload.get("code") != 1:
++        message = _safe_text(payload.get("msg") or "订单查询失败")
++        if "人机" in message or "验证" in message:
++            raise CaptchaVerificationExpired()
++        raise UpstreamOrderError(message, code="upstream_order_rejected")
++    data = payload.get("data")
++    if not isinstance(data, dict):
++        raise UpstreamOrderError("订单接口未返回有效列表", code="invalid_order_response")
++    raw_orders = data.get("list")
++    if raw_orders is None:
++        raw_orders = []
++    if not isinstance(raw_orders, list):
++        raise UpstreamOrderError("订单列表格式无效", code="invalid_order_response")
++    orders = [normalized for item in raw_orders if (normalized := normalize_order(item)) is not None]
++    total = max(0, _integer(data.get("total"), len(orders)))
++    return {
++        "orders": orders,
++        "pagination": {
++            "page": page,
++            "page_size": page_size,
++            "total": total,
++            "pages": max(1, math.ceil(total / page_size)),
++        },
++    }
++
++
++class OrderQueryClient:
++    def __init__(self, *, timeout: float = 12.0, opener: Any = None) -> None:
++        self.timeout = timeout
++        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
++        self.visitor_id = "".join(secrets.choice(alphabet) for _ in range(9))
++        self.cookie_jar = CookieJar()
++        self.opener = opener or build_opener(HTTPCookieProcessor(self.cookie_jar))
++
++    @staticmethod
++    def _validated_url(url: str, allowed_paths: set[str]) -> str:
++        parsed = urlparse(str(url or ""))
++        try:
++            port = parsed.port
++        except ValueError as exc:
++            raise UpstreamOrderError("验证码接口地址无效", code="invalid_captcha_url") from exc
++        if (
++            parsed.scheme != "https"
++            or parsed.hostname != ALLOWED_HOST
++            or parsed.username is not None
++            or parsed.password is not None
++            or port not in (None, 443)
++            or parsed.fragment
++            or parsed.path.lower() not in {path.lower() for path in allowed_paths}
++        ):
++            raise UpstreamOrderError("验证码接口地址无效", code="invalid_captcha_url")
++        return parsed.geturl()
++
++    def _headers(self) -> dict[str, str]:
++        return {
++            "User-Agent": USER_AGENT,
++            "Accept": "application/json, text/plain, */*",
++            "Content-Type": "application/json",
++            "Origin": BASE_URL,
++            "Referer": f"{BASE_URL}/order",
++            "Visitorid": self.visitor_id,
++        }
++
++    def _open(self, request: Request) -> Any:
++        try:
++            return self.opener.open(request, timeout=self.timeout)
++        except HTTPError as exc:
++            if exc.code == 429:
++                raise UpstreamOrderError(
++                    "链动小铺订单接口请求过于频繁",
++                    code="upstream_rate_limited",
++                    status=429,
++                    retryable=True,
++                ) from exc
++            raise UpstreamOrderError(
++                f"链动小铺订单接口返回 HTTP {exc.code}",
++                code="upstream_http_error",
++            ) from exc
++        except (socket.timeout, TimeoutError) as exc:
++            raise UpstreamOrderError(
++                "链动小铺订单接口请求超时",
++                code="upstream_timeout",
++                status=504,
++                retryable=True,
++            ) from exc
++        except URLError as exc:
++            if isinstance(exc.reason, (socket.timeout, TimeoutError)):
++                raise UpstreamOrderError(
++                    "链动小铺订单接口请求超时",
++                    code="upstream_timeout",
++                    status=504,
++                    retryable=True,
++                ) from exc
++            raise UpstreamOrderError(
++                "无法连接链动小铺订单接口",
++                code="upstream_unavailable",
++                retryable=True,
++            ) from exc
++
++    def _json_request(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
++        request = Request(
++            url,
++            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
++            headers=self._headers(),
++            method="POST",
++        )
++        with self._open(request) as response:
++            raw = response.read(MAX_JSON_BYTES + 1)
++            content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
++        if len(raw) > MAX_JSON_BYTES:
++            raise UpstreamOrderError("订单接口响应过大", code="upstream_response_too_large")
++        if any(marker in raw for marker in WAF_MARKERS):
++            raise WafChallengeRequired("链动小铺触发阿里云 WAF 验证")
++        if "text/html" in content_type.lower():
++            raise UpstreamOrderError("订单接口返回了 HTML 页面", code="invalid_order_response")
++        try:
++            result = json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise UpstreamOrderError("订单接口返回了无法解析的数据", code="invalid_order_response") from exc
++        if not isinstance(result, dict):
++            raise UpstreamOrderError("订单接口响应格式无效", code="invalid_order_response")
++        return result
++
++    def start_captcha(self, previous_code: str = "") -> CaptchaChallenge:
++        result = self._json_request(f"{BASE_URL}{CAPTCHA_START_PATH}", {"code": previous_code})
++        if result.get("code") != 1 or not isinstance(result.get("data"), dict):
++            raise UpstreamOrderError(
++                _safe_text(result.get("msg") or "无法创建订单验证码"),
++                code="captcha_start_failed",
++                retryable=True,
++            )
++        data = result["data"]
++        image_url = self._validated_url(
++            _safe_text(data.get("img_url"), 1000),
++            {"/shopApi/common/captchaImg.html"},
++        )
++        check_url = self._validated_url(
++            _safe_text(data.get("check_url"), 1000),
++            {"/shopApi/common/captchaCheck.html"},
++        )
++        ip = _safe_text(data.get("ip"), 128)
++        if not ip:
++            raise UpstreamOrderError("验证码接口未返回签名参数", code="invalid_captcha_response")
++        return CaptchaChallenge(image_url=image_url, check_url=check_url, ip=ip)
++
++    def download_captcha(self, challenge: CaptchaChallenge) -> tuple[bytes, str]:
++        image_url = self._validated_url(challenge.image_url, {"/shopApi/common/captchaImg.html"})
++        request = Request(
++            image_url,
++            headers={
++                "User-Agent": USER_AGENT,
++                "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
++                "Referer": f"{BASE_URL}/order",
++                "Visitorid": self.visitor_id,
++            },
++            method="GET",
++        )
++        with self._open(request) as response:
++            raw = response.read(MAX_CAPTCHA_BYTES + 1)
++            content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
++        if len(raw) > MAX_CAPTCHA_BYTES:
++            raise UpstreamOrderError("验证码图片过大", code="captcha_image_too_large")
++        if any(marker in raw for marker in WAF_MARKERS):
++            raise WafChallengeRequired("链动小铺触发阿里云 WAF 验证")
++        mime_type = content_type.partition(";")[0].strip().lower()
++        if not raw or mime_type not in ALLOWED_CAPTCHA_MIME_TYPES:
++            raise UpstreamOrderError("验证码图片响应无效", code="invalid_captcha_image")
++        return raw, mime_type
++
++    def check_captcha(self, challenge: CaptchaChallenge, code: str) -> str | None:
++        check_url = self._validated_url(challenge.check_url, {"/shopApi/common/captchaCheck.html"})
++        result = self._json_request(
++            check_url,
++            {"code": code, "sign": captcha_sign(code, challenge.ip)},
++        )
++        if result.get("code") != 1 or not isinstance(result.get("data"), dict):
++            return None
++        ticket = _safe_text(result["data"].get("ticket"), 512)
++        return ticket or None
++
++    def list_orders(
++        self,
++        *,
++        keywords: str,
++        ticket: str,
++        status: int,
++        page: int,
++        page_size: int,
++    ) -> dict[str, Any]:
++        result = self._json_request(
++            f"{BASE_URL}{ORDER_LIST_PATH}",
++            {
++                "status": status,
++                "current": page,
++                "pageSize": page_size,
++                "keywords": keywords,
++                "ticket": ticket,
++            },
++        )
++        return normalize_order_list(result, page=page, page_size=page_size)
+diff --git a/backend/order_query/errors.py b/backend/order_query/errors.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d52e0ee03f032b41e4253a4d8d4901d444a8b20
+--- /dev/null
++++ b/backend/order_query/errors.py
+@@ -0,0 +1,62 @@
++"""Domain errors for the order-query integration."""
++
++from __future__ import annotations
++
++
++class OrderQueryError(RuntimeError):
++    def __init__(
++        self,
++        detail: str,
++        *,
++        code: str = "order_query_failed",
++        status: int = 502,
++        retryable: bool = False,
++    ) -> None:
++        super().__init__(detail)
++        self.detail = detail
++        self.code = code
++        self.status = status
++        self.retryable = retryable
++
++
++class OrderQueryInputError(OrderQueryError):
++    def __init__(self, detail: str) -> None:
++        super().__init__(detail, code="invalid_order_query", status=400)
++
++
++class OrderQuerySessionExpired(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "订单查询会话已过期，请重新查询",
++            code="order_query_session_expired",
++            status=410,
++            retryable=True,
++        )
++
++
++class OrderQueryBusy(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "订单查询任务较多，请稍后重试",
++            code="order_query_busy",
++            status=429,
++            retryable=True,
++        )
++
++
++class UpstreamOrderError(OrderQueryError):
++    pass
++
++
++class CaptchaVerificationExpired(UpstreamOrderError):
++    def __init__(self) -> None:
++        super().__init__(
++            "订单验证码已失效",
++            code="captcha_verification_expired",
++            status=502,
++            retryable=True,
++        )
++
++
++class CaptchaRecognizerUnavailable(RuntimeError):
++    """Raised internally so the service can fall back to manual entry."""
+diff --git a/backend/order_query/routes.py b/backend/order_query/routes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d24fa156066a2978b18e925412dfe37dd9f471a
+--- /dev/null
++++ b/backend/order_query/routes.py
+@@ -0,0 +1,117 @@
++"""HTTP route adapter for order lookup."""
++
++from __future__ import annotations
++
++from typing import Any, Callable
++from urllib.parse import urlparse
++
++from monitor_core.storefront import WafChallengeRequired
++
++from .errors import OrderQueryError
++
++SendJson = Callable[[Any, int], Any]
++ORDER_QUERY_PATH = "/api/order-query/search"
++LOCAL_DEVELOPMENT_HOSTS = {"127.0.0.1", "localhost"}
++
++
++def _origin_key(value: str) -> tuple[str, str, int] | None:
++    parsed = urlparse(str(value or "").strip())
++    try:
++        port = parsed.port
++    except ValueError:
++        return None
++    if (
++        parsed.scheme not in {"http", "https"}
++        or not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++    ):
++        return None
++    scheme = parsed.scheme.lower()
++    return scheme, parsed.hostname.lower(), port or (443 if scheme == "https" else 80)
++
++
++def request_rejection(
++    path: str,
++    headers: Any,
++    *,
++    frontend_url: str,
++) -> tuple[int, dict[str, Any]] | None:
++    """Reject browser requests that could make the local service perform cross-site work."""
++    if path != ORDER_QUERY_PATH:
++        return None
++
++    content_type = str(headers.get("Content-Type", "")).partition(";")[0].strip().lower()
++    if content_type != "application/json":
++        return 415, {
++            "detail": "订单查询仅接受 application/json 请求",
++            "code": "unsupported_media_type",
++            "retryable": False,
++        }
++
++    origin = str(headers.get("Origin", "")).strip()
++    if not origin:
++        return None
++    parsed_origin = urlparse(origin)
++    origin_key = _origin_key(origin)
++    frontend_key = _origin_key(frontend_url)
++    is_bare_origin = (
++        parsed_origin.path in {"", "/"}
++        and not parsed_origin.params
++        and not parsed_origin.query
++        and not parsed_origin.fragment
++    )
++    is_frontend = origin_key is not None and origin_key == frontend_key
++    is_local_development = (
++        origin_key is not None
++        and origin_key[0] == "http"
++        and origin_key[1] in LOCAL_DEVELOPMENT_HOSTS
++    )
++    if is_bare_origin and (is_frontend or is_local_development):
++        return None
++    return 403, {
++        "detail": "订单查询请求来源不受信任",
++        "code": "untrusted_origin",
++        "retryable": False,
++    }
++
++
++def handle_post(
++    path: str,
++    data: dict[str, Any],
++    *,
++    send_json: SendJson,
++    search: Callable[[dict[str, Any]], dict[str, Any]],
++) -> bool:
++    if path != ORDER_QUERY_PATH:
++        return False
++    try:
++        send_json(search(data), 200)
++    except OrderQueryError as exc:
++        send_json(
++            {
++                "detail": exc.detail,
++                "code": exc.code,
++                "retryable": exc.retryable,
++            },
++            exc.status,
++        )
++    except WafChallengeRequired as exc:
++        send_json(
++            {
++                "detail": str(exc)[:240],
++                "code": "waf_verification_required",
++                "retryable": True,
++            },
++            409,
++        )
++    except RuntimeError as exc:
++        send_json(
++            {
++                "detail": str(exc)[:240] or "订单查询失败",
++                "code": "order_query_failed",
++                "retryable": True,
++            },
++            502,
++        )
++    return True
+diff --git a/backend/order_query/service.py b/backend/order_query/service.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3ec89758d8abd7865b88388e77ddbe909362d68
+--- /dev/null
++++ b/backend/order_query/service.py
+@@ -0,0 +1,253 @@
++"""Order-query workflow with automatic OCR and manual fallback."""
++
++from __future__ import annotations
++
++import base64
++import re
++import threading
++from typing import Any, Callable
++
++from .captcha import CaptchaRecognizer, normalize_captcha_code
++from .client import CaptchaChallenge, OrderQueryClient
++from .errors import (
++    CaptchaRecognizerUnavailable,
++    CaptchaVerificationExpired,
++    OrderQueryBusy,
++    OrderQueryInputError,
++)
++from .sessions import OrderQuerySession, OrderQuerySessionStore
++
++ALLOWED_STATUSES = {999, 0, 1, 2, 3}
++SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
++
++
++class OrderQueryService:
++    def __init__(
++        self,
++        *,
++        client_factory: Callable[[], Any] = OrderQueryClient,
++        recognizer: Any = None,
++        sessions: OrderQuerySessionStore | None = None,
++        max_ocr_attempts: int = 3,
++        max_concurrent: int = 2,
++    ) -> None:
++        self.client_factory = client_factory
++        self.recognizer = recognizer or CaptchaRecognizer()
++        self.sessions = sessions or OrderQuerySessionStore()
++        self.max_ocr_attempts = max(1, min(3, int(max_ocr_attempts)))
++        self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent)))
++
++    @staticmethod
++    def _validated_request(data: Any) -> dict[str, Any]:
++        if not isinstance(data, dict):
++            raise OrderQueryInputError("订单查询参数必须是 JSON 对象")
++        keywords = str(data.get("keywords") or "").strip()
++        if not keywords or len(keywords) > 160:
++            raise OrderQueryInputError("请输入 1 到 160 个字符的联系方式或订单号")
++        try:
++            status = int(data.get("status", 999))
++            page = int(data.get("page", 1))
++            page_size = int(data.get("page_size", 10))
++        except (TypeError, ValueError) as exc:
++            raise OrderQueryInputError("订单状态或分页参数无效") from exc
++        if status not in ALLOWED_STATUSES:
++            raise OrderQueryInputError("订单状态筛选无效")
++        if page < 1 or page > 1000:
++            raise OrderQueryInputError("订单页码应为 1 到 1000")
++        if page_size < 1 or page_size > 50:
++            raise OrderQueryInputError("每页订单数应为 1 到 50")
++        session_id = str(data.get("session_id") or "").strip()
++        if session_id and not SESSION_ID_PATTERN.fullmatch(session_id):
++            raise OrderQueryInputError("订单查询会话编号无效")
++        captcha_code = str(data.get("captcha_code") or "").strip()
++        if captcha_code and not normalize_captcha_code(captcha_code):
++            raise OrderQueryInputError("验证码格式无效")
++        refresh_captcha = data.get("refresh_captcha", False)
++        if not isinstance(refresh_captcha, bool):
++            raise OrderQueryInputError("refresh_captcha 必须是布尔值")
++        return {
++            "keywords": keywords,
++            "status": status,
++            "page": page,
++            "page_size": page_size,
++            "session_id": session_id,
++            "captcha_code": normalize_captcha_code(captcha_code),
++            "refresh_captcha": refresh_captcha,
++        }
++
++    def _session(self, request: dict[str, Any]) -> OrderQuerySession:
++        if request["session_id"]:
++            return self.sessions.get(request["session_id"], request["keywords"])
++        if request["captcha_code"]:
++            raise OrderQueryInputError("手工验证码缺少有效查询会话")
++        return self.sessions.create(request["keywords"], self.client_factory())
++
++    @staticmethod
++    def _image_data_url(image: bytes, mime_type: str) -> str:
++        encoded = base64.b64encode(image).decode("ascii")
++        return f"data:{mime_type};base64,{encoded}"
++
++    def _new_challenge(
++        self,
++        session: OrderQuerySession,
++        previous_code: str = "",
++    ) -> tuple[CaptchaChallenge, bytes, str]:
++        challenge = session.client.start_captcha(previous_code)
++        image, mime_type = session.client.download_captcha(challenge)
++        session.challenge = challenge
++        session.captcha_image = image
++        session.captcha_mime = mime_type
++        session.ticket = ""
++        session.cache.clear()
++        return challenge, image, mime_type
++
++    def _manual_required(
++        self,
++        session: OrderQuerySession,
++        *,
++        attempts: int,
++        previous_code: str = "",
++    ) -> dict[str, Any]:
++        _, image, mime_type = self._new_challenge(session, previous_code)
++        return {
++            "session_id": session.session_id,
++            "expires_in": self.sessions.remaining(session),
++            "verification": {
++                "status": "manual_required",
++                "mode": "manual",
++                "attempts": attempts,
++            },
++            "captcha": {"image_data_url": self._image_data_url(image, mime_type)},
++        }
++
++    def _automatic_ticket(
++        self,
++        session: OrderQuerySession,
++        *,
++        attempts_used: int,
++    ) -> tuple[str, int]:
++        previous_code = ""
++        while attempts_used < self.max_ocr_attempts:
++            challenge, image, _ = self._new_challenge(session, previous_code)
++            try:
++                code = normalize_captcha_code(self.recognizer.recognize(image))
++            except CaptchaRecognizerUnavailable:
++                return "", attempts_used
++            attempts_used += 1
++            if not code:
++                previous_code = ""
++                continue
++            previous_code = code
++            ticket = session.client.check_captcha(challenge, code)
++            if ticket:
++                session.ticket = ticket
++                session.challenge = None
++                session.captcha_image = b""
++                return ticket, attempts_used
++        return "", attempts_used
++
++    def _query_verified(
++        self,
++        session: OrderQuerySession,
++        request: dict[str, Any],
++        *,
++        mode: str,
++        attempts: int,
++    ) -> dict[str, Any]:
++        cache_key = (request["status"], request["page"], request["page_size"])
++        now = self.sessions.now()
++        cached = session.cached(cache_key, now)
++        if cached is None:
++            result = session.client.list_orders(
++                keywords=request["keywords"],
++                ticket=session.ticket,
++                status=request["status"],
++                page=request["page"],
++                page_size=request["page_size"],
++            )
++            if not isinstance(result, dict) or not isinstance(result.get("orders"), list):
++                raise RuntimeError("订单查询客户端返回格式无效")
++            cached = {
++                "orders": result["orders"],
++                "pagination": result["pagination"],
++            }
++            if self.sessions.cache_seconds:
++                session.store_cache(
++                    cache_key,
++                    cached,
++                    now + self.sessions.cache_seconds,
++                )
++        return {
++            "session_id": session.session_id,
++            "expires_in": self.sessions.remaining(session),
++            "verification": {
++                "status": "verified",
++                "mode": mode,
++                "attempts": attempts,
++            },
++            **cached,
++        }
++
++    def _search(self, data: Any) -> dict[str, Any]:
++        request = self._validated_request(data)
++        session = self._session(request)
++        with session.lock:
++            if request["refresh_captcha"]:
++                return self._manual_required(session, attempts=0)
++
++            attempts = 0
++            mode = "session"
++            if request["captcha_code"]:
++                mode = "manual"
++                challenge = session.challenge
++                if challenge is None:
++                    return self._manual_required(session, attempts=0)
++                attempts = 1
++                ticket = session.client.check_captcha(challenge, request["captcha_code"])
++                if not ticket:
++                    return self._manual_required(
++                        session,
++                        attempts=attempts,
++                        previous_code=request["captcha_code"],
++                    )
++                session.ticket = ticket
++                session.challenge = None
++                session.captcha_image = b""
++            elif not session.ticket:
++                mode = "ocr"
++                ticket, attempts = self._automatic_ticket(session, attempts_used=0)
++                if not ticket:
++                    return self._manual_required(session, attempts=attempts)
++
++            try:
++                return self._query_verified(
++                    session,
++                    request,
++                    mode=mode,
++                    attempts=attempts,
++                )
++            except CaptchaVerificationExpired:
++                session.clear_verification()
++
++            mode = "ocr"
++            ticket, attempts = self._automatic_ticket(session, attempts_used=attempts)
++            if not ticket:
++                return self._manual_required(session, attempts=attempts)
++            try:
++                return self._query_verified(
++                    session,
++                    request,
++                    mode=mode,
++                    attempts=attempts,
++                )
++            except CaptchaVerificationExpired:
++                session.clear_verification()
++                return self._manual_required(session, attempts=attempts)
++
++    def search(self, data: Any) -> dict[str, Any]:
++        if not self._slots.acquire(blocking=False):
++            raise OrderQueryBusy()
++        try:
++            return self._search(data)
++        finally:
++            self._slots.release()
+diff --git a/backend/order_query/sessions.py b/backend/order_query/sessions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..98d09d2770ad5838052d81b8388e488d7e87bdef
+--- /dev/null
++++ b/backend/order_query/sessions.py
+@@ -0,0 +1,115 @@
++"""Bounded in-memory sessions for order captcha and pagination reuse."""
++
++from __future__ import annotations
++
++import copy
++import hashlib
++import hmac
++import secrets
++import threading
++import time
++from dataclasses import dataclass, field
++from typing import Any, Callable
++
++from .client import CaptchaChallenge
++from .errors import OrderQueryInputError, OrderQuerySessionExpired
++
++
++@dataclass
++class OrderQuerySession:
++    session_id: str
++    keyword_fingerprint: str
++    client: Any
++    expires_at: float
++    ticket: str = ""
++    challenge: CaptchaChallenge | None = None
++    captcha_image: bytes = b""
++    captcha_mime: str = "image/png"
++    cache: dict[tuple[int, int, int], tuple[float, dict[str, Any]]] = field(default_factory=dict)
++    lock: threading.RLock = field(default_factory=threading.RLock)
++
++    def clear_verification(self) -> None:
++        self.ticket = ""
++        self.challenge = None
++        self.captcha_image = b""
++        self.cache.clear()
++
++    def cached(self, key: tuple[int, int, int], now: float) -> dict[str, Any] | None:
++        entry = self.cache.get(key)
++        if entry is None:
++            return None
++        expires_at, value = entry
++        if expires_at <= now:
++            self.cache.pop(key, None)
++            return None
++        return copy.deepcopy(value)
++
++    def store_cache(self, key: tuple[int, int, int], value: dict[str, Any], expires_at: float) -> None:
++        self.cache[key] = (expires_at, copy.deepcopy(value))
++        if len(self.cache) > 8:
++            oldest = min(self.cache, key=lambda item: self.cache[item][0])
++            self.cache.pop(oldest, None)
++
++
++class OrderQuerySessionStore:
++    def __init__(
++        self,
++        *,
++        ttl_seconds: int = 300,
++        max_sessions: int = 64,
++        cache_seconds: int = 5,
++        clock: Callable[[], float] = time.monotonic,
++    ) -> None:
++        self.ttl_seconds = max(30, min(600, int(ttl_seconds)))
++        self.max_sessions = max(1, int(max_sessions))
++        self.cache_seconds = max(0, min(30, int(cache_seconds)))
++        self._clock = clock
++        self._secret = secrets.token_bytes(32)
++        self._sessions: dict[str, OrderQuerySession] = {}
++        self._lock = threading.Lock()
++
++    def _fingerprint(self, keywords: str) -> str:
++        return hmac.new(self._secret, keywords.encode("utf-8"), hashlib.sha256).hexdigest()
++
++    def _prune(self, now: float) -> None:
++        for session_id in [
++            key for key, value in self._sessions.items() if value.expires_at <= now
++        ]:
++            self._sessions.pop(session_id, None)
++        while len(self._sessions) >= self.max_sessions:
++            oldest = min(self._sessions, key=lambda key: self._sessions[key].expires_at)
++            self._sessions.pop(oldest, None)
++
++    def create(self, keywords: str, client: Any) -> OrderQuerySession:
++        now = self._clock()
++        with self._lock:
++            self._prune(now)
++            session = OrderQuerySession(
++                session_id=secrets.token_urlsafe(24),
++                keyword_fingerprint=self._fingerprint(keywords),
++                client=client,
++                expires_at=now + self.ttl_seconds,
++            )
++            self._sessions[session.session_id] = session
++            return session
++
++    def get(self, session_id: str, keywords: str) -> OrderQuerySession:
++        now = self._clock()
++        with self._lock:
++            self._prune(now)
++            session = self._sessions.get(str(session_id or ""))
++            if session is None:
++                raise OrderQuerySessionExpired()
++            if not hmac.compare_digest(session.keyword_fingerprint, self._fingerprint(keywords)):
++                raise OrderQueryInputError("订单查询会话与查询内容不匹配")
++            return session
++
++    def remaining(self, session: OrderQuerySession) -> int:
++        return max(0, int(session.expires_at - self._clock()))
++
++    def now(self) -> float:
++        return self._clock()
++
++    def clear(self) -> None:
++        with self._lock:
++            self._sessions.clear()
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index be0340252a5e30ef0352970fb8d212934c23e414..077e6f76ec3b1c888341c09a3ded104258d952ad 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -1 +1,2 @@
+ selenium==4.48.0
++ddddocr==1.6.1
+diff --git a/backend/test_order_query_modules.py b/backend/test_order_query_modules.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..128df02960000b8482eaa5814578c67500c7108c
+--- /dev/null
++++ b/backend/test_order_query_modules.py
+@@ -0,0 +1,508 @@
++from __future__ import annotations
++
++import json
++import unittest
++from io import BytesIO
++from types import SimpleNamespace
++from typing import Any
++from unittest.mock import patch
++from urllib.request import Request
++
++import main
++from order_query import routes
++from order_query.captcha import CaptchaRecognizer, captcha_sign, normalize_captcha_code
++from order_query.client import CaptchaChallenge, OrderQueryClient
++from order_query.errors import CaptchaRecognizerUnavailable, OrderQueryInputError
++from order_query.service import OrderQueryService
++from order_query.sessions import OrderQuerySessionStore
++
++
++class FakeResponse:
++    def __init__(self, body: bytes, content_type: str = "application/json") -> None:
++        self.body = body
++        self.headers = {"Content-Type": content_type}
++
++    def __enter__(self) -> "FakeResponse":
++        return self
++
++    def __exit__(self, *args: Any) -> bool:
++        return False
++
++    def read(self, limit: int) -> bytes:
++        return self.body[:limit]
++
++
++class FakeOpener:
++    def __init__(self, responses: list[FakeResponse]) -> None:
++        self.responses = responses
++        self.requests: list[Request] = []
++
++    def open(self, request: Request, timeout: float) -> FakeResponse:
++        self.requests.append(request)
++        return self.responses.pop(0)
++
++
++class FakeRecognizer:
++    def __init__(self, values: list[Any]) -> None:
++        self.values = list(values)
++        self.calls = 0
++
++    def recognize(self, image: bytes) -> str:
++        self.calls += 1
++        value = self.values.pop(0)
++        if isinstance(value, Exception):
++            raise value
++        return str(value)
++
++
++class FakeOrderClient:
++    def __init__(self) -> None:
++        self.start_count = 0
++        self.check_codes: list[str] = []
++        self.list_calls: list[dict[str, Any]] = []
++        self.expire_next_list = False
++
++    def start_captcha(self, previous_code: str = "") -> CaptchaChallenge:
++        self.start_count += 1
++        return CaptchaChallenge(
++            image_url=f"https://pay.ldxp.cn/image/{self.start_count}",
++            check_url=f"https://pay.ldxp.cn/check/{self.start_count}",
++            ip="127.0.0.1",
++        )
++
++    def download_captcha(self, challenge: CaptchaChallenge) -> tuple[bytes, str]:
++        return f"image-{self.start_count}".encode("ascii"), "image/png"
++
++    def check_captcha(self, challenge: CaptchaChallenge, code: str) -> str | None:
++        self.check_codes.append(code)
++        return "ticket-ok" if code == "AB12" else None
++
++    def list_orders(self, **kwargs: Any) -> dict[str, Any]:
++        from order_query.errors import CaptchaVerificationExpired
++
++        self.list_calls.append(kwargs)
++        if self.expire_next_list:
++            self.expire_next_list = False
++            raise CaptchaVerificationExpired()
++        return {
++            "orders": [{"trade_no": "ORDER-1", "status": kwargs["status"]}],
++            "pagination": {
++                "page": kwargs["page"],
++                "page_size": kwargs["page_size"],
++                "total": 1,
++                "pages": 1,
++            },
++        }
++
++
++class CaptchaTests(unittest.TestCase):
++    def test_sign_matches_storefront_javascript(self) -> None:
++        self.assertEqual(
++            captcha_sign("A1b2", "223.104.78.191"),
++            "8759a73371a8d08f3ef0b1292843d0a9",
++        )
++
++    def test_code_is_strictly_four_ascii_alphanumeric_characters(self) -> None:
++        self.assertEqual(normalize_captcha_code(" A1b2\n"), "A1b2")
++        for value in ("123", "12345", "１２３４", "ab-1", "中文验证码"):
++            self.assertEqual(normalize_captcha_code(value), "")
++
++    def test_recognizer_loads_injected_classifier_lazily(self) -> None:
++        loads: list[bool] = []
++
++        class Classifier:
++            def classification(self, image: bytes) -> str:
++                return " Z9x8 "
++
++        recognizer = CaptchaRecognizer(lambda: loads.append(True) or Classifier())
++        self.assertEqual(loads, [])
++        self.assertEqual(recognizer.recognize(b"png"), "Z9x8")
++        self.assertEqual(recognizer.recognize(b"png"), "Z9x8")
++        self.assertEqual(loads, [True])
++
++
++class ClientTests(unittest.TestCase):
++    @staticmethod
++    def _json_response(value: Any) -> FakeResponse:
++        return FakeResponse(json.dumps(value, ensure_ascii=False).encode("utf-8"))
++
++    def test_one_client_handles_complete_cookie_session_and_normalizes_orders(self) -> None:
++        opener = FakeOpener([
++            self._json_response({
++                "code": 1,
++                "data": {
++                    "img_url": "https://pay.ldxp.cn/shopApi/common/captchaImg.html?key=image",
++                    "check_url": "https://pay.ldxp.cn/shopApi/common/captchaCheck.html?key=check",
++                    "ip": "223.104.78.191",
++                },
++            }),
++            FakeResponse(b"png-bytes", "image/png; charset=utf-8"),
++            self._json_response({"code": 1, "data": {"ticket": "ticket-value"}}),
++            self._json_response({
++                "code": 1,
++                "data": {
++                    "total": 1,
++                    "list": [{
++                        "trade_no": "LD-100",
++                        "goods_name": "测试商品",
++                        "create_time": "2026-08-30T19:20:21+08:00",
++                        "total_amount": "9.9",
++                        "quantity": "2",
++                        "status": 1,
++                        "need_query_password": 1,
++                        "can_complaint": 0,
++                        "private_contact": "must-not-leak",
++                        "goods": {
++                            "goods_key": "GOODS1",
++                            "goods_type": "card",
++                            "image": "https://cdn.example.test/goods.png",
++                            "secret_cards": ["must-not-leak"],
++                        },
++                        "complaint": {"status": -1, "messages": ["must-not-leak"]},
++                    }],
++                },
++            }),
++        ])
++        client = OrderQueryClient(opener=opener)
++
++        challenge = client.start_captcha()
++        image, mime_type = client.download_captcha(challenge)
++        ticket = client.check_captcha(challenge, "A1b2")
++        result = client.list_orders(
++            keywords="buyer@example.test",
++            ticket=str(ticket),
++            status=999,
++            page=1,
++            page_size=10,
++        )
++
++        self.assertEqual(image, b"png-bytes")
++        self.assertEqual(mime_type, "image/png")
++        self.assertEqual(ticket, "ticket-value")
++        self.assertEqual(len(opener.requests), 4)
++        visitor_ids = []
++        for request in opener.requests:
++            headers = {key.lower(): value for key, value in request.header_items()}
++            visitor_ids.append(headers["visitorid"])
++        self.assertEqual(visitor_ids, [client.visitor_id] * 4)
++        self.assertRegex(client.visitor_id, r"^[a-z0-9]{9}$")
++        order = result["orders"][0]
++        self.assertEqual(order["created_at"], "2026-08-30T11:20:21+00:00")
++        self.assertEqual(order["total_amount"], "9.90")
++        self.assertEqual(order["status_label"], "已付款")
++        self.assertNotIn("private_contact", order)
++        self.assertNotIn("secret_cards", json.dumps(order, ensure_ascii=False))
++        self.assertNotIn("messages", json.dumps(order, ensure_ascii=False))
++
++        check_payload = json.loads(opener.requests[2].data.decode("utf-8"))
++        self.assertEqual(check_payload["sign"], captcha_sign("A1b2", challenge.ip))
++        list_payload = json.loads(opener.requests[3].data.decode("utf-8"))
++        self.assertEqual(list_payload["current"], 1)
++        self.assertEqual(list_payload["pageSize"], 10)
++
++    def test_dynamic_captcha_urls_reject_other_hosts(self) -> None:
++        opener = FakeOpener([
++            self._json_response({
++                "code": 1,
++                "data": {
++                    "img_url": "https://example.test/shopApi/common/captchaImg.html?key=x",
++                    "check_url": "https://pay.ldxp.cn/shopApi/common/captchaCheck.html?key=x",
++                    "ip": "127.0.0.1",
++                },
++            }),
++        ])
++        with self.assertRaisesRegex(RuntimeError, "地址无效"):
++            OrderQueryClient(opener=opener).start_captcha()
++
++    def test_empty_order_result_keeps_one_pagination_page(self) -> None:
++        from order_query.client import normalize_order_list
++
++        result = normalize_order_list(
++            {"code": 1, "data": {"total": 0, "list": []}},
++            page=1,
++            page_size=10,
++        )
++        self.assertEqual(result["orders"], [])
++        self.assertEqual(result["pagination"], {
++            "page": 1,
++            "page_size": 10,
++            "total": 0,
++            "pages": 1,
++        })
++
++    def test_captcha_image_rejects_non_raster_mime_type(self) -> None:
++        client = OrderQueryClient(opener=FakeOpener([
++            FakeResponse(b"<svg/>", "image/svg+xml"),
++        ]))
++        challenge = CaptchaChallenge(
++            image_url="https://pay.ldxp.cn/shopApi/common/captchaImg.html?key=image",
++            check_url="https://pay.ldxp.cn/shopApi/common/captchaCheck.html?key=check",
++            ip="127.0.0.1",
++        )
++        with self.assertRaisesRegex(RuntimeError, "图片响应无效"):
++            client.download_captcha(challenge)
++
++
++class ServiceTests(unittest.TestCase):
++    @staticmethod
++    def service(client: FakeOrderClient, recognizer: FakeRecognizer) -> OrderQueryService:
++        return OrderQueryService(
++            client_factory=lambda: client,
++            recognizer=recognizer,
++            sessions=OrderQuerySessionStore(ttl_seconds=120, cache_seconds=5),
++            max_ocr_attempts=3,
++        )
++
++    def test_auto_ocr_retries_then_ticket_is_reused_for_filters_and_pages(self) -> None:
++        client = FakeOrderClient()
++        recognizer = FakeRecognizer(["ZZ99", "AB12"])
++        service = self.service(client, recognizer)
++
++        first = service.search({"keywords": "buyer", "status": 999, "page": 1, "page_size": 10})
++        second = service.search({
++            "keywords": "buyer",
++            "status": 1,
++            "page": 2,
++            "page_size": 10,
++            "session_id": first["session_id"],
++        })
++        cached = service.search({
++            "keywords": "buyer",
++            "status": 1,
++            "page": 2,
++            "page_size": 10,
++            "session_id": first["session_id"],
++        })
++
++        self.assertEqual(first["verification"], {"status": "verified", "mode": "ocr", "attempts": 2})
++        self.assertEqual(second["verification"], {"status": "verified", "mode": "session", "attempts": 0})
++        self.assertEqual(cached["orders"], second["orders"])
++        self.assertEqual(client.start_count, 2)
++        self.assertEqual(client.check_codes, ["ZZ99", "AB12"])
++        self.assertEqual(len(client.list_calls), 2)
++        self.assertEqual(client.list_calls[1]["ticket"], "ticket-ok")
++
++    def test_three_failed_ocr_attempts_return_manual_challenge_then_accept_code(self) -> None:
++        client = FakeOrderClient()
++        recognizer = FakeRecognizer(["AAAA", "BBBB", "CCCC"])
++        service = self.service(client, recognizer)
++
++        manual = service.search({"keywords": "LD-100", "status": 999, "page": 1, "page_size": 10})
++        self.assertEqual(manual["verification"], {
++            "status": "manual_required",
++            "mode": "manual",
++            "attempts": 3,
++        })
++        self.assertTrue(manual["captcha"]["image_data_url"].startswith("data:image/png;base64,"))
++        self.assertEqual(client.start_count, 4)
++
++        verified = service.search({
++            "keywords": "LD-100",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++            "session_id": manual["session_id"],
++            "captcha_code": "AB12",
++        })
++        self.assertEqual(verified["verification"], {
++            "status": "verified",
++            "mode": "manual",
++            "attempts": 1,
++        })
++
++    def test_missing_ocr_falls_back_to_manual_and_refresh_does_not_query(self) -> None:
++        client = FakeOrderClient()
++        recognizer = FakeRecognizer([CaptchaRecognizerUnavailable("missing")])
++        service = self.service(client, recognizer)
++
++        manual = service.search({"keywords": "buyer", "status": 999, "page": 1, "page_size": 10})
++        refreshed = service.search({
++            "keywords": "buyer",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++            "session_id": manual["session_id"],
++            "refresh_captcha": True,
++        })
++
++        self.assertEqual(manual["verification"]["status"], "manual_required")
++        self.assertEqual(manual["verification"]["attempts"], 0)
++        self.assertEqual(refreshed["verification"], {
++            "status": "manual_required",
++            "mode": "manual",
++            "attempts": 0,
++        })
++        self.assertEqual(client.list_calls, [])
++        self.assertEqual(client.start_count, 3)
++
++    def test_expired_ticket_is_reverified_within_three_attempt_budget(self) -> None:
++        client = FakeOrderClient()
++        client.expire_next_list = True
++        service = self.service(client, FakeRecognizer(["AB12", "AB12"]))
++
++        result = service.search({"keywords": "buyer", "status": 999, "page": 1, "page_size": 10})
++
++        self.assertEqual(result["verification"], {
++            "status": "verified",
++            "mode": "ocr",
++            "attempts": 2,
++        })
++        self.assertEqual(client.start_count, 2)
++        self.assertEqual(len(client.list_calls), 2)
++
++    def test_session_is_bound_to_keywords_and_manual_code_is_strict(self) -> None:
++        client = FakeOrderClient()
++        service = self.service(client, FakeRecognizer(["AB12"]))
++        result = service.search({"keywords": "buyer-a", "status": 999, "page": 1, "page_size": 10})
++        with self.assertRaisesRegex(OrderQueryInputError, "不匹配"):
++            service.search({
++                "keywords": "buyer-b",
++                "status": 999,
++                "page": 1,
++                "page_size": 10,
++                "session_id": result["session_id"],
++            })
++        with self.assertRaisesRegex(OrderQueryInputError, "验证码格式"):
++            service.search({
++                "keywords": "buyer-a",
++                "status": 999,
++                "page": 1,
++                "page_size": 10,
++                "session_id": result["session_id"],
++                "captcha_code": "123",
++            })
++
++
++class RouteTests(unittest.TestCase):
++    def test_manual_required_is_a_successful_route_result(self) -> None:
++        responses: list[tuple[int, Any]] = []
++        payload = {
++            "session_id": "session",
++            "expires_in": 100,
++            "verification": {"status": "manual_required", "mode": "manual", "attempts": 3},
++            "captcha": {"image_data_url": "data:image/png;base64,eA=="},
++        }
++        handled = routes.handle_post(
++            "/api/order-query/search",
++            {"keywords": "buyer"},
++            send_json=lambda value, status=200: responses.append((status, value)),
++            search=lambda data: payload,
++        )
++        self.assertTrue(handled)
++        self.assertEqual(responses, [(200, payload)])
++
++    def test_route_returns_structured_validation_error(self) -> None:
++        responses: list[tuple[int, Any]] = []
++
++        def fail(data: dict[str, Any]) -> dict[str, Any]:
++            raise OrderQueryInputError("bad query")
++
++        routes.handle_post(
++            "/api/order-query/search",
++            {},
++            send_json=lambda value, status=200: responses.append((status, value)),
++            search=fail,
++        )
++        self.assertEqual(responses, [(400, {
++            "detail": "bad query",
++            "code": "invalid_order_query",
++            "retryable": False,
++        })])
++
++    def test_main_http_handler_mounts_order_query_route(self) -> None:
++        body = json.dumps({
++            "keywords": "buyer",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++        }).encode("utf-8")
++        expected = {
++            "session_id": "session",
++            "expires_in": 120,
++            "verification": {"status": "verified", "mode": "ocr", "attempts": 1},
++            "orders": [],
++            "pagination": {"page": 1, "page_size": 10, "total": 0, "pages": 1},
++        }
++        trusted_origins = (
++            ("http://127.0.0.1:5173/", "http://localhost:5188"),
++            ("https://dashboard.example/app", "https://dashboard.example"),
++        )
++        for frontend_url, origin in trusted_origins:
++            with self.subTest(origin=origin):
++                handler = object.__new__(main.ApiHandler)
++                handler.path = "/api/order-query/search"
++                handler.headers = {
++                    "Content-Length": str(len(body)),
++                    "Content-Type": "application/json; charset=utf-8",
++                    "Origin": origin,
++                }
++                handler.rfile = BytesIO(body)
++                responses: list[tuple[int, Any]] = []
++                handler._send_json = lambda value, status=200: responses.append((status, value))
++                service = SimpleNamespace(search=lambda data: expected)
++
++                with patch.object(main, "FRONTEND_URL", frontend_url), \
++                     patch.object(main, "ORDER_QUERY_SERVICE", service):
++                    handler.do_POST()
++
++                self.assertEqual(responses, [(200, expected)])
++
++    def test_order_query_request_guard_does_not_apply_to_other_routes(self) -> None:
++        rejection = routes.request_rejection(
++            "/api/preorders",
++            {"Content-Type": "text/plain", "Origin": "https://untrusted.example"},
++            frontend_url="http://127.0.0.1:5173/",
++        )
++        self.assertIsNone(rejection)
++
++    def test_main_http_handler_rejects_order_query_with_wrong_content_type(self) -> None:
++        body = json.dumps({"keywords": "buyer"}).encode("utf-8")
++        handler = object.__new__(main.ApiHandler)
++        handler.path = "/api/order-query/search"
++        handler.headers = {
++            "Content-Length": str(len(body)),
++            "Content-Type": "text/plain",
++            "Origin": "http://127.0.0.1:5173",
++        }
++        handler.rfile = BytesIO(body)
++        responses: list[tuple[int, Any]] = []
++        handler._send_json = lambda value, status=200: responses.append((status, value))
++        calls: list[dict[str, Any]] = []
++
++        with patch.object(main, "ORDER_QUERY_SERVICE", SimpleNamespace(search=calls.append)):
++            handler.do_POST()
++
++        self.assertEqual(calls, [])
++        self.assertEqual(responses, [(415, {
++            "detail": "订单查询仅接受 application/json 请求",
++            "code": "unsupported_media_type",
++            "retryable": False,
++        })])
++
++    def test_main_http_handler_rejects_untrusted_order_query_origin(self) -> None:
++        body = json.dumps({"keywords": "buyer"}).encode("utf-8")
++        handler = object.__new__(main.ApiHandler)
++        handler.path = "/api/order-query/search"
++        handler.headers = {
++            "Content-Length": str(len(body)),
++            "Content-Type": "application/json",
++            "Origin": "https://untrusted.example",
++        }
++        handler.rfile = BytesIO(body)
++        responses: list[tuple[int, Any]] = []
++        handler._send_json = lambda value, status=200: responses.append((status, value))
++        calls: list[dict[str, Any]] = []
++
++        with patch.object(main, "ORDER_QUERY_SERVICE", SimpleNamespace(search=calls.append)):
++            handler.do_POST()
++
++        self.assertEqual(calls, [])
++        self.assertEqual(responses, [(403, {
++            "detail": "订单查询请求来源不受信任",
++            "code": "untrusted_origin",
++            "retryable": False,
++        })])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/frontend/src/OrderQueryView.jsx b/frontend/src/OrderQueryView.jsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..a64b8db5cd813d89f98baa071b5e3c79f508254f
+--- /dev/null
++++ b/frontend/src/OrderQueryView.jsx
+@@ -0,0 +1,335 @@
++import React, {useEffect, useMemo, useRef, useState} from 'react';
++import {
++  AlertCircle,
++  ArrowUpRight,
++  Check,
++  ChevronLeft,
++  ChevronRight,
++  Clipboard,
++  Clock3,
++  Database,
++  ExternalLink,
++  Image,
++  Package,
++  ReceiptText,
++  RefreshCw,
++  Search,
++  ShieldCheck,
++  TriangleAlert,
++} from 'lucide-react';
++import {
++  ORDER_STATUS_OPTIONS,
++  formatOrderDateTime,
++  formatOrderMoney,
++  normalizeOrderResponse,
++  orderQueryContextChanged,
++  summarizeOrders,
++  verificationLabel,
++} from './orderQueryModel.js';
++import './orderQuery.css';
++
++const EMPTY_RESULT = {orders: [], pagination: {page: 1, page_size: 10, total: 0, pages: 1}};
++
++function QueryIconButton({label, children, ...props}) {
++  return <button className="icon-button" type="button" aria-label={label} title={label} {...props}>{children}</button>;
++}
++
++function OrderImage({order}) {
++  const [failed, setFailed] = useState(false);
++  useEffect(() => setFailed(false), [order.goods_image]);
++  if (!order.goods_image || failed) return <span className="order-product-image fallback"><Package size={18}/></span>;
++  return <img className="order-product-image" src={order.goods_image} alt="" onError={() => setFailed(true)}/>;
++}
++
++function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaCode, onRefresh, onSubmit, expiresIn}) {
++  const manualRequired = verification?.status === 'manual_required';
++  const attempts = Number(verification?.attempts || 0);
++  const state = busy ? 'busy' : manualRequired ? 'manual' : verification?.status === 'verified' ? 'verified' : 'idle';
++  const stateLabel = busy
++    ? busy === 'refresh' ? '正在刷新验证码' : busy === 'manual' ? '正在核对验证码' : '正在自动识别并查询'
++    : verificationLabel(verification);
++  const imageSource = captcha?.image_data_url || captcha?.image_url || '';
++
++  return <section className={`order-verification ${state}`} aria-live="polite">
++    <div className="order-verification-head">
++      <span className="order-verification-icon">{state === 'busy' ? <RefreshCw className="spin" size={18}/> : state === 'verified' ? <Check size={18}/> : state === 'manual' ? <TriangleAlert size={18}/> : <ShieldCheck size={18}/>}</span>
++      <div><span>CAPTCHA SESSION</span><strong>{stateLabel}</strong></div>
++      {attempts > 0 && <em>尝试 {attempts} 次</em>}
++    </div>
++    {!manualRequired ? <div className="order-verification-flow" aria-label="验证码处理流程">
++      <span className={state !== 'idle' ? 'done' : ''}>获取挑战</span>
++      <span className={state === 'verified' ? 'done' : state === 'busy' ? 'active' : ''}>自动识别</span>
++      <span className={state === 'verified' ? 'done' : ''}>官网校验</span>
++      <span className={state === 'verified' ? 'done' : ''}>读取订单</span>
++    </div> : <form className="order-captcha-form" onSubmit={onSubmit}>
++      <div className="order-captcha-preview">
++        {imageSource ? <img src={imageSource} alt="链动小铺验证码"/> : <span><Image size={22}/>验证码图片待刷新</span>}
++        <QueryIconButton label="刷新验证码" onClick={onRefresh} disabled={Boolean(busy)}><RefreshCw size={15} className={busy === 'refresh' ? 'spin' : ''}/></QueryIconButton>
++      </div>
++      <label><span>验证码</span><input value={captchaCode} onChange={event => onCaptchaCode(event.target.value.replace(/[^A-Za-z0-9]/g, '').slice(0, 4))} placeholder="4 位字母或数字" autoComplete="off" spellCheck="false" inputMode="text" pattern="[A-Za-z0-9]{4}" maxLength={4} autoFocus/></label>
++      <button className="button primary" type="submit" disabled={Boolean(busy) || !/^[A-Za-z0-9]{4}$/.test(captchaCode)}><ShieldCheck size={15}/>{busy === 'manual' ? '正在验证' : '验证并继续'}</button>
++      <small>{expiresIn ? `当前验证会话约 ${Math.max(1, Math.ceil(Number(expiresIn) / 60))} 分钟内有效` : '自动识别未通过，请确认图片内容'}</small>
++    </form>}
++  </section>;
++}
++
++function OrderRow({order, onCopy}) {
++  return <tr>
++    <td data-label="商品">
++      <div className="order-product-cell"><OrderImage order={order}/><span><strong>{order.goods_name}</strong><small>{formatOrderDateTime(order.created_at)}</small></span></div>
++    </td>
++    <td data-label="订单号"><div className="order-number"><strong title={order.trade_no}>{order.trade_no || '--'}</strong><QueryIconButton label={`复制订单号 ${order.trade_no}`} onClick={() => onCopy(order.trade_no)} disabled={!order.trade_no}><Clipboard size={13}/></QueryIconButton></div></td>
++    <td data-label="金额 / 数量"><div className="order-amount"><strong>{formatOrderMoney(order.total_amount)}</strong><small>共 {order.quantity} 件</small></div></td>
++    <td data-label="状态"><span className={`order-status ${order.status_tone}`}>{order.status_label}</span></td>
++    <td data-label="商品类型"><div className="order-type"><strong>{order.goods_type_label}</strong>{order.need_query_password && <small><ShieldCheck size={11}/>权益需安全密码</small>}</div></td>
++    <td data-label="操作"><div className="order-row-actions">
++      {order.detail_url && <a className="icon-button" href={order.detail_url} target="_blank" rel="noreferrer" aria-label="打开官方订单详情" title="打开官方订单详情"><ExternalLink size={14}/></a>}
++      {order.status === 1 && order.result_url && !order.need_query_password && <a className="button secondary order-result-link" href={order.result_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>{order.goods_action_label}</a>}
++    </div></td>
++  </tr>;
++}
++
++export default function OrderQueryView({request, notify, initialKeywords = ''}) {
++  const [keywords, setKeywords] = useState(initialKeywords || '');
++  const [submittedKeywords, setSubmittedKeywords] = useState('');
++  const [activeStatus, setActiveStatus] = useState(999);
++  const [pageSize, setPageSize] = useState(10);
++  const [result, setResult] = useState(EMPTY_RESULT);
++  const [verification, setVerification] = useState(null);
++  const [captcha, setCaptcha] = useState(null);
++  const [captchaCode, setCaptchaCode] = useState('');
++  const [sessionId, setSessionId] = useState('');
++  const [expiresIn, setExpiresIn] = useState(0);
++  const [busy, setBusy] = useState('');
++  const [error, setError] = useState('');
++  const [hasQueried, setHasQueried] = useState(false);
++  const [queriedAt, setQueriedAt] = useState(null);
++  const requestVersion = useRef(0);
++  const resultContext = useRef({keywords: '', status: 999, pageSize: 10});
++  const initialKeywordsApplied = useRef(false);
++
++  useEffect(() => {
++    if (initialKeywordsApplied.current || !initialKeywords) return;
++    initialKeywordsApplied.current = true;
++    setKeywords(current => current || initialKeywords);
++  }, [initialKeywords]);
++
++  const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
++  const verified = verification?.status === 'verified';
++  const manualRequired = verification?.status === 'manual_required';
++
++  const sendSearch = async (payload, allowExpiredRetry = true) => {
++    try {
++      return await request('/order-query/search', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify(payload),
++      });
++    } catch (requestError) {
++      if (allowExpiredRetry && requestError.status === 410 && payload.session_id) {
++        const retryPayload = {...payload};
++        delete retryPayload.session_id;
++        delete retryPayload.captcha_code;
++        return sendSearch(retryPayload, false);
++      }
++      throw requestError;
++    }
++  };
++
++  const runSearch = async ({
++    keywordValue = submittedKeywords || keywords,
++    statusValue = activeStatus,
++    pageValue = 1,
++    pageSizeValue = pageSize,
++    manualCode = '',
++    refreshCaptcha = false,
++    reuseSession = true,
++    quiet = false,
++  } = {}) => {
++    const normalizedKeywords = keywordValue.trim();
++    if (!normalizedKeywords) {
++      notify('请输入预留联系方式或订单号', 'error');
++      return false;
++    }
++
++    const version = requestVersion.current + 1;
++    requestVersion.current = version;
++    const isNewKeyword = normalizedKeywords !== submittedKeywords;
++    const canReuseSession = reuseSession && !isNewKeyword && Boolean(sessionId);
++    const nextContext = {
++      keywords: normalizedKeywords,
++      status: Number(statusValue),
++      pageSize: Number(pageSizeValue),
++    };
++    const resultWouldBeStale = hasQueried && orderQueryContextChanged(resultContext.current, nextContext);
++    const clearStaleResult = () => {
++      if (!resultWouldBeStale) return;
++      setResult({orders: [], pagination: {page: 1, page_size: nextContext.pageSize, total: 0, pages: 1}});
++      setHasQueried(false);
++      setQueriedAt(null);
++    };
++    if (isNewKeyword) {
++      setSubmittedKeywords(normalizedKeywords);
++      setResult(EMPTY_RESULT);
++      setHasQueried(false);
++      setVerification(null);
++      setCaptcha(null);
++      setCaptchaCode('');
++      setSessionId('');
++      setExpiresIn(0);
++      setQueriedAt(null);
++    }
++    setBusy(refreshCaptcha ? 'refresh' : manualCode ? 'manual' : 'search');
++    setError('');
++    const payload = {
++      keywords: normalizedKeywords,
++      status: Number(statusValue),
++      page: Number(pageValue),
++      page_size: Number(pageSizeValue),
++    };
++    if (canReuseSession) payload.session_id = sessionId;
++    if (manualCode) payload.captcha_code = manualCode;
++    if (refreshCaptcha) payload.refresh_captcha = true;
++
++    try {
++      const response = await sendSearch(payload);
++      if (version !== requestVersion.current) return false;
++      setSessionId(String(response.session_id || ''));
++      setExpiresIn(Number(response.expires_in || 0));
++      setVerification(response.verification || null);
++      setSubmittedKeywords(normalizedKeywords);
++
++      if (response.verification?.status === 'manual_required') {
++        clearStaleResult();
++        setCaptcha(response.captcha || null);
++        setCaptchaCode('');
++        if (!quiet && !refreshCaptcha) notify({
++          type: 'warning',
++          title: '需要确认验证码',
++          message: manualCode ? '验证码未通过，请刷新或重新输入' : '自动识别未通过，请核对验证码后继续查询',
++          duration: 6000,
++        });
++        return false;
++      }
++
++      const normalized = normalizeOrderResponse(response, {page: pageValue, pageSize: pageSizeValue});
++      setResult(normalized);
++      resultContext.current = nextContext;
++      setCaptcha(null);
++      setCaptchaCode('');
++      setHasQueried(true);
++      setQueriedAt(new Date());
++      if (!quiet) notify({type: 'success', title: '订单查询完成', message: `已获取 ${normalized.pagination.total} 笔订单`, duration: 4200});
++      return true;
++    } catch (requestError) {
++      if (version !== requestVersion.current) return false;
++      clearStaleResult();
++      setError(requestError.message || '订单查询失败');
++      notify(requestError.message || '订单查询失败', 'error');
++      return false;
++    } finally {
++      if (version === requestVersion.current) setBusy('');
++    }
++  };
++
++  const submitSearch = event => {
++    event.preventDefault();
++    runSearch({keywordValue: keywords, pageValue: 1, reuseSession: !manualRequired});
++  };
++
++  const submitManualCaptcha = event => {
++    event.preventDefault();
++    runSearch({manualCode: captchaCode.trim(), pageValue: 1});
++  };
++
++  const changeStatus = status => {
++    setActiveStatus(status);
++    if (submittedKeywords && !manualRequired) runSearch({statusValue: status, pageValue: 1, quiet: true});
++  };
++
++  const changePage = page => {
++    if (!submittedKeywords || page === result.pagination.page || busy) return;
++    runSearch({pageValue: page, quiet: true});
++  };
++
++  const changePageSize = value => {
++    const nextSize = Number(value);
++    setPageSize(nextSize);
++    if (submittedKeywords && !manualRequired) runSearch({pageSizeValue: nextSize, pageValue: 1, quiet: true});
++  };
++
++  const copyOrderNumber = async tradeNo => {
++    try {
++      await navigator.clipboard.writeText(tradeNo);
++      notify(`已复制订单号：${tradeNo}`);
++    } catch {
++      notify('无法访问剪贴板，请检查浏览器权限', 'error');
++    }
++  };
++
++  const emptyMessage = busy && !result.orders.length
++    ? {icon: <RefreshCw className="spin" size={22}/>, title: '正在自动验证并读取订单', detail: '结果返回后会显示在这里'}
++    : error && !result.orders.length
++      ? {icon: <AlertCircle size={22}/>, title: '订单查询未完成', detail: error}
++      : hasQueried
++        ? {icon: <Database size={22}/>, title: '没有查询到订单', detail: '请核对联系方式、订单号或切换订单状态'}
++        : {icon: <ReceiptText size={22}/>, title: '尚未查询订单', detail: '输入购买时预留的联系方式或订单号'};
++
++  return <section className="order-query-view">
++    <section className="order-query-console">
++      <div className="order-query-form-panel">
++        <div className="order-section-heading"><div><span>LDXP ORDER LOOKUP</span><h2>链动小铺订单查询</h2><p>使用购买时预留的联系方式或订单号查询</p></div><a className="icon-button" href="https://pay.ldxp.cn/order" target="_blank" rel="noreferrer" aria-label="打开官方订单查询" title="打开官方订单查询"><ArrowUpRight size={16}/></a></div>
++        <form className="order-search-form" onSubmit={submitSearch}>
++          <label><span>联系方式 / 订单号</span><div><Search size={16}/><input value={keywords} onChange={event => setKeywords(event.target.value)} placeholder="邮箱、手机号、QQ 或订单号" autoComplete="off" spellCheck="false"/></div></label>
++          <button className="button primary" type="submit" disabled={Boolean(busy) || !keywords.trim()}><ShieldCheck size={16}/>{busy === 'search' ? '正在查询' : '自动验证并查询'}</button>
++        </form>
++        <div className="order-query-source"><span><ShieldCheck size={13}/>数据来源</span><strong>pay.ldxp.cn/order</strong>{submittedKeywords && <em>当前查询：{submittedKeywords}</em>}</div>
++        {error && <div className="order-query-error"><TriangleAlert size={15}/><span>{error}</span><button type="button" onClick={() => runSearch({pageValue: result.pagination.page || 1})}>重试</button></div>}
++      </div>
++      <VerificationPanel
++        busy={busy}
++        verification={verification}
++        captcha={captcha}
++        captchaCode={captchaCode}
++        onCaptchaCode={setCaptchaCode}
++        onRefresh={() => runSearch({refreshCaptcha: true, quiet: true})}
++        onSubmit={submitManualCaptcha}
++        expiresIn={expiresIn}
++      />
++    </section>
++
++    <section className={`order-results-panel ${busy && result.orders.length ? 'updating' : ''}`}>
++      <div className="order-results-head">
++        <div><span>ORDER LIST</span><h2>购买订单</h2><p>{hasQueried ? `${submittedKeywords} · 共 ${result.pagination.total} 笔` : '查询完成后按订单状态查看结果'}</p></div>
++        <div className="order-results-actions">
++          <label><span>每页</span><select value={pageSize} onChange={event => changePageSize(event.target.value)} disabled={!hasQueried || Boolean(busy)}><option value="10">10</option><option value="20">20</option><option value="50">50</option></select></label>
++          <QueryIconButton label="刷新当前订单" onClick={() => runSearch({pageValue: result.pagination.page, quiet: true})} disabled={!submittedKeywords || Boolean(busy)}><RefreshCw size={16} className={busy ? 'spin' : ''}/></QueryIconButton>
++        </div>
++      </div>
++
++      <div className="order-status-tabs" role="tablist" aria-label="订单状态">
++        {ORDER_STATUS_OPTIONS.map(option => <button type="button" role="tab" aria-selected={activeStatus === option.value} className={activeStatus === option.value ? 'active' : ''} key={option.value} onClick={() => changeStatus(option.value)} disabled={Boolean(busy)}>{option.label}</button>)}
++      </div>
++
++      {hasQueried && <div className="order-summary-strip">
++        <div><span>订单总数</span><strong>{summary.total}</strong></div>
++        <div><span>当前页</span><strong>{summary.pageCount}</strong></div>
++        <div><span>本页金额</span><strong>{formatOrderMoney(summary.pageAmount)}</strong></div>
++        <div><span>验证状态</span><strong>{verificationLabel(verification)}</strong><small>{queriedAt ? formatOrderDateTime(queriedAt) : '--'}</small></div>
++      </div>}
++
++      <div className="order-table-wrap">
++        <table className="order-query-table">
++          <thead><tr><th>商品 / 下单时间</th><th>订单号</th><th>金额 / 数量</th><th>状态</th><th>商品类型</th><th>操作</th></tr></thead>
++          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
++        </table>
++      </div>
++
++      <div className="order-pagination">
++        <span>第 {result.pagination.page} / {result.pagination.pages} 页 · 共 {result.pagination.total} 笔</span>
++        <div><QueryIconButton label="上一页" onClick={() => changePage(Math.max(1, result.pagination.page - 1))} disabled={Boolean(busy) || result.pagination.page <= 1}><ChevronLeft size={16}/></QueryIconButton><QueryIconButton label="下一页" onClick={() => changePage(Math.min(result.pagination.pages, result.pagination.page + 1))} disabled={Boolean(busy) || result.pagination.page >= result.pagination.pages}><ChevronRight size={16}/></QueryIconButton></div>
++      </div>
++      {busy && result.orders.length > 0 && <div className="order-update-indicator"><RefreshCw className="spin" size={14}/>正在更新订单</div>}
++    </section>
++  </section>;
++}
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 1d6cf19342d3cf8af6d71ed369cc14b7a649fc3e..1c7e83a6684d73fd48697a90340b87c3db707fba 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -27,6 +27,7 @@ import {
+   Package,
+   PanelRight,
+   Plus,
++  ReceiptText,
+   RefreshCw,
+   Save,
+   Search,
+@@ -35,6 +36,7 @@ import {
+   Sun,
+   Tag,
+   TimerReset,
++  TriangleAlert,
+   Upload,
+   ShieldCheck,
+   ShoppingBag,
+@@ -55,11 +57,13 @@ import {
+ const API = '/api';
+ const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
+ const ProductDetailPriceChart = React.lazy(() => import('./PriceHistoryChart.jsx').then(module => ({default: module.ProductDetailPriceChart})));
++const loadOrderQueryView = () => import('./OrderQueryView.jsx');
+ const loadReclaimView = () => import('./ReclaimView.jsx');
+ const loadSub2ApiView = () => import('./Sub2ApiView.jsx');
++const OrderQueryView = React.lazy(() => loadOrderQueryView());
+ const ReclaimView = React.lazy(() => loadReclaimView());
+ const Sub2ApiView = React.lazy(() => loadSub2ApiView());
+-const FEATURE_MODULE_LOADERS = {reclaim: loadReclaimView, sub2api: loadSub2ApiView};
++const FEATURE_MODULE_LOADERS = {orders: loadOrderQueryView, reclaim: loadReclaimView, sub2api: loadSub2ApiView};
+ const DEFAULT_SUB2API_AUTOMATION = {
+   enabled: false,
+   interval_seconds: 300,
+@@ -2615,6 +2619,7 @@ function App() {
+     products: {title: '商品总览', description: '聚合监控店铺报价，快速比较最低价、库存与销售状态'},
+     monitor: {title: '店铺与商品监控', description: '汇总店铺商品，追踪库存、价格与在售状态'},
+     history: {title: '价格记录', description: '查看选中商品的抓取结果与价格变化'},
++    orders: {title: '订单查询', description: '自动完成链动小铺验证并查看购买订单'},
+     reclaim: {title: '卡密 401 找回', description: '检测并找回 30d.team 卡密关联的 401 账号'},
+     sub2api: {title: 'Sub2API 账号导入', description: '使用管理员密钥将账号 JSON 导入 Sub2API'},
+   }[activeView];
+@@ -2632,6 +2637,7 @@ function App() {
+           <button className={activeView === 'products' ? 'active' : ''} onClick={() => switchView('products')}><CircleDollarSign size={18}/>商品总览</button>
+           <button className={activeView === 'monitor' ? 'active' : ''} onClick={() => switchView('monitor')}><ListChecks size={18}/>监控面板</button>
+           <button className={activeView === 'history' ? 'active' : ''} onClick={() => switchView('history')}><History size={18}/>价格记录</button>
++          <button className={activeView === 'orders' ? 'active' : ''} onClick={() => switchView('orders')}><ReceiptText size={18}/>订单查询</button>
+           <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>
+           <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>
+         </nav>
+@@ -2758,6 +2764,10 @@ function App() {
+             onPageSizeChange={changeHistoryPageSize}
+             busy={historyBusy}
+           />
++        ) : activeView === 'orders' ? (
++          <React.Suspense fallback={<FeatureLoadingState feature="订单查询界面" state={{status: 'loading'}}/>}>
++            <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact}/>
++          </React.Suspense>
+         ) : activeView === 'reclaim' ? featureLoadState.reclaim.status !== 'ready' ? (
+           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
+         ) : (
+diff --git a/frontend/src/orderQuery.css b/frontend/src/orderQuery.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..2386f3b48bb8ab5eb269f25aebb2bd8363255dbe
+--- /dev/null
++++ b/frontend/src/orderQuery.css
+@@ -0,0 +1,238 @@
++.order-query-view {
++  margin-top: 18px;
++  display: grid;
++  gap: 14px;
++  color: var(--ui-text);
++}
++
++.order-query-console {
++  min-width: 0;
++  display: grid;
++  grid-template-columns: minmax(410px, 1.12fr) minmax(360px, .88fr);
++  background: var(--ui-surface);
++  border: 1px solid var(--ui-border);
++  border-radius: 4px;
++  overflow: hidden;
++}
++
++.order-query-form-panel,
++.order-verification { min-width: 0; padding: 20px; }
++.order-verification { border-left: 1px solid var(--ui-border); background: var(--ui-surface-muted); }
++
++.order-section-heading,
++.order-results-head,
++.order-verification-head {
++  display: flex;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 14px;
++}
++
++.order-section-heading > div,
++.order-results-head > div:first-child,
++.order-verification-head > div { min-width: 0; }
++.order-section-heading span,
++.order-results-head > div:first-child > span,
++.order-verification-head > div > span {
++  display: block;
++  color: var(--ui-text-faint);
++  font-size: 9px;
++  font-weight: 750;
++}
++.order-section-heading h2,
++.order-results-head h2 {
++  margin: 5px 0 0;
++  color: var(--ui-text);
++  font-size: 18px;
++}
++.order-section-heading p,
++.order-results-head p {
++  margin: 5px 0 0;
++  overflow-wrap: anywhere;
++  color: var(--ui-text-muted);
++  font-size: 11px;
++}
++
++.order-search-form {
++  margin-top: 18px;
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) auto;
++  gap: 9px;
++  align-items: end;
++}
++.order-search-form label { min-width: 0; }
++.order-search-form label > div { position: relative; }
++.order-search-form label svg { position: absolute; left: 11px; top: 11px; color: var(--ui-text-faint); pointer-events: none; }
++.order-search-form input { height: 40px; padding-left: 35px; color: var(--ui-text); background: var(--ui-control); border-color: var(--ui-border); border-radius: 4px; }
++.order-search-form .button { min-height: 40px; padding-inline: 17px; white-space: nowrap; }
++
++.order-query-source {
++  min-height: 34px;
++  margin-top: 12px;
++  padding-top: 11px;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  overflow: hidden;
++  border-top: 1px solid var(--ui-border-soft);
++  font-size: 10px;
++}
++.order-query-source span { display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-faint); }
++.order-query-source strong { color: var(--ui-text-muted); font-weight: 650; }
++.order-query-source em { min-width: 0; margin-left: auto; overflow: hidden; color: var(--ui-text-faint); font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
++.order-query-error { min-height: 36px; margin-top: 10px; padding: 8px 10px; display: flex; align-items: center; gap: 8px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 7%, var(--ui-surface)); border-left: 3px solid var(--ui-danger); font-size: 10px; }
++.order-query-error span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
++.order-query-error button { border: 0; padding: 3px 5px; color: inherit; background: transparent; font-weight: 700; }
++
++.order-verification-head { align-items: center; }
++.order-verification-icon { width: 36px; height: 36px; flex: 0 0 auto; display: grid; place-items: center; color: var(--ui-text-muted); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; }
++.order-verification-head > div { margin-right: auto; }
++.order-verification-head strong { display: block; margin-top: 4px; color: var(--ui-text); font-size: 13px; }
++.order-verification-head em { color: var(--ui-text-faint); font-size: 9px; font-style: normal; }
++.order-verification.verified .order-verification-icon { color: var(--ui-success); border-color: color-mix(in srgb, var(--ui-success) 35%, var(--ui-border)); background: color-mix(in srgb, var(--ui-success) 9%, var(--ui-surface)); }
++.order-verification.manual .order-verification-icon { color: var(--ui-warning); border-color: color-mix(in srgb, var(--ui-warning) 35%, var(--ui-border)); background: color-mix(in srgb, var(--ui-warning) 9%, var(--ui-surface)); }
++
++.order-verification-flow { margin-top: 18px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--ui-border-soft); border: 1px solid var(--ui-border-soft); }
++.order-verification-flow span { min-width: 0; min-height: 44px; padding: 8px 5px; display: grid; place-items: center; color: var(--ui-text-faint); background: var(--ui-surface); font-size: 9px; text-align: center; }
++.order-verification-flow span.active { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 8%, var(--ui-surface)); }
++.order-verification-flow span.done { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 7%, var(--ui-surface)); }
++
++.order-captcha-form { margin-top: 14px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 9px; align-items: end; }
++.order-captcha-preview { min-height: 68px; grid-column: 1 / -1; padding: 7px; display: flex; align-items: center; justify-content: center; gap: 8px; background: var(--ui-surface); border: 1px solid var(--ui-border); }
++.order-captcha-preview img { max-width: min(250px, calc(100% - 48px)); height: 54px; object-fit: contain; }
++.order-captcha-preview > span { min-height: 54px; flex: 1; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); font-size: 10px; }
++.order-captcha-preview .icon-button { flex: 0 0 32px; }
++.order-captcha-form label { min-width: 0; }
++.order-captcha-form input { height: 38px; color: var(--ui-text); background: var(--ui-control); border-color: var(--ui-border); border-radius: 4px; }
++.order-captcha-form .button { min-height: 38px; white-space: nowrap; }
++.order-captcha-form > small { grid-column: 1 / -1; color: var(--ui-text-faint); font-size: 9px; }
++
++.order-results-panel { position: relative; min-width: 0; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; overflow: hidden; }
++.order-results-panel.updating .order-table-wrap { opacity: .66; }
++.order-results-head { min-height: 76px; padding: 17px 18px; align-items: center; }
++.order-results-actions { display: flex; align-items: flex-end; gap: 7px; }
++.order-results-actions label { margin: 0; display: grid; grid-template-columns: auto 68px; gap: 7px; align-items: center; }
++.order-results-actions label > span { margin: 0; color: var(--ui-text-faint); font-size: 9px; }
++.order-results-actions select { width: 68px; height: 32px; color: var(--ui-text); background: var(--ui-control); border-color: var(--ui-border); border-radius: 4px; font-size: 10px; }
++.order-results-actions .icon-button { width: 32px; height: 32px; }
++
++.order-status-tabs { padding: 0 18px; display: flex; gap: 3px; overflow-x: auto; border-bottom: 1px solid var(--ui-border); }
++.order-status-tabs button { min-width: max-content; height: 39px; border: 0; border-bottom: 2px solid transparent; padding: 0 12px; color: var(--ui-text-muted); background: transparent; font-size: 11px; font-weight: 650; }
++.order-status-tabs button:hover { color: var(--ui-text); background: var(--ui-surface-muted); }
++.order-status-tabs button.active { color: var(--ui-text); border-bottom-color: var(--ui-black); }
++
++.order-summary-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--ui-surface-muted); border-bottom: 1px solid var(--ui-border); }
++.order-summary-strip > div { min-width: 0; min-height: 69px; padding: 12px 16px; border-right: 1px solid var(--ui-border-soft); }
++.order-summary-strip > div:last-child { border-right: 0; }
++.order-summary-strip span,
++.order-summary-strip strong,
++.order-summary-strip small { display: block; }
++.order-summary-strip span { color: var(--ui-text-faint); font-size: 9px; }
++.order-summary-strip strong { margin-top: 6px; overflow: hidden; color: var(--ui-text); font-size: 16px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.order-summary-strip > div:last-child strong { font-size: 12px; }
++.order-summary-strip small { margin-top: 4px; overflow: hidden; color: var(--ui-text-faint); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
++
++.order-table-wrap { min-width: 0; overflow-x: auto; transition: opacity .15s ease; }
++.order-query-table { width: 100%; min-width: 980px; border-collapse: collapse; table-layout: fixed; }
++.order-query-table th,
++.order-query-table td { padding: 12px 13px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: middle; text-align: left; }
++.order-query-table th:last-child,
++.order-query-table td:last-child { border-right: 0; }
++.order-query-table th { height: 36px; color: var(--ui-text-faint); background: var(--ui-surface-muted); font-size: 9px; font-weight: 700; white-space: nowrap; }
++.order-query-table td { min-width: 0; color: var(--ui-text); font-size: 11px; }
++.order-query-table tbody tr:not(.order-empty-row):hover { background: color-mix(in srgb, var(--ui-surface-muted) 72%, transparent); }
++.order-query-table th:nth-child(1) { width: 27%; }
++.order-query-table th:nth-child(2) { width: 19%; }
++.order-query-table th:nth-child(3) { width: 12%; }
++.order-query-table th:nth-child(4) { width: 10%; }
++.order-query-table th:nth-child(5) { width: 14%; }
++.order-query-table th:nth-child(6) { width: 18%; }
++
++.order-product-cell { min-width: 0; display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 10px; align-items: center; }
++.order-product-image { width: 38px; height: 38px; display: block; object-fit: cover; border: 1px solid var(--ui-border-soft); border-radius: 4px; background: var(--ui-surface-muted); }
++.order-product-image.fallback { display: grid; place-items: center; color: var(--ui-text-faint); }
++.order-product-cell > span { min-width: 0; }
++.order-product-cell strong,
++.order-product-cell small,
++.order-amount strong,
++.order-amount small,
++.order-type strong,
++.order-type small { display: block; }
++.order-product-cell strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
++.order-product-cell small,
++.order-amount small,
++.order-type small { margin-top: 5px; color: var(--ui-text-faint); font-size: 9px; }
++.order-number { min-width: 0; display: flex; align-items: center; gap: 5px; }
++.order-number strong { min-width: 0; flex: 1; overflow: hidden; font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.order-number .icon-button { width: 26px; height: 26px; flex: 0 0 26px; }
++.order-amount strong { font-size: 13px; font-variant-numeric: tabular-nums; }
++.order-status { width: fit-content; min-height: 23px; padding: 0 7px; display: inline-flex; align-items: center; border: 1px solid currentColor; border-radius: 3px; font-size: 9px; font-weight: 700; white-space: nowrap; }
++.order-status.success { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 8%, transparent); }
++.order-status.pending { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 8%, transparent); }
++.order-status.muted,
++.order-status.refunded,
++.order-status.neutral { color: var(--ui-text-muted); background: var(--ui-surface-muted); }
++.order-type strong { font-size: 10px; }
++.order-type small { display: flex; align-items: center; gap: 4px; color: var(--ui-warning); }
++.order-row-actions { display: flex; align-items: center; gap: 6px; }
++.order-row-actions .icon-button { width: 29px; height: 29px; flex: 0 0 29px; text-decoration: none; }
++.order-result-link { min-height: 29px; padding-inline: 8px; font-size: 9px; text-decoration: none; white-space: nowrap; }
++
++.order-empty-state { min-height: 210px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); text-align: center; }
++.order-empty-state strong { margin-top: 3px; color: var(--ui-text-muted); font-size: 12px; }
++.order-empty-state span { max-width: 360px; font-size: 10px; line-height: 1.5; }
++.order-pagination { min-height: 52px; padding: 9px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ui-text-faint); background: var(--ui-surface); font-size: 10px; }
++.order-pagination > div { display: flex; gap: 6px; }
++.order-pagination .icon-button { width: 30px; height: 30px; }
++.order-update-indicator { position: absolute; right: 16px; bottom: 62px; min-height: 29px; padding: 0 9px; display: flex; align-items: center; gap: 6px; color: var(--ui-text-muted); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; box-shadow: 0 6px 18px #11131518; font-size: 9px; }
++
++@media (max-width: 1100px) {
++  .order-query-console { grid-template-columns: 1fr; }
++  .order-verification { border-top: 1px solid var(--ui-border); border-left: 0; }
++}
++
++@media (max-width: 680px) {
++  .order-query-view { margin-top: 14px; gap: 10px; }
++  .order-query-form-panel,
++  .order-verification { padding: 14px; }
++  .order-section-heading h2,
++  .order-results-head h2 { font-size: 16px; }
++  .order-search-form { grid-template-columns: 1fr; margin-top: 14px; }
++  .order-search-form .button { width: 100%; }
++  .order-query-source { align-items: flex-start; flex-wrap: wrap; }
++  .order-query-source em { width: 100%; margin-left: 0; }
++  .order-verification-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .order-captcha-form { grid-template-columns: 1fr; }
++  .order-captcha-form .button,
++  .order-captcha-form > small { grid-column: 1; }
++  .order-results-head { min-height: 70px; padding: 14px; align-items: flex-start; }
++  .order-results-head p { max-width: 190px; }
++  .order-results-actions label { display: none; }
++  .order-status-tabs { padding-inline: 8px; }
++  .order-status-tabs button { padding-inline: 10px; }
++  .order-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .order-summary-strip > div:nth-child(2) { border-right: 0; }
++  .order-summary-strip > div:nth-child(-n+2) { border-bottom: 1px solid var(--ui-border-soft); }
++  .order-query-table { min-width: 0; table-layout: auto; }
++  .order-query-table thead { display: none; }
++  .order-query-table,
++  .order-query-table tbody,
++  .order-query-table tr,
++  .order-query-table td { width: 100%; display: block; }
++  .order-query-table tr { padding: 12px 13px; border-bottom: 1px solid var(--ui-border); }
++  .order-query-table td { padding: 7px 0; border: 0; }
++  .order-query-table td::before { margin-bottom: 5px; display: block; color: var(--ui-text-faint); content: attr(data-label); font-size: 8px; font-weight: 700; }
++  .order-query-table td:first-child { padding-top: 0; }
++  .order-query-table td:last-child { padding-bottom: 0; }
++  .order-query-table .order-empty-row { padding: 0; }
++  .order-query-table .order-empty-row td::before { display: none; }
++  .order-product-image { width: 42px; height: 42px; }
++  .order-product-cell { grid-template-columns: 42px minmax(0, 1fr); }
++  .order-number strong { flex: 0 1 auto; }
++  .order-row-actions { flex-wrap: wrap; }
++  .order-result-link { min-height: 32px; }
++  .order-empty-state { min-height: 190px; padding: 18px; }
++  .order-pagination { align-items: flex-start; }
++  .order-pagination > span { max-width: 210px; line-height: 1.5; }
++  .order-update-indicator { right: 12px; bottom: 65px; }
++}
+diff --git a/frontend/src/orderQueryModel.js b/frontend/src/orderQueryModel.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ab72e12a8ef6f1f7da0b17f4df68cecfd33b3a2
+--- /dev/null
++++ b/frontend/src/orderQueryModel.js
+@@ -0,0 +1,147 @@
++export const ORDER_STATUS_OPTIONS = Object.freeze([
++  {value: 999, label: '全部'},
++  {value: 0, label: '待付款'},
++  {value: 1, label: '已付款'},
++  {value: 2, label: '已关闭'},
++  {value: 3, label: '已退款'},
++]);
++
++const ORDER_STATUS_META = {
++  0: {label: '待付款', tone: 'pending'},
++  1: {label: '已付款', tone: 'success'},
++  2: {label: '已关闭', tone: 'muted'},
++  3: {label: '已退款', tone: 'refunded'},
++};
++
++const GOODS_TYPE_LABELS = {
++  card: '卡密商品',
++  article: '文章商品',
++  resource: '资源商品',
++  equity: '权益商品',
++};
++
++const GOODS_ACTION_LABELS = {
++  card: '获取卡密',
++  article: '查看文章',
++  resource: '获取资源',
++  equity: '查看权益',
++};
++
++function finiteNumber(value, fallback = 0) {
++  const number = Number(value);
++  return Number.isFinite(number) ? number : fallback;
++}
++
++export function orderStatusMeta(value, upstreamLabel = '') {
++  const key = finiteNumber(value, -1);
++  const meta = ORDER_STATUS_META[key] || {label: '状态未知', tone: 'neutral'};
++  return {...meta, key, label: String(upstreamLabel || meta.label)};
++}
++
++export function orderGoodsTypeLabel(value) {
++  return GOODS_TYPE_LABELS[String(value || '').toLowerCase()] || '其他商品';
++}
++
++export function orderGoodsActionLabel(value) {
++  return GOODS_ACTION_LABELS[String(value || '').toLowerCase()] || '查看订单';
++}
++
++export function formatOrderMoney(value) {
++  if (value === null || value === undefined || value === '') return '--';
++  const number = Number(value);
++  if (!Number.isFinite(number)) return '--';
++  return `¥${number.toLocaleString('zh-CN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
++}
++
++export function formatOrderDateTime(value) {
++  if (value === null || value === undefined || value === '') return '时间未知';
++  let candidate = value;
++  if (typeof value === 'number' || /^\d+$/.test(String(value))) {
++    const timestamp = Number(value);
++    candidate = timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp;
++  }
++  const date = new Date(candidate);
++  if (Number.isNaN(date.getTime())) return '时间未知';
++  return new Intl.DateTimeFormat('zh-CN', {
++    year: 'numeric',
++    month: '2-digit',
++    day: '2-digit',
++    hour: '2-digit',
++    minute: '2-digit',
++    hour12: false,
++  }).format(date);
++}
++
++export function safeOfficialOrderUrl(value, fallbackPath = '/order') {
++  try {
++    const url = new URL(String(value || fallbackPath), 'https://pay.ldxp.cn');
++    if (url.protocol !== 'https:' || url.hostname !== 'pay.ldxp.cn') return '';
++    return url.href;
++  } catch {
++    return '';
++  }
++}
++
++export function normalizeOrder(raw = {}) {
++  const status = orderStatusMeta(raw.status, raw.status_label);
++  const goodsType = String(raw.goods_type || raw.goods?.goods_type || '').toLowerCase();
++  const tradeNo = String(raw.trade_no || '').trim();
++  const goodsKey = String(raw.goods_key || raw.goods?.goods_key || '').trim();
++  return {
++    ...raw,
++    trade_no: tradeNo,
++    goods_name: String(raw.goods_name || '未命名商品'),
++    goods_key: goodsKey,
++    goods_type: goodsType,
++    goods_type_label: orderGoodsTypeLabel(goodsType),
++    goods_action_label: orderGoodsActionLabel(goodsType),
++    goods_image: String(raw.goods_image || raw.goods?.image || ''),
++    created_at: raw.created_at ?? raw.create_time ?? null,
++    total_amount: raw.total_amount,
++    quantity: Math.max(0, finiteNumber(raw.quantity, 0)),
++    status: status.key,
++    status_label: status.label,
++    status_tone: status.tone,
++    need_query_password: Boolean(Number(raw.need_query_password || 0)),
++    can_complaint: Boolean(Number(raw.can_complaint || 0)),
++    complaint_status: raw.complaint_status ?? raw.complaint?.status ?? null,
++    detail_url: safeOfficialOrderUrl(raw.detail_url, tradeNo ? `/order/info/${encodeURIComponent(tradeNo)}` : '/order'),
++    result_url: safeOfficialOrderUrl(raw.result_url, tradeNo ? `/order/result/${encodeURIComponent(tradeNo)}` : '/order'),
++    goods_url: safeOfficialOrderUrl(raw.goods_url, goodsKey ? `/item/${encodeURIComponent(goodsKey)}` : '/order'),
++  };
++}
++
++export function normalizeOrderResponse(payload = {}, fallback = {}) {
++  const orders = Array.isArray(payload.orders) ? payload.orders.map(normalizeOrder) : [];
++  const source = payload.pagination && typeof payload.pagination === 'object' ? payload.pagination : {};
++  const page = Math.max(1, finiteNumber(source.page, fallback.page || 1));
++  const pageSize = Math.max(1, finiteNumber(source.page_size, fallback.pageSize || 10));
++  const total = Math.max(0, finiteNumber(source.total, orders.length));
++  const pages = Math.max(1, finiteNumber(source.pages, Math.ceil(total / pageSize) || 1));
++  return {
++    orders,
++    pagination: {page, page_size: pageSize, total, pages},
++  };
++}
++
++export function summarizeOrders(orders = [], total = orders.length) {
++  return {
++    total: Math.max(0, finiteNumber(total, 0)),
++    pageCount: orders.length,
++    pageAmount: orders.reduce((sum, order) => sum + finiteNumber(order.total_amount, 0), 0),
++  };
++}
++
++export function orderQueryContextChanged(current = {}, next = {}) {
++  return String(current.keywords || '') !== String(next.keywords || '')
++    || Number(current.status ?? 999) !== Number(next.status ?? 999)
++    || Number(current.pageSize ?? 10) !== Number(next.pageSize ?? 10);
++}
++
++export function verificationLabel(verification = {}) {
++  if (verification?.status === 'manual_required') return '等待手工确认';
++  if (verification?.status !== 'verified') return '等待查询';
++  if (verification?.mode === 'manual') return '手工验证通过';
++  if (verification?.mode === 'session') return '会话验证有效';
++  return '自动识别通过';
++}
+diff --git a/frontend/src/orderQueryModel.test.js b/frontend/src/orderQueryModel.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8c751c30e63190d38e5acc2a5de79339550fa73
+--- /dev/null
++++ b/frontend/src/orderQueryModel.test.js
+@@ -0,0 +1,70 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  formatOrderDateTime,
++  formatOrderMoney,
++  normalizeOrder,
++  normalizeOrderResponse,
++  orderQueryContextChanged,
++  orderGoodsActionLabel,
++  orderStatusMeta,
++  safeOfficialOrderUrl,
++  summarizeOrders,
++  verificationLabel,
++} from './orderQueryModel.js';
++
++test('normalizes upstream order fields and status labels', () => {
++  const order = normalizeOrder({
++    trade_no: 'LD-1001',
++    goods_name: '测试卡密',
++    goods_type: 'card',
++    goods_key: 'goods-1',
++    create_time: 1_788_000_000,
++    total_amount: '19.9',
++    quantity: '2',
++    status: 1,
++    need_query_password: 1,
++  });
++
++  assert.equal(order.status_label, '已付款');
++  assert.equal(order.status_tone, 'success');
++  assert.equal(order.goods_type_label, '卡密商品');
++  assert.equal(order.goods_action_label, '获取卡密');
++  assert.equal(order.quantity, 2);
++  assert.equal(order.need_query_password, true);
++  assert.equal(order.detail_url, 'https://pay.ldxp.cn/order/info/LD-1001');
++});
++
++test('normalizes pagination and computes current page summary', () => {
++  const result = normalizeOrderResponse({
++    orders: [
++      {trade_no: 'A', total_amount: '9.90', status: 0},
++      {trade_no: 'B', total_amount: 10, status: 3},
++    ],
++    pagination: {page: 2, page_size: 2, total: 7, pages: 4},
++  });
++  const summary = summarizeOrders(result.orders, result.pagination.total);
++
++  assert.deepEqual(result.pagination, {page: 2, page_size: 2, total: 7, pages: 4});
++  assert.deepEqual(summary, {total: 7, pageCount: 2, pageAmount: 19.9});
++  assert.equal(formatOrderMoney(summary.pageAmount), '¥19.90');
++});
++
++test('handles unknown values and restricts official links', () => {
++  assert.equal(orderStatusMeta(9).label, '状态未知');
++  assert.equal(orderGoodsActionLabel('other'), '查看订单');
++  assert.equal(formatOrderMoney('not-a-number'), '--');
++  assert.equal(formatOrderDateTime('not-a-date'), '时间未知');
++  assert.equal(safeOfficialOrderUrl('https://example.com/order/1'), '');
++  assert.equal(verificationLabel(null), '等待查询');
++  assert.equal(verificationLabel({status: 'manual_required'}), '等待手工确认');
++  assert.equal(verificationLabel({status: 'verified', mode: 'ocr'}), '自动识别通过');
++});
++
++test('detects result context changes that would make preserved rows stale', () => {
++  const current = {keywords: 'buyer', status: 999, pageSize: 10};
++  assert.equal(orderQueryContextChanged(current, {...current}), false);
++  assert.equal(orderQueryContextChanged(current, {...current, status: 3}), true);
++  assert.equal(orderQueryContextChanged(current, {...current, pageSize: 20}), true);
++  assert.equal(orderQueryContextChanged(current, {...current, keywords: 'other'}), true);
++});
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index 7f56d3ff119702427454e14925e63d10fe894ce5..53f11c206ee6a2bae791969d3ebbd71353f08ff7 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -1413,8 +1413,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ 
+ @media (max-width: 680px) {
+   .sidebar { position: fixed; inset: auto 0 0 0; width: auto; height: 64px; padding: 7px 10px; }
+-  .nav-list { gap: 3px; }
+-  .nav-list button { width: auto; min-width: 0; flex: 1; min-height: 50px; padding-inline: 2px; font-size: 10px; }
++  .nav-list { justify-content: flex-start; gap: 3px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
++  .nav-list::-webkit-scrollbar { display: none; }
++  .nav-list button { width: 64px; min-width: 0; flex: 0 0 64px; flex-direction: column; justify-content: center; gap: 3px; min-height: 50px; padding-inline: 2px; font-size: 10px; scroll-snap-align: center; white-space: nowrap; }
+   .workspace { width: 100%; margin: 0; padding: 17px 12px 87px; }
+   .topbar { min-height: 44px; align-items: flex-start; }
+   .topbar h1 { font-size: 19px; }
+diff --git a/start.ps1 b/start.ps1
+index 7fd38451d1792b751fa1cad3a298bece913d93da..752bebe7f272085aa1dd81abcafa097a3fb176c1 100644
+--- a/start.ps1
++++ b/start.ps1
+@@ -8,6 +8,64 @@ $requirements = Join-Path $backendDirectory 'requirements.txt'
+ $runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
+ $backendPidFile = Join-Path $runtimeDirectory 'backend.pid'
+ 
++function Resolve-LdxpPython {
++    $candidates = @()
++    $fallback = $null
++    if (-not [string]::IsNullOrWhiteSpace($env:LDXP_PYTHON)) {
++        $candidates += $env:LDXP_PYTHON
++    }
++    $candidates += @(
++        (Join-Path $runtimeDirectory 'python\Scripts\python.exe'),
++        (Join-Path $runtimeDirectory 'python\python.exe'),
++        (Join-Path $runtimeDirectory 'python.exe')
++    )
++    $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
++    if ($launcher) {
++        & $launcher.Source -0p 2>$null | ForEach-Object {
++            if ([string]$_ -match '([A-Za-z]:\\.*\\python(?:[0-9.]*)?\.exe)\s*$') {
++                $candidates += $Matches[1]
++            }
++        }
++    }
++    $candidates += 'python'
++    $seen = @{}
++    foreach ($candidate in $candidates) {
++        if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
++        $candidateKey = ([string]$candidate).ToLowerInvariant()
++        if ($seen.ContainsKey($candidateKey)) { continue }
++        $seen[$candidateKey] = $true
++        $resolved = $null
++        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
++            $resolved = (Resolve-Path -LiteralPath $candidate).Path
++        }
++        else {
++            $command = Get-Command $candidate -ErrorAction SilentlyContinue
++            if ($command) {
++                $resolved = $command.Source
++            }
++        }
++        if ($resolved) {
++            if (-not $fallback) {
++                $fallback = $resolved
++            }
++            & $resolved -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)" *> $null
++            if ($LASTEXITCODE -eq 0) {
++                return $resolved
++            }
++        }
++    }
++    if ($fallback) {
++        Write-Warning 'Python 3.10-3.13 was not found. The app will start with the available interpreter and use manual captcha entry if OCR cannot load.'
++        return $fallback
++    }
++    throw 'Python interpreter not found. Set LDXP_PYTHON or install Python.'
++}
++
++function Test-LdxpBackendDependencies([string]$PythonExecutable) {
++    & $PythonExecutable -c "import selenium, ddddocr, numpy, onnxruntime" *> $null
++    return $LASTEXITCODE -eq 0
++}
++
+ function Stop-RecordedLdxpBackend {
+     if (-not (Test-Path -LiteralPath $backendPidFile)) { return }
+     $recordedPid = 0
+@@ -77,15 +135,36 @@ if (-not (Test-Path -LiteralPath $viteCommand)) {
+ }
+ 
+ New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
++$pythonExecutable = Resolve-LdxpPython
+ Stop-RecordedLdxpBackend
+ Stop-StaleLdxpProcesses
+ 
+ if (Test-Path $requirements) {
+-    python -c "import selenium" 2>$null
+-    $seleniumMissing = $LASTEXITCODE -ne 0
+-    if ($seleniumMissing) {
+-        Write-Host 'Installing backend browser verification dependency...'
+-        python -m pip install -r $requirements
++    $backendDependenciesReady = Test-LdxpBackendDependencies $pythonExecutable
++    if (-not $backendDependenciesReady) {
++        Write-Host 'Installing backend browser verification and OCR dependencies...'
++        & $pythonExecutable -m pip install -r $requirements
++        $backendDependenciesReady = $LASTEXITCODE -eq 0 -and (Test-LdxpBackendDependencies $pythonExecutable)
++        if (-not $backendDependenciesReady) {
++            $runtimeEnvironment = Join-Path $runtimeDirectory 'python'
++            $runtimePython = Join-Path $runtimeEnvironment 'Scripts\python.exe'
++            $selectedPython = [IO.Path]::GetFullPath($pythonExecutable)
++            $runtimePythonPath = [IO.Path]::GetFullPath($runtimePython)
++            if (-not $selectedPython.Equals($runtimePythonPath, [StringComparison]::OrdinalIgnoreCase)) {
++                Write-Host 'Creating an isolated backend Python runtime...'
++                & $pythonExecutable -m venv $runtimeEnvironment
++                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
++                    & $runtimePython -m pip install -r $requirements
++                    $backendDependenciesReady = $LASTEXITCODE -eq 0 -and (Test-LdxpBackendDependencies $runtimePython)
++                    if ($backendDependenciesReady) {
++                        $pythonExecutable = $runtimePython
++                    }
++                }
++            }
++        }
++        if (-not $backendDependenciesReady) {
++            Write-Warning 'Some optional backend dependencies could not be installed. Order lookup will offer manual captcha entry when OCR is unavailable.'
++        }
+     }
+ }
+ 
+@@ -96,7 +175,7 @@ $env:LDXP_FRONTEND_URL = "http://127.0.0.1:$frontendPort/"
+ 
+ Write-Host "Starting backend at http://127.0.0.1:$backendPort"
+ $backendScript = Join-Path $backendDirectory 'main.py'
+-$backendProcess = Start-Process python `
++$backendProcess = Start-Process $pythonExecutable `
+     -ArgumentList ('"{0}"' -f $backendScript) `
+     -WorkingDirectory $backendDirectory `
+     -WindowStyle Hidden `
