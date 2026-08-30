@@ -17,7 +17,7 @@ Sub2API 导入记录删除路由修复验收
 哈希
 - BASELINE backend/sub2api/routes.py SHA256: C037BF1155A2EB59FD88A70007260D2E4682133B91DE9127E1A66153ED976E56
 - MODIFIED backend/sub2api/routes.py SHA256: F80B8E95CA1379A7A1BDAF731D9986A0895BD854A2242252CE3D1825B64A2C2B
-- DIFF_FILE SHA256: FF621AF1C8A179E674FAAA02BC60CBA60893F436A9DDCB31405476120D8DB563
+- DIFF_FILE SHA256: 5F8CDC1C816A8273076B869AAF07F714C72273263C58912474CB4566963680B7
 
 BASELINE
 - command: python -m unittest discover -s backend -q
@@ -51,6 +51,20 @@ MODIFIED
 - literal result: no whitespace errors
 - exit status: 0
 
+FINAL MAIN
+- command: python -m unittest discover -s backend -q
+- input: main 8309866
+- literal output: Ran 112 tests in 2.279s; OK
+- exit status: 0
+- command: npm test
+- input: main/frontend at 8309866
+- literal output: tests 16; pass 16; fail 0; duration_ms 118.1103
+- exit status: 0
+- command: npm run build
+- input: main/frontend at 8309866
+- literal output: 2385 modules transformed; built in 476ms
+- exit status: 0
+
 HTTP 验收
 - command: GET http://127.0.0.1:18733/api/health
 - input: isolated modified backend with temporary empty database
@@ -72,6 +86,21 @@ HTTP 验收
 - input: after single and batch deletion
 - literal output: {"check":"remaining-records","status":200,"total":0}
 - exit status: 0
+
+RUNNING SERVICE
+- command: GET http://127.0.0.1:5173/api/health
+- input: Vite frontend proxy to restarted main backend on port 8000
+- literal output: {"check":"frontend-proxy-health","status":200,"deleteCapability":true}
+- exit status: 0
+- command: POST http://127.0.0.1:5173/api/sub2api/card-import-records/delete
+- input: {"id":2147483647}
+- literal output: {"check":"frontend-proxy-single-delete","status":404,"body":"{\"detail\": \"卡密导入记录不存在\"}"}
+- exit status: 0
+- command: POST http://127.0.0.1:5173/api/sub2api/card-import-records/batch-delete
+- input: {"ids":[2147483647]}
+- literal output: {"check":"frontend-proxy-batch-delete","status":200,"requestedCount":1,"deletedCount":0}
+- exit status: 0
+- restored behavior/status: 运行中的后端已加载单删和批删路由，前端代理保持可用，测试 ID 未写入或删除业务记录。
 
 ROLLBACK
 - command: E:/soft/Git/bin/bash.exe artifacts/sub2api-history-delete-route-fix/ROLLBACK.sh E:/soft/java/ldxp-sub2api-delete-route-rollback-check
