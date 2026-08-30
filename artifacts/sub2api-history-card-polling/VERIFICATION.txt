@@ -17,7 +17,7 @@ Sub2API 导入记录卡密显示与 JSON 轮询验收
 哈希
 - BASELINE frontend/src/sub2apiCardPolling.js SHA256: FD94D964AD8B631FA1D5333777827D98F18DD4300BA14EF2A0A1FD02C3A77B75
 - MODIFIED frontend/src/sub2apiCardPolling.js SHA256: DABBD26C9E0B878B77B9D06222B7DE291F4CA4E820401DA60BEDC51DEAA4AAB6
-- DIFF_FILE SHA256: 8375741CE425645CE82BCDB4235CC10DFA54DD87CB94A46951F904B4D35F55A0
+- DIFF_FILE SHA256: 7C7AF7C9FEA769196D41A8FEA6090B0741B465F569CC51710AA6A21809A1B599
 
 BASELINE
 - command: python -m unittest discover -s backend -q
@@ -61,6 +61,24 @@ MODIFIED
 - command: git diff --check
 - input: 58483a5..working tree
 - literal result: no whitespace errors
+- exit status: 0
+
+FINAL MAIN
+- command: python -m unittest discover -s backend -q
+- input: main cda7dbd
+- literal output: Ran 120 tests in 1.694s; OK
+- exit status: 0
+- command: npm test
+- input: main/frontend at cda7dbd
+- literal output: tests 20; pass 20; fail 0; duration_ms 108.511
+- exit status: 0
+- command: npm run build
+- input: main/frontend at cda7dbd
+- literal output: 2385 modules transformed; built in 354ms
+- exit status: 0
+- command: GET live Vite modules from http://127.0.0.1:5173
+- input: /src/style.css, /src/sub2apiCardPolling.js, /src/Sub2ApiView.jsx
+- literal output: {"CardColumn320":true,"TableMinWidth1280":true,"FullCardWrap":true,"OnlyCompletedStopsEarly":true,"Timeout60000":true,"ProgressAttempts":true,"ProgressDeadline":true}
 - exit status: 0
 
 ROLLBACK
