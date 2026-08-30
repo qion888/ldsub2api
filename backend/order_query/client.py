@@ -569,10 +569,10 @@ class OrderQueryClient:
             {"trade_no": trade_no},
         )
         if not self._strict_numeric_code(result.get("code"), 1) or not isinstance(result.get("data"), dict):
-            raise UpstreamOrderError(
-                self._response_message(result, "投诉查询密码状态获取失败"),
+            self._complaint_history_error(
+                result,
+                fallback="投诉查询密码状态获取失败",
                 code="complaint_history_password_check_failed",
-                retryable=True,
             )
         data = result["data"]
         returned_trade_no = _safe_text(data.get("trade_no"), 160)
@@ -592,7 +592,12 @@ class OrderQueryClient:
         return {"need_pwd": int(need_pwd)}
 
     @staticmethod
-    def _complaint_history_error(result: dict[str, Any]) -> None:
+    def _complaint_history_error(
+        result: dict[str, Any],
+        *,
+        fallback: str = "投诉历史获取失败",
+        code: str = "complaint_history_failed",
+    ) -> None:
         message = _safe_text(result.get("msg") or result.get("message"), 240)
         if any(token in message for token in ("安全密码", "查询密码", "密码错误", "密码不正确")):
             raise OrderQueryPasswordInvalid()
@@ -606,8 +611,8 @@ class OrderQueryClient:
         if any(token in message for token in ("订单不存在", "未找到订单", "订单号不存在")):
             raise OrderQueryDetailNotFound()
         raise UpstreamOrderError(
-            message or "投诉历史获取失败",
-            code="complaint_history_failed",
+            message or fallback,
+            code=code,
             retryable=True,
         )
 

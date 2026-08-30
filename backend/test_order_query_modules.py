@@ -331,6 +331,15 @@ class ClientTests(unittest.TestCase):
                         query_password="",
                     )
 
+    def test_complaint_password_check_maps_human_verification_failure_to_expired_session(self) -> None:
+        opener = FakeOpener([self._json_response({
+            "code": 0,
+            "msg": "human verification failed",
+            "data": None,
+        })])
+        with self.assertRaises(OrderQuerySessionExpired):
+            OrderQueryClient(opener=opener).check_need_complaint_password(trade_no="ORDER-1")
+
     def test_order_detail_uses_fixed_endpoint_and_returns_a_strict_allowlist(self) -> None:
         upstream = {
             "code": 1,
