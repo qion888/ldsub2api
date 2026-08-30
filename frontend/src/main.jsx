@@ -44,6 +44,7 @@ import {
 import './style.css';
 
 const API = '/api';
+const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
 const DEFAULT_SUB2API_AUTOMATION = {
   enabled: false,
   interval_seconds: 300,
@@ -155,53 +156,19 @@ function historyStatusLabel(point) {
   return point?.status === 'success' ? '抓取成功' : point?.error || '抓取失败';
 }
 
-function PriceHistoryChart({points}) {
-  const [hovered, setHovered] = useState(null);
-  const chartPoints = useMemo(() => (points || [])
-    .filter(point => point.status === 'success' && point.price !== null && point.price !== '' && Number.isFinite(Number(point.price)))
-    .slice(-160), [points]);
-  if (!chartPoints.length) return <div className="chart-empty"><BarChart3 size={24}/><strong>暂无可绘制的有效报价</strong><span>完成成功抓取后，价格趋势会显示在这里</span></div>;
+function signedMoney(value) {
+  if (value === null || value === undefined || value === '') return '--';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '--';
+  if (number === 0) return '持平';
+  return `${number > 0 ? '+' : '-'}${money(Math.abs(number))}`;
+}
 
-  const width = 900;
-  const height = 270;
-  const padding = {top: 22, right: 24, bottom: 30, left: 56};
-  const values = chartPoints.map(point => Number(point.price));
-  const rawMin = Math.min(...values);
-  const rawMax = Math.max(...values);
-  const equalValuePadding = rawMax === rawMin ? Math.max(Math.abs(rawMax) * .05, .01) : 0;
-  const min = rawMin - equalValuePadding;
-  const max = rawMax + equalValuePadding;
-  const range = max - min;
-  const x = index => padding.left + (index / Math.max(chartPoints.length - 1, 1)) * (width - padding.left - padding.right);
-  const y = value => padding.top + (1 - (value - min) / range) * (height - padding.top - padding.bottom);
-  const linePoints = chartPoints.map((point, index) => `${x(index)},${y(Number(point.price))}`).join(' ');
-  const hoveredIndex = hovered === null ? -1 : chartPoints.findIndex(point => String(point.id) === String(hovered));
-  const hoveredPoint = hoveredIndex >= 0 ? chartPoints[hoveredIndex] : null;
-  const hoveredLeft = hoveredIndex >= 0 ? Math.min(86, Math.max(14, x(hoveredIndex) / width * 100)) : 50;
-  const hoveredTop = hoveredIndex >= 0 ? Math.min(66, Math.max(10, y(Number(hoveredPoint.price)) / height * 100)) : 18;
-
-  return <div className="history-chart-wrap" onMouseLeave={() => setHovered(null)}>
-    <div className="history-chart-canvas">
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="价格历史趋势图" preserveAspectRatio="none">
-        {[0, 1, 2, 3, 4].map(step => {
-          const value = max - (range * step / 4);
-          const yPosition = y(value);
-          return <g key={step} className="chart-grid-line"><line x1={padding.left} x2={width - padding.right} y1={yPosition} y2={yPosition}/><text x={padding.left - 10} y={yPosition + 4} textAnchor="end">{money(value)}</text></g>;
-        })}
-        <polyline className="history-chart-line" points={linePoints}/>
-        {chartPoints.map((point, index) => <g className="history-chart-point" key={`${point.id}-${index}`}>
-          <circle className="history-chart-hit" cx={x(index)} cy={y(Number(point.price))} r="13" tabIndex="0" role="button" aria-label={`${compactTime(point.fetched_at)} ${money(point.price)}`} onMouseEnter={() => setHovered(point.id)} onFocus={() => setHovered(point.id)} onClick={() => setHovered(point.id)} onBlur={() => setHovered(null)}/>
-          <circle className={`history-chart-dot ${historyStockMeta(point).key}`} cx={x(index)} cy={y(Number(point.price))} r={hovered === point.id ? 5 : 3.5} pointerEvents="none"/>
-        </g>)}
-      </svg>
-      {hoveredPoint && <div className="history-chart-tooltip" style={{left: `${hoveredLeft}%`, top: `${hoveredTop}%`}}>
-        <strong>{money(hoveredPoint.price)}</strong>
-        <span>{compactTime(hoveredPoint.fetched_at)}</span>
-        <span>{historyStockMeta(hoveredPoint).label}{historyStockMeta(hoveredPoint).value !== null ? ` · ${historyStockMeta(hoveredPoint).value}` : ''}</span>
-      </div>}
-    </div>
-    <div className="history-chart-axis"><span>{compactTime(chartPoints[0].fetched_at)}</span><span>{chartPoints.length > 2 ? `${chartPoints.length} 个有效报价` : '最近记录'}</span><span>{compactTime(chartPoints[chartPoints.length - 1].fetched_at)}</span></div>
-  </div>;
+function signedPercent(value) {
+  if (value === null || value === undefined || value === '') return '--';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '--';
+  return `${number > 0 ? '+' : ''}${number.toFixed(2)}%`;
 }
 
 function Tooltip({label, children, placement = 'top'}) {
@@ -703,6 +670,9 @@ function HistoryView({
   busy,
 }) {
   const [itemQuery, setItemQuery] = useState('');
+  const [chartMode, setChartMode] = useState('combined');
+  const [comparison, setComparison] = useState('average');
+  const [rangePreset, setRangePreset] = useState('all');
   const selected = items.find(item => item.id === selectedId) || null;
   const stats = meta?.stats || {};
   const total = Number(meta?.total || 0);
@@ -715,24 +685,46 @@ function HistoryView({
     return items.filter(item => [item.latest?.title, item.name, item.url, item.latest?.goods_key].filter(Boolean).join(' ').toLowerCase().includes(needle));
   }, [itemQuery, items]);
   const updateFilter = (key, value) => {
+    if (key === 'startDate' || key === 'endDate') setRangePreset('custom');
     onFiltersChange({...filters, [key]: value});
     onPageChange(1);
   };
   const clearFilters = () => {
+    setRangePreset('all');
     onResetFilters();
+    onPageChange(1);
+  };
+  const applyRangePreset = preset => {
+    setRangePreset(preset);
+    if (preset === 'all') {
+      onFiltersChange({...filters, startDate: '', endDate: ''});
+    } else {
+      const days = {day: 1, week: 7, month: 30, quarter: 90}[preset];
+      const end = new Date();
+      const start = new Date(end);
+      start.setDate(start.getDate() - days);
+      const dateValue = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      onFiltersChange({...filters, startDate: dateValue(start), endDate: dateValue(end)});
+    }
     onPageChange(1);
   };
   const successRate = total ? `${Math.round((Number(stats.success_count || 0) / total) * 100)}%` : '--';
   const rows = history || [];
   const rowDelta = index => {
     const currentRaw = rows[index]?.price;
-    const previousRaw = rows[index + 1]?.price;
+    const previousRow = rows.slice(index + 1).find(row => row.status === 'success' && row.price !== null && row.price !== undefined && row.price !== '');
+    const previousRaw = previousRow?.price;
     if (currentRaw === null || currentRaw === undefined || currentRaw === '' || previousRaw === null || previousRaw === undefined || previousRaw === '') return null;
     const current = Number(currentRaw);
     const previous = Number(previousRaw);
     if (!Number.isFinite(current) || !Number.isFinite(previous)) return null;
     return current - previous;
   };
+  const numericStat = value => value === null || value === undefined || value === '' ? Number.NaN : Number(value);
+  const latestChange = numericStat(stats.latest_change);
+  const intervalChange = numericStat(stats.price_change);
+  const availabilityRate = numericStat(stats.availability_rate);
+  const volatility = numericStat(stats.volatility_percent);
 
   return <section className="history-view history-view-enhanced">
     <aside className="history-sidebar">
@@ -753,7 +745,7 @@ function HistoryView({
     <div className="history-main history-main-enhanced">
       <div className="history-top history-top-enhanced">
         <div><span className="history-kicker">PRICE HISTORY / DATA EXPLORER</span><h2>{selected?.latest?.title || '请选择商品'}</h2><p>{selected ? `${total.toLocaleString('zh-CN')} 条历史记录 · 服务端分页加载` : '从左侧选择商品查看价格、库存和抓取结果'}</p></div>
-        <div className="history-current-price"><span>当前价格</span><strong>{money(selected?.latest?.price)}</strong><small>{selected?.last_attempt?.fetched_at ? `同步于 ${compactTime(selected.last_attempt.fetched_at)}` : '尚未同步'}</small></div>
+        <div className="history-current-price"><span>当前价格</span><strong>{money(stats.latest_price ?? selected?.latest?.price)}</strong><small className={latestChange > 0 ? 'negative' : latestChange < 0 ? 'positive' : ''}>{Number.isFinite(latestChange) ? `较上次 ${signedMoney(latestChange)} · ${signedPercent(stats.latest_change_percent)}` : selected?.last_attempt?.fetched_at ? `同步于 ${compactTime(selected.last_attempt.fetched_at)}` : '尚未同步'}</small></div>
       </div>
 
       <div className="history-filter-panel">
@@ -769,16 +761,28 @@ function HistoryView({
       </div>
 
       <div className="history-summary-grid">
-        <div><span>筛选后记录</span><strong>{total.toLocaleString('zh-CN')}</strong><small>当前页 {rows.length} 条</small></div>
-        <div><span>有效报价</span><strong>{Number(stats.quoted_count || 0).toLocaleString('zh-CN')}</strong><small>成功率 {successRate}</small></div>
-        <div><span>价格区间</span><strong>{money(stats.min_price)} <em>至</em> {money(stats.max_price)}</strong><small>平均 {money(stats.average_price)}</small></div>
-        <div><span>库存快照</span><strong className="positive">{Number(stats.in_stock_count || 0).toLocaleString('zh-CN')}</strong><small>{Number(stats.out_stock_count || 0).toLocaleString('zh-CN')} 缺货 · {Number(stats.unknown_stock_count || 0).toLocaleString('zh-CN')} 未知</small></div>
-        <div><span>异常记录</span><strong className={Number(stats.error_count || 0) ? 'negative' : ''}>{Number(stats.error_count || 0).toLocaleString('zh-CN')}</strong><small>抓取失败或返回异常</small></div>
+        <Tooltip label="筛选区间内最后一笔有效报价，相对该区间第一笔报价的变化"><div tabIndex={0}><span>区间变化</span><strong className={intervalChange > 0 ? 'negative' : intervalChange < 0 ? 'positive' : ''}>{Number.isFinite(intervalChange) ? signedMoney(intervalChange) : '--'}</strong><small>{signedPercent(stats.price_change_percent)} · 首价 {money(stats.first_price)}</small></div></Tooltip>
+        <Tooltip label="筛选区间内的最低价、最高价与算术平均价"><div tabIndex={0}><span>价格区间</span><strong>{money(stats.min_price)} <em>至</em> {money(stats.max_price)}</strong><small>均价 {money(stats.average_price)}</small></div></Tooltip>
+        <Tooltip label="有货率只统计返回了明确库存数量的成功快照"><div tabIndex={0}><span>库存可用率</span><strong className={Number.isFinite(availabilityRate) && availabilityRate < 50 ? 'negative' : 'positive'}>{Number.isFinite(availabilityRate) ? `${availabilityRate.toFixed(1)}%` : '--'}</strong><small>{Number(stats.in_stock_count || 0)} 有货 · {Number(stats.out_stock_count || 0)} 缺货</small></div></Tooltip>
+        <Tooltip label="价格波动率为区间价格标准差占平均价格的比例"><div tabIndex={0}><span>价格波动率</span><strong>{Number.isFinite(volatility) ? `${volatility.toFixed(2)}%` : '--'}</strong><small>{Number(stats.price_change_count || 0)} 次价格变化</small></div></Tooltip>
+        <Tooltip label="库存从无货变为有货记为补货，从有货变为无货记为缺货"><div tabIndex={0}><span>库存事件</span><strong>{Number(stats.restock_count || 0)} <em>补货</em> / {Number(stats.sold_out_count || 0)} <em>缺货</em></strong><small>{Number(stats.unknown_stock_count || 0)} 条库存未知</small></div></Tooltip>
+        <Tooltip label="筛选后的抓取覆盖情况与失败数量"><div tabIndex={0}><span>数据质量</span><strong>{Number(stats.quoted_count || 0).toLocaleString('zh-CN')}</strong><small>成功率 {successRate} · <span className={Number(stats.error_count || 0) ? 'negative' : ''}>{Number(stats.error_count || 0)} 异常</span></small></div></Tooltip>
       </div>
 
       <section className="history-chart-card">
-        <div className="history-card-head"><div><span className="history-kicker">TREND SAMPLE</span><h3>价格与库存走势</h3></div><div className="history-chart-legend"><span><i className="legend-dot price"/>价格</span><span><i className="legend-dot stock"/>有货节点</span><small>{trend?.length || 0} 个趋势节点</small></div></div>
-        <PriceHistoryChart points={trend}/>
+        <div className="history-card-head"><div><span className="history-kicker">TREND ANALYSIS</span><h3>价格与库存走势</h3></div><span className="history-record-total">按真实抓取时间绘制 · 最多 720 个节点</span></div>
+        <div className="history-chart-toolbar">
+          <div className="history-chart-control"><span>时间范围</span><div className="history-segmented history-range-segmented" role="group" aria-label="趋势时间范围">{[
+            ['day', '24小时'], ['week', '7天'], ['month', '30天'], ['quarter', '90天'], ['all', '全部'],
+          ].map(([value, label]) => <button key={value} className={rangePreset === value ? 'active' : ''} aria-pressed={rangePreset === value} onClick={() => applyRangePreset(value)}>{label}</button>)}</div></div>
+          <div className="history-chart-control"><span>图表模式</span><div className="history-segmented" role="group" aria-label="图表显示模式">{[
+            ['combined', '价格 + 库存'], ['price', '仅价格'], ['inventory', '仅库存'],
+          ].map(([value, label]) => <button key={value} className={chartMode === value ? 'active' : ''} aria-pressed={chartMode === value} onClick={() => setChartMode(value)}>{label}</button>)}</div></div>
+          <label className="history-comparison-select"><span>价格对比</span><select value={comparison} onChange={event => setComparison(event.target.value)} disabled={chartMode === 'inventory'}><option value="none">无基准</option><option value="previous">上次价格</option><option value="average">区间均价</option><option value="lowest">区间最低</option><option value="highest">区间最高</option></select></label>
+        </div>
+        <React.Suspense fallback={<div className="history-loading"><RefreshCw size={18} className="spin"/><span>正在加载趋势图…</span></div>}>
+          <PriceHistoryChart points={trend} stats={stats} mode={chartMode} comparison={comparison}/>
+        </React.Suspense>
       </section>
 
       <section className="history-record-card">
