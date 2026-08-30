@@ -1220,7 +1220,19 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .detail-history-summary span, .detail-history-summary strong { display: block; }
 .detail-history-summary span { color: var(--ui-text-muted); font-size: 9px; }
 .detail-history-summary strong { margin-top: 6px; overflow-wrap: anywhere; color: var(--ui-text); font-size: 13px; font-variant-numeric: tabular-nums; }
-.detail-price-history .price-chart, .detail-price-history .chart-empty { height: 190px; margin-top: 17px; }
+.detail-price-chart { min-width: 0; margin-top: 13px; border-top: 1px solid var(--ui-border-soft); }
+.detail-chart-context { min-height: 36px; padding: 10px 3px 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ui-text-faint); font-size: 9px; }
+.detail-chart-context > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-chart-context > span:first-child { display: inline-flex; align-items: center; gap: 6px; color: var(--ui-text-muted); font-weight: 680; }
+.detail-price-chart-canvas { position: relative; height: 250px; min-width: 0; }
+.detail-price-chart-canvas .recharts-wrapper { outline: 0; }
+.detail-price-chart-canvas .recharts-reference-dot-label { font-variant-numeric: tabular-nums; }
+.detail-chart-foot { min-height: 32px; padding: 4px 3px 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ui-text-faint); border-top: 1px solid var(--ui-border-soft); font-size: 9px; }
+.detail-chart-foot > div { display: flex; align-items: center; gap: 13px; }
+.detail-chart-foot > div span { display: inline-flex; align-items: center; gap: 6px; color: var(--ui-text-muted); white-space: nowrap; }
+.detail-price-chart-empty, .detail-price-chart-loading { height: 250px; margin-top: 13px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border-top: 1px solid var(--ui-border-soft); }
+.detail-price-chart-empty strong { color: var(--ui-text); font-size: 11px; }
+.detail-price-chart-empty span, .detail-price-chart-loading span { font-size: 9px; }
 
 .detail-product-information { margin-top: 14px; display: grid; grid-template-columns: minmax(230px, .75fr) minmax(0, 1.25fr); gap: 14px; }
 .detail-description, .detail-drawer-specs { min-width: 0; padding: 17px 18px; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; }
@@ -1628,6 +1640,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .detail-history-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .detail-history-summary > div:nth-child(2) { border-right: 0; }
   .detail-history-summary > div:nth-child(-n+2) { border-bottom: 1px solid var(--ui-border-soft); }
+  .detail-chart-context { align-items: flex-start; flex-direction: column; gap: 3px; }
+  .detail-price-chart-canvas, .detail-price-chart-empty, .detail-price-chart-loading { height: 225px; }
+  .detail-chart-foot { align-items: flex-start; flex-direction: column; gap: 6px; padding-block: 8px 3px; }
   .detail-drawer-specs > div { grid-template-columns: 1fr; }
   .detail-drawer-specs dl:nth-child(odd), .detail-drawer-specs dl:nth-child(even) { padding-inline: 0; border-right: 0; }
   .detail-action-bar { min-height: 64px; padding: 10px 14px; }
