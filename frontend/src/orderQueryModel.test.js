@@ -2,6 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canOpenProtectedOrderDetail,
+  COMPLAINT_REASON_OPTIONS,
+  complaintActionForOrder,
+  complaintStatusMeta,
+  createComplaintDraft,
   formatOrderDateTime,
   formatOrderCardsForCopy,
   formatOrderMoney,
@@ -10,12 +14,14 @@ import {
   normalizeOrderResponse,
   orderDeliveryKindLabel,
   orderDetailErrorState,
+  normalizeComplaintPayload,
   orderQueryContextChanged,
   orderGoodsActionLabel,
   orderStatusMeta,
   safeOrderContentUrl,
   safeOfficialOrderUrl,
   summarizeOrders,
+  validateComplaintPayload,
   verificationLabel,
 } from './orderQueryModel.js';
 
@@ -30,6 +36,8 @@ test('normalizes upstream order fields and status labels', () => {
     quantity: '2',
     status: 1,
     need_query_password: 1,
+    can_complaint: '1',
+    complaint_status: '-1',
   });
 
   assert.equal(order.status_label, '已付款');
@@ -38,10 +46,89 @@ test('normalizes upstream order fields and status labels', () => {
   assert.equal(order.goods_action_label, '获取卡密');
   assert.equal(order.quantity, 2);
   assert.equal(order.need_query_password, true);
+  assert.equal(order.can_complaint, true);
+  assert.equal(order.complaint_status, -1);
   assert.equal(order.detail_url, 'https://pay.ldxp.cn/order/info/LD-1001');
   assert.equal(canOpenProtectedOrderDetail(order), true);
   assert.equal(canOpenProtectedOrderDetail({...order, status: 0}), false);
   assert.equal(canOpenProtectedOrderDetail({...order, need_query_password: false}), false);
+});
+
+test('distinguishes complaint actions and statuses conservatively', () => {
+  const eligible = {trade_no: 'LD-1001', can_complaint: true};
+  assert.deepEqual(complaintActionForOrder({...eligible, complaint_status: null}), {
+    kind: 'apply',
+    label: '申请售后',
+    status: {key: null, label: '未申请售后', tone: 'neutral'},
+  });
+  assert.equal(complaintActionForOrder({...eligible, complaint_status: -1}).label, '重新申请');
+  assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: -1}).kind, 'status');
+  assert.equal(complaintActionForOrder({...eligible, complaint_status: 0}).label, '售后待处理');
+  assert.equal(complaintActionForOrder({...eligible, complaint_status: 1}).label, '售后已完成');
+  assert.equal(complaintActionForOrder({...eligible, complaint_status: 7}).kind, 'status');
+  assert.equal(complaintActionForOrder({...eligible, complaint_status: 'unexpected'}).kind, 'status');
+  assert.equal(complaintStatusMeta(7).label, '售后状态未知');
+  assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: null}).kind, 'none');
+});
+
+test('creates and normalizes the exact complaint preview payload', () => {
+  const draft = createComplaintDraft({trade_no: ' LD-1001 '}, ' buyer@example.com ');
+  assert.deepEqual(draft.images, ['', '', '']);
+  const payload = normalizeComplaintPayload({
+    ...draft,
+    reason: ' 描述不符 ',
+    content: ' 补充说明 ',
+    images: [' https://cdn.example.test/one.png ', '', 'https://cdn.example.test/two.png'],
+    collect_image: ' https://cdn.example.test/qr.png ',
+    query_pwd: ' 123456 ',
+    email_code: ' 9988 ',
+  });
+
+  assert.deepEqual(payload, {
+    trade_no: 'LD-1001',
+    reason: '描述不符',
+    content: '补充说明',
+    contact: 'buyer@example.com',
+    images: ['https://cdn.example.test/one.png', 'https://cdn.example.test/two.png'],
+    collect_image: 'https://cdn.example.test/qr.png',
+    query_pwd: '123456',
+    email_code: '9988',
+  });
+});
+
+test('validates complaint fields, limits and URL schemes', () => {
+  const valid = {
+    trade_no: 'LD-1001',
+    reason: COMPLAINT_REASON_OPTIONS[0],
+    content: 'a'.repeat(200),
+    contact: 'buyer@example.com',
+    images: ['https://cdn.example.test/1.png', 'http://cdn.example.test/2.png', ''],
+    collect_image: 'https://cdn.example.test/qr.png',
+    query_pwd: '123456',
+    email_code: '',
+  };
+  assert.deepEqual(validateComplaintPayload(valid), {
+    valid: true,
+    errors: {},
+    payload: {...valid, images: valid.images.slice(0, 2)},
+  });
+
+  const missing = validateComplaintPayload({});
+  assert.deepEqual(Object.keys(missing.errors).sort(), ['contact', 'content', 'query_pwd', 'reason', 'trade_no']);
+  assert.equal(validateComplaintPayload({...valid, reason: '其他原因'}).errors.reason, '请选择投诉类型');
+  assert.equal(validateComplaintPayload({...valid, content: 'a'.repeat(201)}).errors.content, '补充说明不能超过 200 字');
+  assert.equal(validateComplaintPayload({...valid, contact: 'not-an-email'}).errors.contact, '请输入正确的邮箱地址');
+  assert.ok(validateComplaintPayload({...valid, query_pwd: '12345'}).errors.query_pwd);
+  assert.ok(validateComplaintPayload({...valid, query_pwd: '1234567'}).errors.query_pwd);
+  assert.ok(validateComplaintPayload({...valid, query_pwd: '１２３４５６'}).errors.query_pwd);
+  assert.ok(validateComplaintPayload({...valid, query_pwd: 'abc123'}).errors.query_pwd);
+  assert.ok(validateComplaintPayload({...valid, email_code: 'code-with-symbols'}).errors.email_code);
+  assert.equal(validateComplaintPayload({...valid, email_code: 'Code123'}).valid, true);
+  assert.ok(validateComplaintPayload({...valid, images: ['https://a.test/1', 'https://a.test/2', 'https://a.test/3', 'https://a.test/4']}).errors.images);
+  assert.ok(validateComplaintPayload({...valid, images: ['javascript:alert(1)']}).errors.images);
+  assert.ok(validateComplaintPayload({...valid, images: ['https://user:secret@a.test/image.png']}).errors.images);
+  assert.ok(validateComplaintPayload({...valid, images: [`https://a.test/${'x'.repeat(1000)}`]}).errors.images);
+  assert.ok(validateComplaintPayload({...valid, collect_image: 'file:///tmp/qr.png'}).errors.collect_image);
 });
 
 test('normalizes pagination and computes current page summary', () => {

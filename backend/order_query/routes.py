@@ -7,12 +7,18 @@ from urllib.parse import urlparse
 
 from monitor_core.storefront import WafChallengeRequired
 
+from .complaint import build_complaint_preview
 from .errors import OrderQueryError
 
 SendJson = Callable[[Any, int], Any]
 ORDER_QUERY_PATH = "/api/order-query/search"
 ORDER_DETAIL_PATH = "/api/order-query/detail"
-ORDER_QUERY_PATHS = {ORDER_QUERY_PATH, ORDER_DETAIL_PATH}
+ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
+ORDER_QUERY_POST_PATHS = frozenset({
+    ORDER_QUERY_PATH,
+    ORDER_DETAIL_PATH,
+    ORDER_COMPLAINT_PREVIEW_PATH,
+})
 LOCAL_DEVELOPMENT_HOSTS = {"127.0.0.1", "localhost"}
 
 
@@ -40,7 +46,7 @@ def request_rejection(
     frontend_url: str,
 ) -> tuple[int, dict[str, Any]] | None:
     """Reject browser requests that could make the local service perform cross-site work."""
-    if path not in ORDER_QUERY_PATHS:
+    if path not in ORDER_QUERY_POST_PATHS:
         return None
 
     content_type = str(headers.get("Content-Type", "")).partition(";")[0].strip().lower()
@@ -85,11 +91,14 @@ def handle_post(
     send_json: SendJson,
     search: Callable[[dict[str, Any]], dict[str, Any]],
     detail: Callable[[dict[str, Any]], dict[str, Any]],
+    complaint_preview: Callable[[dict[str, Any]], dict[str, Any]] = build_complaint_preview,
 ) -> bool:
     if path == ORDER_QUERY_PATH:
         operation = search
     elif path == ORDER_DETAIL_PATH:
         operation = detail
+    elif path == ORDER_COMPLAINT_PREVIEW_PATH:
+        operation = complaint_preview
     else:
         return False
     try:
@@ -113,10 +122,12 @@ def handle_post(
             409,
         )
     except RuntimeError as exc:
+        is_complaint_preview = path == ORDER_COMPLAINT_PREVIEW_PATH
+        fallback_detail = "售后申请参数预览失败" if is_complaint_preview else "订单查询失败"
         send_json(
             {
-                "detail": str(exc)[:240] or "订单查询失败",
-                "code": "order_query_failed",
+                "detail": str(exc)[:240] or fallback_detail,
+                "code": "order_complaint_preview_failed" if is_complaint_preview else "order_query_failed",
                 "retryable": True,
             },
             502,

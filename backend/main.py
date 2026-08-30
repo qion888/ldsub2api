@@ -35,6 +35,7 @@ from monitor_core import settings as monitor_setting_store
 from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
 from monitor_core.workers import MonitorWorker as CoreMonitorWorker
+from order_query.complaint import build_complaint_preview
 from order_query import routes as order_query_routes
 from order_query.service import OrderQueryService
 from sub2api import automation as sub2api_automation
@@ -1020,6 +1021,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             send_json=self._send_json,
             search=ORDER_QUERY_SERVICE.search,
             detail=ORDER_QUERY_SERVICE.detail,
+            complaint_preview=build_complaint_preview,
         ):
             return
 

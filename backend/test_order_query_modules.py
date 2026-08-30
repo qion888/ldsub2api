@@ -12,9 +12,15 @@ import main
 from order_query import routes
 from order_query.captcha import CaptchaRecognizer, captcha_sign, normalize_captcha_code
 from order_query.client import CaptchaChallenge, OrderQueryClient
+from order_query.complaint import (
+    COMPLAINT_PREVIEW_TARGET,
+    COMPLAINT_REASONS,
+    build_complaint_preview,
+)
 from order_query.detail import normalize_order_detail
 from order_query.errors import (
     CaptchaRecognizerUnavailable,
+    OrderComplaintInputError,
     OrderQueryDetailNotFound,
     OrderQueryInputError,
     OrderQueryPasswordInvalid,
@@ -477,6 +483,113 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn("169.254.169.254", json.dumps(detail, ensure_ascii=False))
 
 
+class ComplaintPreviewTests(unittest.TestCase):
+    @staticmethod
+    def valid_payload() -> dict[str, Any]:
+        return {
+            "trade_no": "LD260830R9AZU5",
+            "reason": "描述不符",
+            "content": "收到的卡密与商品描述不一致",
+            "contact": "buyer@example.test",
+            "images": [
+                "https://pay.ldxp.cn/uploads/complaint/evidence-1.png",
+                "http://cdn.example.test/evidence-2.jpg",
+            ],
+            "collect_image": "https://pay.ldxp.cn/uploads/complaint/refund.png",
+            "query_pwd": "012345",
+            "email_code": "A1B2C3",
+        }
+
+    def test_preview_normalizes_exact_official_payload_without_submitting(self) -> None:
+        payload = self.valid_payload()
+        payload.update({
+            "trade_no": f"  {payload['trade_no']}  ",
+            "reason": f" {payload['reason']} ",
+            "content": f"\n{payload['content']}\n",
+            "contact": f" {payload['contact']} ",
+            "images": [f" {url} " for url in payload["images"]],
+            "collect_image": f" {payload['collect_image']} ",
+            "query_pwd": f" {payload['query_pwd']} ",
+            "email_code": f" {payload['email_code']} ",
+        })
+
+        result = build_complaint_preview(payload)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["mode"], "preview")
+        self.assertEqual(result["target"], {
+            "method": "POST",
+            "url": COMPLAINT_PREVIEW_TARGET,
+        })
+        self.assertEqual(result["requirements"], {
+            "email_code": {
+                "required_when": "order.order_complaint_email_verify == 1",
+                "provided": True,
+            },
+        })
+        self.assertEqual(list(result["payload"]), [
+            "trade_no",
+            "reason",
+            "content",
+            "contact",
+            "images",
+            "collect_image",
+            "query_pwd",
+            "email_code",
+        ])
+        self.assertEqual(result["payload"], self.valid_payload())
+
+    def test_preview_accepts_every_official_complaint_reason(self) -> None:
+        self.assertEqual(COMPLAINT_REASONS, {
+            "不会使用",
+            "无效商品",
+            "涉嫌色情",
+            "涉嫌赌博",
+            "欺诈骗钱",
+            "没人售后",
+            "描述不符",
+        })
+        for reason in COMPLAINT_REASONS:
+            with self.subTest(reason=reason):
+                payload = self.valid_payload()
+                payload["reason"] = reason
+                self.assertEqual(build_complaint_preview(payload)["payload"]["reason"], reason)
+
+    def test_preview_uses_empty_defaults_for_optional_official_fields(self) -> None:
+        payload = self.valid_payload()
+        for field in ("images", "collect_image", "email_code"):
+            payload.pop(field)
+
+        result = build_complaint_preview(payload)
+
+        self.assertEqual(result["payload"]["images"], [])
+        self.assertEqual(result["payload"]["collect_image"], "")
+        self.assertEqual(result["payload"]["email_code"], "")
+        self.assertEqual(result["requirements"]["email_code"]["provided"], False)
+
+    def test_preview_rejects_invalid_or_unofficial_fields(self) -> None:
+        invalid_payloads: list[tuple[str, Any, str]] = [
+            ("body", [], "JSON 对象"),
+            ("unknown", {**self.valid_payload(), "target": "https://example.test"}, "未知字段"),
+            ("trade_no", {**self.valid_payload(), "trade_no": "LD/../../bad"}, "trade_no 格式"),
+            ("reason", {**self.valid_payload(), "reason": "其他"}, "投诉类型"),
+            ("empty_content", {**self.valid_payload(), "content": "  "}, "content 不能为空"),
+            ("long_content", {**self.valid_payload(), "content": "x" * 201}, "最多允许 200"),
+            ("contact", {**self.valid_payload(), "contact": "not-an-email"}, "邮箱地址"),
+            ("password", {**self.valid_payload(), "query_pwd": "12345"}, "6 位数字"),
+            ("unicode_password", {**self.valid_payload(), "query_pwd": "１２３４５６"}, "6 位数字"),
+            ("email_code", {**self.valid_payload(), "email_code": "bad code"}, "email_code 格式"),
+            ("images_type", {**self.valid_payload(), "images": "https://example.test/a.png"}, "URL 数组"),
+            ("images_count", {**self.valid_payload(), "images": ["https://example.test/a.png"] * 4}, "最多允许 3"),
+            ("image_url", {**self.valid_payload(), "images": ["file:///tmp/a.png"]}, r"http\(s\) URL"),
+            ("malformed_image_url", {**self.valid_payload(), "images": ["http://[invalid"]}, r"http\(s\) URL"),
+            ("collect_image", {**self.valid_payload(), "collect_image": "ftp://example.test/refund.png"}, r"http\(s\) URL"),
+        ]
+        for label, payload, message in invalid_payloads:
+            with self.subTest(label=label), self.assertRaisesRegex(OrderComplaintInputError, message):
+                build_complaint_preview(payload)
+
+
 class ServiceTests(unittest.TestCase):
     @staticmethod
     def service(client: FakeOrderClient, recognizer: FakeRecognizer) -> OrderQueryService:
@@ -783,6 +896,7 @@ class RouteTests(unittest.TestCase):
             send_json=lambda value, status=200: responses.append((status, value)),
             search=lambda data: payload,
             detail=lambda data: {},
+            complaint_preview=lambda data: {},
         )
         self.assertTrue(handled)
         self.assertEqual(responses, [(200, payload)])
@@ -799,6 +913,7 @@ class RouteTests(unittest.TestCase):
             send_json=lambda value, status=200: responses.append((status, value)),
             search=fail,
             detail=lambda data: {},
+            complaint_preview=lambda data: {},
         )
         self.assertEqual(responses, [(400, {
             "detail": "bad query",
@@ -818,12 +933,53 @@ class RouteTests(unittest.TestCase):
             send_json=lambda value, status=200: responses.append((status, value)),
             search=lambda data: {},
             detail=fail,
+            complaint_preview=lambda data: {},
         )
 
         self.assertTrue(handled)
         self.assertEqual(responses, [(403, {
             "detail": "订单安全密码错误，请重新输入",
             "code": "order_query_password_invalid",
+            "retryable": False,
+        })])
+
+    def test_complaint_preview_route_is_distinct_and_returns_local_result(self) -> None:
+        responses: list[tuple[int, Any]] = []
+        calls: list[dict[str, Any]] = []
+        payload = ComplaintPreviewTests.valid_payload()
+        expected = build_complaint_preview(payload)
+
+        handled = routes.handle_post(
+            "/api/order-query/complaints/preview",
+            payload,
+            send_json=lambda value, status=200: responses.append((status, value)),
+            search=lambda data: self.fail("search route must not run"),
+            detail=lambda data: self.fail("detail route must not run"),
+            complaint_preview=lambda data: calls.append(data) or expected,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(calls, [payload])
+        self.assertEqual(responses, [(200, expected)])
+
+    def test_complaint_preview_route_returns_specific_validation_error(self) -> None:
+        responses: list[tuple[int, Any]] = []
+
+        def fail(data: dict[str, Any]) -> dict[str, Any]:
+            raise OrderComplaintInputError("bad complaint")
+
+        routes.handle_post(
+            "/api/order-query/complaints/preview",
+            {},
+            send_json=lambda value, status=200: responses.append((status, value)),
+            search=lambda data: {},
+            detail=lambda data: {},
+            complaint_preview=fail,
+        )
+
+        self.assertEqual(responses, [(400, {
+            "detail": "bad complaint",
+            "code": "invalid_order_complaint",
             "retryable": False,
         })])
 
@@ -898,6 +1054,54 @@ class RouteTests(unittest.TestCase):
 
         self.assertEqual(calls, [json.loads(body)])
         self.assertEqual(responses, [(200, expected)])
+
+    def test_main_http_handler_mounts_local_complaint_preview_without_network(self) -> None:
+        payload = ComplaintPreviewTests.valid_payload()
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        expected = build_complaint_preview(payload)
+        handler = object.__new__(main.ApiHandler)
+        handler.path = "/api/order-query/complaints/preview"
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "Content-Type": "application/json; charset=utf-8",
+            "Origin": "http://127.0.0.1:5173",
+        }
+        handler.rfile = BytesIO(body)
+        responses: list[tuple[int, Any]] = []
+        handler._send_json = lambda value, status=200: responses.append((status, value))
+
+        with patch.object(main, "build_complaint_preview", wraps=build_complaint_preview) as preview, \
+             patch.object(OrderQueryClient, "_json_request", side_effect=AssertionError("network called")):
+            handler.do_POST()
+
+        preview.assert_called_once_with(payload)
+        self.assertEqual(responses, [(200, expected)])
+
+    def test_complaint_preview_request_guard_rejects_bad_content_type_and_origin(self) -> None:
+        cases = (
+            (
+                {"Content-Type": "text/plain", "Origin": "http://127.0.0.1:5173"},
+                415,
+                "unsupported_media_type",
+            ),
+            (
+                {"Content-Type": "application/json", "Origin": "https://untrusted.example"},
+                403,
+                "untrusted_origin",
+            ),
+        )
+        for headers, expected_status, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                rejection = routes.request_rejection(
+                    "/api/order-query/complaints/preview",
+                    headers,
+                    frontend_url="http://127.0.0.1:5173/",
+                )
+                self.assertIsNotNone(rejection)
+                assert rejection is not None
+                status, response = rejection
+                self.assertEqual(status, expected_status)
+                self.assertEqual(response["code"], expected_code)
 
     def test_order_query_request_guard_does_not_apply_to_other_routes(self) -> None:
         rejection = routes.request_rejection(

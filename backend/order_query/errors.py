@@ -24,6 +24,11 @@ class OrderQueryInputError(OrderQueryError):
         super().__init__(detail, code="invalid_order_query", status=400)
 
 
+class OrderComplaintInputError(OrderQueryError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail, code="invalid_order_complaint", status=400)
+
+
 class OrderQuerySessionExpired(OrderQueryError):
     def __init__(self) -> None:
         super().__init__(

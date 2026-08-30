@@ -13,6 +13,7 @@ import {
   Image,
   KeyRound,
   Link2,
+  MessageSquareWarning,
   Package,
   ReceiptText,
   RefreshCw,
@@ -23,22 +24,28 @@ import {
   X,
 } from 'lucide-react';
 import {
+  COMPLAINT_REASON_OPTIONS,
   ORDER_STATUS_OPTIONS,
   canOpenProtectedOrderDetail,
+  complaintActionForOrder,
+  createComplaintDraft,
   formatOrderDateTime,
   formatOrderCardsForCopy,
   formatOrderMoney,
   normalizeOrderDetail,
+  normalizeComplaintPayload,
   normalizeOrderResponse,
   orderDeliveryKindLabel,
   orderDetailErrorState,
   orderQueryContextChanged,
   summarizeOrders,
+  validateComplaintPayload,
   verificationLabel,
 } from './orderQueryModel.js';
 import './orderQuery.css';
 
 const EMPTY_RESULT = {orders: [], pagination: {page: 1, page_size: 10, total: 0, pages: 1}};
+const COMPLAINT_TARGET = Object.freeze({method: 'POST', url: 'https://pay.ldxp.cn/shopApi/Order/complaintOrder'});
 
 function QueryIconButton({label, children, ...props}) {
   return <button className="icon-button" type="button" aria-label={label} title={label} {...props}>{children}</button>;
@@ -232,7 +239,99 @@ function OrderDetailDialog({
   </div>;
 }
 
-function OrderRow({order, onCopy, onOpenProtectedDetail}) {
+function ComplaintFieldError({id, message}) {
+  return message ? <small className="order-complaint-field-error" id={id}>{message}</small> : null;
+}
+
+function ComplaintDialog({order, draft, errors, busy, error, preview, dialogRef, onChange, onImageChange, onSubmit, onCopy, onBack, onClose, onCopyOrder}) {
+  const previewText = preview ? JSON.stringify(preview.payload, null, 2) : '';
+  const emailCodeRequirement = preview?.requirements?.email_code;
+  return <div className="modal-backdrop order-complaint-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="checkout-modal order-complaint-modal" role="dialog" aria-modal="true" aria-labelledby="order-complaint-title">
+      <div className="modal-head order-complaint-head">
+        <div><span>AFTER-SALES PREVIEW</span><h2 id="order-complaint-title">{preview ? '售后申请参数' : '申请售后'}</h2></div>
+        <QueryIconButton label="关闭售后弹窗" onClick={onClose}><X size={17}/></QueryIconButton>
+      </div>
+
+      <div className="order-complaint-order">
+        <div><span>当前订单</span><strong>{order.goods_name}</strong><small>{order.trade_no}</small></div>
+        <QueryIconButton label={`复制订单号 ${order.trade_no}`} onClick={() => onCopyOrder(order.trade_no)}><Clipboard size={14}/></QueryIconButton>
+      </div>
+
+      {!preview ? <form className="order-complaint-form" onSubmit={onSubmit} noValidate>
+        <div className="order-complaint-notice"><ShieldCheck size={17}/><p>仅在本地校验并生成参数预览，不会上传图片或向官方站点提交。</p></div>
+        {error && <div className="order-complaint-error" role="alert"><TriangleAlert size={15}/><span>{error}</span></div>}
+
+        <div className="order-complaint-fields">
+          <label className="order-complaint-reason">
+            <span>投诉类型</span>
+            <select value={draft.reason} onChange={event => onChange('reason', event.target.value)} aria-invalid={Boolean(errors.reason)} aria-describedby={errors.reason ? 'complaint-reason-error' : undefined} data-complaint-form-focus>
+              <option value="">请选择投诉类型</option>
+              {COMPLAINT_REASON_OPTIONS.map(reason => <option value={reason} key={reason}>{reason}</option>)}
+            </select>
+            <ComplaintFieldError id="complaint-reason-error" message={errors.reason}/>
+          </label>
+
+          <label className="order-complaint-contact">
+            <span>通知邮箱</span>
+            <input type="email" value={draft.contact} onChange={event => onChange('contact', event.target.value)} placeholder="name@example.com" autoComplete="email" spellCheck="false" aria-invalid={Boolean(errors.contact)} aria-describedby={errors.contact ? 'complaint-contact-error' : undefined}/>
+            <ComplaintFieldError id="complaint-contact-error" message={errors.contact}/>
+          </label>
+
+          <label className="order-complaint-content">
+            <span>补充说明 <em>{draft.content.length} / 200</em></span>
+            <textarea value={draft.content} onChange={event => onChange('content', event.target.value)} placeholder="请输入补充说明及凭证" maxLength={200} rows={4} aria-invalid={Boolean(errors.content)} aria-describedby={errors.content ? 'complaint-content-error' : undefined}/>
+            <ComplaintFieldError id="complaint-content-error" message={errors.content}/>
+          </label>
+
+          <label>
+            <span>投诉查询密码</span>
+            <input type="password" value={draft.query_pwd} onChange={event => onChange('query_pwd', event.target.value.replace(/[^0-9]/g, '').slice(0, 6))} placeholder="6 位数字" inputMode="numeric" autoComplete="new-password" pattern="[0-9]{6}" maxLength={6} aria-invalid={Boolean(errors.query_pwd)} aria-describedby={errors.query_pwd ? 'complaint-password-error' : undefined}/>
+            <ComplaintFieldError id="complaint-password-error" message={errors.query_pwd}/>
+          </label>
+
+          <label>
+            <span>邮箱验证码 <em>按官方配置条件必填</em></span>
+            <input value={draft.email_code} onChange={event => onChange('email_code', event.target.value)} placeholder="官方启用邮箱验证时填写" autoComplete="one-time-code" spellCheck="false" maxLength={32} aria-invalid={Boolean(errors.email_code)} aria-describedby={errors.email_code ? 'complaint-email-code-error' : undefined}/>
+            <ComplaintFieldError id="complaint-email-code-error" message={errors.email_code}/>
+          </label>
+
+          <fieldset className="order-complaint-images">
+            <legend>图片凭证 URL <em>选填，最多 3 个</em></legend>
+            {draft.images.map((value, index) => <label key={index}>
+              <span className="sr-only">图片凭证 URL {index + 1}</span>
+              <div><Link2 size={14}/><input value={value} onChange={event => onImageChange(index, event.target.value)} placeholder={`https://.../evidence-${index + 1}.png`} inputMode="url" spellCheck="false" aria-invalid={Boolean(errors.images)} aria-describedby={errors.images ? 'complaint-images-error' : undefined}/></div>
+            </label>)}
+            <ComplaintFieldError id="complaint-images-error" message={errors.images}/>
+          </fieldset>
+
+          <label className="order-complaint-collect-image">
+            <span>退款二维码 URL <em>选填</em></span>
+            <div><Link2 size={14}/><input value={draft.collect_image} onChange={event => onChange('collect_image', event.target.value)} placeholder="https://.../refund-qr.png" inputMode="url" spellCheck="false" aria-invalid={Boolean(errors.collect_image)} aria-describedby={errors.collect_image ? 'complaint-collect-error' : undefined}/></div>
+            <ComplaintFieldError id="complaint-collect-error" message={errors.collect_image}/>
+          </label>
+        </div>
+
+        <div className="modal-foot order-complaint-foot">
+          <span><ShieldCheck size={14}/>目标参数只读预览</span>
+          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={busy}>{busy ? <RefreshCw className="spin" size={15}/> : <ShieldCheck size={15}/>}<span>{busy ? '正在校验' : '生成参数预览'}</span></button></div>
+        </div>
+      </form> : <div className="order-complaint-preview" aria-live="polite">
+        <div className="order-complaint-preview-status" data-complaint-preview-focus tabIndex={-1}><Check size={18}/><div><strong>本地字段格式已校验，未向官方提交</strong><span>submitted: false · mode: preview</span><span>邮箱验证码：{emailCodeRequirement?.provided ? '已填写' : '官方启用邮箱验证时仍需填写'}</span></div></div>
+        <dl className="order-complaint-target"><div><dt>目标方法</dt><dd>{COMPLAINT_TARGET.method}</dd></div><div><dt>目标地址</dt><dd>{COMPLAINT_TARGET.url}</dd></div></dl>
+        <div className="order-complaint-payload-head"><div><span>REQUEST PAYLOAD</span><strong>官方字段预览</strong></div><QueryIconButton label="复制售后参数" onClick={() => onCopy(previewText)}><Clipboard size={15}/></QueryIconButton></div>
+        <pre className="order-complaint-payload">{previewText}</pre>
+        <div className="modal-foot order-complaint-foot">
+          <span><ShieldCheck size={14}/>本地预览已完成</span>
+          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onBack}><ChevronLeft size={15}/>返回编辑</button><button className="button secondary" type="button" onClick={onClose}>关闭</button><button className="button primary" type="button" onClick={() => onCopy(previewText)}><Clipboard size={15}/>复制参数</button></div>
+        </div>
+      </div>}
+    </div>
+  </div>;
+}
+
+function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint}) {
+  const complaintAction = complaintActionForOrder(order);
   return <tr>
     <td data-label="商品">
       <div className="order-product-cell"><OrderImage order={order}/><span><strong>{order.goods_name}</strong><small>{formatOrderDateTime(order.created_at)}</small></span></div>
@@ -245,6 +344,8 @@ function OrderRow({order, onCopy, onOpenProtectedDetail}) {
       {order.detail_url && <a className="icon-button" href={order.detail_url} target="_blank" rel="noreferrer" aria-label="打开官方订单详情" title="打开官方订单详情"><ExternalLink size={14}/></a>}
       {canOpenProtectedOrderDetail(order) && <button className="button secondary order-result-link order-password-button" type="button" onClick={event => onOpenProtectedDetail(order, event.currentTarget)}><KeyRound size={14}/>安全密码</button>}
       {order.status === 1 && order.result_url && !order.need_query_password && <a className="button secondary order-result-link" href={order.result_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>{order.goods_action_label}</a>}
+      {complaintAction.kind === 'apply' && <button className="button secondary order-complaint-button" type="button" onClick={event => onComplaint(order, event.currentTarget)}><MessageSquareWarning size={14}/>{complaintAction.label}</button>}
+      {complaintAction.kind === 'status' && <span className={`order-complaint-state ${complaintAction.status.tone}`}>{complaintAction.label}</span>}
     </div></td>
   </tr>;
 }
@@ -271,6 +372,12 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   const [detailBusy, setDetailBusy] = useState(false);
   const [detailError, setDetailError] = useState('');
   const [detailSessionExpired, setDetailSessionExpired] = useState(false);
+  const [complaintOrder, setComplaintOrder] = useState(null);
+  const [complaintDraft, setComplaintDraft] = useState(null);
+  const [complaintErrors, setComplaintErrors] = useState({});
+  const [complaintBusy, setComplaintBusy] = useState(false);
+  const [complaintError, setComplaintError] = useState('');
+  const [complaintPreview, setComplaintPreview] = useState(null);
   const requestVersion = useRef(0);
   const detailRequestVersion = useRef(0);
   const detailAbortController = useRef(null);
@@ -279,6 +386,21 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   const detailTriggerRef = useRef(null);
   const resultContext = useRef({keywords: '', status: 999, pageSize: 10});
   const initialKeywordsApplied = useRef(false);
+  const complaintTrigger = useRef(null);
+  const complaintDialog = useRef(null);
+  const complaintRequest = useRef(null);
+  const complaintOpen = Boolean(complaintOrder && complaintDraft);
+
+  const closeComplaint = useCallback(() => {
+    complaintRequest.current?.abort();
+    complaintRequest.current = null;
+    setComplaintBusy(false);
+    setComplaintOrder(null);
+    setComplaintDraft(null);
+    setComplaintErrors({});
+    setComplaintError('');
+    setComplaintPreview(null);
+  }, []);
 
   const closeOrderDetail = useCallback(() => {
     detailRequestVersion.current += 1;
@@ -350,6 +472,46 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [closeOrderDetail, detailOrder, orderDetail]);
+
+  useEffect(() => {
+    if (!complaintOpen) return undefined;
+    document.body.classList.add('order-complaint-open');
+    const dialog = complaintDialog.current;
+    const focusFrame = window.requestAnimationFrame(() => {
+      const selector = complaintPreview ? '[data-complaint-preview-focus]' : '[data-complaint-form-focus]';
+      dialog?.querySelector(selector)?.focus();
+    });
+    const handleDialogKey = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeComplaint();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialog) return;
+      const focusable = Array.from(dialog.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const focusIsOutside = !dialog.contains(document.activeElement);
+      if ((event.shiftKey && (document.activeElement === first || focusIsOutside)) || (!event.shiftKey && (document.activeElement === last || focusIsOutside))) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    };
+    window.addEventListener('keydown', handleDialogKey);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.body.classList.remove('order-complaint-open');
+      window.removeEventListener('keydown', handleDialogKey);
+    };
+  }, [complaintOpen, complaintPreview, closeComplaint]);
+
+  useEffect(() => {
+    if (complaintOpen || !complaintTrigger.current) return;
+    const trigger = complaintTrigger.current;
+    complaintTrigger.current = null;
+    window.requestAnimationFrame(() => trigger.focus());
+  }, [complaintOpen]);
 
   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
   const manualRequired = verification?.status === 'manual_required';
@@ -479,6 +641,7 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   };
 
   const openProtectedOrderDetail = (order, trigger) => {
+    if (complaintOpen) return;
     const sessionAvailable = Boolean(sessionId && submittedKeywords);
     detailRequestVersion.current += 1;
     detailAbortController.current?.abort();
@@ -591,6 +754,105 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
 
   const copyOrderNumber = tradeNo => copyDetailValue(tradeNo, '订单号');
 
+  const openComplaint = (order, trigger) => {
+    if (detailOrder) return;
+    const contact = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(submittedKeywords.trim()) ? submittedKeywords.trim() : '';
+    complaintRequest.current?.abort();
+    complaintRequest.current = null;
+    complaintTrigger.current = trigger;
+    setComplaintBusy(false);
+    setComplaintOrder(order);
+    setComplaintDraft(createComplaintDraft(order, contact));
+    setComplaintErrors({});
+    setComplaintError('');
+    setComplaintPreview(null);
+  };
+
+  const updateComplaintField = (field, value) => {
+    setComplaintDraft(current => current ? {...current, [field]: value} : current);
+    setComplaintErrors(current => {
+      if (!current[field]) return current;
+      const next = {...current};
+      delete next[field];
+      return next;
+    });
+    setComplaintError('');
+  };
+
+  const updateComplaintImage = (index, value) => {
+    setComplaintDraft(current => {
+      if (!current) return current;
+      const images = [...current.images];
+      images[index] = value;
+      return {...current, images};
+    });
+    setComplaintErrors(current => {
+      if (!current.images) return current;
+      const next = {...current};
+      delete next.images;
+      return next;
+    });
+    setComplaintError('');
+  };
+
+  const submitComplaintPreview = async event => {
+    event.preventDefault();
+    if (!complaintDraft || complaintBusy) return;
+    const validation = validateComplaintPayload(complaintDraft);
+    setComplaintErrors(validation.errors);
+    setComplaintError('');
+    if (!validation.valid) {
+      setComplaintError('请检查标记字段后重新生成预览');
+      window.requestAnimationFrame(() => document.querySelector('.order-complaint-modal [aria-invalid="true"]')?.focus());
+      return;
+    }
+
+    const controller = new AbortController();
+    complaintRequest.current?.abort();
+    complaintRequest.current = controller;
+    setComplaintBusy(true);
+    try {
+      const response = await request('/order-query/complaints/preview', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(validation.payload),
+        signal: controller.signal,
+      });
+      if (complaintRequest.current !== controller) return;
+      if (response?.submitted !== false) throw new Error('本地预览响应缺少未提交标记');
+      setComplaintPreview({
+        submitted: false,
+        mode: 'preview',
+        target: COMPLAINT_TARGET,
+        requirements: response.requirements || {
+          email_code: {
+            required_when: 'order.order_complaint_email_verify == 1',
+            provided: Boolean(validation.payload.email_code),
+          },
+        },
+        payload: normalizeComplaintPayload(response.payload || validation.payload),
+      });
+      notify({type: 'success', title: '售后参数格式已校验', message: '已生成本地预览，未向官方提交', duration: 4200});
+    } catch (requestError) {
+      if (complaintRequest.current !== controller || requestError.name === 'AbortError') return;
+      setComplaintError(requestError.message || '售后参数校验失败');
+    } finally {
+      if (complaintRequest.current === controller) {
+        complaintRequest.current = null;
+        setComplaintBusy(false);
+      }
+    }
+  };
+
+  const copyComplaintPayload = async text => {
+    try {
+      await navigator.clipboard.writeText(text);
+      notify({type: 'success', title: '售后参数已复制', message: '已复制规范化请求 payload', duration: 3200});
+    } catch {
+      notify('无法访问剪贴板，请检查浏览器权限', 'error');
+    }
+  };
+
   const emptyMessage = busy && !result.orders.length
     ? {icon: <RefreshCw className="spin" size={22}/>, title: '正在自动验证并读取订单', detail: '结果返回后会显示在这里'}
     : error && !result.orders.length
@@ -645,7 +907,7 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
       <div className="order-table-wrap">
         <table className="order-query-table">
           <thead><tr><th>商品 / 下单时间</th><th>订单号</th><th>金额 / 数量</th><th>状态</th><th>商品类型</th><th>操作</th></tr></thead>
-          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
+          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} onComplaint={openComplaint} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
         </table>
       </div>
 
@@ -674,6 +936,22 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
       onClose={closeOrderDetail}
       onCopy={copyDetailValue}
       onRequery={requeryAfterDetailExpiry}
+    />}
+    {complaintOpen && <ComplaintDialog
+      order={complaintOrder}
+      draft={complaintDraft}
+      errors={complaintErrors}
+      busy={complaintBusy}
+      error={complaintError}
+      preview={complaintPreview}
+      dialogRef={complaintDialog}
+      onChange={updateComplaintField}
+      onImageChange={updateComplaintImage}
+      onSubmit={submitComplaintPreview}
+      onCopy={copyComplaintPayload}
+      onBack={() => { setComplaintPreview(null); setComplaintError(''); }}
+      onClose={closeComplaint}
+      onCopyOrder={copyOrderNumber}
     />}
   </section>;
 }

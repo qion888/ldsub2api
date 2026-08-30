@@ -6,6 +6,22 @@ export const ORDER_STATUS_OPTIONS = Object.freeze([
   {value: 3, label: '已退款'},
 ]);
 
+export const COMPLAINT_REASON_OPTIONS = Object.freeze([
+  '不会使用',
+  '无效商品',
+  '涉嫌色情',
+  '涉嫌赌博',
+  '欺诈骗钱',
+  '没人售后',
+  '描述不符',
+]);
+
+const COMPLAINT_STATUS_META = Object.freeze({
+  '-1': {label: '售后已撤销', tone: 'muted'},
+  0: {label: '售后待处理', tone: 'pending'},
+  1: {label: '售后已完成', tone: 'success'},
+});
+
 const ORDER_STATUS_META = {
   0: {label: '待付款', tone: 'pending'},
   1: {label: '已付款', tone: 'success'},
@@ -30,6 +46,91 @@ const GOODS_ACTION_LABELS = {
 function finiteNumber(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function complaintStatusKey(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isInteger(number) ? number : 'unknown';
+}
+
+function normalizedText(value) {
+  return String(value ?? '').trim();
+}
+
+function isHttpUrl(value) {
+  if (value.length > 1000 || /\s/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:')
+      && Boolean(url.hostname)
+      && !url.username
+      && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+export function complaintStatusMeta(value) {
+  const key = complaintStatusKey(value);
+  if (key === null) return {key: null, label: '未申请售后', tone: 'neutral'};
+  return {key, ...(COMPLAINT_STATUS_META[key] || {label: '售后状态未知', tone: 'neutral'})};
+}
+
+export function complaintActionForOrder(order = {}) {
+  const status = complaintStatusMeta(order.complaint_status);
+  const canApply = Boolean(order.trade_no && order.can_complaint);
+  if (status.key === null && canApply) return {kind: 'apply', label: '申请售后', status};
+  if (status.key === -1 && canApply) return {kind: 'apply', label: '重新申请', status};
+  if (status.key === null) return {kind: 'none', label: '', status};
+  return {kind: 'status', label: status.label, status};
+}
+
+export function createComplaintDraft(order = {}, contact = '') {
+  return {
+    trade_no: normalizedText(order.trade_no),
+    reason: '',
+    content: '',
+    contact: normalizedText(contact),
+    images: ['', '', ''],
+    collect_image: '',
+    query_pwd: '',
+    email_code: '',
+  };
+}
+
+export function normalizeComplaintPayload(raw = {}) {
+  const images = Array.isArray(raw.images)
+    ? raw.images.map(normalizedText).filter(Boolean)
+    : [];
+  return {
+    trade_no: normalizedText(raw.trade_no),
+    reason: normalizedText(raw.reason),
+    content: normalizedText(raw.content),
+    contact: normalizedText(raw.contact),
+    images,
+    collect_image: normalizedText(raw.collect_image),
+    query_pwd: normalizedText(raw.query_pwd),
+    email_code: normalizedText(raw.email_code),
+  };
+}
+
+export function validateComplaintPayload(raw = {}) {
+  const payload = normalizeComplaintPayload(raw);
+  const errors = {};
+  if (!payload.trade_no) errors.trade_no = '订单号不能为空';
+  else if (!/^[A-Za-z0-9_-]{1,160}$/.test(payload.trade_no)) errors.trade_no = '订单号格式无效';
+  if (!COMPLAINT_REASON_OPTIONS.includes(payload.reason)) errors.reason = '请选择投诉类型';
+  if (!payload.content) errors.content = '请输入补充说明';
+  else if (payload.content.length > 200) errors.content = '补充说明不能超过 200 字';
+  if (!payload.contact) errors.contact = '请输入通知邮箱';
+  else if (payload.contact.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.contact)) errors.contact = '请输入正确的邮箱地址';
+  if (!/^\d{6}$/.test(payload.query_pwd)) errors.query_pwd = '查询密码必须为 6 位数字';
+  if (payload.email_code && !/^[A-Za-z0-9]{1,32}$/.test(payload.email_code)) errors.email_code = '邮箱验证码只能包含 1 至 32 位字母或数字';
+  if (payload.images.length > 3) errors.images = '图片凭证最多填写 3 个 URL';
+  else if (payload.images.some(value => !isHttpUrl(value))) errors.images = '图片凭证必须使用有效的 HTTP 或 HTTPS URL';
+  if (payload.collect_image && !isHttpUrl(payload.collect_image)) errors.collect_image = '退款二维码必须使用有效的 HTTP 或 HTTPS URL';
+  return {valid: Object.keys(errors).length === 0, errors, payload};
 }
 
 export function orderStatusMeta(value, upstreamLabel = '') {
@@ -234,7 +335,7 @@ export function normalizeOrder(raw = {}) {
     status_tone: status.tone,
     need_query_password: Boolean(Number(raw.need_query_password || 0)),
     can_complaint: Boolean(Number(raw.can_complaint || 0)),
-    complaint_status: raw.complaint_status ?? raw.complaint?.status ?? null,
+    complaint_status: complaintStatusMeta(raw.complaint_status ?? raw.complaint?.status ?? null).key,
     detail_url: safeOfficialOrderUrl(raw.detail_url, tradeNo ? `/order/info/${encodeURIComponent(tradeNo)}` : '/order'),
     result_url: safeOfficialOrderUrl(raw.result_url, tradeNo ? `/order/result/${encodeURIComponent(tradeNo)}` : '/order'),
     goods_url: safeOfficialOrderUrl(raw.goods_url, goodsKey ? `/item/${encodeURIComponent(goodsKey)}` : '/order'),
