@@ -4,6 +4,22 @@ $backendDirectory = Join-Path $PSScriptRoot 'backend'
 $frontendDirectory = Join-Path $PSScriptRoot 'frontend'
 $nodeModules = Join-Path $frontendDirectory 'node_modules'
 $requirements = Join-Path $backendDirectory 'requirements.txt'
+$runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
+$backendPidFile = Join-Path $runtimeDirectory 'backend.pid'
+
+function Stop-RecordedLdxpBackend {
+    if (-not (Test-Path -LiteralPath $backendPidFile)) { return }
+    $recordedPid = 0
+    $recordedValue = [string](Get-Content -LiteralPath $backendPidFile -Raw)
+    if ([int]::TryParse($recordedValue.Trim(), [ref]$recordedPid)) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $recordedPid" -ErrorAction SilentlyContinue
+        $backendScript = (Join-Path $PSScriptRoot 'backend\main.py').ToLowerInvariant()
+        if ($process -and ([string]$process.CommandLine).ToLowerInvariant().Contains($backendScript)) {
+            Stop-Process -Id $recordedPid -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item -LiteralPath $backendPidFile -Force -ErrorAction SilentlyContinue
+}
 
 function Stop-StaleLdxpProcesses {
     $root = $PSScriptRoot.ToLowerInvariant()
@@ -37,11 +53,30 @@ function Get-FreeLocalPort([int]$StartPort) {
     throw "No available local port found after $StartPort"
 }
 
+function Wait-LdxpBackend([int]$Port, $Process) {
+    foreach ($attempt in 1..50) {
+        if ($Process.HasExited) {
+            throw "Backend exited before becoming ready (exit code $($Process.ExitCode))"
+        }
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
+            if ($health.ok -and $health.sub2api_accounts) {
+                return
+            }
+        }
+        catch {}
+        Start-Sleep -Milliseconds 200
+    }
+    throw 'Backend readiness check failed: Sub2API account-list route was not loaded'
+}
+
 if (-not (Test-Path $nodeModules)) {
     Write-Host 'Installing frontend dependencies...'
     npm --prefix $frontendDirectory install
 }
 
+New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
+Stop-RecordedLdxpBackend
 Stop-StaleLdxpProcesses
 
 if (Test-Path $requirements) {
@@ -67,6 +102,8 @@ $backendProcess = Start-Process python `
     -PassThru
 
 try {
+    Set-Content -LiteralPath $backendPidFile -Value $backendProcess.Id -NoNewline
+    Wait-LdxpBackend $backendPort $backendProcess
     $env:LDXP_API_TARGET = "http://127.0.0.1:$backendPort"
     Write-Host ''
     Write-Host '========================================' -ForegroundColor DarkGray
@@ -74,6 +111,7 @@ try {
     Write-Host "Frontend:      http://127.0.0.1:$frontendPort" -ForegroundColor Cyan
     Write-Host "Backend API:   http://127.0.0.1:$backendPort" -ForegroundColor Cyan
     Write-Host "Health check:  http://127.0.0.1:$backendPort/api/health" -ForegroundColor Cyan
+    Write-Host "Account list:  http://127.0.0.1:$backendPort/api/sub2api/accounts" -ForegroundColor Cyan
     Write-Host "Ports:         frontend=$frontendPort  backend=$backendPort" -ForegroundColor Yellow
     Write-Host 'Press Ctrl+C to stop both services.' -ForegroundColor DarkGray
     Write-Host '========================================' -ForegroundColor DarkGray
@@ -83,4 +121,5 @@ finally {
     if (-not $backendProcess.HasExited) {
         Stop-Process -Id $backendProcess.Id
     }
+    Remove-Item -LiteralPath $backendPidFile -Force -ErrorAction SilentlyContinue
 }

@@ -82,7 +82,11 @@ function needsBrowserVerification(shop) {
 async function request(path, options) {
   const response = await fetch(`${API}${path}`, options);
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.detail || '请求失败');
+  if (!response.ok) {
+    const error = new Error(payload.detail || '请求失败');
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
@@ -911,6 +915,7 @@ function App() {
   const [sub2apiAccounts, setSub2apiAccounts] = useState({items: [], total: 0, page: 1, page_size: 12, pages: 1, usage: {}, usage_errors: {}});
   const [sub2apiAccountFilters, setSub2apiAccountFilters] = useState({search: '', status: '', platform: ''});
   const [sub2apiAccountBusy, setSub2apiAccountBusy] = useState(false);
+  const [sub2apiAccountError, setSub2apiAccountError] = useState('');
   const [sub2apiAccountActions, setSub2apiAccountActions] = useState({});
   const [sub2apiTestedAccounts, setSub2apiTestedAccounts] = useState({});
   const [sub2apiAutomation, setSub2apiAutomation] = useState(DEFAULT_SUB2API_AUTOMATION);
@@ -1960,6 +1965,7 @@ function App() {
   const loadSub2ApiAccounts = async ({page = 1, quiet = false} = {}) => {
     if (!sub2apiConfig.admin_key_set) return null;
     setSub2apiAccountBusy(true);
+    setSub2apiAccountError('');
     try {
       const params = new URLSearchParams({
         page: String(page),
@@ -1972,7 +1978,11 @@ function App() {
       setSub2apiAccounts(result);
       return result;
     } catch (error) {
-      if (!quiet) notify(error.message, 'error');
+      const message = error.status === 404
+        ? '账号列表接口未加载，请重启 LDXP 服务后刷新页面'
+        : error.message;
+      setSub2apiAccountError(message);
+      if (!quiet) notify(message, 'error');
       return null;
     } finally {
       setSub2apiAccountBusy(false);
@@ -2349,7 +2359,7 @@ function App() {
         ) : activeView === 'reclaim' ? (
           <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
         ) : (
-          <Sub2ApiView config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey} fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy} optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds} codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode} reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy} onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy} onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()} accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters} accountBusy={sub2apiAccountBusy} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount}/>
+          <Sub2ApiView config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey} fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy} optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds} codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode} reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy} onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy} onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()} accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters} accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount}/>
         )}
       </main>
 
@@ -2393,7 +2403,7 @@ function ReclaimView({config, setConfig, cardCodes, setCardCodes, result, busy, 
   );
 }
 
-function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, actions, tested, onRefresh, onTest, onDelete, onPage}) {
+function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, actions, tested, onRefresh, onTest, onDelete, onPage}) {
   const items = Array.isArray(data?.items) ? data.items : [];
   const usage = data?.usage && typeof data.usage === 'object' ? data.usage : {};
   const formatQuota = value => {
@@ -2431,7 +2441,7 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, actions, te
             const accountProxy = account.proxy?.name || (account.proxy_id ? `代理 #${account.proxy_id}` : '无代理');
             const error = account.error_message || account.temp_unschedulable_reason;
             return <tr key={account.id}><td><strong>{account.name || `账号 ${account.id}`}</strong><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td><td><span>{account.platform || '--'}</span><small>{account.type || '--'}</small></td><td><span className={`account-status ${statusLabel(account) === '正常' ? 'ok' : 'bad'}`}>{statusLabel(account)}</span><small>{account.schedulable === false ? '不可调度' : '可调度'}{error ? ` · ${String(error).slice(0, 48)}` : ''}</small></td><td><strong>{formatQuota(account.quota_used)} / {formatQuota(account.quota_limit)}</strong></td><td>{formatQuota(account.quota_daily_used)} / {formatQuota(account.quota_daily_limit)}</td><td>{formatQuota(account.quota_weekly_used)} / {formatQuota(account.quota_weekly_limit)}</td><td>{formatWindow(account, 'five_hour')}</td><td>{formatWindow(account, 'seven_day')}</td><td><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td><td><div className="account-row-actions"><IconButton label={test ? (test.ok ? '已测试' : '重新测试') : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `已测试 ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td></tr>;
-          }) : <tr><td colSpan="10"><div className="account-table-empty"><Database size={20}/><span>{busy ? '正在加载账号列表' : '暂无匹配账号'}</span></div></td></tr>}
+          }) : <tr><td colSpan="10"><div className="account-table-empty"><Database size={20}/><span>{busy ? '正在加载账号列表' : error || '暂无匹配账号'}</span></div></td></tr>}
         </tbody></table>
       </div>
       <div className="account-pagination"><span>共 {data?.total ?? 0} 个账号 · 第 {data?.page || 1} / {data?.pages || 1} 页</span><div><IconButton label="上一页" onClick={() => onPage(Math.max(1, (data?.page || 1) - 1))} disabled={busy || (data?.page || 1) <= 1}><ChevronLeft size={16}/></IconButton><IconButton label="下一页" onClick={() => onPage(Math.min(data?.pages || 1, (data?.page || 1) + 1))} disabled={busy || (data?.page || 1) >= (data?.pages || 1)}><ChevronRight size={16}/></IconButton></div></div>
@@ -2439,7 +2449,7 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, actions, te
   );
 }
 
-function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount}) {
+function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -2574,6 +2584,7 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payloa
           filters={accountFilters}
           onFiltersChange={patch => { onAccountFiltersChange({...accountFilters, ...patch}); }}
           busy={accountBusy}
+          error={accountError}
           actions={accountActions}
           tested={testedAccounts}
           onRefresh={onLoadAccounts}

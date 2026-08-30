@@ -1245,6 +1245,38 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertEqual(payload["detail"], "接口不存在")
 
+    def test_sub2api_account_list_is_mounted_on_the_http_handler(self):
+        expected = {
+            "ok": True,
+            "items": [{"id": 8, "name": "account-8"}],
+            "total": 1,
+            "page": 2,
+            "page_size": 12,
+            "pages": 1,
+            "usage": {},
+            "usage_errors": {},
+        }
+        with patch.object(main, "fetch_sub2api_account_page", return_value=expected) as loader:
+            status, payload = self.request_api(
+                "GET",
+                "/api/sub2api/accounts?page=2&page_size=12&search=account",
+                {},
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, expected)
+        loader.assert_called_once_with({
+            "page": ["2"],
+            "page_size": ["12"],
+            "search": ["account"],
+        })
+
+    def test_health_advertises_sub2api_account_list_capability(self):
+        status, payload = self.request_api("GET", "/api/health", {})
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["sub2api_accounts"])
+
     def test_sub2api_401_text_recognizes_token_revoked_parenthesized_status(self):
         self.assertTrue(main._sub2api_account_is_401({
             "status": "error",

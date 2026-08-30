@@ -4,6 +4,7 @@ backend/*.db-*
 backend/waf-browser-profile/
 backend/server.*.log
 frontend/server.*.log
+.runtime/
 
 # Reproducible dependencies and build output
 frontend/node_modules/

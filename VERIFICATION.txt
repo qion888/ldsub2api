@@ -1,5 +1,5 @@
-Branch: codex/sub2api-account-ops
-Changed field: backend/sub2api/automation.py imported_order_nos completion ledger
+Branch: codex/sub2api-account-route-fix
+Changed field: backend/main.py sub2api_accounts health capability; start.ps1 Wait-LdxpBackend readiness gate
 
 Artifacts:
 - E:\soft\java\ldxp\MODIFIED_FILE
@@ -9,43 +9,56 @@ Artifacts:
 
 BASELINE
 Command: python -m unittest discover -s backend -q
-Input: git worktree at 532a70db379be3af89d1d3130787575063ebbed0
+Input: E:\soft\java\ldxp-sub2api-account-route-fix at 5c8e4ff before account-route changes
 Literal output:
 ----------------------------------------------------------------------
-Ran 61 tests in 1.137s
+Ran 69 tests in 1.920s
 
 OK
 Result: exit 0
 
 MODIFIED
 Command: python -m unittest discover -s backend -q
-Input: E:\soft\java\ldxp
+Input: E:\soft\java\ldxp-sub2api-account-route-fix after account-route changes
 Literal output:
 ----------------------------------------------------------------------
-Ran 68 tests in 1.192s
+Ran 71 tests in 1.586s
 
 OK
 Result: exit 0
 
 MODIFIED FRONTEND
 Command: npm run build
-Input: E:\soft\java\ldxp\frontend
-Literal output: vite v8.2.2; 2378 modules transformed; built in 0.332s
+Input: E:\soft\java\ldxp-sub2api-account-route-fix\frontend
+Literal output: vite v8.2.2; 2378 modules transformed; built in 6.99s
+Result: exit 0
+
+MODIFIED HTTP
+Command: Python urllib requests to GET /api/health, PUT /api/sub2api/config, GET /api/sub2api/accounts?page=1&page_size=2
+Input: temporary backend at http://127.0.0.1:8100 using acceptance-account-route.db and the locally stored Sub2API configuration
+Literal output:
+health_status=200
+sub2api_accounts_capability= True
+config_saved= True
+account_status= 200
+account_items= 2
+account_total= 8
+account_page= 1
+credentials_exposed= False
 Result: exit 0
 
 ROLLBACK
-Command: $script = [scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-copy2
-Input: MODIFIED_FILE copied to rollback-test-copy2
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-account-route
+Input: MODIFIED_FILE copied to rollback-test-account-route
 Literal output:
-Restored E:\soft\java\ldxp-sub2api-account-ops\rollback-test-copy2 from ROLLBACK_BASELINE
+Restored E:\soft\java\ldxp-sub2api-account-route-fix\rollback-test-account-route from ROLLBACK_BASELINE
 Result: exit 0
-Restored hash: BEE18A2DA2D293FB6935F9B6544ACDC83D4F8D25BB626CBB5D632F6C8A8C1523
-Baseline hash: BEE18A2DA2D293FB6935F9B6544ACDC83D4F8D25BB626CBB5D632F6C8A8C1523
-Modified artifact hash left changed: 99C46BE12F01DC0BCF68A518EDA50FFAD92F85EFDEF656EC85BB57378AF578B4
-Restored behavior: rollback-test-copy2 matches baseline byte-for-byte; MODIFIED_FILE remains modified.
+Restored hash: 03690E6B992EA0EDF5E2AD613BAA79D67CBC23169E9B567A0D1B60A46FFCF3F5
+Baseline hash: 03690E6B992EA0EDF5E2AD613BAA79D67CBC23169E9B567A0D1B60A46FFCF3F5
+Modified artifact hash left changed: B04F561FF3EA38036400B9D01402CB2A89C1F1BC8DC631BE3AEC237801F01F5B
+Restored behavior/status: rollback-test-account-route matches the original start.ps1 byte-for-byte and no longer requires the Sub2API account-list health capability; MODIFIED_FILE retains the readiness gate.
 
-HTTP/browser acceptance:
-- GET http://127.0.0.1:18081/api/health returned {"ok":true,"worker":true,"sub2api_automation_worker":true}.
-- GET /api/sub2api/accounts without an admin key returned HTTP 400 with the expected configuration detail.
-- Desktop viewport 1440x1000: account list table rendered, body width 1440, no overflow.
-- Mobile viewport 390x844: account list panel rendered, body width 390, no horizontal overflow.
+Upstream contract reference:
+- GET /api/v1/admin/accounts returned HTTP 200 from the configured Sub2API service.
+- Response data contained items, total, page, page_size, and pages.
+- The configured service returned 8 accounts during acceptance.

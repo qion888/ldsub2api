@@ -881,6 +881,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "time": utc_now(),
                 "worker": WORKER.is_alive(),
                 "sub2api_automation_worker": AUTOMATION_WORKER.is_alive(),
+                "sub2api_accounts": True,
             })
         if path == "/api/watches":
             return self._send_json(list_watches())
