@@ -1724,6 +1724,33 @@ class ComplaintWorkflowTests(unittest.TestCase):
             service.complaint_history({**identity, "query_password": ""})
         self.assertEqual(client.history_calls, 5)
 
+    def test_public_complaint_history_does_not_clear_detail_password_failures(self) -> None:
+        class PublicHistoryClient(self.Client):
+            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
+                return {"need_pwd": 0}
+
+            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
+                return {
+                    "status": 0,
+                    "reason": "鎻忚堪涓嶇",
+                    "content": "x",
+                    "images": [],
+                    "messages": [],
+                    "collect_image": None,
+                }
+
+        client = PublicHistoryClient()
+        service = self._service(client)
+        identity = self._identity(service)
+        session = service.sessions.get(identity["session_id"], identity["keywords"])
+        session.record_password_failure(identity["trade_no"], service.sessions.now())
+
+        result = service.complaint_history({**identity, "query_password": ""})
+
+        self.assertEqual(result["complaint"]["status"], 0)
+        self.assertIn(identity["trade_no"], session.password_failures)
+        self.assertNotIn(identity["trade_no"], session.complaint_password_failures)
+
 
 if __name__ == "__main__":
     unittest.main()

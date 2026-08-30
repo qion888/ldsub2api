@@ -532,7 +532,7 @@ class OrderQueryService:
             # of the latest ``need_pwd`` flag.  This keeps an inconsistent
             # metadata response from bypassing a lock already earned by a
             # password rejection.
-            if not session.password_attempt_allowed(identity["trade_no"], now):
+            if not session.complaint_password_attempt_allowed(identity["trade_no"], now):
                 raise OrderQueryPasswordRateLimited()
             try:
                 history_result = session.client.get_complaint_history(
@@ -544,7 +544,7 @@ class OrderQueryService:
                 # preceding metadata said no password was needed.  A stale or
                 # inconsistent ``need_pwd`` response must not provide a way
                 # around the same order-level backoff used by detail lookup.
-                if session.record_password_failure(identity["trade_no"], now):
+                if session.record_complaint_password_failure(identity["trade_no"], now):
                     raise OrderQueryPasswordRateLimited() from exc
                 raise
             except OrderQuerySessionExpired:
@@ -561,7 +561,7 @@ class OrderQueryService:
                     "投诉历史响应格式无效",
                     code="invalid_complaint_history_response",
                 ) from exc
-            session.clear_password_failure(identity["trade_no"])
+            session.clear_complaint_password_failure(identity["trade_no"])
             return {
                 "session_id": session.session_id,
                 "expires_in": self.sessions.remaining(session),

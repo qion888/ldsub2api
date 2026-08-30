@@ -33,6 +33,7 @@ class OrderQuerySession:
     cache: dict[tuple[int, int, int], tuple[float, dict[str, Any]]] = field(default_factory=dict)
     authorized_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
     password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
+    complaint_password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
     complaint_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
     complaint_uploads: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     complaint_submitting: set[str] = field(default_factory=set)
@@ -47,6 +48,7 @@ class OrderQuerySession:
         self.cache.clear()
         self.authorized_orders.clear()
         self.password_failures.clear()
+        self.complaint_password_failures.clear()
 
     def remember_orders(self, orders: list[Any]) -> None:
         for order in orders:
@@ -69,6 +71,7 @@ class OrderQuerySession:
                 oldest = next(iter(self.authorized_orders))
                 self.authorized_orders.pop(oldest)
                 self.password_failures.pop(oldest, None)
+                self.complaint_password_failures.pop(oldest, None)
 
     def authorized_order(self, trade_no: str) -> dict[str, Any] | None:
         value = self.authorized_orders.get(trade_no)
@@ -99,6 +102,33 @@ class OrderQuerySession:
 
     def clear_password_failure(self, trade_no: str) -> None:
         self.password_failures.pop(trade_no, None)
+
+    def complaint_password_attempt_allowed(self, trade_no: str, now: float) -> bool:
+        """Check the independent cooldown for complaint-history passwords."""
+        failure = self.complaint_password_failures.get(trade_no)
+        if failure is None:
+            return True
+        _, blocked_until = failure
+        if blocked_until > now:
+            return False
+        if blocked_until:
+            self.complaint_password_failures.pop(trade_no, None)
+        return True
+
+    def record_complaint_password_failure(self, trade_no: str, now: float) -> bool:
+        count, blocked_until = self.complaint_password_failures.get(trade_no, (0, 0.0))
+        if blocked_until and blocked_until <= now:
+            count = 0
+        count += 1
+        blocked = count >= MAX_PASSWORD_FAILURES
+        self.complaint_password_failures[trade_no] = (
+            count,
+            now + PASSWORD_BACKOFF_SECONDS if blocked else 0.0,
+        )
+        return blocked
+
+    def clear_complaint_password_failure(self, trade_no: str) -> None:
+        self.complaint_password_failures.pop(trade_no, None)
 
     def remember_complaint_context(self, trade_no: str, context: dict[str, Any]) -> None:
         self.complaint_contexts[trade_no] = copy.deepcopy(context)
