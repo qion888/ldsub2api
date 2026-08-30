@@ -1,8 +1,8 @@
 diff --git a/backend/main.py b/backend/main.py
-index 3e8b24f..3d6e24d 100644
+index 4aa72e8..7beada7 100644
 --- a/backend/main.py
 +++ b/backend/main.py
-@@ -339,6 +339,16 @@ def sub2api_automation_state() -> dict[str, Any]:
+@@ -347,6 +347,16 @@ def sub2api_automation_state() -> dict[str, Any]:
      return sub2api_config.read_automation_state(_setting_json)
  
  
@@ -19,7 +19,7 @@ index 3e8b24f..3d6e24d 100644
  def _store_sub2api_automation_state(value: dict[str, Any]) -> None:
      _store_setting("sub2api_automation_state", value)
  
-@@ -449,6 +459,45 @@ def _sub2api_fetch_accounts(
+@@ -457,6 +467,45 @@ def _sub2api_fetch_accounts(
      )
  
  
@@ -65,7 +65,7 @@ index 3e8b24f..3d6e24d 100644
  def _sub2api_codex_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
      return sub2api_client.codex_accounts(config, accounts_loader=_sub2api_fetch_accounts)
  
-@@ -516,6 +565,8 @@ def _download_reclaim_payloads(
+@@ -524,6 +573,8 @@ def _download_reclaim_payloads(
  def reclaim_sub2api_401_accounts(
      *, include_downloads: bool = True, exclude_order_nos: list[str] | None = None
  ) -> dict[str, Any]:
@@ -74,7 +74,7 @@ index 3e8b24f..3d6e24d 100644
      return sub2api_reclaim.reclaim_401_accounts(
          config=sub2api_settings(reveal=True),
          accounts_loader=_sub2api_fetch_accounts,
-@@ -570,8 +621,17 @@ def _sub2api_import_payload(
+@@ -578,8 +629,17 @@ def _sub2api_import_payload(
      codex_fingerprint_mode: Any = None,
      assign_existing: bool | None = None,
      endpoint: str | None = None,
@@ -93,7 +93,7 @@ index 3e8b24f..3d6e24d 100644
          source,
          config=sub2api_settings(reveal=True),
          request_json=_external_json_request,
-@@ -581,7 +641,15 @@ def _sub2api_import_payload(
+@@ -589,7 +649,15 @@ def _sub2api_import_payload(
          codex_fingerprint_mode=codex_fingerprint_mode,
          assign_existing=assign_existing,
          endpoint=endpoint,
@@ -109,7 +109,7 @@ index 3e8b24f..3d6e24d 100644
  
  
  def test_sub2api_connection() -> dict[str, Any]:
-@@ -602,6 +670,8 @@ def save_sub2api_automation_settings(data: dict[str, Any]) -> dict[str, Any]:
+@@ -610,6 +678,8 @@ def save_sub2api_automation_settings(data: dict[str, Any]) -> dict[str, Any]:
  def refresh_sub2api_reclaim(
      card_codes: list[str], *, exclude_order_nos: list[str] | None = None
  ) -> dict[str, Any]:
@@ -118,7 +118,7 @@ index 3e8b24f..3d6e24d 100644
      return sub2api_reclaim.refresh_reclaim(
          card_codes,
          redeem_client_factory=_redeem_client,
-@@ -855,6 +925,8 @@ class ApiHandler(BaseHTTPRequestHandler):
+@@ -867,6 +937,8 @@ class ApiHandler(BaseHTTPRequestHandler):
              automation_settings_loader=sub2api_automation_settings,
              automation_state_loader=sub2api_automation_state,
              options_loader=fetch_sub2api_options,
@@ -127,7 +127,7 @@ index 3e8b24f..3d6e24d 100644
          ):
              return
          if path == "/api/pay/juuid":
-@@ -948,6 +1020,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+@@ -960,6 +1032,7 @@ class ApiHandler(BaseHTTPRequestHandler):
              refresh_reclaim=refresh_sub2api_reclaim,
              run_automation=AUTOMATION_WORKER.run_once,
              import_payload=_sub2api_import_payload,
@@ -135,7 +135,7 @@ index 3e8b24f..3d6e24d 100644
          ):
              return
  
-@@ -1352,6 +1425,12 @@ class ApiHandler(BaseHTTPRequestHandler):
+@@ -1395,6 +1468,12 @@ class ApiHandler(BaseHTTPRequestHandler):
  
      def do_DELETE(self) -> None:
          path = urlparse(self.path).path.rstrip("/")
@@ -222,7 +222,7 @@ index fd9f86a..0ff4461 100644
      }
      state = {
 diff --git a/backend/sub2api/client.py b/backend/sub2api/client.py
-index df0e016..8b044d9 100644
+index df0e016..cbe26df 100644
 --- a/backend/sub2api/client.py
 +++ b/backend/sub2api/client.py
 @@ -3,6 +3,7 @@
@@ -233,7 +233,7 @@ index df0e016..8b044d9 100644
  from typing import Any, Callable
  from urllib.parse import urlencode
  
-@@ -85,6 +86,256 @@ def codex_accounts(
+@@ -85,6 +86,263 @@ def codex_accounts(
      return result
  
  
@@ -337,6 +337,13 @@ index df0e016..8b044d9 100644
 +            for group in groups
 +            if isinstance(group, dict)
 +        ]
++    proxy = account.get("proxy")
++    if isinstance(proxy, dict):
++        result["proxy"] = {
++            key: proxy.get(key)
++            for key in ("id", "name", "protocol", "host", "port", "status")
++            if key in proxy
++        }
 +    return result
 +
 +
@@ -490,7 +497,7 @@ index df0e016..8b044d9 100644
  def reconcile_codex_fingerprint(
      config: dict[str, Any],
      normalized: dict[str, Any],
-@@ -251,6 +502,7 @@ def import_payload(
+@@ -251,6 +509,7 @@ def import_payload(
      config: dict[str, Any],
      request_json: JsonRequest,
      fingerprint_reconciler: Callable[[dict[str, Any], dict[str, Any], str | None, Any], dict[str, Any]],
@@ -498,7 +505,7 @@ index df0e016..8b044d9 100644
      proxy_id: Any = None,
      group_ids: Any = None,
      codex_fingerprint_mode: Any = None,
-@@ -263,6 +515,7 @@ def import_payload(
+@@ -263,6 +522,7 @@ def import_payload(
      normalized, fingerprint_mode, codex_account_count = apply_codex_fingerprint_mode(
          normalized, codex_fingerprint_mode
      )
@@ -506,7 +513,7 @@ index df0e016..8b044d9 100644
      if assign_existing is None:
          assign_existing = proxy_id not in (None, "") or bool(group_ids)
      if assign_existing:
-@@ -300,6 +553,10 @@ def import_payload(
+@@ -300,6 +560,10 @@ def import_payload(
          fingerprint_verification = fingerprint_verification_error(
              fingerprint_mode, codex_account_count, exc
          )
@@ -517,7 +524,7 @@ index df0e016..8b044d9 100644
      return {
          "ok": True,
          "mode": mode,
-@@ -309,6 +566,7 @@ def import_payload(
+@@ -309,6 +573,7 @@ def import_payload(
          "codex_fingerprint_mode": fingerprint_mode,
          "codex_account_count": codex_account_count,
          "fingerprint_verification": fingerprint_verification,
@@ -655,10 +662,10 @@ index 8d7fa82..f89c24e 100644
      path: str,
      data: dict[str, Any],
 diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
-index b4bd6d4..10778c5 100644
+index 2781557..71f125c 100644
 --- a/frontend/src/main.jsx
 +++ b/frontend/src/main.jsx
-@@ -889,6 +889,12 @@ function App() {
+@@ -906,6 +906,12 @@ function App() {
    const [sub2apiCodexFingerprintMode, setSub2apiCodexFingerprintMode] = useState('off');
    const [sub2apiReclaimBusy, setSub2apiReclaimBusy] = useState(false);
    const [sub2apiReclaimResult, setSub2apiReclaimResult] = useState(null);
@@ -671,7 +678,7 @@ index b4bd6d4..10778c5 100644
    const [sub2apiAutomation, setSub2apiAutomation] = useState(DEFAULT_SUB2API_AUTOMATION);
    const [sub2apiAutomationState, setSub2apiAutomationState] = useState(null);
    const [sub2apiAutomationBusy, setSub2apiAutomationBusy] = useState(false);
-@@ -1069,9 +1075,13 @@ function App() {
+@@ -1123,9 +1129,13 @@ function App() {
    useEffect(() => {
      if (activeView !== 'sub2api') return undefined;
      loadSub2ApiAutomation();
@@ -686,7 +693,7 @@ index b4bd6d4..10778c5 100644
      }, 60000);
      return () => {
        window.clearInterval(stateTimer);
-@@ -1079,6 +1089,12 @@ function App() {
+@@ -1133,6 +1143,12 @@ function App() {
      };
    }, [activeView, sub2apiConfig.admin_key_set]);
  
@@ -699,7 +706,7 @@ index b4bd6d4..10778c5 100644
    const fastestInterval = [...items, ...shops, ...preorders.filter(entry => entry.enabled)]
      .filter(item => item.enabled)
      .reduce((fastest, item) => Math.min(fastest, Number(item.interval_seconds || 60)), 60);
-@@ -1729,6 +1745,8 @@ function App() {
+@@ -1820,6 +1836,8 @@ function App() {
      setSub2apiPayload(merged);
      setSub2apiFileName(filename);
      setSub2apiResult(null);
@@ -708,7 +715,7 @@ index b4bd6d4..10778c5 100644
      if (download) {
        const original = usable.length === 1 && usable[0].content_base64
          ? Uint8Array.from(window.atob(usable[0].content_base64), value => value.charCodeAt(0))
-@@ -1797,6 +1815,7 @@ function App() {
+@@ -1888,6 +1906,7 @@ function App() {
        setSub2apiPayload(merged);
        setSub2apiFileName(files.length === 1 ? files[0].name : `${files.length} 个 JSON 文件`);
        setSub2apiResult(null);
@@ -716,7 +723,7 @@ index b4bd6d4..10778c5 100644
        notify(`已合并 ${files.length} 个文件、${merged.accounts.length} 个账号`);
      } catch (error) {
        setSub2apiPayload(null);
-@@ -1846,6 +1865,60 @@ function App() {
+@@ -1937,6 +1956,60 @@ function App() {
      }
    };
  
@@ -777,7 +784,7 @@ index b4bd6d4..10778c5 100644
    const testSub2Api = async () => {
      setSub2apiBusy(true);
      try {
-@@ -1948,7 +2021,13 @@ function App() {
+@@ -2039,7 +2112,13 @@ function App() {
        const result = await request('/sub2api/automation/run', {method: 'POST'});
        setSub2apiAutomationState(result.state || null);
        const summary = result.result || result.state?.last_result;
@@ -792,7 +799,7 @@ index b4bd6d4..10778c5 100644
      } catch (error) {
        notify(error.message, 'error');
        await loadSub2ApiAutomation();
-@@ -1969,13 +2048,29 @@ function App() {
+@@ -2060,13 +2139,29 @@ function App() {
          body: JSON.stringify({
            data: payload,
            assign_existing: assignExisting,
@@ -823,7 +830,7 @@ index b4bd6d4..10778c5 100644
      } catch (error) {
        notify(error.message, 'error');
      } finally {
-@@ -2157,7 +2252,7 @@ function App() {
+@@ -2253,7 +2348,7 @@ function App() {
          ) : activeView === 'reclaim' ? (
            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
          ) : (
@@ -832,7 +839,7 @@ index b4bd6d4..10778c5 100644
          )}
        </main>
  
-@@ -2201,7 +2296,47 @@ function ReclaimView({config, setConfig, cardCodes, setCardCodes, result, busy,
+@@ -2297,7 +2392,53 @@ function ReclaimView({config, setConfig, cardCodes, setCardCodes, result, busy,
    );
  }
  
@@ -851,6 +858,11 @@ index b4bd6d4..10778c5 100644
 +    if (!window || typeof window !== 'object') return '--';
 +    const used = window.used ?? window.usage ?? window.current;
 +    const limit = window.limit ?? window.max;
++    const percent = window.used_percent ?? window.utilization;
++    if (percent !== undefined && percent !== null && percent !== '') {
++      const numeric = Number(percent);
++      return `${Number.isFinite(numeric) ? numeric.toFixed(1) : percent}%${window.reset_at || window.resets_at ? ` · ${compactTime(window.reset_at || window.resets_at)}` : ''}`;
++    }
 +    if (used === undefined && limit === undefined) return '--';
 +    return `${formatQuota(used)} / ${formatQuota(limit)}`;
 +  };
@@ -862,13 +874,14 @@ index b4bd6d4..10778c5 100644
 +        <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
 +      </div>
 +      <div className="account-table-wrap">
-+        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 类型</th><th>状态</th><th>额度总量</th><th>日额度</th><th>周额度</th><th>5 小时窗口</th><th>7 天窗口</th><th>并发 / 分组</th><th>操作</th></tr></thead><tbody>
++        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 类型</th><th>状态</th><th>额度总量</th><th>日额度</th><th>周额度</th><th>5 小时窗口</th><th>7 天窗口</th><th>代理 / 分组</th><th>操作</th></tr></thead><tbody>
 +          {items.length ? items.map(account => {
 +            const id = Number(account.id);
 +            const test = tested[id];
 +            const accountGroups = Array.isArray(account.groups) ? account.groups.map(group => group.name).filter(Boolean).join('、') : '';
++            const accountProxy = account.proxy?.name || (account.proxy_id ? `代理 #${account.proxy_id}` : '无代理');
 +            const error = account.error_message || account.temp_unschedulable_reason;
-+            return <tr key={account.id}><td><strong>{account.name || `账号 ${account.id}`}</strong><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td><td><span>{account.platform || '--'}</span><small>{account.type || '--'}</small></td><td><span className={`account-status ${statusLabel(account) === '正常' ? 'ok' : 'bad'}`}>{statusLabel(account)}</span><small>{account.schedulable === false ? '不可调度' : '可调度'}{error ? ` · ${String(error).slice(0, 48)}` : ''}</small></td><td><strong>{formatQuota(account.quota_used)} / {formatQuota(account.quota_limit)}</strong></td><td>{formatQuota(account.quota_daily_used)} / {formatQuota(account.quota_daily_limit)}</td><td>{formatQuota(account.quota_weekly_used)} / {formatQuota(account.quota_weekly_limit)}</td><td>{formatWindow(account, 'five_hour')}</td><td>{formatWindow(account, 'seven_day')}</td><td><strong>{account.current_concurrency ?? account.concurrency ?? 0}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td><td><div className="account-row-actions"><IconButton label={test ? (test.ok ? '已测试' : '重新测试') : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `已测试 ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td></tr>;
++            return <tr key={account.id}><td><strong>{account.name || `账号 ${account.id}`}</strong><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td><td><span>{account.platform || '--'}</span><small>{account.type || '--'}</small></td><td><span className={`account-status ${statusLabel(account) === '正常' ? 'ok' : 'bad'}`}>{statusLabel(account)}</span><small>{account.schedulable === false ? '不可调度' : '可调度'}{error ? ` · ${String(error).slice(0, 48)}` : ''}</small></td><td><strong>{formatQuota(account.quota_used)} / {formatQuota(account.quota_limit)}</strong></td><td>{formatQuota(account.quota_daily_used)} / {formatQuota(account.quota_daily_limit)}</td><td>{formatQuota(account.quota_weekly_used)} / {formatQuota(account.quota_weekly_limit)}</td><td>{formatWindow(account, 'five_hour')}</td><td>{formatWindow(account, 'seven_day')}</td><td><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td><td><div className="account-row-actions"><IconButton label={test ? (test.ok ? '已测试' : '重新测试') : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `已测试 ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td></tr>;
 +          }) : <tr><td colSpan="10"><div className="account-table-empty"><Database size={20}/><span>{busy ? '正在加载账号列表' : '暂无匹配账号'}</span></div></td></tr>}
 +        </tbody></table>
 +      </div>
@@ -881,7 +894,7 @@ index b4bd6d4..10778c5 100644
    const [dragging, setDragging] = useState(false);
    const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
    const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
-@@ -2330,6 +2465,19 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payloa
+@@ -2426,6 +2567,19 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payloa
              <div className="account-alert-list">{recentErrors.length ? recentErrors.map(account => <div key={account.id || account.name}><TriangleAlert size={15}/><span><strong>{account.name}</strong><small>{account.platform} · {account.error}</small></span><em>{account.status}</em></div>) : <div className="compact-empty"><ShieldCheck size={16}/>当前没有账号异常</div>}</div>
            </section>
          </div>
@@ -902,10 +915,10 @@ index b4bd6d4..10778c5 100644
      </section>
    );
 diff --git a/frontend/src/style.css b/frontend/src/style.css
-index e7ee632..aa45e5d 100644
+index d254387..22cd9bc 100644
 --- a/frontend/src/style.css
 +++ b/frontend/src/style.css
-@@ -2156,6 +2156,54 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+@@ -2158,6 +2158,54 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
  .sub2api-import-panel .import-button { margin-top: 13px; }
  .sub2api-view .connection-result { font-size: 12px; }
  

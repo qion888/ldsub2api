@@ -2,10 +2,10 @@ Branch: codex/sub2api-account-ops
 Changed field: backend/sub2api/automation.py imported_order_nos completion ledger
 
 Artifacts:
-- E:\soft\java\ldxp-sub2api-account-ops\MODIFIED_FILE
-- E:\soft\java\ldxp-sub2api-account-ops\DIFF_FILE
-- E:\soft\java\ldxp-sub2api-account-ops\VERIFICATION.txt
-- E:\soft\java\ldxp-sub2api-account-ops\ROLLBACK.sh
+- E:\soft\java\ldxp\MODIFIED_FILE
+- E:\soft\java\ldxp\DIFF_FILE
+- E:\soft\java\ldxp\VERIFICATION.txt
+- E:\soft\java\ldxp\ROLLBACK.sh
 
 BASELINE
 Command: python -m unittest discover -s backend -q
@@ -19,29 +19,29 @@ Result: exit 0
 
 MODIFIED
 Command: python -m unittest discover -s backend -q
-Input: E:\soft\java\ldxp-sub2api-account-ops
+Input: E:\soft\java\ldxp
 Literal output:
 ----------------------------------------------------------------------
-Ran 68 tests in 1.264s
+Ran 68 tests in 1.192s
 
 OK
 Result: exit 0
 
 MODIFIED FRONTEND
 Command: npm run build
-Input: E:\soft\java\ldxp-sub2api-account-ops\frontend
-Literal output: vite v8.2.2; 2378 modules transformed; built in 0.347s
+Input: E:\soft\java\ldxp\frontend
+Literal output: vite v8.2.2; 2378 modules transformed; built in 0.332s
 Result: exit 0
 
 ROLLBACK
 Command: $script = [scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-copy2
 Input: MODIFIED_FILE copied to rollback-test-copy2
 Literal output:
-Restored E:\soft\java\ldxp-sub2api-account-ops\rollback-test-copy2 from ROLLBACK_BASELINE
+Restored E:\soft\java\ldxp\rollback-test-copy2 from ROLLBACK_BASELINE
 Result: exit 0
 Restored hash: BEE18A2DA2D293FB6935F9B6544ACDC83D4F8D25BB626CBB5D632F6C8A8C1523
 Baseline hash: BEE18A2DA2D293FB6935F9B6544ACDC83D4F8D25BB626CBB5D632F6C8A8C1523
-Modified artifact hash left changed: EC97E096B04BA6F3F5BAB66045AF3FA16A434BCB6B1F325389EE2246E62821C8
+Modified artifact hash left changed: 99C46BE12F01DC0BCF68A518EDA50FFAD92F85EFDEF656EC85BB57378AF578B4
 Restored behavior: rollback-test-copy2 matches baseline byte-for-byte; MODIFIED_FILE remains modified.
 
 HTTP/browser acceptance:
