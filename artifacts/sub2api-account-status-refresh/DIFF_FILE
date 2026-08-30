@@ -1,0 +1,180 @@
+﻿diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
+index 69cf20a..253d600 100644
+--- a/frontend/src/Sub2ApiView.jsx
++++ b/frontend/src/Sub2ApiView.jsx
+@@ -56,7 +56,12 @@ function intervalLabel(value) {
+ }
+ 
+ function IconButton({label, children, tone = '', ...props}) {
+-  return <button className={`icon-button ${tone}`} aria-label={label} title={label} {...props}>{children}</button>;
++  const displayLabel = typeof label === 'string' && /(账号|璐﹀彿)/.test(label) && /(测试|娴嬭瘯)/.test(label)
++    ? '刷新状态'
++    : typeof label === 'string' && /(刷新账号列表|鍒锋柊璐﹀彿鍒楄〃)/.test(label)
++      ? '刷新全部账号状态'
++      : label;
++  return <button className={`icon-button ${tone}`} aria-label={displayLabel} title={displayLabel} {...props}>{children}</button>;
+ }
+ 
+ function Tooltip({label, children}) {
+@@ -283,7 +288,7 @@ function Sub2ApiUsageStack({account, usage, usageError}) {
+   </div>;
+ }
+ 
+-function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, actions, tested, onRefresh, onTest, onDelete, onCopyName, onPage}) {
++function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, actions, tested, refreshProgress, onRefresh, onTest, onDelete, onCopyName, onPage}) {
+   const items = Array.isArray(data?.items) ? data.items : [];
+   const usage = data?.usage && typeof data.usage === 'object' ? data.usage : {};
+   const usageErrors = data?.usage_errors && typeof data.usage_errors === 'object' ? data.usage_errors : {};
+@@ -293,6 +298,7 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
+         <div><span className="detail-kicker">SUB2API ACCOUNTS</span><h3>账号列表</h3><p>账号费用、上游窗口与实时调度状态</p></div>
+         <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
+       </div>
++      {refreshProgress?.running && <div className="account-refresh-progress account-refresh-progress-banner" aria-live="polite">{refreshProgress.phase === 'collecting' ? '正在读取账号...' : `刷新状态 ${refreshProgress.completed}/${refreshProgress.total}`}{refreshProgress.failed ? ` · 失败 ${refreshProgress.failed}` : ''}</div>}
+       <div className="account-table-wrap">
+         <table className="account-table">
+           <colgroup>
+@@ -549,7 +555,7 @@ function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false,
+   );
+ }
+ 
+-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
++export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+   const [dragging, setDragging] = useState(false);
+   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
+   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
+@@ -701,7 +707,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
+           error={accountError}
+           actions={accountActions}
+           tested={testedAccounts}
+-          onRefresh={onLoadAccounts}
++          refreshProgress={accountRefresh}
++          onRefresh={onRefreshAllAccounts || onLoadAccounts}
+           onTest={onTestAccount}
+           onDelete={onDeleteAccount}
+           onCopyName={onCopyAccountName}
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index fa1236c..644cb06 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -987,6 +987,8 @@ function App() {
+   const [sub2apiAccountError, setSub2apiAccountError] = useState('');
+   const [sub2apiAccountActions, setSub2apiAccountActions] = useState({});
+   const [sub2apiTestedAccounts, setSub2apiTestedAccounts] = useState({});
++  const [sub2apiAccountRefresh, setSub2apiAccountRefresh] = useState({running: false, phase: 'idle', completed: 0, total: 0, failed: 0});
++  const sub2apiAccountRefreshRef = useRef(false);
+   const [sub2apiAutomation, setSub2apiAutomation] = useState(DEFAULT_SUB2API_AUTOMATION);
+   const [sub2apiAutomationState, setSub2apiAutomationState] = useState(null);
+   const [sub2apiAutomationBusy, setSub2apiAutomationBusy] = useState(false);
+@@ -1098,9 +1100,12 @@ function App() {
+ 
+   const notify = (content, type = 'info') => {
+     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+-    const notice = typeof content === 'string'
+-      ? {message: content, type, duration: 3200}
+-      : {...content, type: content?.type || type, duration: content?.duration || 6000};
++    const normalizedContent = typeof content === 'string'
++      ? content.replace(/娴嬭瘯/g, '刷新状态').replace(/閫氳繃/g, '成功').replace(/澶辫触/g, '失败')
++      : content;
++    const notice = typeof normalizedContent === 'string'
++      ? {message: normalizedContent, type, duration: 3200}
++      : {...normalizedContent, type: normalizedContent?.type || type, duration: normalizedContent?.duration || 6000};
+     setToast({id, ...notice});
+     window.clearTimeout(toastTimer.current);
+     toastTimer.current = window.setTimeout(() => {
+@@ -2150,7 +2155,7 @@ function App() {
+       if (!quiet) notify(message, 'error');
+       return null;
+     } finally {
+-      setSub2apiAccountBusy(false);
++      if (!sub2apiAccountRefreshRef.current) setSub2apiAccountBusy(false);
+     }
+   };
+ 
+@@ -2174,6 +2179,59 @@ function App() {
+     }
+   };
+ 
++  const refreshAllSub2ApiAccounts = async () => {
++    if (!sub2apiConfig.admin_key_set || sub2apiAccountRefreshRef.current) return;
++    sub2apiAccountRefreshRef.current = true;
++    const currentPage = sub2apiAccounts.page || 1;
++    setSub2apiAccountRefresh({running: true, phase: 'collecting', completed: 0, total: 0, failed: 0});
++    setSub2apiAccountBusy(true);
++    setSub2apiAccountError('');
++    try {
++      const accountIds = new Set();
++      let page = 1;
++      let pages = 1;
++      while (page <= pages) {
++        const params = new URLSearchParams({page: String(page), page_size: '100'});
++        const result = await request(`/sub2api/accounts?${params.toString()}`);
++        (Array.isArray(result?.items) ? result.items : []).forEach(account => {
++          const id = Number(account?.id);
++          if (Number.isInteger(id) && id > 0) accountIds.add(id);
++        });
++        pages = Math.max(1, Number(result?.pages) || 1);
++        page += 1;
++      }
++      const ids = [...accountIds];
++      let completed = 0;
++      let failed = 0;
++      setSub2apiAccountRefresh({running: true, phase: 'refreshing', completed: 0, total: ids.length, failed: 0});
++      for (const id of ids) {
++        setSub2apiAccountActions(current => ({...current, [id]: 'test'}));
++        try {
++          const tested = await request(`/sub2api/accounts/${id}/test`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
++          setSub2apiTestedAccounts(current => ({...current, [id]: {...tested, tested_at: new Date().toISOString()}}));
++          if (!tested.ok) failed += 1;
++        } catch (error) {
++          failed += 1;
++          setSub2apiTestedAccounts(current => ({...current, [id]: {ok: false, message: error.message, tested_at: new Date().toISOString()}}));
++        }
++        setSub2apiAccountActions(current => ({...current, [id]: null}));
++        completed += 1;
++        setSub2apiAccountRefresh({running: true, phase: 'refreshing', completed, total: ids.length, failed});
++        if (completed < ids.length) await new Promise(resolve => window.setTimeout(resolve, 120));
++      }
++      await loadSub2ApiAccounts({page: currentPage, quiet: true});
++      setSub2apiAccountRefresh({running: false, phase: 'complete', completed, total: ids.length, failed});
++      notify(ids.length ? `已刷新 ${ids.length} 个账号状态${failed ? `，${failed} 个失败` : ''}` : '暂无可刷新的账号');
++    } catch (error) {
++      setSub2apiAccountRefresh({running: false, phase: 'error', completed: 0, total: 0, failed: 0});
++      setSub2apiAccountError(error.message);
++      notify(error.message, 'error');
++    } finally {
++      sub2apiAccountRefreshRef.current = false;
++      setSub2apiAccountBusy(false);
++    }
++  };
++
+   const copySub2ApiAccountName = async account => {
+     const name = String(account?.name || `账号 ${account?.id || ''}`).trim();
+     try {
+@@ -2992,8 +3050,8 @@ function App() {
+             onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy}
+             onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}
+             accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters}
+-            accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts}
+-            onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount} onCopyAccountName={copySub2ApiAccountName}
++            accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} accountRefresh={sub2apiAccountRefresh}
++            onLoadAccounts={loadSub2ApiAccounts} onRefreshAllAccounts={refreshAllSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount} onCopyAccountName={copySub2ApiAccountName}
+             />
+           </React.Suspense>
+         )}
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index c866b6a..a0a0f16 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2488,6 +2488,12 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .account-test-result { max-width: 74px; display: -webkit-box; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+ .account-test-result.ok { color: var(--ui-success) !important; }
+ .account-test-result.bad { color: var(--ui-danger) !important; }
++.account-test-result.ok { font-size: 0; }
++.account-test-result.ok::after { content: '刷新成功'; font-size: 10px; }
++.account-test-result.bad { font-size: 0; }
++.account-test-result.bad::after { content: '刷新失败'; font-size: 10px; }
++.account-refresh-progress { color: var(--ui-text-muted); font-size: 11px; white-space: nowrap; }
++.account-refresh-progress-banner { padding: 6px 16px; border-bottom: 1px solid var(--ui-border-soft); background: var(--ui-surface-muted); }
+ .account-table-empty { min-height: 90px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
+ .account-pagination { min-height: 50px; padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); font-size: 12px; }
+ .account-pagination > div { display: flex; gap: 5px; }

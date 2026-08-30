@@ -1,0 +1,26 @@
+Sub2API account status refresh verification
+
+Changed branch/field:
+- Branch: codex/sub2api-account-status-refresh
+- Single account action: account row action presents Refresh status.
+- Bulk action: account list refresh checks every account id sequentially.
+
+Artifacts:
+- MODIFIED_FILE: artifacts/sub2api-account-status-refresh/MODIFIED_FILE
+- DIFF_FILE: artifacts/sub2api-account-status-refresh/DIFF_FILE
+- VERIFICATION.txt: artifacts/sub2api-account-status-refresh/VERIFICATION.txt
+- ROLLBACK.sh: artifacts/sub2api-account-status-refresh/ROLLBACK.sh
+
+BASELINE command: git hash-object artifacts/sub2api-account-status-refresh/BASELINE_FILE
+BASELINE result: fa1236c1dae544b5a84f78cf72cfe82d7512df21 (exit 0)
+MODIFIED command: git hash-object artifacts/sub2api-account-status-refresh/MODIFIED_FILE
+MODIFIED result: 644cb0632a50e88c585ae7b1af981915252cf5f3 (exit 0)
+ROLLBACK command: Copy-Item artifacts/sub2api-account-status-refresh/BASELINE_FILE artifacts/sub2api-account-status-refresh/rollback-test-main.jsx; git hash-object artifacts/sub2api-account-status-refresh/rollback-test-main.jsx
+ROLLBACK result: fa1236c1dae544b5a84f78cf72cfe82d7512df21 (exit 0)
+
+BASELINE test: $env:PYTHONPATH='backend'; python -m unittest discover -s backend -p 'test_*.py' -> 157 passed, exit 0.
+MODIFIED test: npm test -> 38 passed, exit 0.
+MODIFIED test: npm run build -> Vite build succeeded, exit 0.
+MODIFIED test: $env:PYTHONPATH='backend'; python -m unittest discover -s backend -p 'test_*.py' -> 157 passed, exit 0.
+
+Restored behavior/status: rollback-test-main.jsx matches BASELINE_FILE; MODIFIED_FILE remains the modified copy.
