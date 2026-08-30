@@ -1,0 +1,69 @@
+{
+  "result": "PASS",
+  "appUrl": "http://127.0.0.1:5203/",
+  "desktop": {
+    "viewport": "1440x1000",
+    "uploadRequests": 3,
+    "evidenceRetryCovered": true,
+    "focusTrapCovered": true,
+    "submitRequestsAfterDoubleClick": 1,
+    "officialPayload": {
+      "trade_no": "LDACCEPT1001",
+      "reason": "描述不符",
+      "content": "商品内容与订单描述不一致，请核对并处理。",
+      "contact": "buyer@example.test",
+      "images": [
+        "https://pay.ldxp.cn/uploads/acceptance/evidence.png"
+      ],
+      "collect_image": "https://pay.ldxp.cn/uploads/acceptance/refund.png",
+      "query_pwd": "123456",
+      "email_code": ""
+    },
+    "overflow": {
+      "documentClientWidth": 1440,
+      "documentScrollWidth": 1440,
+      "bodyClientWidth": 1440,
+      "bodyScrollWidth": 1440
+    }
+  },
+  "mobile": {
+    "viewport": "390x844",
+    "unknownSubmitLocked": true,
+    "submitRequestsAfterDoubleClick": 1,
+    "overflow": {
+      "documentClientWidth": 390,
+      "documentScrollWidth": 390,
+      "bodyClientWidth": 390,
+      "bodyScrollWidth": 390
+    },
+    "modalBox": {
+      "x": 0,
+      "y": 0,
+      "width": 390,
+      "height": 844
+    }
+  },
+  "narrow": {
+    "viewport": "320x720",
+    "overflow": {
+      "documentClientWidth": 320,
+      "documentScrollWidth": 320,
+      "bodyClientWidth": 320,
+      "bodyScrollWidth": 320
+    },
+    "modalBox": {
+      "x": 0,
+      "y": 0,
+      "width": 320,
+      "height": 720
+    }
+  },
+  "emailCodeRequests": 0,
+  "officialBrowserWriteRequests": 0,
+  "screenshots": [
+    "C:\\Users\\0\\.codex\\worktrees\\2a5f\\ldxp\\.runtime\\task10\\final\\desktop-real-upload-form.png",
+    "C:\\Users\\0\\.codex\\worktrees\\2a5f\\ldxp\\.runtime\\task10\\final\\desktop-submit-success.png",
+    "C:\\Users\\0\\.codex\\worktrees\\2a5f\\ldxp\\.runtime\\task10\\final\\mobile-submit-unknown-lock.png",
+    "C:\\Users\\0\\.codex\\worktrees\\2a5f\\ldxp\\.runtime\\task10\\final\\narrow-320-upload-form.png"
+  ]
+}

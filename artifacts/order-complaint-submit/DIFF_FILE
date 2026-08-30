@@ -1,0 +1,2623 @@
+diff --git a/backend/main.py b/backend/main.py
+index 1bbb3ab..f811e37 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1057,6 +1057,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+                 "sub2api_card_import_history": True,
+                 "sub2api_card_import_history_delete": True,
+                 "order_query": True,
++                "order_complaint_submit": True,
+             })
+         if path == "/api/watches":
+             return self._send_json(list_watches())
+@@ -1159,6 +1160,10 @@ class ApiHandler(BaseHTTPRequestHandler):
+             search=ORDER_QUERY_SERVICE.search,
+             detail=ORDER_QUERY_SERVICE.detail,
+             complaint_preview=build_complaint_preview,
++            complaint_context=getattr(ORDER_QUERY_SERVICE, "complaint_context", None),
++            complaint_upload=getattr(ORDER_QUERY_SERVICE, "complaint_upload", None),
++            complaint_submit=getattr(ORDER_QUERY_SERVICE, "complaint_submit", None),
++            complaint_remove_upload=getattr(ORDER_QUERY_SERVICE, "complaint_remove_upload", None),
+         ):
+             return
+ 
+diff --git a/backend/order_query/client.py b/backend/order_query/client.py
+index 7c29009..292e535 100644
+--- a/backend/order_query/client.py
++++ b/backend/order_query/client.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ import math
++import mimetypes
+ import re
+ import secrets
+ import socket
+@@ -26,6 +27,13 @@ BASE_URL = f"https://{ALLOWED_HOST}"
+ CAPTCHA_START_PATH = "/shopApi/Common/captchaStart"
+ ORDER_LIST_PATH = "/shopApi/Order/list"
+ ORDER_DETAIL_PATH = "/shopApi/Order/info"
++COMPLAINT_INFO_PATH = "/shopApi/Order/info"
++COMPLAINT_UPLOAD_PATH = "/shopApi/upload/file"
++COMPLAINT_SUBMIT_PATH = "/shopApi/Order/complaintOrder"
++# Public aliases used by route-level tests and integrations.
++COMPLAINT_INFO_ENDPOINT = COMPLAINT_INFO_PATH
++COMPLAINT_UPLOAD_ENDPOINT = COMPLAINT_UPLOAD_PATH
++COMPLAINT_SUBMIT_ENDPOINT = COMPLAINT_SUBMIT_PATH
+ MAX_JSON_BYTES = 2 * 1024 * 1024
+ MAX_CAPTCHA_BYTES = 512 * 1024
+ STATUS_LABELS = {
+@@ -44,6 +52,14 @@ class CaptchaChallenge:
+     ip: str
+ 
+ 
++class ComplaintContext(dict[str, Any]):
++    """Normalized context with an internal flag for resolving uncertain submits."""
++
++    def __init__(self, values: dict[str, Any], *, status_known: bool) -> None:
++        super().__init__(values)
++        self.status_known = bool(status_known)
++
++
+ def _safe_text(value: Any, limit: int = 240) -> str:
+     return str(value or "").strip()[:limit]
+ 
+@@ -254,6 +270,187 @@ class OrderQueryClient:
+             raise UpstreamOrderError("订单接口响应格式无效", code="invalid_order_response")
+         return result
+ 
++    @staticmethod
++    def _response_json(raw: bytes, content_type: str) -> dict[str, Any]:
++        if len(raw) > MAX_JSON_BYTES:
++            raise UpstreamOrderError("订单接口响应过大", code="upstream_response_too_large")
++        if any(marker in raw for marker in WAF_MARKERS):
++            raise WafChallengeRequired("链动小铺触发阿里云 WAF 验证")
++        if "text/html" in content_type.lower():
++            raise UpstreamOrderError("订单接口返回了 HTML 页面", code="invalid_order_response")
++        try:
++            result = json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise UpstreamOrderError("订单接口返回了无法解析的数据", code="invalid_order_response") from exc
++        if not isinstance(result, dict):
++            raise UpstreamOrderError("订单接口响应格式无效", code="invalid_order_response")
++        return result
++
++    def _request_json_with_headers(
++        self,
++        url: str,
++        payload: bytes,
++        *,
++        headers: dict[str, str],
++    ) -> dict[str, Any]:
++        request = Request(url, data=payload, headers=headers, method="POST")
++        with self._open(request) as response:
++            raw = response.read(MAX_JSON_BYTES + 1)
++            content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
++        return self._response_json(raw, content_type)
++
++    @staticmethod
++    def _response_message(result: dict[str, Any], fallback: str) -> str:
++        value = result.get("msg") or result.get("message") or fallback
++        return _safe_text(value, 240)
++
++    @staticmethod
++    def _as_flag(value: Any) -> bool:
++        if isinstance(value, bool):
++            return value
++        return _integer(value, 0) == 1
++
++    @staticmethod
++    def _strict_numeric_code(value: Any, expected: int) -> bool:
++        return OrderQueryClient._is_numeric_code(value) and value == expected
++
++    @staticmethod
++    def _nonzero_numeric_code(value: Any) -> bool:
++        return OrderQueryClient._is_numeric_code(value) and value != 0
++
++    @staticmethod
++    def _is_numeric_code(value: Any) -> bool:
++        if type(value) not in (int, float) or isinstance(value, bool):
++            return False
++        try:
++            return math.isfinite(float(value))
++        except (OverflowError, TypeError, ValueError):
++            return False
++
++    def get_complaint_context(self, trade_no: str) -> dict[str, Any]:
++        """Fetch the order and system complaint flags using the query session cookies."""
++        info = self._json_request(f"{BASE_URL}{COMPLAINT_INFO_PATH}", {"trade_no": trade_no})
++        if not self._strict_numeric_code(info.get("code"), 1) or not isinstance(info.get("data"), dict):
++            raise UpstreamOrderError(
++                self._response_message(info, "订单信息获取失败"),
++                code="complaint_context_failed",
++                retryable=True,
++            )
++        order = info["data"]
++        returned_trade_no = _safe_text(order.get("trade_no"), 160)
++        if not returned_trade_no or returned_trade_no != _safe_text(trade_no, 160):
++            raise UpstreamOrderError(
++                "订单信息与请求订单号不一致",
++                code="complaint_context_mismatch",
++            )
++        status_known = False
++        if isinstance(order.get("complaint"), dict) and "status" in order["complaint"]:
++            status_value = order["complaint"].get("status")
++            status_known = True
++        elif "complaint_status" in order:
++            status_value = order.get("complaint_status")
++            status_known = True
++        elif "complaint" not in order or order.get("complaint") is None:
++            # The official page treats a missing/null complaint as no record.
++            status_value = -1
++            status_known = True
++        else:
++            status_value = -1
++        try:
++            complaint_status = int(status_value)
++        except (TypeError, ValueError):
++            complaint_status = -1
++            status_known = False
++        return ComplaintContext(
++            {
++                "can_complaint": self._as_flag(order.get("can_complaint")),
++                "complaint_status": complaint_status,
++            },
++            status_known=status_known,
++        )
++
++    def upload_complaint_file(
++        self,
++        content: bytes,
++        filename: str,
++        mime_type: str,
++    ) -> str:
++        """Upload one complaint image as the official multipart ``file`` field."""
++        safe_name = re.sub(r"[\x00\r\n\\/\"]", "_", str(filename or "file"))[:180] or "file"
++        mime_type = str(mime_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream").lower()
++        boundary = "----LDXPComplaint" + secrets.token_hex(16)
++        preamble = (
++            f"--{boundary}\r\n"
++            f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
++            f"Content-Type: {mime_type}\r\n\r\n"
++        ).encode("utf-8")
++        body = preamble + bytes(content) + f"\r\n--{boundary}--\r\n".encode("ascii")
++        result = self._request_json_with_headers(
++            f"{BASE_URL}{COMPLAINT_UPLOAD_PATH}",
++            body,
++            headers={
++                **self._headers(),
++                "Content-Type": f"multipart/form-data; boundary={boundary}",
++                "Content-Length": str(len(body)),
++            },
++        )
++        if not self._nonzero_numeric_code(result.get("code")):
++            raise UpstreamOrderError(
++                self._response_message(result, "图片上传失败"),
++                code="complaint_upload_failed",
++                retryable=True,
++            )
++        data = result.get("data")
++        url = data.get("url") if isinstance(data, dict) else None
++        try:
++            parsed = urlparse(str(url or "").strip())
++            hostname = parsed.hostname
++            parsed.port
++        except (UnicodeError, ValueError) as exc:
++            raise UpstreamOrderError("图片上传接口未返回有效地址", code="invalid_complaint_upload_response") from exc
++        relative_path = (
++            not parsed.scheme
++            and not parsed.netloc
++            and parsed.path.startswith("/")
++            and ".." not in parsed.path.split("/")
++            and parsed.username is None
++            and parsed.password is None
++            and not parsed.fragment
++        )
++        absolute_url = (
++            parsed.scheme == "https"
++            and bool(hostname)
++            and parsed.username is None
++            and parsed.password is None
++            and not parsed.fragment
++        )
++        if not (absolute_url or relative_path):
++            raise UpstreamOrderError("图片上传接口未返回有效地址", code="invalid_complaint_upload_response")
++        if relative_path:
++            return f"{BASE_URL}{parsed.path}" + (f"?{parsed.query}" if parsed.query else "")
++        return parsed.geturl()
++
++    def submit_complaint(self, payload: dict[str, Any]) -> dict[str, Any]:
++        """Submit the exact official complaint payload and return its response."""
++        result = self._json_request(f"{BASE_URL}{COMPLAINT_SUBMIT_PATH}", payload)
++        if not self._is_numeric_code(result.get("code")):
++            raise UpstreamOrderError(
++                "售后申请接口响应格式无效",
++                code="invalid_complaint_submit_response",
++            )
++        if not self._nonzero_numeric_code(result.get("code")):
++            raise UpstreamOrderError(
++                self._response_message(result, "售后申请提交失败"),
++                code="complaint_submit_failed",
++                retryable=True,
++            )
++        return result
++
++    # Compatibility names for callers that use the endpoint terminology.
++    get_complaint_info = get_complaint_context
++    upload_file = upload_complaint_file
++    submit_complaint_order = submit_complaint
++
+     def start_captcha(self, previous_code: str = "") -> CaptchaChallenge:
+         result = self._json_request(f"{BASE_URL}{CAPTCHA_START_PATH}", {"code": previous_code})
+         if result.get("code") != 1 or not isinstance(result.get("data"), dict):
+diff --git a/backend/order_query/complaint.py b/backend/order_query/complaint.py
+index 2c58271..5e15428 100644
+--- a/backend/order_query/complaint.py
++++ b/backend/order_query/complaint.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import base64
++import binascii
+ import re
+ from typing import Any
+ from urllib.parse import urlparse
+@@ -31,8 +33,11 @@ COMPLAINT_FIELDS = frozenset({
+ TRADE_NO_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,160}")
+ EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+ QUERY_PASSWORD_PATTERN = re.compile(r"[0-9]{6}")
+-EMAIL_CODE_PATTERN = re.compile(r"[A-Za-z0-9]{1,32}")
+ MAX_IMAGE_URL_LENGTH = 1000
++MAX_COMPLAINT_IMAGE_BYTES = 5 * 1024 * 1024
++COMPLAINT_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
++MAX_UPLOAD_BYTES = MAX_COMPLAINT_IMAGE_BYTES
++ALLOWED_UPLOAD_MIME_TYPES = COMPLAINT_IMAGE_MIME_TYPES
+ 
+ 
+ def _text_field(
+@@ -77,8 +82,10 @@ def _image_url(value: Any, field: str) -> str:
+     return value
+ 
+ 
+-def build_complaint_preview(data: Any) -> dict[str, Any]:
+-    """Validate an official complaint payload without performing any request."""
++def validate_complaint_payload(
++    data: Any,
++) -> dict[str, Any]:
++    """Return the exact payload accepted by the official complaint endpoint."""
+     if not isinstance(data, dict):
+         raise OrderComplaintInputError("售后申请参数必须是 JSON 对象")
+ 
+@@ -104,8 +111,8 @@ def build_complaint_preview(data: Any) -> dict[str, Any]:
+         raise OrderComplaintInputError("query_pwd 必须是 6 位数字")
+ 
+     email_code = _text_field(data, "email_code", required=False, max_length=32)
+-    if email_code and not EMAIL_CODE_PATTERN.fullmatch(email_code):
+-        raise OrderComplaintInputError("email_code 格式无效")
++    if email_code:
++        raise OrderComplaintInputError("当前售后流程不使用邮箱验证码")
+ 
+     raw_images = data.get("images", [])
+     if not isinstance(raw_images, list):
+@@ -118,6 +125,21 @@ def build_complaint_preview(data: Any) -> dict[str, Any]:
+     if collect_image:
+         collect_image = _image_url(collect_image, "collect_image")
+ 
++    return {
++        "trade_no": trade_no,
++        "reason": reason,
++        "content": content,
++        "contact": contact,
++        "images": images,
++        "collect_image": collect_image,
++        "query_pwd": query_password,
++        "email_code": email_code,
++    }
++
++
++def build_complaint_preview(data: Any) -> dict[str, Any]:
++    """Validate an official complaint payload without performing any request."""
++    payload = validate_complaint_payload(data)
+     return {
+         "submitted": False,
+         "mode": "preview",
+@@ -125,20 +147,61 @@ def build_complaint_preview(data: Any) -> dict[str, Any]:
+             "method": "POST",
+             "url": COMPLAINT_PREVIEW_TARGET,
+         },
+-        "requirements": {
+-            "email_code": {
+-                "required_when": "order.order_complaint_email_verify == 1",
+-                "provided": bool(email_code),
+-            },
+-        },
+-        "payload": {
+-            "trade_no": trade_no,
+-            "reason": reason,
+-            "content": content,
+-            "contact": contact,
+-            "images": images,
+-            "collect_image": collect_image,
+-            "query_pwd": query_password,
+-            "email_code": email_code,
+-        },
++        "payload": payload,
++    }
++
++
++def decode_complaint_upload(data: Any) -> tuple[str, str, bytes]:
++    """Validate and decode a browser-selected complaint image."""
++    if not isinstance(data, dict):
++        raise OrderComplaintInputError("图片上传参数必须是 JSON 对象")
++    # ``name``/``mime_type``/``data_base64`` are the canonical browser fields;
++    # the aliases keep direct API clients interoperable without accepting URLs.
++    name_key = "name" if "name" in data else "filename"
++    name = _text_field(data, name_key, required=True, max_length=180)
++    if any(char in name for char in "\x00\r\n/\\"):
++        raise OrderComplaintInputError("图片文件名格式无效")
++    mime_key = "mime_type" if "mime_type" in data else ("mime" if "mime" in data else "type")
++    mime_value = data.get(mime_key, "")
++    if not isinstance(mime_value, str):
++        raise OrderComplaintInputError("图片格式参数无效")
++    mime_type = mime_value.strip().lower()
++    encoded = data.get("data_base64")
++    if encoded is None:
++        encoded = data.get("base64")
++    if encoded is None:
++        encoded = data.get("data")
++    data_url = data.get("data_url")
++    if encoded is None and isinstance(data_url, str):
++        header, separator, encoded = data_url.partition(",")
++        match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64", header.strip(), re.IGNORECASE)
++        if not separator or match is None:
++            raise OrderComplaintInputError("图片 data URL 格式无效")
++        data_url_mime = match.group(1).lower()
++        if mime_type and mime_type != data_url_mime and not (mime_type == "image/jpg" and data_url_mime == "image/jpeg"):
++            raise OrderComplaintInputError("图片格式参数与 data URL 不一致")
++        if not mime_type:
++            mime_type = data_url_mime
++    if mime_type == "image/jpg":
++        mime_type = "image/jpeg"
++    if mime_type not in COMPLAINT_IMAGE_MIME_TYPES:
++        raise OrderComplaintInputError("图片仅支持 PNG、JPEG 或 WebP 格式")
++    if not isinstance(encoded, str) or not encoded:
++        raise OrderComplaintInputError("图片内容不能为空")
++    if len(encoded) > ((MAX_COMPLAINT_IMAGE_BYTES + 2) // 3) * 4 + 8:
++        raise OrderComplaintInputError("单张图片不能超过 5 MiB")
++    try:
++        content = base64.b64decode(encoded, validate=True)
++    except (binascii.Error, ValueError) as exc:
++        raise OrderComplaintInputError("图片内容不是有效的 Base64") from exc
++    if not content or len(content) > MAX_COMPLAINT_IMAGE_BYTES:
++        raise OrderComplaintInputError("单张图片不能超过 5 MiB")
++
++    signatures = {
++        "image/png": content.startswith(b"\x89PNG\r\n\x1a\n"),
++        "image/jpeg": content.startswith(b"\xff\xd8\xff"),
++        "image/webp": len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP",
+     }
++    if not signatures[mime_type]:
++        raise OrderComplaintInputError("图片内容与声明格式不一致")
++    return name, mime_type, content
+diff --git a/backend/order_query/errors.py b/backend/order_query/errors.py
+index 6a4d86c..af8b4cf 100644
+--- a/backend/order_query/errors.py
++++ b/backend/order_query/errors.py
+@@ -29,6 +29,26 @@ class OrderComplaintInputError(OrderQueryError):
+         super().__init__(detail, code="invalid_order_complaint", status=400)
+ 
+ 
++class OrderComplaintUnavailable(OrderQueryError):
++    def __init__(self, detail: str = "当前订单暂不支持申请售后") -> None:
++        super().__init__(detail, code="order_complaint_unavailable", status=409)
++
++
++class OrderComplaintSubmissionConflict(OrderQueryError):
++    def __init__(self, detail: str = "该订单已提交售后申请，请勿重复提交") -> None:
++        super().__init__(detail, code="order_complaint_submission_conflict", status=409)
++
++
++class OrderComplaintSubmissionUnknown(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "提交结果暂时无法确认，请刷新订单状态后再决定是否重试",
++            code="order_complaint_submission_unknown",
++            status=503,
++            retryable=True,
++        )
++
++
+ class OrderQuerySessionExpired(OrderQueryError):
+     def __init__(self) -> None:
+         super().__init__(
+diff --git a/backend/order_query/routes.py b/backend/order_query/routes.py
+index f7f4157..8be45e6 100644
+--- a/backend/order_query/routes.py
++++ b/backend/order_query/routes.py
+@@ -14,10 +14,18 @@ SendJson = Callable[[Any, int], Any]
+ ORDER_QUERY_PATH = "/api/order-query/search"
+ ORDER_DETAIL_PATH = "/api/order-query/detail"
+ ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
++ORDER_COMPLAINT_CONTEXT_PATH = "/api/order-query/complaints/context"
++ORDER_COMPLAINT_UPLOAD_PATH = "/api/order-query/complaints/upload"
++ORDER_COMPLAINT_SUBMIT_PATH = "/api/order-query/complaints/submit"
++ORDER_COMPLAINT_REMOVE_UPLOAD_PATH = "/api/order-query/complaints/upload/remove"
+ ORDER_QUERY_POST_PATHS = frozenset({
+     ORDER_QUERY_PATH,
+     ORDER_DETAIL_PATH,
+     ORDER_COMPLAINT_PREVIEW_PATH,
++    ORDER_COMPLAINT_CONTEXT_PATH,
++    ORDER_COMPLAINT_UPLOAD_PATH,
++    ORDER_COMPLAINT_SUBMIT_PATH,
++    ORDER_COMPLAINT_REMOVE_UPLOAD_PATH,
+ })
+ LOCAL_DEVELOPMENT_HOSTS = {"127.0.0.1", "localhost"}
+ 
+@@ -92,6 +100,10 @@ def handle_post(
+     search: Callable[[dict[str, Any]], dict[str, Any]],
+     detail: Callable[[dict[str, Any]], dict[str, Any]],
+     complaint_preview: Callable[[dict[str, Any]], dict[str, Any]] = build_complaint_preview,
++    complaint_context: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
++    complaint_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
++    complaint_submit: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
++    complaint_remove_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+ ) -> bool:
+     if path == ORDER_QUERY_PATH:
+         operation = search
+@@ -99,19 +111,29 @@ def handle_post(
+         operation = detail
+     elif path == ORDER_COMPLAINT_PREVIEW_PATH:
+         operation = complaint_preview
++    elif path == ORDER_COMPLAINT_CONTEXT_PATH:
++        operation = complaint_context
++    elif path == ORDER_COMPLAINT_UPLOAD_PATH:
++        operation = complaint_upload
++    elif path == ORDER_COMPLAINT_SUBMIT_PATH:
++        operation = complaint_submit
++    elif path == ORDER_COMPLAINT_REMOVE_UPLOAD_PATH:
++        operation = complaint_remove_upload
+     else:
+         return False
++    if operation is None:
++        return False
+     try:
+         send_json(operation(data), 200)
+     except OrderQueryError as exc:
+-        send_json(
+-            {
+-                "detail": exc.detail,
+-                "code": exc.code,
+-                "retryable": exc.retryable,
+-            },
+-            exc.status,
+-        )
++        payload = {
++            "detail": exc.detail,
++            "code": exc.code,
++            "retryable": exc.retryable,
++        }
++        if hasattr(exc, "seconds"):
++            payload["cooldown_seconds"] = int(getattr(exc, "seconds"))
++        send_json(payload, exc.status)
+     except WafChallengeRequired as exc:
+         send_json(
+             {
+@@ -122,12 +144,13 @@ def handle_post(
+             409,
+         )
+     except RuntimeError as exc:
++        is_complaint = path.startswith("/api/order-query/complaints/")
+         is_complaint_preview = path == ORDER_COMPLAINT_PREVIEW_PATH
+-        fallback_detail = "售后申请参数预览失败" if is_complaint_preview else "订单查询失败"
++        fallback_detail = "售后申请参数预览失败" if is_complaint_preview else ("售后申请失败" if is_complaint else "订单查询失败")
+         send_json(
+             {
+                 "detail": str(exc)[:240] or fallback_detail,
+-                "code": "order_complaint_preview_failed" if is_complaint_preview else "order_query_failed",
++                "code": "order_complaint_preview_failed" if is_complaint_preview else ("order_complaint_failed" if is_complaint else "order_query_failed"),
+                 "retryable": True,
+             },
+             502,
+diff --git a/backend/order_query/service.py b/backend/order_query/service.py
+index c65fc2a..7612ec5 100644
+--- a/backend/order_query/service.py
++++ b/backend/order_query/service.py
+@@ -3,12 +3,18 @@
+ from __future__ import annotations
+ 
+ import base64
++import math
+ import re
+ import threading
+ from typing import Any, Callable
++from urllib.parse import urlparse
+ 
+ from .captcha import CaptchaRecognizer, normalize_captcha_code
+-from .client import CaptchaChallenge, OrderQueryClient
++from .client import BASE_URL, CaptchaChallenge, OrderQueryClient
++from .complaint import (
++    decode_complaint_upload,
++    validate_complaint_payload,
++)
+ from .errors import (
+     CaptchaRecognizerUnavailable,
+     CaptchaVerificationExpired,
+@@ -20,6 +26,11 @@ from .errors import (
+     OrderQueryPasswordRateLimited,
+     OrderQueryPasswordRequired,
+     OrderQuerySessionExpired,
++    OrderComplaintInputError,
++    OrderComplaintSubmissionConflict,
++    OrderComplaintSubmissionUnknown,
++    OrderComplaintUnavailable,
++    UpstreamOrderError,
+ )
+ from .sessions import OrderQuerySession, OrderQuerySessionStore
+ 
+@@ -43,6 +54,10 @@ class OrderQueryService:
+         self.sessions = sessions or OrderQuerySessionStore()
+         self.max_ocr_attempts = max(1, min(3, int(max_ocr_attempts)))
+         self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent)))
++        self._complaint_state_lock = threading.Lock()
++        self._complaint_submitted_trades: set[str] = set()
++        self._complaint_inflight_trades: set[str] = set()
++        self._complaint_unknown_trades: set[str] = set()
+ 
+     @staticmethod
+     def _validated_request(data: Any) -> dict[str, Any]:
+@@ -326,3 +341,303 @@ class OrderQueryService:
+             return self._detail(data)
+         finally:
+             self._slots.release()
++
++    @staticmethod
++    def _validated_complaint_identity(data: Any) -> dict[str, str]:
++        if not isinstance(data, dict):
++            raise OrderComplaintInputError("售后申请参数必须是 JSON 对象")
++        if any(not isinstance(data.get(field), str) for field in ("keywords", "session_id", "trade_no")):
++            raise OrderComplaintInputError("售后申请身份参数格式无效")
++        keywords = data["keywords"].strip()
++        session_id = data["session_id"].strip()
++        trade_no = data["trade_no"].strip()
++        if not keywords or len(keywords) > 160:
++            raise OrderComplaintInputError("售后申请缺少有效的查询内容")
++        if not SESSION_ID_PATTERN.fullmatch(session_id):
++            raise OrderComplaintInputError("售后申请缺少有效的查询会话")
++        if not TRADE_NO_PATTERN.fullmatch(trade_no):
++            raise OrderComplaintInputError("订单号格式无效")
++        return {"keywords": keywords, "session_id": session_id, "trade_no": trade_no}
++
++    def _complaint_session(self, data: Any) -> tuple[dict[str, str], OrderQuerySession]:
++        identity = self._validated_complaint_identity(data)
++        session = self.sessions.get(identity["session_id"], identity["keywords"])
++        if not session.ticket:
++            raise OrderQuerySessionExpired()
++        if session.authorized_order(identity["trade_no"]) is None:
++            raise OrderQueryDetailNotFound()
++        return identity, session
++
++    @staticmethod
++    def _context_flag(value: Any) -> bool:
++        if isinstance(value, bool):
++            return value
++        try:
++            return int(value) == 1
++        except (TypeError, ValueError):
++            return False
++
++    @staticmethod
++    def _is_numeric_code(value: Any) -> bool:
++        if type(value) not in (int, float) or isinstance(value, bool):
++            return False
++        try:
++            return math.isfinite(float(value))
++        except (OverflowError, TypeError, ValueError):
++            return False
++
++    @staticmethod
++    def _strict_success_code(value: Any) -> bool:
++        return OrderQueryService._is_numeric_code(value) and value != 0
++
++    @staticmethod
++    def _context_status_known(context: dict[str, Any]) -> bool:
++        """Return whether the upstream complaint status was explicitly resolved."""
++        value = getattr(context, "status_known", context.get("complaint_status_known", False))
++        return value is True or (
++            type(value) in (int, float)
++            and not isinstance(value, bool)
++            and value == 1
++        )
++
++    @staticmethod
++    def _complaint_context_response(
++        identity: dict[str, str], session: OrderQuerySession, context: dict[str, Any], remaining: int
++    ) -> dict[str, Any]:
++        try:
++            complaint_status = int(context.get("complaint_status", -1))
++        except (TypeError, ValueError):
++            complaint_status = -1
++        return {
++            "session_id": session.session_id,
++            "expires_in": remaining,
++            "trade_no": identity["trade_no"],
++            "can_complaint": OrderQueryService._context_flag(context.get("can_complaint")),
++            "complaint_status": complaint_status,
++            "complaint_status_known": OrderQueryService._context_status_known(context),
++        }
++
++    def complaint_context(self, data: Any) -> dict[str, Any]:
++        if not self._slots.acquire(blocking=False):
++            raise OrderQueryBusy()
++        try:
++            identity, session = self._complaint_session(data)
++            with session.lock:
++                context = session.client.get_complaint_context(trade_no=identity["trade_no"])
++                if not isinstance(context, dict):
++                    raise UpstreamOrderError("售后上下文响应格式无效", code="invalid_complaint_context_response")
++                session.remember_complaint_context(identity["trade_no"], context)
++                if self._context_status_known(context):
++                    with self._complaint_state_lock:
++                        # Only an explicit upstream status resolves an uncertain submit.
++                        self._complaint_unknown_trades.discard(identity["trade_no"])
++                    session.clear_complaint_unknown(identity["trade_no"])
++                return self._complaint_context_response(
++                    identity, session, context, self.sessions.remaining(session)
++                )
++        finally:
++            self._slots.release()
++
++    @staticmethod
++    def _context_or_fetch(
++        session: OrderQuerySession,
++        trade_no: str,
++    ) -> dict[str, Any]:
++        context = session.complaint_context(trade_no)
++        if context is None:
++            context = session.client.get_complaint_context(trade_no=trade_no)
++            if not isinstance(context, dict):
++                raise UpstreamOrderError("售后上下文响应格式无效", code="invalid_complaint_context_response")
++            session.remember_complaint_context(trade_no, context)
++        return context
++
++    def complaint_upload(self, data: Any) -> dict[str, Any]:
++        if not self._slots.acquire(blocking=False):
++            raise OrderQueryBusy()
++        try:
++            identity, session = self._complaint_session(data)
++            # Decode before taking the session lock so malformed large requests do not block queries.
++            if isinstance(data, dict):
++                unknown = set(data) - {
++                    "keywords", "session_id", "trade_no", "name", "filename",
++                    "mime_type", "mime", "type", "data_base64", "base64", "data", "data_url",
++                }
++                if unknown:
++                    raise OrderComplaintInputError("图片上传包含未知字段")
++            name, mime_type, content = decode_complaint_upload(data)
++            with session.lock:
++                context = self._context_or_fetch(session, identity["trade_no"])
++                if not self._context_status_known(context):
++                    raise UpstreamOrderError(
++                        "官方售后状态无法确认，请刷新后重试",
++                        code="complaint_context_unknown",
++                        status=409,
++                        retryable=True,
++                    )
++                if not self._context_flag(context.get("can_complaint")):
++                    raise OrderComplaintUnavailable()
++                try:
++                    context_status = int(context.get("complaint_status", -1))
++                except (TypeError, ValueError):
++                    context_status = -1
++                if context_status != -1:
++                    raise OrderComplaintSubmissionConflict()
++                if session.complaint_upload_count(identity["trade_no"]) >= 12:
++                    raise OrderComplaintInputError("每个订单最多登记 12 个上传文件")
++                uploaded = session.client.upload_complaint_file(
++                    content=content,
++                    filename=name,
++                    mime_type=mime_type,
++                )
++                if isinstance(uploaded, dict) and "code" in uploaded and not self._strict_success_code(uploaded.get("code")):
++                    raise UpstreamOrderError(str(uploaded.get("msg") or "图片上传失败"), code="complaint_upload_failed", retryable=True)
++                url = uploaded.get("url") if isinstance(uploaded, dict) else uploaded
++                if not isinstance(url, str) or not url:
++                    raise UpstreamOrderError("图片上传响应格式无效", code="invalid_complaint_upload_response")
++                if url.startswith("/") and not url.startswith("//") and ".." not in url.split("/"):
++                    url = f"{BASE_URL}{url}"
++                try:
++                    parsed_url = urlparse(url)
++                    parsed_url.port
++                except (UnicodeError, ValueError) as exc:
++                    raise UpstreamOrderError("图片上传地址无效", code="invalid_complaint_upload_response") from exc
++                if (
++                    parsed_url.scheme != "https"
++                    or not parsed_url.hostname
++                    or parsed_url.username is not None
++                    or parsed_url.password is not None
++                    or parsed_url.fragment
++                ):
++                    raise UpstreamOrderError("图片上传地址必须使用 HTTPS", code="invalid_complaint_upload_response")
++                if not session.register_complaint_upload(
++                    identity["trade_no"],
++                    url,
++                    name=name,
++                    mime_type=mime_type,
++                    size=len(content),
++                ):
++                    raise OrderComplaintInputError("每个订单最多登记 12 个上传文件")
++                return {"url": url, "name": name, "mime_type": mime_type, "size": len(content)}
++        finally:
++            self._slots.release()
++
++    def complaint_remove_upload(self, data: Any) -> dict[str, Any]:
++        if not self._slots.acquire(blocking=False):
++            raise OrderQueryBusy()
++        try:
++            identity, session = self._complaint_session(data)
++            url = str(data.get("url") or "").strip() if isinstance(data, dict) else ""
++            if not url:
++                raise OrderComplaintInputError("缺少要移除的图片地址")
++            with session.lock:
++                removed = session.remove_complaint_upload(identity["trade_no"], url)
++                if not removed:
++                    raise OrderComplaintInputError("图片地址未登记")
++                return {"removed": True, "url": url}
++        finally:
++            self._slots.release()
++
++    def complaint_submit(self, data: Any) -> dict[str, Any]:
++        if not self._slots.acquire(blocking=False):
++            raise OrderQueryBusy()
++        try:
++            identity, session = self._complaint_session(data)
++            with session.lock:
++                with self._complaint_state_lock:
++                    if identity["trade_no"] in self._complaint_unknown_trades or session.complaint_submission_unknown(identity["trade_no"]):
++                        raise OrderComplaintSubmissionUnknown()
++                    if (
++                        identity["trade_no"] in self._complaint_submitted_trades
++                        or identity["trade_no"] in self._complaint_inflight_trades
++                        or session.complaint_submission(identity["trade_no"]) is not None
++                    ):
++                        raise OrderComplaintSubmissionConflict()
++                # Re-read immediately before reserving the trade number so a
++                # complaint created after the dialog opened cannot be duplicated.
++                context = session.client.get_complaint_context(trade_no=identity["trade_no"])
++                if not isinstance(context, dict):
++                    raise UpstreamOrderError(
++                        "售后上下文响应格式无效",
++                        code="invalid_complaint_context_response",
++                    )
++                session.remember_complaint_context(identity["trade_no"], context)
++                if not self._context_status_known(context):
++                    raise UpstreamOrderError(
++                        "官方售后状态无法确认，请刷新后重试",
++                        code="complaint_context_unknown",
++                        status=409,
++                        retryable=True,
++                    )
++                if not self._context_flag(context.get("can_complaint")):
++                    raise OrderComplaintUnavailable()
++                try:
++                    status = int(context.get("complaint_status", -1))
++                except (TypeError, ValueError):
++                    status = -1
++                if status != -1:
++                    raise OrderComplaintSubmissionConflict()
++                complaint_data = {
++                    key: value
++                    for key, value in (data.items() if isinstance(data, dict) else [])
++                    if key not in {"keywords", "session_id"}
++                }
++                payload = validate_complaint_payload(complaint_data)
++                for url in payload["images"]:
++                    if session.complaint_upload(identity["trade_no"], url) is None:
++                        raise OrderComplaintInputError("证据图片必须先通过本地上传")
++                if payload["collect_image"] and session.complaint_upload(identity["trade_no"], payload["collect_image"]) is None:
++                    raise OrderComplaintInputError("退款二维码必须先通过本地上传")
++                with self._complaint_state_lock:
++                    # Context fetching and payload validation happen outside the
++                    # global lock, so re-check before reserving the trade number.
++                    # Separate query sessions can authorize the same order.
++                    if identity["trade_no"] in self._complaint_unknown_trades:
++                        raise OrderComplaintSubmissionUnknown()
++                    if (
++                        identity["trade_no"] in self._complaint_submitted_trades
++                        or identity["trade_no"] in self._complaint_inflight_trades
++                    ):
++                        raise OrderComplaintSubmissionConflict()
++                    if not session.begin_complaint_submission(identity["trade_no"]):
++                        raise OrderComplaintSubmissionConflict()
++                    self._complaint_inflight_trades.add(identity["trade_no"])
++                try:
++                    submit_result = session.client.submit_complaint(payload)
++                    if not isinstance(submit_result, dict):
++                        raise OrderComplaintSubmissionUnknown()
++                    code = submit_result.get("code")
++                    if not self._is_numeric_code(code):
++                        raise OrderComplaintSubmissionUnknown()
++                    if not self._strict_success_code(code):
++                        raise UpstreamOrderError(str(submit_result.get("msg") or "售后申请提交失败"), code="complaint_submit_failed", retryable=True)
++                except UpstreamOrderError as exc:
++                    if exc.code != "complaint_submit_failed":
++                        session.mark_complaint_unknown(identity["trade_no"])
++                        with self._complaint_state_lock:
++                            self._complaint_inflight_trades.discard(identity["trade_no"])
++                            self._complaint_unknown_trades.add(identity["trade_no"])
++                        raise OrderComplaintSubmissionUnknown() from exc
++                    session.fail_complaint_submission(identity["trade_no"])
++                    with self._complaint_state_lock:
++                        self._complaint_inflight_trades.discard(identity["trade_no"])
++                    raise
++                except Exception:
++                    # Any non-domain exception leaves the upstream outcome unknown.
++                    session.mark_complaint_unknown(identity["trade_no"])
++                    with self._complaint_state_lock:
++                        self._complaint_inflight_trades.discard(identity["trade_no"])
++                        self._complaint_unknown_trades.add(identity["trade_no"])
++                    raise OrderComplaintSubmissionUnknown()
++                result = {
++                    "submitted": True,
++                    "trade_no": identity["trade_no"],
++                    "complaint_status": 0,
++                    "message": "售后申请提交成功",
++                }
++                session.finish_complaint_submission(identity["trade_no"], result)
++                with self._complaint_state_lock:
++                    self._complaint_inflight_trades.discard(identity["trade_no"])
++                    self._complaint_submitted_trades.add(identity["trade_no"])
++                return result
++        finally:
++            self._slots.release()
+diff --git a/backend/order_query/sessions.py b/backend/order_query/sessions.py
+index eeb9a66..904df35 100644
+--- a/backend/order_query/sessions.py
++++ b/backend/order_query/sessions.py
+@@ -17,6 +17,7 @@ from .errors import OrderQueryInputError, OrderQuerySessionExpired
+ MAX_AUTHORIZED_ORDERS = 500
+ MAX_PASSWORD_FAILURES = 5
+ PASSWORD_BACKOFF_SECONDS = 60
++MAX_COMPLAINT_UPLOADS = 12
+ 
+ 
+ @dataclass
+@@ -32,6 +33,11 @@ class OrderQuerySession:
+     cache: dict[tuple[int, int, int], tuple[float, dict[str, Any]]] = field(default_factory=dict)
+     authorized_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
+     password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
++    complaint_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
++    complaint_uploads: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
++    complaint_submitting: set[str] = field(default_factory=set)
++    complaint_unknown: set[str] = field(default_factory=set)
++    complaint_submitted: dict[str, dict[str, Any]] = field(default_factory=dict)
+     lock: threading.RLock = field(default_factory=threading.RLock)
+ 
+     def clear_verification(self) -> None:
+@@ -94,6 +100,69 @@ class OrderQuerySession:
+     def clear_password_failure(self, trade_no: str) -> None:
+         self.password_failures.pop(trade_no, None)
+ 
++    def remember_complaint_context(self, trade_no: str, context: dict[str, Any]) -> None:
++        self.complaint_contexts[trade_no] = copy.deepcopy(context)
++
++    def complaint_context(self, trade_no: str) -> dict[str, Any] | None:
++        value = self.complaint_contexts.get(trade_no)
++        return copy.deepcopy(value) if value is not None else None
++
++    def register_complaint_upload(
++        self,
++        trade_no: str,
++        url: str,
++        *,
++        name: str,
++        mime_type: str,
++        size: int,
++    ) -> bool:
++        uploads = self.complaint_uploads.setdefault(trade_no, {})
++        if url not in uploads and len(uploads) >= MAX_COMPLAINT_UPLOADS:
++            return False
++        uploads[url] = {"url": url, "name": name, "mime_type": mime_type, "size": int(size)}
++        return True
++
++    def remove_complaint_upload(self, trade_no: str, url: str) -> bool:
++        uploads = self.complaint_uploads.get(trade_no)
++        if not uploads or url not in uploads:
++            return False
++        uploads.pop(url, None)
++        return True
++
++    def complaint_upload(self, trade_no: str, url: str) -> dict[str, Any] | None:
++        value = self.complaint_uploads.get(trade_no, {}).get(url)
++        return copy.deepcopy(value) if value is not None else None
++
++    def complaint_upload_count(self, trade_no: str) -> int:
++        return len(self.complaint_uploads.get(trade_no, {}))
++
++    def begin_complaint_submission(self, trade_no: str) -> bool:
++        if trade_no in self.complaint_submitted or trade_no in self.complaint_submitting or trade_no in self.complaint_unknown:
++            return False
++        self.complaint_submitting.add(trade_no)
++        return True
++
++    def finish_complaint_submission(self, trade_no: str, result: dict[str, Any]) -> None:
++        self.complaint_submitting.discard(trade_no)
++        self.complaint_submitted[trade_no] = copy.deepcopy(result)
++
++    def fail_complaint_submission(self, trade_no: str) -> None:
++        self.complaint_submitting.discard(trade_no)
++
++    def mark_complaint_unknown(self, trade_no: str) -> None:
++        self.complaint_submitting.discard(trade_no)
++        self.complaint_unknown.add(trade_no)
++
++    def clear_complaint_unknown(self, trade_no: str) -> None:
++        self.complaint_unknown.discard(trade_no)
++
++    def complaint_submission_unknown(self, trade_no: str) -> bool:
++        return trade_no in self.complaint_unknown
++
++    def complaint_submission(self, trade_no: str) -> dict[str, Any] | None:
++        value = self.complaint_submitted.get(trade_no)
++        return copy.deepcopy(value) if value is not None else None
++
+     def cached(self, key: tuple[int, int, int], now: float) -> dict[str, Any] | None:
+         entry = self.cache.get(key)
+         if entry is None:
+diff --git a/backend/test_main.py b/backend/test_main.py
+index 1da5da2..421fa84 100644
+--- a/backend/test_main.py
++++ b/backend/test_main.py
+@@ -1278,6 +1278,7 @@ class GoodsParserTests(unittest.TestCase):
+         self.assertTrue(payload["sub2api_accounts"])
+         self.assertTrue(payload["sub2api_card_import_history"])
+         self.assertTrue(payload["sub2api_card_import_history_delete"])
++        self.assertTrue(payload["order_complaint_submit"])
+ 
+     def test_sub2api_card_import_history_http_lifecycle(self):
+         with tempfile.TemporaryDirectory() as directory:
+diff --git a/backend/test_order_query_modules.py b/backend/test_order_query_modules.py
+index 85ca7e3..6c4e8e3 100644
+--- a/backend/test_order_query_modules.py
++++ b/backend/test_order_query_modules.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
++import base64
+ import json
++import threading
+ import unittest
+ from io import BytesIO
+ from types import SimpleNamespace
+@@ -21,12 +23,15 @@ from order_query.detail import normalize_order_detail
+ from order_query.errors import (
+     CaptchaRecognizerUnavailable,
+     OrderComplaintInputError,
++    OrderComplaintSubmissionConflict,
+     OrderQueryDetailNotFound,
+     OrderQueryInputError,
+     OrderQueryPasswordInvalid,
+     OrderQueryPasswordRateLimited,
+     OrderQueryPasswordRequired,
+     OrderQuerySessionExpired,
++    OrderComplaintSubmissionUnknown,
++    UpstreamOrderError,
+ )
+ from order_query.service import OrderQueryService
+ from order_query.sessions import OrderQuerySessionStore
+@@ -482,6 +487,99 @@ class ClientTests(unittest.TestCase):
+         self.assertNotIn("127.0.0.1", json.dumps(detail, ensure_ascii=False))
+         self.assertNotIn("169.254.169.254", json.dumps(detail, ensure_ascii=False))
+ 
++    def test_complaint_context_normalizes_flags_and_rejects_mismatched_trade(self) -> None:
++        opener = FakeOpener([
++            self._json_response({
++                "code": 1,
++                "data": {
++                    "trade_no": "ORDER-1",
++                    "can_complaint": 1,
++                    "complaint": None,
++                },
++            }),
++        ])
++        context = OrderQueryClient(opener=opener).get_complaint_context("ORDER-1")
++        self.assertEqual(context, {
++            "can_complaint": True,
++            "complaint_status": -1,
++        })
++        self.assertTrue(getattr(context, "status_known"))
++        self.assertEqual(len(opener.requests), 1)
++
++        missing_status = FakeOpener([
++            self._json_response({"code": 1, "data": {"trade_no": "ORDER-1", "can_complaint": 1}}),
++        ])
++        missing_context = OrderQueryClient(opener=missing_status).get_complaint_context("ORDER-1")
++        self.assertEqual(missing_context["complaint_status"], -1)
++        self.assertTrue(getattr(missing_context, "status_known"))
++
++        top_level_status = FakeOpener([
++            self._json_response({
++                "code": 1,
++                "data": {
++                    "trade_no": "ORDER-1",
++                    "can_complaint": 1,
++                    "complaint_status": 0,
++                },
++            }),
++        ])
++        existing_context = OrderQueryClient(opener=top_level_status).get_complaint_context("ORDER-1")
++        self.assertEqual(existing_context["complaint_status"], 0)
++        self.assertTrue(getattr(existing_context, "status_known"))
++
++        mismatch = FakeOpener([
++            self._json_response({"code": 1, "data": {"trade_no": "OTHER", "can_complaint": 1}}),
++        ])
++        with self.assertRaisesRegex(RuntimeError, "不一致"):
++            OrderQueryClient(opener=mismatch).get_complaint_context("ORDER-1")
++
++    def test_complaint_upload_is_multipart_file_and_requires_https_result(self) -> None:
++        opener = FakeOpener([
++            self._json_response({"code": 1, "data": {"url": "https://pay.ldxp.cn/uploads/a.png"}}),
++        ])
++        client = OrderQueryClient(opener=opener)
++        url = client.upload_complaint_file(b"fixture", "a.png", "image/png")
++        self.assertEqual(url, "https://pay.ldxp.cn/uploads/a.png")
++        request = opener.requests[0]
++        content_type = request.get_header("Content-type") or ""
++        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
++        self.assertIn(b'name="file"', request.data)
++        self.assertIn(b"fixture", request.data)
++
++        insecure = FakeOpener([
++            self._json_response({"code": 1, "data": {"url": "http://pay.ldxp.cn/uploads/a.png"}}),
++        ])
++        with self.assertRaisesRegex(RuntimeError, "有效地址"):
++            OrderQueryClient(opener=insecure).upload_complaint_file(b"fixture", "a.png", "image/png")
++
++    def test_complaint_writes_follow_official_nonzero_numeric_code_rules(self) -> None:
++        opener = FakeOpener([
++            self._json_response({"code": 2, "data": {"url": "https://pay.ldxp.cn/uploads/a.png"}}),
++            self._json_response({"code": 2}),
++        ])
++        client = OrderQueryClient(opener=opener)
++        self.assertEqual(
++            client.upload_complaint_file(b"fixture", "a.png", "image/png"),
++            "https://pay.ldxp.cn/uploads/a.png",
++        )
++        self.assertEqual(client.submit_complaint({"trade_no": "ORDER-1"})["code"], 2)
++
++        failed_upload = FakeOpener([self._json_response({"code": 0, "msg": "failed"})])
++        with self.assertRaisesRegex(RuntimeError, "failed"):
++            OrderQueryClient(opener=failed_upload).upload_complaint_file(b"fixture", "a.png", "image/png")
++        failed_submit = FakeOpener([self._json_response({"code": 0, "msg": "failed"})])
++        with self.assertRaisesRegex(RuntimeError, "failed"):
++            OrderQueryClient(opener=failed_submit).submit_complaint({"trade_no": "ORDER-1"})
++
++        for malformed in ({}, {"code": "1"}, {"code": True}, {"code": float("nan")}, {"code": float("inf")}):
++            with self.subTest(malformed=malformed):
++                upload = FakeOpener([self._json_response({**malformed, "data": {"url": "https://pay.ldxp.cn/u/a.png"}})])
++                with self.assertRaisesRegex(RuntimeError, "上传失败"):
++                    OrderQueryClient(opener=upload).upload_complaint_file(b"fixture", "a.png", "image/png")
++                submit = FakeOpener([self._json_response(malformed)])
++                with self.assertRaisesRegex(RuntimeError, "响应格式无效"):
++                    OrderQueryClient(opener=submit).submit_complaint({"trade_no": "ORDER-1"})
++
+ 
+ class ComplaintPreviewTests(unittest.TestCase):
+     @staticmethod
+@@ -497,7 +595,7 @@ class ComplaintPreviewTests(unittest.TestCase):
+             ],
+             "collect_image": "https://pay.ldxp.cn/uploads/complaint/refund.png",
+             "query_pwd": "012345",
+-            "email_code": "A1B2C3",
++            "email_code": "",
+         }
+ 
+     def test_preview_normalizes_exact_official_payload_without_submitting(self) -> None:
+@@ -510,7 +608,7 @@ class ComplaintPreviewTests(unittest.TestCase):
+             "images": [f" {url} " for url in payload["images"]],
+             "collect_image": f" {payload['collect_image']} ",
+             "query_pwd": f" {payload['query_pwd']} ",
+-            "email_code": f" {payload['email_code']} ",
++            "email_code": "",
+         })
+ 
+         result = build_complaint_preview(payload)
+@@ -521,12 +619,6 @@ class ComplaintPreviewTests(unittest.TestCase):
+             "method": "POST",
+             "url": COMPLAINT_PREVIEW_TARGET,
+         })
+-        self.assertEqual(result["requirements"], {
+-            "email_code": {
+-                "required_when": "order.order_complaint_email_verify == 1",
+-                "provided": True,
+-            },
+-        })
+         self.assertEqual(list(result["payload"]), [
+             "trade_no",
+             "reason",
+@@ -565,7 +657,6 @@ class ComplaintPreviewTests(unittest.TestCase):
+         self.assertEqual(result["payload"]["images"], [])
+         self.assertEqual(result["payload"]["collect_image"], "")
+         self.assertEqual(result["payload"]["email_code"], "")
+-        self.assertEqual(result["requirements"]["email_code"]["provided"], False)
+ 
+     def test_preview_rejects_invalid_or_unofficial_fields(self) -> None:
+         invalid_payloads: list[tuple[str, Any, str]] = [
+@@ -578,7 +669,7 @@ class ComplaintPreviewTests(unittest.TestCase):
+             ("contact", {**self.valid_payload(), "contact": "not-an-email"}, "邮箱地址"),
+             ("password", {**self.valid_payload(), "query_pwd": "12345"}, "6 位数字"),
+             ("unicode_password", {**self.valid_payload(), "query_pwd": "１２３４５６"}, "6 位数字"),
+-            ("email_code", {**self.valid_payload(), "email_code": "bad code"}, "email_code 格式"),
++            ("email_code", {**self.valid_payload(), "email_code": "A1B2"}, "不使用邮箱验证码"),
+             ("images_type", {**self.valid_payload(), "images": "https://example.test/a.png"}, "URL 数组"),
+             ("images_count", {**self.valid_payload(), "images": ["https://example.test/a.png"] * 4}, "最多允许 3"),
+             ("image_url", {**self.valid_payload(), "images": ["file:///tmp/a.png"]}, r"http\(s\) URL"),
+@@ -1077,6 +1168,37 @@ class RouteTests(unittest.TestCase):
+         preview.assert_called_once_with(payload)
+         self.assertEqual(responses, [(200, expected)])
+ 
++    def test_main_http_handler_mounts_all_complaint_workflow_routes(self) -> None:
++        endpoints = {
++            "/api/order-query/complaints/context": "complaint_context",
++            "/api/order-query/complaints/upload": "complaint_upload",
++            "/api/order-query/complaints/upload/remove": "complaint_remove_upload",
++            "/api/order-query/complaints/submit": "complaint_submit",
++        }
++        self.assertNotIn("/api/order-query/complaints/email-code", routes.ORDER_QUERY_POST_PATHS)
++        for path, method_name in endpoints.items():
++            with self.subTest(path=path):
++                body = b"{}"
++                handler = object.__new__(main.ApiHandler)
++                handler.path = path
++                handler.headers = {
++                    "Content-Length": str(len(body)),
++                    "Content-Type": "application/json",
++                    "Origin": "http://127.0.0.1:5173",
++                }
++                handler.rfile = BytesIO(body)
++                responses: list[tuple[int, Any]] = []
++                calls: list[dict[str, Any]] = []
++                handler._send_json = lambda value, status=200: responses.append((status, value))
++                service = SimpleNamespace(search=lambda data: {}, detail=lambda data: {})
++                setattr(service, method_name, lambda data, name=method_name: calls.append(data) or {"route": name})
++
++                with patch.object(main, "ORDER_QUERY_SERVICE", service):
++                    handler.do_POST()
++
++                self.assertEqual(calls, [{}])
++                self.assertEqual(responses, [(200, {"route": method_name})])
++
+     def test_complaint_preview_request_guard_rejects_bad_content_type_and_origin(self) -> None:
+         cases = (
+             (
+@@ -1183,5 +1305,273 @@ class RouteTests(unittest.TestCase):
+         })])
+ 
+ 
++class ComplaintWorkflowTests(unittest.TestCase):
++    class Client(FakeOrderClient):
++        def __init__(self, *, submit_error: Exception | None = None, status_known: bool = True) -> None:
++            super().__init__()
++            self.submit_error = submit_error
++            self.status_known = status_known
++            self.context_calls: list[str] = []
++            self.upload_calls: list[dict[str, Any]] = []
++            self.submit_calls: list[dict[str, Any]] = []
++
++        def list_orders(self, **kwargs: Any) -> dict[str, Any]:
++            return {
++                "orders": [{"trade_no": "ORDER-1", "status": 1, "need_query_password": False}],
++                "pagination": {"page": 1, "page_size": 10, "total": 1, "pages": 1},
++            }
++
++        def get_complaint_context(self, *, trade_no: str) -> dict[str, Any]:
++            self.context_calls.append(trade_no)
++            result = {
++                "can_complaint": True,
++                "complaint_status": -1,
++            }
++            if self.status_known:
++                result["complaint_status_known"] = True
++            return result
++
++        def upload_complaint_file(self, **kwargs: Any) -> str:
++            self.upload_calls.append(kwargs)
++            return f"https://pay.ldxp.cn/uploads/{len(self.upload_calls)}.png"
++
++        def submit_complaint(self, payload: dict[str, Any]) -> dict[str, Any]:
++            self.submit_calls.append(payload)
++            if self.submit_error is not None:
++                raise self.submit_error
++            return {"code": 1}
++
++    @staticmethod
++    def _identity(service: OrderQueryService) -> dict[str, str]:
++        result = service.search({"keywords": "buyer"})
++        return {"keywords": "buyer", "session_id": result["session_id"], "trade_no": "ORDER-1"}
++
++    @staticmethod
++    def _service(client: Any, recognizer: Any = None) -> OrderQueryService:
++        return OrderQueryService(
++            client_factory=lambda: client,
++            recognizer=recognizer or FakeRecognizer(["AB12"]),
++            sessions=OrderQuerySessionStore(ttl_seconds=120, cache_seconds=0),
++        )
++
++    def test_context_upload_and_submit_use_authorized_session_and_exact_payload(self) -> None:
++        client = self.Client()
++        service = self._service(client)
++        identity = self._identity(service)
++        context_response = service.complaint_context(identity)
++        self.assertIs(context_response["complaint_status_known"], True)
++        image = b"\x89PNG\r\n\x1a\nfixture"
++        uploaded = service.complaint_upload({
++            **identity,
++            "name": "evidence.png",
++            "mime_type": "image/png",
++            "data_base64": base64.b64encode(image).decode("ascii"),
++        })
++        reason = next(iter(COMPLAINT_REASONS))
++        payload = {
++            **identity,
++            "reason": reason,
++            "content": "商品描述与收到内容不一致",
++            "contact": "buyer@example.test",
++            "images": [uploaded["url"]],
++            "collect_image": "",
++            "query_pwd": "012345",
++            "email_code": "",
++        }
++        result = service.complaint_submit(payload)
++        self.assertEqual(result["submitted"], True)
++        self.assertEqual(client.submit_calls, [{
++            "trade_no": "ORDER-1",
++            "reason": reason,
++            "content": "商品描述与收到内容不一致",
++            "contact": "buyer@example.test",
++            "images": [uploaded["url"]],
++            "collect_image": "",
++            "query_pwd": "012345",
++            "email_code": "",
++        }])
++        self.assertEqual(client.context_calls, ["ORDER-1", "ORDER-1"])
++        with self.assertRaisesRegex(Exception, "重复提交"):
++            service.complaint_submit(payload)
++        self.assertEqual(len(client.submit_calls), 1)
++
++    def test_existing_top_level_complaint_status_blocks_submit(self) -> None:
++        class ExistingComplaintClient(self.Client):
++            def get_complaint_context(self, *, trade_no: str) -> dict[str, Any]:
++                self.context_calls.append(trade_no)
++                return {
++                    "can_complaint": True,
++                    "complaint_status": 0,
++                    "complaint_status_known": True,
++                }
++
++        client = ExistingComplaintClient()
++        service = self._service(client)
++        identity = self._identity(service)
++        with self.assertRaises(OrderComplaintSubmissionConflict):
++            service.complaint_submit(identity)
++        self.assertEqual(client.context_calls, ["ORDER-1"])
++        self.assertEqual(client.submit_calls, [])
++
++    def test_unknown_official_status_blocks_upload_and_submit(self) -> None:
++        client = self.Client(status_known=False)
++        service = self._service(client)
++        identity = self._identity(service)
++        image = b"\x89PNG\r\n\x1a\nfixture"
++        with self.assertRaisesRegex(RuntimeError, "状态无法确认"):
++            service.complaint_upload({
++                **identity,
++                "name": "evidence.png",
++                "mime_type": "image/png",
++                "data_base64": base64.b64encode(image).decode("ascii"),
++            })
++        with self.assertRaisesRegex(RuntimeError, "状态无法确认"):
++            service.complaint_submit({
++                **identity,
++                "reason": next(iter(COMPLAINT_REASONS)),
++                "content": "x",
++                "contact": "buyer@example.test",
++                "images": [],
++                "collect_image": "",
++                "query_pwd": "012345",
++                "email_code": "",
++            })
++        self.assertEqual(client.upload_calls, [])
++        self.assertEqual(client.submit_calls, [])
++
++    def test_two_sessions_cannot_submit_the_same_trade_concurrently(self) -> None:
++        context_barrier = threading.Barrier(2)
++
++        class RacingClient(self.Client):
++            def get_complaint_context(self, *, trade_no: str) -> dict[str, Any]:
++                context_barrier.wait(2)
++                return super().get_complaint_context(trade_no=trade_no)
++
++        client = RacingClient()
++        service = self._service(client, FakeRecognizer(["AB12", "AB12"]))
++        first_identity = self._identity(service)
++        second_identity = self._identity(service)
++        reason = next(iter(COMPLAINT_REASONS))
++
++        def payload(identity: dict[str, str]) -> dict[str, Any]:
++            return {
++                **identity,
++                "reason": reason,
++                "content": "x",
++                "contact": "buyer@example.test",
++                "images": [],
++                "collect_image": "",
++                "query_pwd": "012345",
++                "email_code": "",
++            }
++
++        results: list[dict[str, Any]] = []
++        errors: list[Exception] = []
++
++        def submit(identity: dict[str, str]) -> None:
++            try:
++                results.append(service.complaint_submit(payload(identity)))
++            except Exception as exc:
++                errors.append(exc)
++
++        workers = [
++            threading.Thread(target=submit, args=(first_identity,)),
++            threading.Thread(target=submit, args=(second_identity,)),
++        ]
++        for worker in workers:
++            worker.start()
++        for worker in workers:
++            worker.join(3)
++
++        self.assertFalse(any(worker.is_alive() for worker in workers))
++        self.assertEqual(len(results), 1)
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], OrderComplaintSubmissionConflict)
++        self.assertEqual(len(client.submit_calls), 1)
++
++    def test_unknown_submit_is_locked_until_context_refresh(self) -> None:
++        client = self.Client(submit_error=RuntimeError("network"))
++        service = self._service(client)
++        identity = self._identity(service)
++        image = b"\x89PNG\r\n\x1a\nfixture"
++        uploaded = service.complaint_upload({
++            **identity,
++            "name": "evidence.png",
++            "mime_type": "image/png",
++            "data_base64": base64.b64encode(image).decode("ascii"),
++        })
++        payload = {
++            **identity,
++            "reason": next(iter(COMPLAINT_REASONS)),
++            "content": "x",
++            "contact": "buyer@example.test",
++            "images": [uploaded["url"]],
++            "collect_image": "",
++            "query_pwd": "012345",
++            "email_code": "",
++        }
++        with self.assertRaises(OrderComplaintSubmissionUnknown):
++            service.complaint_submit(payload)
++        with self.assertRaises(OrderComplaintSubmissionUnknown):
++            service.complaint_submit(payload)
++        self.assertEqual(len(client.submit_calls), 1)
++        service.complaint_context(identity)
++        with self.assertRaises(OrderComplaintSubmissionUnknown):
++            service.complaint_submit(payload)
++        self.assertEqual(len(client.submit_calls), 2)
++
++    def test_unparseable_submit_responses_lock_without_a_second_request(self) -> None:
++        for code in ("invalid_order_response", "upstream_response_too_large"):
++            with self.subTest(code=code):
++                client = self.Client(submit_error=UpstreamOrderError("bad response", code=code))
++                service = self._service(client)
++                identity = self._identity(service)
++                payload = {
++                    **identity,
++                    "reason": next(iter(COMPLAINT_REASONS)),
++                    "content": "x",
++                    "contact": "buyer@example.test",
++                    "images": [],
++                    "collect_image": "",
++                    "query_pwd": "012345",
++                    "email_code": "",
++                }
++                with self.assertRaises(OrderComplaintSubmissionUnknown):
++                    service.complaint_submit(payload)
++                with self.assertRaises(OrderComplaintSubmissionUnknown):
++                    service.complaint_submit(payload)
++                self.assertEqual(len(client.submit_calls), 1)
++
++    def test_unknown_submit_is_not_cleared_by_context_without_explicit_status(self) -> None:
++        client = self.Client(submit_error=RuntimeError("network"))
++        service = self._service(client)
++        identity = self._identity(service)
++        image = b"\x89PNG\r\n\x1a\nfixture"
++        uploaded = service.complaint_upload({
++            **identity,
++            "name": "evidence.png",
++            "mime_type": "image/png",
++            "data_base64": base64.b64encode(image).decode("ascii"),
++        })
++        payload = {
++            **identity,
++            "reason": next(iter(COMPLAINT_REASONS)),
++            "content": "x",
++            "contact": "buyer@example.test",
++            "images": [uploaded["url"]],
++            "collect_image": "",
++            "query_pwd": "012345",
++            "email_code": "",
++        }
++        with self.assertRaises(OrderComplaintSubmissionUnknown):
++            service.complaint_submit(payload)
++        client.status_known = False
++        context_response = service.complaint_context(identity)
++        self.assertIs(context_response["complaint_status_known"], False)
++        with self.assertRaises(OrderComplaintSubmissionUnknown):
++            service.complaint_submit(payload)
++        self.assertEqual(len(client.submit_calls), 1)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/frontend/src/OrderQueryView.jsx b/frontend/src/OrderQueryView.jsx
+index 1dced8f..9e110ad 100644
+--- a/frontend/src/OrderQueryView.jsx
++++ b/frontend/src/OrderQueryView.jsx
+@@ -10,16 +10,21 @@ import {
+   Eye,
+   EyeOff,
+   ExternalLink,
++  FileUp,
+   Image,
++  ImagePlus,
+   KeyRound,
+   Link2,
+   MessageSquareWarning,
+   Package,
+   ReceiptText,
+   RefreshCw,
++  RotateCcw,
+   Search,
++  Send,
+   ShieldCheck,
+   Store,
++  Trash2,
+   TriangleAlert,
+   X,
+ } from 'lucide-react';
+@@ -33,11 +38,11 @@ import {
+   formatOrderCardsForCopy,
+   formatOrderMoney,
+   normalizeOrderDetail,
+-  normalizeComplaintPayload,
+   normalizeOrderResponse,
+   orderDeliveryKindLabel,
+   orderDetailErrorState,
+   orderQueryContextChanged,
++  selectComplaintImageFiles,
+   summarizeOrders,
+   validateComplaintPayload,
+   verificationLabel,
+@@ -45,7 +50,27 @@ import {
+ import './orderQuery.css';
+ 
+ const EMPTY_RESULT = {orders: [], pagination: {page: 1, page_size: 10, total: 0, pages: 1}};
+-const COMPLAINT_TARGET = Object.freeze({method: 'POST', url: 'https://pay.ldxp.cn/shopApi/Order/complaintOrder'});
++const COMPLAINT_ACCEPT = '.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp';
++const COMPLAINT_PHASES = new Set(['loading', 'error', 'edit', 'confirm', 'submitting', 'success']);
++
++function complaintPreviewUrl(file) {
++  try {
++    return typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
++      ? URL.createObjectURL(file)
++      : '';
++  } catch {
++    return '';
++  }
++}
++
++function revokeComplaintPreview(url) {
++  if (!url || !String(url).startsWith('blob:')) return;
++  try {
++    URL.revokeObjectURL(url);
++  } catch {
++    // The URL may already have been revoked by the browser.
++  }
++}
+ 
+ function QueryIconButton({label, children, ...props}) {
+   return <button className="icon-button" type="button" aria-label={label} title={label} {...props}>{children}</button>;
+@@ -243,14 +268,69 @@ function ComplaintFieldError({id, message}) {
+   return message ? <small className="order-complaint-field-error" id={id}>{message}</small> : null;
+ }
+ 
+-function ComplaintDialog({order, draft, errors, busy, error, preview, dialogRef, onChange, onImageChange, onSubmit, onCopy, onBack, onClose, onCopyOrder}) {
+-  const previewText = preview ? JSON.stringify(preview.payload, null, 2) : '';
+-  const emailCodeRequirement = preview?.requirements?.email_code;
+-  return <div className="modal-backdrop order-complaint-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+-    <div ref={dialogRef} className="checkout-modal order-complaint-modal" role="dialog" aria-modal="true" aria-labelledby="order-complaint-title">
++function ComplaintDropZone({label, hint, multiple = false, disabled = false, invalid = false, errorId, onFiles}) {
++  const [dragging, setDragging] = useState(false);
++  const inputRef = useRef(null);
++  const selectFiles = files => {
++    if (!disabled && files?.length) onFiles(files);
++    if (inputRef.current) inputRef.current.value = '';
++  };
++  return <label
++    className={`order-complaint-drop ${dragging ? 'dragging' : ''} ${disabled ? 'disabled' : ''}`}
++    tabIndex={disabled ? -1 : 0}
++    aria-disabled={disabled}
++    aria-invalid={invalid}
++    aria-describedby={invalid ? errorId : undefined}
++    onKeyDown={event => {
++      if (!disabled && (event.key === 'Enter' || event.key === ' ')) {
++        event.preventDefault();
++        inputRef.current?.click();
++      }
++    }}
++    onDragEnter={event => { event.preventDefault(); if (!disabled) setDragging(true); }}
++    onDragOver={event => event.preventDefault()}
++    onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }}
++    onDrop={event => { event.preventDefault(); setDragging(false); selectFiles(event.dataTransfer.files); }}
++  >
++    <input ref={inputRef} type="file" accept={COMPLAINT_ACCEPT} multiple={multiple} disabled={disabled} onChange={event => selectFiles(event.target.files)}/>
++    <ImagePlus size={19}/><span><strong>{label}</strong><small>{hint}</small></span>
++  </label>;
++}
++
++function ComplaintUploadItem({item, label, onRetry, onRemove}) {
++  return <div className={`order-complaint-upload ${item.status}`} role="listitem" aria-busy={item.status === 'uploading'}>
++    <img src={item.previewUrl || undefined} alt={`${label}预览`}/>
++    <div><strong title={item.name}>{label}</strong><span>{item.status === 'uploading' ? '上传中' : item.status === 'done' ? '已上传' : '上传失败'}</span></div>
++    {item.status === 'uploading' && <RefreshCw className="spin" size={15} role="progressbar" aria-label={`${label}正在上传`}/>}
++    {item.status === 'error' && <QueryIconButton label={`重试上传${label}`} onClick={() => onRetry(item)}><RotateCcw size={14}/></QueryIconButton>}
++    <QueryIconButton label={`删除${label}`} onClick={() => onRemove(item)}><Trash2 size={14}/></QueryIconButton>
++    {item.error && <small role="alert">{item.error}</small>}
++  </div>;
++}
++
++function readComplaintFile(file) {
++  return new Promise((resolve, reject) => {
++    const reader = new FileReader();
++    reader.onload = () => resolve(String(reader.result || ''));
++    reader.onerror = () => reject(new Error('无法读取图片文件'));
++    reader.readAsDataURL(file);
++  });
++}
++
++function ComplaintDialog({
++  order, draft, errors, error, phase, uploads, snapshot, dialogRef, onChange, onFiles,
++  onRetryUpload, onRemoveUpload, onEditSubmit, onConfirmSubmit, onRetryContext,
++  onBack, onClose, onCopyOrder, resultMessage, submissionUnknown,
++}) {
++  const submitting = phase === 'submitting';
++  const phaseKnown = COMPLAINT_PHASES.has(phase);
++  const title = phase === 'confirm' || submitting ? '确认售后申请' : phase === 'success' ? '售后申请已提交' : '申请售后';
++  const uploadBusy = [...uploads.evidence, ...uploads.collect].some(item => item.status === 'uploading');
++  return <div className="modal-backdrop order-complaint-backdrop" onMouseDown={event => event.target === event.currentTarget && !submitting && onClose()}>
++    <div ref={dialogRef} className="checkout-modal order-complaint-modal" role="dialog" aria-modal="true" aria-labelledby="order-complaint-title" tabIndex={-1}>
+       <div className="modal-head order-complaint-head">
+-        <div><span>AFTER-SALES PREVIEW</span><h2 id="order-complaint-title">{preview ? '售后申请参数' : '申请售后'}</h2></div>
+-        <QueryIconButton label="关闭售后弹窗" onClick={onClose}><X size={17}/></QueryIconButton>
++        <div><span>AFTER-SALES REQUEST</span><h2 id="order-complaint-title">{title}</h2></div>
++        <QueryIconButton label="关闭售后弹窗" onClick={onClose} disabled={submitting}><X size={17}/></QueryIconButton>
+       </div>
+ 
+       <div className="order-complaint-order">
+@@ -258,8 +338,12 @@ function ComplaintDialog({order, draft, errors, busy, error, preview, dialogRef,
+         <QueryIconButton label={`复制订单号 ${order.trade_no}`} onClick={() => onCopyOrder(order.trade_no)}><Clipboard size={14}/></QueryIconButton>
+       </div>
+ 
+-      {!preview ? <form className="order-complaint-form" onSubmit={onSubmit} noValidate>
+-        <div className="order-complaint-notice"><ShieldCheck size={17}/><p>仅在本地校验并生成参数预览，不会上传图片或向官方站点提交。</p></div>
++      {(phase === 'loading' || phase === 'error' || !phaseKnown) && <div className={`order-complaint-loading ${phase === 'error' || !phaseKnown ? 'error' : ''}`} data-complaint-phase-focus tabIndex={-1} role={phase === 'loading' ? 'status' : 'alert'} aria-busy={phase === 'loading'}>
++        {phase === 'loading' && <RefreshCw className="spin" size={20}/>} {phase !== 'loading' && <TriangleAlert size={20}/>}<strong>{phase === 'loading' ? '正在读取官方售后状态' : '售后状态暂时无法确认'}</strong><span>{phase === 'loading' ? '确认订单是否仍可申请售后' : '请刷新订单状态后重试'}</span>{error && <small>{error}</small>}{(phase !== 'loading' || error) && <button className="button secondary" type="button" onClick={onRetryContext}><RotateCcw size={15}/>重试</button>}
++      </div>}
++
++      {phase === 'edit' && <form className="order-complaint-form" onSubmit={onEditSubmit} noValidate>
++        <div className="order-complaint-notice"><ShieldCheck size={17}/><p>官方售后通道已确认，图片会先上传到平台，最终申请将在二次确认后提交。</p></div>
+         {error && <div className="order-complaint-error" role="alert"><TriangleAlert size={15}/><span>{error}</span></div>}
+ 
+         <div className="order-complaint-fields">
+@@ -290,42 +374,39 @@ function ComplaintDialog({order, draft, errors, busy, error, preview, dialogRef,
+             <ComplaintFieldError id="complaint-password-error" message={errors.query_pwd}/>
+           </label>
+ 
+-          <label>
+-            <span>邮箱验证码 <em>按官方配置条件必填</em></span>
+-            <input value={draft.email_code} onChange={event => onChange('email_code', event.target.value)} placeholder="官方启用邮箱验证时填写" autoComplete="one-time-code" spellCheck="false" maxLength={32} aria-invalid={Boolean(errors.email_code)} aria-describedby={errors.email_code ? 'complaint-email-code-error' : undefined}/>
+-            <ComplaintFieldError id="complaint-email-code-error" message={errors.email_code}/>
+-          </label>
+-
+           <fieldset className="order-complaint-images">
+-            <legend>图片凭证 URL <em>选填，最多 3 个</em></legend>
+-            {draft.images.map((value, index) => <label key={index}>
+-              <span className="sr-only">图片凭证 URL {index + 1}</span>
+-              <div><Link2 size={14}/><input value={value} onChange={event => onImageChange(index, event.target.value)} placeholder={`https://.../evidence-${index + 1}.png`} inputMode="url" spellCheck="false" aria-invalid={Boolean(errors.images)} aria-describedby={errors.images ? 'complaint-images-error' : undefined}/></div>
+-            </label>)}
++            <legend>图片凭证 <em>选填，最多 3 张</em></legend>
++            <ComplaintDropZone label="选择或拖入凭证图" hint="PNG / JPEG / WebP，单张不超过 5 MB" multiple disabled={uploads.evidence.length >= 3} invalid={Boolean(errors.images)} errorId="complaint-images-error" onFiles={files => onFiles('evidence', files)}/>
++            {uploads.evidence.length > 0 && <div className="order-complaint-upload-list evidence" role="list" aria-live="polite">{uploads.evidence.map((item, index) => <ComplaintUploadItem item={item} label={`凭证图 ${index + 1}`} onRetry={value => onRetryUpload('evidence', value)} onRemove={value => onRemoveUpload('evidence', value)} key={item.id}/>)}</div>}
+             <ComplaintFieldError id="complaint-images-error" message={errors.images}/>
+           </fieldset>
+ 
+-          <label className="order-complaint-collect-image">
+-            <span>退款二维码 URL <em>选填</em></span>
+-            <div><Link2 size={14}/><input value={draft.collect_image} onChange={event => onChange('collect_image', event.target.value)} placeholder="https://.../refund-qr.png" inputMode="url" spellCheck="false" aria-invalid={Boolean(errors.collect_image)} aria-describedby={errors.collect_image ? 'complaint-collect-error' : undefined}/></div>
++          <fieldset className="order-complaint-collect-image">
++            <legend>退款二维码 <em>选填，最多 1 张</em></legend>
++            <ComplaintDropZone label={uploads.collect.length ? '替换退款二维码' : '选择或拖入退款二维码'} hint="PNG / JPEG / WebP，单张不超过 5 MB" invalid={Boolean(errors.collect_image)} errorId="complaint-collect-error" onFiles={files => onFiles('collect', files)}/>
++            {uploads.collect.length > 0 && <div className="order-complaint-upload-list collect" role="list" aria-live="polite"><ComplaintUploadItem item={uploads.collect[0]} label="退款二维码" onRetry={value => onRetryUpload('collect', value)} onRemove={value => onRemoveUpload('collect', value)}/></div>}
+             <ComplaintFieldError id="complaint-collect-error" message={errors.collect_image}/>
+-          </label>
++          </fieldset>
+         </div>
+ 
+         <div className="modal-foot order-complaint-foot">
+-          <span><ShieldCheck size={14}/>目标参数只读预览</span>
+-          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={busy}>{busy ? <RefreshCw className="spin" size={15}/> : <ShieldCheck size={15}/>}<span>{busy ? '正在校验' : '生成参数预览'}</span></button></div>
++          <span><FileUp size={14}/>{uploadBusy ? '图片正在上传' : '图片经本地服务上传'}</span>
++          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={uploadBusy}><ShieldCheck size={15}/><span>核对并继续</span></button></div>
+         </div>
+-      </form> : <div className="order-complaint-preview" aria-live="polite">
+-        <div className="order-complaint-preview-status" data-complaint-preview-focus tabIndex={-1}><Check size={18}/><div><strong>本地字段格式已校验，未向官方提交</strong><span>submitted: false · mode: preview</span><span>邮箱验证码：{emailCodeRequirement?.provided ? '已填写' : '官方启用邮箱验证时仍需填写'}</span></div></div>
+-        <dl className="order-complaint-target"><div><dt>目标方法</dt><dd>{COMPLAINT_TARGET.method}</dd></div><div><dt>目标地址</dt><dd>{COMPLAINT_TARGET.url}</dd></div></dl>
+-        <div className="order-complaint-payload-head"><div><span>REQUEST PAYLOAD</span><strong>官方字段预览</strong></div><QueryIconButton label="复制售后参数" onClick={() => onCopy(previewText)}><Clipboard size={15}/></QueryIconButton></div>
+-        <pre className="order-complaint-payload">{previewText}</pre>
++      </form>}
++
++      {(phase === 'confirm' || submitting) && <div className="order-complaint-confirm" aria-live="polite">
++        <div className="order-complaint-confirm-warning" data-complaint-phase-focus tabIndex={-1}><TriangleAlert size={18}/><div><strong>提交后本订单不能再次申请</strong><span>请确认投诉类型、说明、邮箱和图片无误。</span></div></div>
++        {error && <div className="order-complaint-error" role="alert"><TriangleAlert size={15}/><span>{error}</span>{submissionUnknown && <button className="button secondary" type="button" onClick={onRetryContext}><RotateCcw size={14}/>刷新状态</button>}</div>}
++        <dl className="order-complaint-confirm-facts"><div><dt>投诉类型</dt><dd>{snapshot.reason}</dd></div><div><dt>通知邮箱</dt><dd>{snapshot.contact}</dd></div><div className="wide"><dt>补充说明</dt><dd>{snapshot.content}</dd></div><div><dt>图片凭证</dt><dd>{snapshot.images.length} 张</dd></div><div><dt>退款二维码</dt><dd>{snapshot.collect_image ? '已上传' : '未上传'}</dd></div></dl>
++        {(uploads.evidence.length > 0 || uploads.collect.length > 0) && <div className="order-complaint-confirm-images">{[...uploads.evidence, ...uploads.collect].filter(item => item.status === 'done').map(item => <img src={item.previewUrl} alt="待提交图片" key={item.id}/>)}</div>}
+         <div className="modal-foot order-complaint-foot">
+-          <span><ShieldCheck size={14}/>本地预览已完成</span>
+-          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onBack}><ChevronLeft size={15}/>返回编辑</button><button className="button secondary" type="button" onClick={onClose}>关闭</button><button className="button primary" type="button" onClick={() => onCopy(previewText)}><Clipboard size={15}/>复制参数</button></div>
++          <span><ShieldCheck size={14}/>将提交到 pay.ldxp.cn</span>
++          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onBack} disabled={submitting || submissionUnknown}><ChevronLeft size={15}/>返回修改</button><button className="button primary danger" type="button" onClick={onConfirmSubmit} disabled={submitting || submissionUnknown}>{submitting ? <RefreshCw className="spin" size={15}/> : <Send size={15}/>} {submitting ? '正在提交' : '确认提交售后'}</button></div>
+         </div>
+       </div>}
++
++      {phase === 'success' && <div className="order-complaint-success" aria-live="polite" data-complaint-phase-focus tabIndex={-1}><Check size={24}/><strong>售后申请已提交</strong><span>{resultMessage}</span><button className="button primary" type="button" onClick={onClose}>完成</button></div>}
+     </div>
+   </div>;
+ }
+@@ -375,9 +456,13 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+   const [complaintOrder, setComplaintOrder] = useState(null);
+   const [complaintDraft, setComplaintDraft] = useState(null);
+   const [complaintErrors, setComplaintErrors] = useState({});
+-  const [complaintBusy, setComplaintBusy] = useState(false);
+   const [complaintError, setComplaintError] = useState('');
+-  const [complaintPreview, setComplaintPreview] = useState(null);
++  const [complaintPhase, setComplaintPhase] = useState('closed');
++  const [complaintContext, setComplaintContext] = useState(null);
++  const [complaintUploads, setComplaintUploads] = useState({evidence: [], collect: []});
++  const [complaintSnapshot, setComplaintSnapshot] = useState(null);
++  const [complaintResultMessage, setComplaintResultMessage] = useState('订单已进入售后待处理状态。');
++  const [complaintSubmissionUnknown, setComplaintSubmissionUnknown] = useState(false);
+   const requestVersion = useRef(0);
+   const detailRequestVersion = useRef(0);
+   const detailAbortController = useRef(null);
+@@ -389,18 +474,43 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+   const complaintTrigger = useRef(null);
+   const complaintDialog = useRef(null);
+   const complaintRequest = useRef(null);
++  const complaintUploadControllers = useRef(new Map());
++  const complaintSubmitController = useRef(null);
++  const complaintGeneration = useRef(0);
++  const complaintSubmitLock = useRef(false);
++  const complaintUploadsRef = useRef(complaintUploads);
++  complaintUploadsRef.current = complaintUploads;
+   const complaintOpen = Boolean(complaintOrder && complaintDraft);
+ 
++  const revokeComplaintUploadUrls = useCallback((uploads) => {
++    [...(uploads?.evidence || []), ...(uploads?.collect || [])].forEach(item => {
++      revokeComplaintPreview(item?.previewUrl);
++    });
++  }, []);
++
+   const closeComplaint = useCallback(() => {
++    if (complaintPhase === 'submitting') return;
++    complaintGeneration.current += 1;
+     complaintRequest.current?.abort();
+     complaintRequest.current = null;
+-    setComplaintBusy(false);
++    complaintSubmitController.current?.abort();
++    complaintSubmitController.current = null;
++    complaintUploadControllers.current.forEach(controller => controller.abort());
++    complaintUploadControllers.current.clear();
++    revokeComplaintUploadUrls(complaintUploadsRef.current);
+     setComplaintOrder(null);
+     setComplaintDraft(null);
+     setComplaintErrors({});
+     setComplaintError('');
+-    setComplaintPreview(null);
+-  }, []);
++    setComplaintPhase('closed');
++    setComplaintContext(null);
++    complaintUploadsRef.current = {evidence: [], collect: []};
++    setComplaintUploads({evidence: [], collect: []});
++    setComplaintSnapshot(null);
++    setComplaintResultMessage('订单已进入售后待处理状态。');
++    setComplaintSubmissionUnknown(false);
++    complaintSubmitLock.current = false;
++  }, [complaintPhase, revokeComplaintUploadUrls]);
+ 
+   const closeOrderDetail = useCallback(() => {
+     detailRequestVersion.current += 1;
+@@ -424,7 +534,14 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+     detailRequestVersion.current += 1;
+     detailAbortController.current?.abort();
+     detailAbortController.current = null;
+-  }, []);
++    complaintGeneration.current += 1;
++    complaintRequest.current?.abort();
++    complaintUploadControllers.current.forEach(controller => controller.abort());
++    complaintUploadControllers.current.clear();
++    complaintSubmitController.current?.abort();
++    complaintSubmitController.current = null;
++    revokeComplaintUploadUrls(complaintUploadsRef.current);
++  }, [revokeComplaintUploadUrls]);
+ 
+   useEffect(() => {
+     if (initialKeywordsApplied.current || !initialKeywords) return;
+@@ -478,22 +595,27 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+     document.body.classList.add('order-complaint-open');
+     const dialog = complaintDialog.current;
+     const focusFrame = window.requestAnimationFrame(() => {
+-      const selector = complaintPreview ? '[data-complaint-preview-focus]' : '[data-complaint-form-focus]';
++      const selector = complaintPhase === 'edit' ? '[data-complaint-form-focus]' : '[data-complaint-phase-focus]';
+       dialog?.querySelector(selector)?.focus();
+     });
+     const handleDialogKey = event => {
+       if (event.key === 'Escape') {
+         event.preventDefault();
+-        closeComplaint();
++        if (complaintPhase !== 'submitting') closeComplaint();
+         return;
+       }
+       if (event.key !== 'Tab' || !dialog) return;
+       const focusable = Array.from(dialog.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+-      if (!focusable.length) return;
++      if (!focusable.length) {
++        event.preventDefault();
++        dialog.focus();
++        return;
++      }
+       const first = focusable[0];
+       const last = focusable[focusable.length - 1];
+       const focusIsOutside = !dialog.contains(document.activeElement);
+-      if ((event.shiftKey && (document.activeElement === first || focusIsOutside)) || (!event.shiftKey && (document.activeElement === last || focusIsOutside))) {
++      const focusIsNotTabbable = !focusable.includes(document.activeElement);
++      if ((event.shiftKey && (document.activeElement === first || focusIsOutside || focusIsNotTabbable)) || (!event.shiftKey && (document.activeElement === last || focusIsOutside || focusIsNotTabbable))) {
+         event.preventDefault();
+         (event.shiftKey ? last : first).focus();
+       }
+@@ -504,13 +626,15 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+       document.body.classList.remove('order-complaint-open');
+       window.removeEventListener('keydown', handleDialogKey);
+     };
+-  }, [complaintOpen, complaintPreview, closeComplaint]);
++  }, [complaintOpen, complaintPhase, closeComplaint]);
+ 
+   useEffect(() => {
+     if (complaintOpen || !complaintTrigger.current) return;
+     const trigger = complaintTrigger.current;
+     complaintTrigger.current = null;
+-    window.requestAnimationFrame(() => trigger.focus());
++    window.requestAnimationFrame(() => {
++      if (trigger?.isConnected) trigger.focus();
++    });
+   }, [complaintOpen]);
+ 
+   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
+@@ -754,18 +878,229 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+ 
+   const copyOrderNumber = tradeNo => copyDetailValue(tradeNo, '订单号');
+ 
++  const complaintIdentity = useCallback((tradeNo = complaintOrder?.trade_no) => ({
++    keywords: submittedKeywords,
++    session_id: sessionId,
++    trade_no: tradeNo,
++  }), [complaintOrder?.trade_no, sessionId, submittedKeywords]);
++
++  const setUploadItem = (kind, id, patch) => {
++    const predicted = complaintUploadsRef.current;
++    complaintUploadsRef.current = {
++      ...predicted,
++      [kind]: (predicted[kind] || []).map(item => item.id === id ? {...item, ...patch} : item),
++    };
++    setComplaintUploads(current => {
++      const items = current[kind] || [];
++      if (!items.some(item => item.id === id)) return current;
++      const next = {...current, [kind]: items.map(item => item.id === id ? {...item, ...patch} : item)};
++      complaintUploadsRef.current = next;
++      return next;
++    });
++  };
++
++  const isCurrentComplaintUpload = (kind, item) => (complaintUploadsRef.current[kind] || [])
++    .some(value => value.id === item?.id && value.file === item?.file);
++
++  const uploadComplaintItem = async (kind, item, generation = complaintGeneration.current) => {
++    if (!item || generation !== complaintGeneration.current || !isCurrentComplaintUpload(kind, item)) return;
++    const controller = new AbortController();
++    complaintUploadControllers.current.get(item.id)?.abort();
++    complaintUploadControllers.current.set(item.id, controller);
++    setUploadItem(kind, item.id, {status: 'uploading', error: ''});
++    try {
++      const dataUrl = await readComplaintFile(item.file);
++      if (generation !== complaintGeneration.current || controller.signal.aborted || !isCurrentComplaintUpload(kind, item)) return;
++      const response = await request('/order-query/complaints/upload', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify({...complaintIdentity(), name: item.name, mime_type: item.mimeType, data_url: dataUrl}),
++        signal: controller.signal,
++      });
++      if (generation !== complaintGeneration.current || controller.signal.aborted || !isCurrentComplaintUpload(kind, item)) return;
++      if (!response?.url) throw new Error('上传响应缺少图片地址');
++      setUploadItem(kind, item.id, {status: 'done', url: String(response.url), error: ''});
++      setComplaintError('');
++      setComplaintDraft(current => {
++        if (!current) return current;
++        if (kind === 'evidence') {
++          const nextImages = [...current.images].filter(Boolean);
++          nextImages.push(String(response.url));
++          return {...current, images: nextImages.slice(0, 3)};
++        }
++        return {...current, collect_image: String(response.url)};
++      });
++      setComplaintErrors(current => {
++        const next = {...current};
++        delete next[kind === 'evidence' ? 'images' : 'collect_image'];
++        return next;
++      });
++    } catch (requestError) {
++      if (controller.signal.aborted || requestError?.name === 'AbortError' || generation !== complaintGeneration.current || !isCurrentComplaintUpload(kind, item)) return;
++      setUploadItem(kind, item.id, {status: 'error', error: requestError.message || '图片上传失败'});
++      setComplaintError(requestError.message || '图片上传失败');
++    } finally {
++      if (complaintUploadControllers.current.get(item.id) === controller) complaintUploadControllers.current.delete(item.id);
++    }
++  };
++
++  const removeComplaintUpload = (kind, item) => {
++    if (!item || !isCurrentComplaintUpload(kind, item)) return;
++    complaintUploadControllers.current.get(item.id)?.abort();
++    complaintUploadControllers.current.delete(item.id);
++    revokeComplaintPreview(item.previewUrl);
++    const currentUploads = complaintUploadsRef.current;
++    const nextUploads = {
++      ...currentUploads,
++      [kind]: (currentUploads[kind] || []).filter(value => value.id !== item.id),
++    };
++    complaintUploadsRef.current = nextUploads;
++    setComplaintUploads(current => {
++      const next = {...current, [kind]: (current[kind] || []).filter(value => value.id !== item.id)};
++      complaintUploadsRef.current = next;
++      return next;
++    });
++    setComplaintDraft(current => {
++      if (!current) return current;
++      if (kind === 'evidence') return {...current, images: current.images.filter(value => value !== item.url)};
++      return {...current, collect_image: ''};
++    });
++    if (item.url && sessionId && submittedKeywords) {
++      request('/order-query/complaints/upload/remove', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify({...complaintIdentity(), url: item.url}),
++      }).catch(() => {});
++    }
++    if (!nextUploads[kind].some(value => value.status === 'error')) {
++      setComplaintErrors(current => {
++        const next = {...current};
++        delete next[kind === 'evidence' ? 'images' : 'collect_image'];
++        return next;
++      });
++    }
++    setComplaintError('');
++  };
++
++  const onComplaintFiles = (kind, files) => {
++    if (!complaintDraft || complaintPhase !== 'edit') return;
++    const currentUploads = complaintUploadsRef.current;
++    const currentCount = kind === 'evidence' ? (currentUploads.evidence || []).length : 0;
++    const selection = selectComplaintImageFiles(files, {currentCount, limit: kind === 'evidence' ? 3 : 1});
++    if (selection.errors.length) {
++      const message = selection.errors.join('；');
++      const field = kind === 'evidence' ? 'images' : 'collect_image';
++      setComplaintErrors(current => ({...current, [field]: message}));
++      setComplaintError(message);
++    }
++    if (!selection.accepted.length) return;
++    const generation = complaintGeneration.current;
++    if (kind === 'collect' && currentUploads.collect?.[0]) removeComplaintUpload('collect', currentUploads.collect[0]);
++    const items = selection.accepted.map(file => ({
++      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`,
++      file,
++      name: String(file.name || 'image'),
++      mimeType: String(file.type || '').toLowerCase(),
++      previewUrl: complaintPreviewUrl(file),
++      status: 'queued',
++      url: '',
++      error: '',
++    }));
++    const latestUploads = complaintUploadsRef.current;
++    const nextUploads = {
++      ...latestUploads,
++      [kind]: kind === 'collect' ? items.slice(0, 1) : [...(latestUploads.evidence || []), ...items].slice(0, 3),
++    };
++    complaintUploadsRef.current = nextUploads;
++    setComplaintUploads(nextUploads);
++    if (kind === 'collect') setComplaintDraft(current => current ? {...current, collect_image: ''} : current);
++    items.forEach(item => uploadComplaintItem(kind, item, generation));
++  };
++
+   const openComplaint = (order, trigger) => {
+     if (detailOrder) return;
+-    const contact = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(submittedKeywords.trim()) ? submittedKeywords.trim() : '';
++    complaintGeneration.current += 1;
++    const generation = complaintGeneration.current;
+     complaintRequest.current?.abort();
+     complaintRequest.current = null;
++    complaintSubmitController.current?.abort();
++    complaintSubmitController.current = null;
++    complaintUploadControllers.current.forEach(controller => controller.abort());
++    complaintUploadControllers.current.clear();
++    revokeComplaintUploadUrls(complaintUploadsRef.current);
++    complaintSubmitLock.current = false;
++    const contact = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(submittedKeywords.trim()) ? submittedKeywords.trim() : '';
+     complaintTrigger.current = trigger;
+-    setComplaintBusy(false);
+     setComplaintOrder(order);
+     setComplaintDraft(createComplaintDraft(order, contact));
+     setComplaintErrors({});
+     setComplaintError('');
+-    setComplaintPreview(null);
++    setComplaintPhase('loading');
++    setComplaintContext(null);
++    complaintUploadsRef.current = {evidence: [], collect: []};
++    setComplaintUploads({evidence: [], collect: []});
++    setComplaintSnapshot(null);
++    setComplaintResultMessage('订单已进入售后待处理状态。');
++    setComplaintSubmissionUnknown(false);
++    if (!sessionId || !submittedKeywords) {
++      setComplaintPhase('error');
++      setComplaintError('订单查询会话已失效，请重新查询后再申请售后');
++      return;
++    }
++    const controller = new AbortController();
++    complaintRequest.current = controller;
++    request('/order-query/complaints/context', {
++      method: 'POST',
++      headers: {'Content-Type': 'application/json'},
++      body: JSON.stringify({keywords: submittedKeywords, session_id: sessionId, trade_no: order.trade_no}),
++      signal: controller.signal,
++    }).then(response => {
++      if (generation !== complaintGeneration.current || controller.signal.aborted) return;
++      if (!response || typeof response !== 'object') throw new Error('售后配置响应格式无效');
++      const rawStatus = response.complaint_status;
++      const status = (typeof rawStatus === 'number' && Number.isInteger(rawStatus))
++        || (typeof rawStatus === 'string' && /^-?\d+$/.test(rawStatus.trim()))
++        ? Number(rawStatus)
++        : NaN;
++      const rawCanComplaint = response.can_complaint;
++      const canComplaint = rawCanComplaint === true || rawCanComplaint === 1 || rawCanComplaint === '1';
++      // A sentinel -1 is actionable only when the upstream explicitly
++      // confirms that the complaint status is known.
++      const complaintStatusKnown = response.complaint_status_known === true;
++      if (!Number.isInteger(status) || ![-1, 0, 1].includes(status) || !complaintStatusKnown) {
++        setComplaintPhase('error');
++        setComplaintError('官方售后状态无法确认，请重试');
++        return;
++      }
++      setSessionId(String(response.session_id || sessionId));
++      setExpiresIn(Number(response.expires_in || expiresIn));
++      const context = {
++        ...response,
++        can_complaint: canComplaint,
++        complaint_status: status,
++        complaint_status_known: complaintStatusKnown,
++      };
++      setComplaintContext(context);
++      if (!canComplaint || status !== -1) {
++        setComplaintPhase('error');
++        setComplaintError(status !== -1 ? '该订单已有售后记录，不能重复申请' : '当前订单已超过售后期限');
++        return;
++      }
++      setComplaintPhase('edit');
++    }).catch(requestError => {
++      if (controller.signal.aborted || requestError?.name === 'AbortError' || generation !== complaintGeneration.current) return;
++      setComplaintPhase('error');
++      setComplaintError(requestError.message || '读取官方售后配置失败');
++    }).finally(() => {
++      if (complaintRequest.current === controller) complaintRequest.current = null;
++    });
++  };
++
++  const retryComplaintContext = () => {
++    if (!complaintOrder) return;
++    const order = complaintOrder;
++    const trigger = complaintTrigger.current;
++    openComplaint(order, trigger);
+   };
+ 
+   const updateComplaintField = (field, value) => {
+@@ -779,77 +1114,79 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+     setComplaintError('');
+   };
+ 
+-  const updateComplaintImage = (index, value) => {
+-    setComplaintDraft(current => {
+-      if (!current) return current;
+-      const images = [...current.images];
+-      images[index] = value;
+-      return {...current, images};
+-    });
+-    setComplaintErrors(current => {
+-      if (!current.images) return current;
+-      const next = {...current};
+-      delete next.images;
+-      return next;
+-    });
+-    setComplaintError('');
+-  };
+-
+-  const submitComplaintPreview = async event => {
++  const submitComplaintEdit = event => {
+     event.preventDefault();
+-    if (!complaintDraft || complaintBusy) return;
+-    const validation = validateComplaintPayload(complaintDraft);
+-    setComplaintErrors(validation.errors);
++    if (!complaintDraft || !complaintContext || complaintPhase !== 'edit') return;
++    const evidencePending = complaintUploads.evidence.some(item => item.status !== 'done');
++    const collectPending = complaintUploads.collect.some(item => item.status !== 'done');
++    const nextDraft = {
++      ...complaintDraft,
++      images: complaintUploads.evidence.filter(item => item.status === 'done' && item.url).map(item => item.url),
++      collect_image: complaintUploads.collect.find(item => item.status === 'done' && item.url)?.url || '',
++    };
++    const validation = validateComplaintPayload(nextDraft);
++    const errors = {...validation.errors};
++    if (evidencePending) errors.images = '请等待凭证图上传完成，失败图片可重试';
++    if (collectPending) errors.collect_image = '请等待退款二维码上传完成，失败图片可重试';
++    setComplaintErrors(errors);
+     setComplaintError('');
+-    if (!validation.valid) {
+-      setComplaintError('请检查标记字段后重新生成预览');
++    if (Object.keys(errors).length) {
++      setComplaintError('请检查标记字段后再继续');
+       window.requestAnimationFrame(() => document.querySelector('.order-complaint-modal [aria-invalid="true"]')?.focus());
+       return;
+     }
++    setComplaintDraft(nextDraft);
++    setComplaintSnapshot(validation.payload);
++    setComplaintSubmissionUnknown(false);
++    setComplaintPhase('confirm');
++  };
+ 
++  const confirmComplaintSubmit = async () => {
++    if (!complaintSnapshot || !complaintOrder || complaintPhase !== 'confirm' || complaintSubmitLock.current || complaintSubmissionUnknown || !sessionId || !submittedKeywords) return;
++    complaintSubmitLock.current = true;
++    const generation = complaintGeneration.current;
+     const controller = new AbortController();
+-    complaintRequest.current?.abort();
+-    complaintRequest.current = controller;
+-    setComplaintBusy(true);
++    complaintSubmitController.current = controller;
++    setComplaintError('');
++    setComplaintPhase('submitting');
+     try {
+-      const response = await request('/order-query/complaints/preview', {
++      const response = await request('/order-query/complaints/submit', {
+         method: 'POST',
+         headers: {'Content-Type': 'application/json'},
+-        body: JSON.stringify(validation.payload),
++        body: JSON.stringify({...complaintSnapshot, ...complaintIdentity()}),
+         signal: controller.signal,
+       });
+-      if (complaintRequest.current !== controller) return;
+-      if (response?.submitted !== false) throw new Error('本地预览响应缺少未提交标记');
+-      setComplaintPreview({
+-        submitted: false,
+-        mode: 'preview',
+-        target: COMPLAINT_TARGET,
+-        requirements: response.requirements || {
+-          email_code: {
+-            required_when: 'order.order_complaint_email_verify == 1',
+-            provided: Boolean(validation.payload.email_code),
+-          },
+-        },
+-        payload: normalizeComplaintPayload(response.payload || validation.payload),
+-      });
+-      notify({type: 'success', title: '售后参数格式已校验', message: '已生成本地预览，未向官方提交', duration: 4200});
++      if (response?.submitted !== true) {
++        setComplaintError('提交结果暂时无法确认，请刷新订单状态后再决定是否重试');
++        setComplaintSubmissionUnknown(true);
++        setComplaintPhase('confirm');
++        return;
++      }
++      setComplaintResultMessage(response.message || '订单已进入售后待处理状态。');
++      setComplaintPhase('success');
++      setResult(current => ({...current, orders: current.orders.map(order => order.trade_no === complaintOrder.trade_no ? {...order, complaint_status: 0, can_complaint: false} : order)}));
++      notify({type: 'success', title: '售后申请已提交', message: response.message || '订单已进入售后待处理状态', duration: 5200});
+     } catch (requestError) {
+-      if (complaintRequest.current !== controller || requestError.name === 'AbortError') return;
+-      setComplaintError(requestError.message || '售后参数校验失败');
+-    } finally {
+-      if (complaintRequest.current === controller) {
+-        complaintRequest.current = null;
+-        setComplaintBusy(false);
++      if (controller.signal.aborted || requestError?.name === 'AbortError') {
++        if (generation === complaintGeneration.current) {
++          complaintSubmitLock.current = false;
++          setComplaintPhase('confirm');
++        }
++        return;
+       }
+-    }
+-  };
+-
+-  const copyComplaintPayload = async text => {
+-    try {
+-      await navigator.clipboard.writeText(text);
+-      notify({type: 'success', title: '售后参数已复制', message: '已复制规范化请求 payload', duration: 3200});
+-    } catch {
+-      notify('无法访问剪贴板，请检查浏览器权限', 'error');
++      if (!requestError?.code || ['order_complaint_submission_unknown', 'order_complaint_submission_conflict'].includes(requestError.code)) {
++        setComplaintError(requestError?.code === 'order_complaint_submission_conflict'
++          ? '该订单可能已经提交售后，请刷新订单状态确认'
++          : '提交结果暂时无法确认，请刷新订单状态后再决定是否重试');
++        setComplaintSubmissionUnknown(true);
++        setComplaintPhase('confirm');
++        return;
++      }
++      setComplaintError(requestError.message || '售后提交失败，可检查后重试');
++      setComplaintPhase('confirm');
++      complaintSubmitLock.current = false;
++    } finally {
++      if (complaintSubmitController.current === controller) complaintSubmitController.current = null;
+     }
+   };
+ 
+@@ -941,15 +1278,21 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+       order={complaintOrder}
+       draft={complaintDraft}
+       errors={complaintErrors}
+-      busy={complaintBusy}
+       error={complaintError}
+-      preview={complaintPreview}
++      phase={complaintPhase}
++      uploads={complaintUploads}
++      snapshot={complaintSnapshot || complaintDraft}
++      resultMessage={complaintResultMessage}
++      submissionUnknown={complaintSubmissionUnknown}
+       dialogRef={complaintDialog}
+       onChange={updateComplaintField}
+-      onImageChange={updateComplaintImage}
+-      onSubmit={submitComplaintPreview}
+-      onCopy={copyComplaintPayload}
+-      onBack={() => { setComplaintPreview(null); setComplaintError(''); }}
++      onFiles={onComplaintFiles}
++      onRetryUpload={uploadComplaintItem}
++      onRemoveUpload={removeComplaintUpload}
++      onEditSubmit={submitComplaintEdit}
++      onConfirmSubmit={confirmComplaintSubmit}
++      onRetryContext={retryComplaintContext}
++      onBack={() => { setComplaintPhase('edit'); setComplaintError(''); }}
+       onClose={closeComplaint}
+       onCopyOrder={copyOrderNumber}
+     />}
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 02d002a..fa1236c 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -109,6 +109,8 @@ async function request(path, options) {
+     const error = new Error(payload.detail || '请求失败');
+     error.status = response.status;
+     error.payload = payload;
++    error.code = payload.code || '';
++    error.retryable = payload.retryable === true;
+     throw error;
+   }
+   return payload;
+diff --git a/frontend/src/orderQuery.css b/frontend/src/orderQuery.css
+index c555425..e42d008 100644
+--- a/frontend/src/orderQuery.css
++++ b/frontend/src/orderQuery.css
+@@ -185,6 +185,7 @@
+ 
+ body.order-complaint-open { overflow: hidden; }
+ .order-complaint-backdrop { z-index: 45; }
++body.order-complaint-open .toast { display: none; }
+ .order-complaint-modal { width: min(720px, 100%); padding: 20px; color: var(--ui-text); background: var(--ui-surface); border-color: var(--ui-border); }
+ .order-complaint-head { gap: 14px; }
+ .order-complaint-head > div { min-width: 0; }
+@@ -209,14 +210,18 @@ body.order-complaint-open { overflow: hidden; }
+ .order-complaint-notice svg,
+ .order-complaint-error svg { flex: 0 0 auto; }
+ .order-complaint-notice p { margin: 0; font-size: 10px; line-height: 1.5; }
+-.order-complaint-error span { min-width: 0; overflow-wrap: anywhere; font-size: 10px; }
++.order-complaint-error span { min-width: 0; flex: 1; overflow-wrap: anywhere; font-size: 10px; }
++.order-complaint-error .button { min-height: 30px; flex: 0 0 auto; padding-inline: 8px; font-size: 9px; }
+ .order-complaint-fields { margin-top: 13px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px 12px; }
+ .order-complaint-fields > label,
+-.order-complaint-images { min-width: 0; margin: 0; }
++.order-complaint-images,
++.order-complaint-collect-image { min-width: 0; margin: 0; }
+ .order-complaint-fields label > span,
+-.order-complaint-images > legend { min-height: 16px; margin: 0 0 5px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ui-text-muted); font-size: 10px; }
++.order-complaint-images > legend,
++.order-complaint-collect-image > legend { min-height: 16px; margin: 0 0 5px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ui-text-muted); font-size: 10px; }
+ .order-complaint-fields em,
+-.order-complaint-images em { color: var(--ui-text-faint); font-size: 8px; font-style: normal; font-weight: 500; }
++.order-complaint-images em,
++.order-complaint-collect-image em { color: var(--ui-text-faint); font-size: 8px; font-style: normal; font-weight: 500; }
+ .order-complaint-fields input,
+ .order-complaint-fields select { width: 100%; height: 38px; color: var(--ui-text); background: var(--ui-control); border-color: var(--ui-border); border-radius: 4px; }
+ .order-complaint-fields textarea { width: 100%; min-height: 96px; padding: 9px 10px; resize: vertical; color: var(--ui-text); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 4px; outline: 0; font: inherit; font-size: 11px; line-height: 1.55; }
+@@ -227,7 +232,9 @@ body.order-complaint-open { overflow: hidden; }
+ .order-complaint-images,
+ .order-complaint-collect-image { grid-column: 1 / -1; }
+ .order-complaint-images { padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; border: 0; }
++.order-complaint-collect-image { padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 7px; border: 0; }
+ .order-complaint-images > legend { width: 100%; grid-column: 1 / -1; }
++.order-complaint-collect-image > legend { width: 100%; }
+ .order-complaint-images label { min-width: 0; margin: 0; }
+ .order-complaint-images label > div,
+ .order-complaint-collect-image > div { position: relative; min-width: 0; }
+@@ -240,28 +247,64 @@ body.order-complaint-open { overflow: hidden; }
+ .order-complaint-foot > span { color: var(--ui-text-faint); }
+ .order-complaint-foot .button { white-space: nowrap; }
+ 
+-.order-complaint-preview { margin-top: 12px; }
+-.order-complaint-preview-status { min-height: 58px; padding: 11px 12px; display: flex; align-items: center; gap: 10px; color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 9%, var(--ui-surface)); border-left: 3px solid var(--ui-success); }
+-.order-complaint-preview-status > div { min-width: 0; }
+-.order-complaint-preview-status strong,
+-.order-complaint-preview-status span { display: block; }
+-.order-complaint-preview-status strong { color: var(--ui-text); font-size: 11px; }
+-.order-complaint-preview-status span { margin-top: 5px; color: var(--ui-text-muted); font-size: 9px; }
+-.order-complaint-preview-status:focus { outline: 2px solid color-mix(in srgb, var(--ui-success) 55%, transparent); outline-offset: 2px; }
+-.order-complaint-target { margin: 12px 0 0; display: grid; grid-template-columns: 120px minmax(0, 1fr); border: 1px solid var(--ui-border-soft); }
+-.order-complaint-target > div { min-width: 0; padding: 9px 10px; }
+-.order-complaint-target > div + div { border-left: 1px solid var(--ui-border-soft); }
+-.order-complaint-target dt { color: var(--ui-text-faint); font-size: 8px; }
+-.order-complaint-target dd { margin: 5px 0 0; overflow-wrap: anywhere; color: var(--ui-text); font-size: 10px; font-weight: 700; }
+-.order-complaint-payload-head { min-height: 48px; margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+-.order-complaint-payload-head > div { min-width: 0; }
+-.order-complaint-payload-head span,
+-.order-complaint-payload-head strong { display: block; }
+-.order-complaint-payload-head span { color: var(--ui-text-faint); font-size: 8px; font-weight: 750; }
+-.order-complaint-payload-head strong { margin-top: 4px; color: var(--ui-text); font-size: 11px; }
+-.order-complaint-payload-head .icon-button { width: 30px; height: 30px; flex: 0 0 30px; }
+-.order-complaint-payload { max-height: 280px; margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; line-height: 1.55; }
+-.order-complaint-modal .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
++/* Local evidence controls mirror the official picture-card workflow while keeping
++   the browser-selected bytes inside the current order session. */
++.order-complaint-form,
++.order-complaint-confirm { min-width: 0; min-height: 0; }
++.order-complaint-drop { min-height: 76px; grid-column: 1 / -1; padding: 12px 14px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--ui-text-muted); background: var(--ui-control); border: 1px dashed var(--ui-border); border-radius: 4px; cursor: pointer; text-align: left; }
++.order-complaint-drop:hover,
++.order-complaint-drop:focus-visible,
++.order-complaint-drop.dragging { color: var(--ui-text); background: var(--ui-surface-muted); border-color: var(--ui-text-muted); outline: 0; box-shadow: inset 0 0 0 1px var(--ui-text-muted); }
++.order-complaint-drop.disabled { cursor: not-allowed; opacity: .55; }
++.order-complaint-drop[aria-invalid="true"] { border-color: var(--ui-danger); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-danger) 40%, transparent); }
++.order-complaint-drop input { display: none; }
++.order-complaint-drop > span { min-width: 0; }
++.order-complaint-drop strong,
++.order-complaint-drop small { display: block; }
++.order-complaint-drop strong { color: inherit; font-size: 10px; }
++.order-complaint-drop small { margin-top: 4px; color: var(--ui-text-faint); font-size: 8px; }
++.order-complaint-upload-list { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
++.order-complaint-upload-list.collect { grid-template-columns: minmax(0, 1fr); }
++.order-complaint-upload { position: relative; min-width: 0; min-height: 88px; padding: 7px; display: grid; grid-template-columns: 54px minmax(0, 1fr) auto; gap: 7px; align-items: center; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 4px; }
++.order-complaint-upload > img { width: 54px; height: 54px; display: block; object-fit: cover; background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 3px; }
++.order-complaint-upload > div { min-width: 0; }
++.order-complaint-upload strong,
++.order-complaint-upload span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.order-complaint-upload strong { color: var(--ui-text); font-size: 9px; }
++.order-complaint-upload span { margin-top: 4px; color: var(--ui-text-faint); font-size: 8px; }
++.order-complaint-upload.error { border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border)); }
++.order-complaint-upload.error span,
++.order-complaint-upload > small { color: var(--ui-danger); }
++.order-complaint-upload > small { grid-column: 1 / -1; overflow-wrap: anywhere; font-size: 8px; line-height: 1.35; }
++.order-complaint-upload .icon-button { width: 29px; height: 29px; flex: 0 0 29px; }
++.order-complaint-loading,
++.order-complaint-success { min-height: 220px; margin-top: 12px; padding: 28px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--ui-text-muted); text-align: center; }
++.order-complaint-loading strong,
++.order-complaint-success strong { color: var(--ui-text); font-size: 13px; }
++.order-complaint-loading span,
++.order-complaint-success span { color: var(--ui-text-faint); font-size: 9px; line-height: 1.5; }
++.order-complaint-loading small { max-width: 360px; overflow-wrap: anywhere; color: var(--ui-danger); font-size: 9px; line-height: 1.45; }
++.order-complaint-loading.error { color: var(--ui-danger); }
++.order-complaint-loading .button { margin-top: 4px; min-height: 34px; }
++.order-complaint-confirm { margin-top: 12px; }
++.order-complaint-confirm-warning { min-height: 58px; padding: 11px 12px; display: flex; align-items: center; gap: 10px; color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, var(--ui-surface)); border-left: 3px solid var(--ui-warning); }
++.order-complaint-confirm-warning > div { min-width: 0; }
++.order-complaint-confirm-warning strong,
++.order-complaint-confirm-warning span { display: block; }
++.order-complaint-confirm-warning strong { color: var(--ui-text); font-size: 11px; }
++.order-complaint-confirm-warning span { margin-top: 4px; color: var(--ui-text-muted); font-size: 9px; line-height: 1.4; }
++.order-complaint-confirm-warning:focus { outline: 2px solid color-mix(in srgb, var(--ui-warning) 55%, transparent); outline-offset: 2px; }
++.order-complaint-confirm-facts { margin: 12px 0 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); border-left: 1px solid var(--ui-border-soft); }
++.order-complaint-confirm-facts > div { min-width: 0; min-height: 52px; padding: 9px 10px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
++.order-complaint-confirm-facts > div.wide { grid-column: 1 / -1; }
++.order-complaint-confirm-facts dt { color: var(--ui-text-faint); font-size: 8px; }
++.order-complaint-confirm-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; color: var(--ui-text); font-size: 10px; line-height: 1.45; }
++.order-complaint-confirm-images { margin-top: 10px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
++.order-complaint-confirm-images img { width: 100%; aspect-ratio: 1; display: block; object-fit: cover; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; }
++.order-complaint-success { margin-top: 12px; color: var(--ui-success); }
++.order-complaint-success .button { margin-top: 7px; min-width: 100px; }
++.order-complaint-modal .button.danger { color: #fff; background: var(--ui-danger); border-color: var(--ui-danger); }
++.order-complaint-modal .button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-danger) 82%, #000); border-color: color-mix(in srgb, var(--ui-danger) 82%, #000); }
+ 
+ .order-empty-state { min-height: 210px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); text-align: center; }
+ .order-empty-state strong { margin-top: 3px; color: var(--ui-text-muted); font-size: 12px; }
+@@ -440,18 +483,33 @@ body.order-complaint-open { overflow: hidden; }
+   .order-pagination > span { max-width: 210px; line-height: 1.5; }
+   .order-update-indicator { right: 12px; bottom: 65px; }
+   .order-complaint-backdrop { padding: 8px; }
+-  .order-complaint-modal { width: 100%; max-height: calc(100dvh - 16px); padding: 14px; }
++  .order-complaint-modal { width: 100%; max-height: calc(100dvh - 16px); padding: 14px; overflow-x: hidden; }
+   .order-complaint-fields { grid-template-columns: 1fr; gap: 10px; }
+   .order-complaint-content,
+   .order-complaint-images,
+   .order-complaint-collect-image { grid-column: 1; }
+   .order-complaint-images { grid-template-columns: 1fr; }
+   .order-complaint-images > legend { grid-column: 1; }
+-  .order-complaint-target { grid-template-columns: 1fr; }
+-  .order-complaint-target > div + div { border-top: 1px solid var(--ui-border-soft); border-left: 0; }
+-  .order-complaint-payload { max-height: 220px; }
+   .order-complaint-foot { align-items: stretch; flex-direction: column; gap: 9px; }
+   .order-complaint-foot > span { display: none; }
+-  .order-complaint-foot .modal-foot-actions { width: 100%; display: flex; flex-wrap: nowrap; gap: 6px; }
+-  .order-complaint-foot .button { min-width: 0; flex: 1; padding-inline: 7px; }
++  .order-complaint-foot .modal-foot-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
++  .order-complaint-foot .button { min-width: 0; width: 100%; padding-inline: 7px; white-space: normal; line-height: 1.25; }
++  .order-complaint-upload-list { grid-template-columns: 1fr; }
++  .order-complaint-upload { min-height: 0; padding: 6px; grid-template-columns: 54px minmax(0, 1fr) auto auto; gap: 5px; }
++  .order-complaint-upload > img { width: 100%; height: auto; aspect-ratio: 1; grid-column: 1 / -1; }
++  .order-complaint-upload .icon-button { width: 30px; height: 30px; }
++  .order-complaint-confirm-facts { grid-template-columns: 1fr; }
++  .order-complaint-confirm-facts > div.wide { grid-column: 1; }
++  .order-complaint-confirm-images { grid-template-columns: repeat(3, minmax(0, 1fr)); }
++}
++
++@media (max-width: 390px) {
++  .order-complaint-backdrop { padding: 0; place-items: stretch; }
++  .order-complaint-modal { min-height: 100dvh; max-height: 100dvh; padding: 12px; border-width: 0; }
++  .order-complaint-order small { overflow-wrap: anywhere; }
++  .order-complaint-drop { min-height: 68px; padding: 10px; }
++  .order-complaint-error { align-items: flex-start; flex-wrap: wrap; }
++  .order-complaint-error .button { width: 100%; }
++  .order-complaint-upload > img { width: 54px; height: 54px; grid-column: 1; }
++  .order-complaint-confirm-images { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+ }
+diff --git a/frontend/src/orderQueryModel.js b/frontend/src/orderQueryModel.js
+index 9ffe358..e376b7a 100644
+--- a/frontend/src/orderQueryModel.js
++++ b/frontend/src/orderQueryModel.js
+@@ -16,6 +16,9 @@ export const COMPLAINT_REASON_OPTIONS = Object.freeze([
+   '描述不符',
+ ]);
+ 
++export const COMPLAINT_IMAGE_TYPES = Object.freeze(['image/png', 'image/jpeg', 'image/webp']);
++export const COMPLAINT_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
++
+ const COMPLAINT_STATUS_META = Object.freeze({
+   '-1': {label: '售后已撤销', tone: 'muted'},
+   0: {label: '售后待处理', tone: 'pending'},
+@@ -92,6 +95,8 @@ export function createComplaintDraft(order = {}, contact = '') {
+     reason: '',
+     content: '',
+     contact: normalizedText(contact),
++    // Keep three empty slots in the model for callers that still consume the
++    // legacy draft shape; the upload UI stores completed URLs in these slots.
+     images: ['', '', ''],
+     collect_image: '',
+     query_pwd: '',
+@@ -111,7 +116,8 @@ export function normalizeComplaintPayload(raw = {}) {
+     images,
+     collect_image: normalizedText(raw.collect_image),
+     query_pwd: normalizedText(raw.query_pwd),
+-    email_code: normalizedText(raw.email_code),
++    // The platform accepts an empty email_code when email verification is disabled.
++    email_code: '',
+   };
+ }
+ 
+@@ -126,13 +132,37 @@ export function validateComplaintPayload(raw = {}) {
+   if (!payload.contact) errors.contact = '请输入通知邮箱';
+   else if (payload.contact.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.contact)) errors.contact = '请输入正确的邮箱地址';
+   if (!/^\d{6}$/.test(payload.query_pwd)) errors.query_pwd = '查询密码必须为 6 位数字';
+-  if (payload.email_code && !/^[A-Za-z0-9]{1,32}$/.test(payload.email_code)) errors.email_code = '邮箱验证码只能包含 1 至 32 位字母或数字';
+-  if (payload.images.length > 3) errors.images = '图片凭证最多填写 3 个 URL';
+-  else if (payload.images.some(value => !isHttpUrl(value))) errors.images = '图片凭证必须使用有效的 HTTP 或 HTTPS URL';
+-  if (payload.collect_image && !isHttpUrl(payload.collect_image)) errors.collect_image = '退款二维码必须使用有效的 HTTP 或 HTTPS URL';
++  if (payload.images.length > 3) errors.images = '图片凭证最多上传 3 张';
++  else if (payload.images.some(value => !isHttpUrl(value))) errors.images = '图片凭证尚未上传完成';
++  if (payload.collect_image && !isHttpUrl(payload.collect_image)) errors.collect_image = '退款二维码尚未上传完成';
+   return {valid: Object.keys(errors).length === 0, errors, payload};
+ }
+ 
++export function complaintImageFileError(file) {
++  if (!file || !COMPLAINT_IMAGE_TYPES.includes(String(file.type || '').toLowerCase())) {
++    return '仅支持 PNG、JPEG 或 WebP 图片';
++  }
++  const size = Number(file.size || 0);
++  if (!Number.isFinite(size) || size <= 0) return '图片文件为空';
++  if (size > COMPLAINT_MAX_IMAGE_BYTES) return '单张图片不能超过 5 MB';
++  return '';
++}
++
++export function selectComplaintImageFiles(files, {currentCount = 0, limit = 3} = {}) {
++  const accepted = [];
++  const errors = [];
++  for (const file of Array.from(files || [])) {
++    if (currentCount + accepted.length >= limit) {
++      errors.push(`最多上传 ${limit} 张图片`);
++      break;
++    }
++    const error = complaintImageFileError(file);
++    if (error) errors.push(`${String(file?.name || '图片')}：${error}`);
++    else accepted.push(file);
++  }
++  return {accepted, errors};
++}
++
+ export function orderStatusMeta(value, upstreamLabel = '') {
+   const key = finiteNumber(value, -1);
+   const meta = ORDER_STATUS_META[key] || {label: '状态未知', tone: 'neutral'};
+diff --git a/frontend/src/orderQueryModel.test.js b/frontend/src/orderQueryModel.test.js
+index 5080363..e9431f9 100644
+--- a/frontend/src/orderQueryModel.test.js
++++ b/frontend/src/orderQueryModel.test.js
+@@ -2,8 +2,10 @@ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import {
+   canOpenProtectedOrderDetail,
++  COMPLAINT_MAX_IMAGE_BYTES,
+   COMPLAINT_REASON_OPTIONS,
+   complaintActionForOrder,
++  complaintImageFileError,
+   complaintStatusMeta,
+   createComplaintDraft,
+   formatOrderDateTime,
+@@ -20,6 +22,7 @@ import {
+   orderStatusMeta,
+   safeOrderContentUrl,
+   safeOfficialOrderUrl,
++  selectComplaintImageFiles,
+   summarizeOrders,
+   validateComplaintPayload,
+   verificationLabel,
+@@ -71,7 +74,7 @@ test('distinguishes complaint actions and statuses conservatively', () => {
+   assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: null}).kind, 'none');
+ });
+ 
+-test('creates and normalizes the exact complaint preview payload', () => {
++test('creates and normalizes the exact complaint submission payload', () => {
+   const draft = createComplaintDraft({trade_no: ' LD-1001 '}, ' buyer@example.com ');
+   assert.deepEqual(draft.images, ['', '', '']);
+   const payload = normalizeComplaintPayload({
+@@ -92,7 +95,7 @@ test('creates and normalizes the exact complaint preview payload', () => {
+     images: ['https://cdn.example.test/one.png', 'https://cdn.example.test/two.png'],
+     collect_image: 'https://cdn.example.test/qr.png',
+     query_pwd: '123456',
+-    email_code: '9988',
++    email_code: '',
+   });
+ });
+ 
+@@ -122,8 +125,6 @@ test('validates complaint fields, limits and URL schemes', () => {
+   assert.ok(validateComplaintPayload({...valid, query_pwd: '1234567'}).errors.query_pwd);
+   assert.ok(validateComplaintPayload({...valid, query_pwd: '１２３４５６'}).errors.query_pwd);
+   assert.ok(validateComplaintPayload({...valid, query_pwd: 'abc123'}).errors.query_pwd);
+-  assert.ok(validateComplaintPayload({...valid, email_code: 'code-with-symbols'}).errors.email_code);
+-  assert.equal(validateComplaintPayload({...valid, email_code: 'Code123'}).valid, true);
+   assert.ok(validateComplaintPayload({...valid, images: ['https://a.test/1', 'https://a.test/2', 'https://a.test/3', 'https://a.test/4']}).errors.images);
+   assert.ok(validateComplaintPayload({...valid, images: ['javascript:alert(1)']}).errors.images);
+   assert.ok(validateComplaintPayload({...valid, images: ['https://user:secret@a.test/image.png']}).errors.images);
+@@ -131,6 +132,68 @@ test('validates complaint fields, limits and URL schemes', () => {
+   assert.ok(validateComplaintPayload({...valid, collect_image: 'file:///tmp/qr.png'}).errors.collect_image);
+ });
+ 
++test('validates complaint image MIME types and size boundaries', () => {
++  const validFiles = [
++    {name: 'proof.png', type: 'image/png', size: 1},
++    {name: 'proof.jpg', type: 'IMAGE/JPEG', size: COMPLAINT_MAX_IMAGE_BYTES},
++    {name: 'proof.webp', type: 'image/webp', size: 1024},
++  ];
++  validFiles.forEach(file => assert.equal(complaintImageFileError(file), ''));
++
++  assert.equal(
++    complaintImageFileError({name: 'proof.gif', type: 'image/gif', size: 1}),
++    '仅支持 PNG、JPEG 或 WebP 图片',
++  );
++  assert.equal(
++    complaintImageFileError({name: 'empty.png', type: 'image/png', size: 0}),
++    '图片文件为空',
++  );
++  assert.equal(
++    complaintImageFileError({name: 'large.png', type: 'image/png', size: COMPLAINT_MAX_IMAGE_BYTES + 1}),
++    '单张图片不能超过 5 MB',
++  );
++  assert.equal(
++    complaintImageFileError({name: 'missing-type', size: 10}),
++    '仅支持 PNG、JPEG 或 WebP 图片',
++  );
++});
++
++test('selects complaint image files while retaining valid files and reporting limits', () => {
++  const png = {name: 'proof.png', type: 'image/png', size: 1024};
++  const jpeg = {name: 'proof.jpg', type: 'image/jpeg', size: 2048};
++  const webp = {name: 'proof.webp', type: 'image/webp', size: 4096};
++  const invalid = {name: 'proof.gif', type: 'image/gif', size: 1024};
++  const oversized = {name: 'large.webp', type: 'image/webp', size: COMPLAINT_MAX_IMAGE_BYTES + 1};
++
++  const selected = selectComplaintImageFiles([png, invalid, jpeg, oversized, webp]);
++  assert.deepEqual(selected.accepted, [png, jpeg, webp]);
++  assert.deepEqual(selected.errors, [
++    'proof.gif：仅支持 PNG、JPEG 或 WebP 图片',
++    'large.webp：单张图片不能超过 5 MB',
++  ]);
++
++  const limited = selectComplaintImageFiles([png, jpeg, webp], {currentCount: 2});
++  assert.deepEqual(limited.accepted, [png]);
++  assert.deepEqual(limited.errors, ['最多上传 3 张图片']);
++});
++
++test('always submits a blank email code when verification is disabled', () => {
++  const base = {
++    trade_no: 'LD-1001',
++    reason: COMPLAINT_REASON_OPTIONS[0],
++    content: '补充说明',
++    contact: 'buyer@example.com',
++    images: [],
++    collect_image: '',
++    query_pwd: '123456',
++    email_code: '',
++  };
++
++  const result = validateComplaintPayload({...base, email_code: 'ignored-value'});
++  assert.equal(result.valid, true);
++  assert.equal(result.payload.email_code, '');
++});
++
+ test('normalizes pagination and computes current page summary', () => {
+   const result = normalizeOrderResponse({
+     orders: [
+diff --git a/start.ps1 b/start.ps1
+index 20bcf5b..d2fa1d0 100644
+--- a/start.ps1
++++ b/start.ps1
+@@ -119,14 +119,19 @@ function Wait-LdxpBackend([int]$Port, $Process) {
+         }
+         try {
+             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
+-            if ($health.ok -and $health.sub2api_accounts -and $health.sub2api_card_import_history_delete) {
++            if (
++                $health.ok `
++                -and $health.sub2api_accounts `
++                -and $health.sub2api_card_import_history_delete `
++                -and $health.order_complaint_submit
++            ) {
+                 return
+             }
+         }
+         catch {}
+         Start-Sleep -Milliseconds 200
+     }
+-    throw 'Backend readiness check failed: Sub2API account-list or import-history deletion route was not loaded'
++    throw 'Backend readiness check failed: required Sub2API or order complaint routes were not loaded'
+ }
+ 
+ if (-not (Test-Path -LiteralPath $viteCommand)) {
