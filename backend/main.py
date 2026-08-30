@@ -1125,6 +1125,7 @@ def sub2api_automation_state() -> dict[str, Any]:
         "last_result": None,
         "pending_card_codes": [],
         "imported_order_nos": [],
+        "run_history": [],
     }
     value = _setting_json("sub2api_automation_state", fallback)
     if not isinstance(value, dict):
@@ -1133,12 +1134,15 @@ def sub2api_automation_state() -> dict[str, Any]:
     value["pending_card_codes"] = pending if isinstance(pending, list) else []
     imported = value.get("imported_order_nos")
     value["imported_order_nos"] = imported if isinstance(imported, list) else []
+    history = value.get("run_history")
+    value["run_history"] = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
     return {
         "last_run": value.get("last_run"),
         "last_error": str(value.get("last_error") or "")[:500],
         "last_result": value.get("last_result") if isinstance(value.get("last_result"), dict) else None,
         "pending_card_codes": value["pending_card_codes"][:100],
         "imported_order_nos": value["imported_order_nos"][-500:],
+        "run_history": value["run_history"][-20:],
     }
 
 
@@ -1663,6 +1667,116 @@ def reclaim_sub2api_401_accounts(
     }
 
 
+def _sub2api_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().replace(".", "", 1).isdigit():
+            return datetime.fromtimestamp(float(value), timezone.utc)
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _sub2api_monitor_summary(
+    accounts: list[dict[str, Any]],
+    proxies: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now(timezone.utc)
+    expiring_cutoff = current.timestamp() + (7 * 86400)
+    platform_counts: dict[str, dict[str, int]] = {}
+    recent_errors = []
+    active_accounts = 0
+    error_accounts = 0
+    schedulable_accounts = 0
+    rate_limited_accounts = 0
+    expiring_accounts = 0
+
+    for account in accounts:
+        status = str(account.get("status") or "unknown").strip().lower()
+        platform = str(account.get("platform") or "unknown").strip().lower() or "unknown"
+        bucket = platform_counts.setdefault(platform, {"count": 0, "errors": 0})
+        bucket["count"] += 1
+        if status == "active":
+            active_accounts += 1
+        if bool(account.get("schedulable", status == "active")):
+            schedulable_accounts += 1
+        error_message = str(account.get("error_message") or "").strip()
+        if status == "error" or error_message:
+            error_accounts += 1
+            bucket["errors"] += 1
+            recent_errors.append({
+                "id": account.get("id"),
+                "name": str(account.get("name") or f"账号 {account.get('id') or '-'}")[:160],
+                "platform": platform,
+                "status": status,
+                "error": error_message[:300] or "账号状态异常",
+                "updated_at": account.get("updated_at"),
+            })
+        account_expiry = _sub2api_datetime(account.get("expires_at"))
+        if account_expiry and current.timestamp() <= account_expiry.timestamp() <= expiring_cutoff:
+            expiring_accounts += 1
+        limited_until = max(
+            (
+                stamp.timestamp()
+                for stamp in (
+                    _sub2api_datetime(account.get("rate_limit_reset_at")),
+                    _sub2api_datetime(account.get("overload_until")),
+                    _sub2api_datetime(account.get("temp_unschedulable_until")),
+                )
+                if stamp is not None
+            ),
+            default=0,
+        )
+        if limited_until > current.timestamp():
+            rate_limited_accounts += 1
+
+    def error_sort_key(item: dict[str, Any]) -> float:
+        stamp = _sub2api_datetime(item.get("updated_at"))
+        return stamp.timestamp() if stamp else 0
+
+    recent_errors.sort(key=error_sort_key, reverse=True)
+    active_proxies = sum(1 for proxy in proxies if str(proxy.get("status") or "").lower() == "active")
+    unhealthy_proxies = sum(
+        1
+        for proxy in proxies
+        if str(proxy.get("status") or "").lower() not in ("", "active")
+        or str(proxy.get("latency_status") or "").lower() in {"error", "failed", "timeout", "unreachable"}
+    )
+    expiring_proxies = sum(
+        1
+        for proxy in proxies
+        if (expiry := _sub2api_datetime(proxy.get("expires_at")))
+        and current.timestamp() <= expiry.timestamp() <= expiring_cutoff
+    )
+    inactive_groups = sum(1 for group in groups if str(group.get("status") or "").lower() not in ("", "active"))
+    platforms = [
+        {"platform": platform, **counts}
+        for platform, counts in sorted(platform_counts.items(), key=lambda item: (-item[1]["count"], item[0]))
+    ]
+    return {
+        "fetched_at": utc_now(),
+        "total_accounts": len(accounts),
+        "active_accounts": active_accounts,
+        "error_accounts": error_accounts,
+        "inactive_accounts": max(0, len(accounts) - active_accounts - error_accounts),
+        "schedulable_accounts": schedulable_accounts,
+        "unschedulable_accounts": max(0, len(accounts) - schedulable_accounts),
+        "rate_limited_accounts": rate_limited_accounts,
+        "expiring_accounts": expiring_accounts,
+        "active_proxies": active_proxies,
+        "unhealthy_proxies": unhealthy_proxies,
+        "expiring_proxies": expiring_proxies,
+        "inactive_groups": inactive_groups,
+        "platforms": platforms,
+        "recent_errors": recent_errors[:8],
+    }
+
+
 def fetch_sub2api_options() -> dict[str, Any]:
     config = sub2api_settings(reveal=True)
     if not config["admin_key"]:
@@ -1700,6 +1814,14 @@ def fetch_sub2api_options() -> dict[str, Any]:
             "port": port,
             "status": str(item.get("status") or ""),
             "account_count": account_count,
+            "expires_at": item.get("expires_at"),
+            "fallback_mode": str(item.get("fallback_mode") or "none"),
+            "latency_ms": item.get("latency_ms"),
+            "latency_status": str(item.get("latency_status") or ""),
+            "quality_grade": str(item.get("quality_grade") or ""),
+            "quality_score": item.get("quality_score"),
+            "country_code": str(item.get("country_code") or ""),
+            "region": str(item.get("region") or "")[:120],
         })
 
     groups = []
@@ -1717,8 +1839,11 @@ def fetch_sub2api_options() -> dict[str, Any]:
             "platform": str(item.get("platform") or ""),
             "status": str(item.get("status") or ""),
             "account_count": account_count,
+            "subscription_type": str(item.get("subscription_type") or ""),
+            "rate_multiplier": item.get("rate_multiplier"),
         })
 
+    accounts = _sub2api_fetch_accounts(config)
     return {
         "ok": True,
         "proxy_service_available": True,
@@ -1726,6 +1851,7 @@ def fetch_sub2api_options() -> dict[str, Any]:
         "group_count": len(groups),
         "proxies": proxies,
         "groups": groups,
+        "monitor": _sub2api_monitor_summary(accounts, proxies, groups),
     }
 
 
@@ -1965,6 +2091,10 @@ def run_sub2api_automation_cycle() -> dict[str, Any]:
         "last_result": summary,
         "pending_card_codes": pending,
         "imported_order_nos": imported_order_nos,
+        "run_history": (
+            state.get("run_history", [])
+            + [{"run_at": utc_now(), "status": "success", **summary}]
+        )[-20:],
     }
     _store_sub2api_automation_state(state)
     return {"ok": True, "settings": settings, "state": state, "result": summary}
@@ -2457,6 +2587,10 @@ class Sub2ApiAutomationWorker(threading.Thread):
                 "last_result": previous.get("last_result"),
                 "pending_card_codes": previous.get("pending_card_codes", []),
                 "imported_order_nos": previous.get("imported_order_nos", []),
+                "run_history": (
+                    previous.get("run_history", [])
+                    + [{"run_at": utc_now(), "status": "error", "error": str(exc)[:500]}]
+                )[-20:],
             }
             _store_sub2api_automation_state(state)
             return {"ok": False, "detail": state["last_error"], "state": state}

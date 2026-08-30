@@ -18,11 +18,14 @@ import {
   EyeOff,
   FileUp,
   Filter,
+  Gauge,
   History,
+  Layers3,
   Link2,
   ListChecks,
   Moon,
   Minus,
+  Network,
   Package,
   PanelRight,
   Plus,
@@ -30,14 +33,18 @@ import {
   Save,
   Search,
   SlidersHorizontal,
+  Settings2,
   KeyRound,
   Sun,
   Tag,
+  TimerReset,
+  TriangleAlert,
   Upload,
   ShieldCheck,
   ShoppingBag,
   Store,
   Trash2,
+  Wifi,
   X,
   Zap,
 } from 'lucide-react';
@@ -856,7 +863,7 @@ function App() {
   const [sub2apiResult, setSub2apiResult] = useState(null);
   const [sub2apiBusy, setSub2apiBusy] = useState(false);
   const [sub2apiOptionsBusy, setSub2apiOptionsBusy] = useState(false);
-  const [sub2apiOptions, setSub2apiOptions] = useState({loaded: false, proxies: [], groups: [], proxy_count: 0, group_count: 0});
+  const [sub2apiOptions, setSub2apiOptions] = useState({loaded: false, proxies: [], groups: [], proxy_count: 0, group_count: 0, monitor: null});
   const [sub2apiProxyChoice, setSub2apiProxyChoice] = useState('json');
   const [sub2apiGroupIds, setSub2apiGroupIds] = useState([]);
   const [sub2apiCodexFingerprintMode, setSub2apiCodexFingerprintMode] = useState('off');
@@ -1031,9 +1038,15 @@ function App() {
   useEffect(() => {
     if (activeView !== 'sub2api') return undefined;
     loadSub2ApiAutomation();
-    const timer = window.setInterval(() => loadSub2ApiAutomation(), 5000);
-    return () => window.clearInterval(timer);
-  }, [activeView]);
+    const stateTimer = window.setInterval(() => loadSub2ApiAutomation(), 5000);
+    const monitorTimer = window.setInterval(() => {
+      if (sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
+    }, 60000);
+    return () => {
+      window.clearInterval(stateTimer);
+      window.clearInterval(monitorTimer);
+    };
+  }, [activeView, sub2apiConfig.admin_key_set]);
 
   const fastestInterval = [...items, ...shops, ...preorders.filter(entry => entry.enabled)]
     .filter(item => item.enabled)
@@ -2098,50 +2111,126 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payloa
   const successCount = importResult?.success ?? importResult?.account_created;
   const failedCount = importResult?.failed ?? importResult?.account_failed;
   const fingerprint = result?.fingerprint_verification;
+  const monitor = options.monitor || {};
+  const selectedProxy = options.proxies.find(proxy => `proxy:${proxy.id}` === proxyChoice);
+  const selectedGroups = options.groups.filter(group => groupIds.includes(group.id));
+  const activeGroups = options.groups.filter(group => !group.status || group.status === 'active');
   const automationReady = Boolean(config.admin_key_set && proxyChoice.startsWith('proxy:') && groupIds.length && codexFingerprintMode !== 'off' && automation.auto_import);
   const automationResult = automationState?.last_result;
+  const runHistory = Array.isArray(automationState?.run_history) ? [...automationState.run_history].reverse() : [];
+  const recentErrors = Array.isArray(monitor.recent_errors) ? monitor.recent_errors : [];
+  const platforms = Array.isArray(monitor.platforms) ? monitor.platforms : [];
+  const nextRun = automation.enabled && automationState?.last_run
+    ? new Date(new Date(automationState.last_run).getTime() + (Number(automation.interval_seconds || 0) * 1000))
+    : null;
+  const fingerprintModes = [
+    {value: 'off', label: '透传'},
+    {value: 'device', label: '设备'},
+    {value: 'session', label: '设备 + 会话'},
+    {value: 'full', label: '完全'},
+  ];
+  const readiness = [
+    {label: '管理员密钥', ready: Boolean(config.admin_key_set)},
+    {label: '固定代理', ready: Boolean(selectedProxy)},
+    {label: '导入分组', ready: groupIds.length > 0},
+    {label: '指纹策略', ready: codexFingerprintMode !== 'off'},
+  ];
+  const proxyLabel = proxyChoice === 'json' ? `JSON 自带（${jsonProxyCount}）` : selectedProxy?.name || '不绑定代理';
+  const fingerprintLabel = fingerprintModes.find(mode => mode.value === codexFingerprintMode)?.label || '透传';
+  const maxPlatformCount = Math.max(1, ...platforms.map(item => Number(item.count || 0)));
+  const selectActiveGroups = () => activeGroups.forEach(group => {
+    if (!groupIds.includes(group.id)) onToggleGroup(group.id);
+  });
+  const clearGroups = () => groupIds.forEach(onToggleGroup);
+
   return (
-    <section className="tool-view">
-      <p className="tool-muted">Sub2API 管理员 API Key 通过 x-api-key 发送，不是 JWT。</p>
-      <div className="tool-grid">
-        <div className="tool-panel">
-          <div className="section-heading"><div><span className="detail-kicker">SUB2API ADMIN</span><h2>Sub2API 配置</h2><p>管理员密钥仅通过后端代理发送</p></div><Upload size={22}/></div>
-          <label><span>Sub2API 地址</span><input value={config.base_url} onChange={event => setConfig({...config, base_url: event.target.value})} placeholder="http://127.0.0.1:8080"/></label>
-          <label><span>管理员密钥 {config.admin_key_set && <small>已保存 {config.admin_key_mask}</small>}</span><input type="password" value={adminKey} onChange={event => setAdminKey(event.target.value)} placeholder={config.admin_key_set ? '留空以保留现有密钥' : '粘贴管理员密钥'} autoComplete="off"/></label>
-          <div className="tool-actions"><button className="button primary" onClick={onSave}><Save size={15}/>保存配置</button><button className="button secondary" onClick={onTest} disabled={busy}><Activity size={15}/>测试连接</button><button className="button secondary" onClick={onReclaim401} disabled={reclaimBusy || busy}><KeyRound size={15}/>{reclaimBusy ? '正在扫描' : '一键找回 401'}</button></div>
-          {result && <div className={`connection-result ${result.ok ? 'ok' : 'bad'}`}>{result.ok ? `连接成功${result.account_count == null ? '' : `，账号 ${result.account_count} 个`}` : (result.detail || `上游 HTTP ${result.upstream_status}`)}</div>}
-          {reclaimResult && <div className={`connection-result ${reclaimResult.ok ? 'ok' : 'bad'}`}>扫描 {reclaimResult.scanned_accounts} 个账号，明确 401 为 {reclaimResult.accounts_401} 个，提交卡密 {reclaimResult.card_code_count} 个，跳过其他错误 {reclaimResult.skipped_non_401} 个</div>}
-        </div>
-        <div className="tool-panel">
-          <div className="section-heading"><div><span className="detail-kicker">ACCOUNT JSON</span><h2>一键导入账号</h2><p>支持 sub2api-data / sub2api-bundle</p></div><FileUp size={22}/></div>
-          <label className={`file-drop ${dragging ? 'dragging' : ''}`} onDragEnter={event => { event.preventDefault(); setDragging(true); }} onDragOver={event => event.preventDefault()} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={event => { event.preventDefault(); setDragging(false); onFiles(event.dataTransfer.files); }}><input type="file" accept="application/json,.json" multiple onChange={onFile}/><FileUp size={24}/><strong>{fileName || '选择或拖入账号 JSON 文件'}</strong><small>{accountCount ? `${accountCount} 个账号待导入` : '可同时选择或拖入多个 JSON'}</small></label>
-          {payload && <pre className="json-preview">{JSON.stringify({type: payload.type, version: payload.version, files: fileName, proxies: Array.isArray(payload.proxies) ? payload.proxies.length : 0, accounts: accountCount}, null, 2)}</pre>}
-          <div className="import-options">
-            <div className="import-options-head"><div><strong>代理与分组</strong><small>{options.loaded ? `${options.proxy_count} 个代理 · ${options.group_count} 个分组` : '尚未加载'}</small></div><button className="icon-button" title="刷新代理和分组" aria-label="刷新代理和分组" onClick={onLoadOptions} disabled={optionsBusy}><RefreshCw size={15} className={optionsBusy ? 'spin' : ''}/></button></div>
-            <label><span>导入代理</span><select value={proxyChoice} onChange={event => onProxyChoice(event.target.value)}><option value="json">JSON 自带代理（{jsonProxyCount}）</option><option value="none">不绑定代理</option>{options.proxies.map(proxy => <option value={`proxy:${proxy.id}`} key={proxy.id}>{proxy.name} · {proxy.protocol}://{proxy.host}:{proxy.port}</option>)}</select></label>
-            <label><span>Codex 指纹收敛（OpenAI OAuth / Setup Token）</span><select data-testid="codex-fingerprint-mode" value={codexFingerprintMode} onChange={event => onCodexFingerprintMode(event.target.value)}><option value="off">关闭（透传，默认）</option><option value="device">仅设备</option><option value="session">设备 + 会话</option><option value="full">完全收敛</option></select></label>
-            <div className="group-picker"><span>导入分组</span>{options.groups.length ? <div>{options.groups.map(group => <label key={group.id}><input type="checkbox" checked={groupIds.includes(group.id)} onChange={() => onToggleGroup(group.id)}/><span><strong>{group.name}</strong><small>{group.platform || '通用'} · {group.account_count} 个账号</small></span></label>)}</div> : <p>{options.loaded ? 'Sub2API 当前没有可用分组' : '保存配置后加载分组'}</p>}</div>
+    <section className="tool-view sub2api-view">
+      <div className="sub2api-service-strip">
+        <div className={`sub2api-service-state ${config.admin_key_set ? 'connected' : ''}`}><Wifi size={17}/><span><strong>{config.admin_key_set ? 'Sub2API 已配置' : 'Sub2API 待配置'}</strong><small>{config.base_url || '未设置服务地址'}</small></span></div>
+        <div><span>账号</span><strong>{monitor.total_accounts ?? '--'}</strong></div>
+        <div><span>代理</span><strong>{options.proxy_count ?? 0}</strong></div>
+        <div><span>分组</span><strong>{options.group_count ?? 0}</strong></div>
+        <div><span>监控刷新</span><strong>{monitor.fetched_at ? compactTime(monitor.fetched_at) : '尚未同步'}</strong></div>
+        <button className="icon-button" title="刷新 Sub2API 状态" aria-label="刷新 Sub2API 状态" onClick={onLoadOptions} disabled={optionsBusy || !config.admin_key_set}><RefreshCw size={16} className={optionsBusy ? 'spin' : ''}/></button>
+      </div>
+
+      <div className="tool-grid sub2api-primary-grid">
+        <div className="tool-panel sub2api-config-panel">
+          <div className="section-heading"><div><span className="detail-kicker">SUB2API ADMIN</span><h2>连接配置</h2><p>x-api-key · 后端代理</p></div><Settings2 size={21}/></div>
+          <div className="sub2api-config-fields">
+            <label><span>服务地址</span><input value={config.base_url} onChange={event => setConfig({...config, base_url: event.target.value})} placeholder="http://127.0.0.1:8080"/></label>
+            <label><span>管理员密钥 {config.admin_key_set && <small>{config.admin_key_mask}</small>}</span><input type="password" value={adminKey} onChange={event => setAdminKey(event.target.value)} placeholder={config.admin_key_set ? '留空保留现有密钥' : '输入管理员密钥'} autoComplete="off"/></label>
           </div>
-          <button className="button primary import-button" onClick={onImport} disabled={!payload || busy}><Upload size={15}/>{busy ? '正在导入' : '一键导入账号'}</button>
+          <div className="tool-actions compact-actions"><button className="button primary" onClick={onSave}><Save size={15}/>保存</button><button className="button secondary" onClick={onTest} disabled={busy}><Activity size={15}/>测试</button><button className="button secondary" onClick={onReclaim401} disabled={reclaimBusy || busy}><KeyRound size={15}/>{reclaimBusy ? '扫描中' : '扫描并找回 401'}</button></div>
+          {result && !result.mode && <div className={`connection-result ${result.ok ? 'ok' : 'bad'}`}>{result.ok ? `连接成功${result.account_count == null ? '' : ` · ${result.account_count} 个账号`}` : (result.detail || `上游 HTTP ${result.upstream_status}`)}</div>}
+          {reclaimResult && <div className={`connection-result ${reclaimResult.ok ? 'ok' : 'bad'}`}>扫描 {reclaimResult.scanned_accounts} · 401 {reclaimResult.accounts_401} · 提交 {reclaimResult.card_code_count} · 跳过 {reclaimResult.skipped_non_401}</div>}
+          <div className="sub2api-capability-grid"><div><span className={config.admin_key_set ? 'ready' : ''}/><small>管理认证</small><strong>{config.admin_key_set ? '已保存' : '待配置'}</strong></div><div><span className={options.loaded ? 'ready' : ''}/><small>账号读取</small><strong>{options.loaded ? '正常' : '待同步'}</strong></div><div><span className={options.proxy_service_available ? 'ready' : ''}/><small>代理资源</small><strong>{options.proxy_service_available ? `${options.proxy_count} 个` : '待同步'}</strong></div><div><span className={automationState ? 'ready' : ''}/><small>自动化状态</small><strong>{automationState ? '已连接' : '待同步'}</strong></div></div>
+        </div>
+        <div className="tool-panel sub2api-import-panel">
+          <div className="section-heading"><div><span className="detail-kicker">ACCOUNT JSON</span><h2>账号导入</h2><p>sub2api-data / sub2api-bundle</p></div><FileUp size={21}/></div>
+          <label className={`file-drop sub2api-file-drop ${dragging ? 'dragging' : ''}`} onDragEnter={event => { event.preventDefault(); setDragging(true); }} onDragOver={event => event.preventDefault()} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={event => { event.preventDefault(); setDragging(false); onFiles(event.dataTransfer.files); }}><input type="file" accept="application/json,.json" multiple onChange={onFile}/><FileUp size={22}/><strong>{fileName || '选择或拖入账号 JSON'}</strong><small>{accountCount ? `${accountCount} 个账号 · ${jsonProxyCount} 个代理` : '支持多文件合并'}</small></label>
+          <div className="import-strategy-summary">
+            <div><Network size={15}/><span>代理<strong>{proxyLabel}</strong></span></div>
+            <div><Layers3 size={15}/><span>分组<strong>{selectedGroups.length ? `${selectedGroups.length} 个已选` : '未分组'}</strong></span></div>
+            <div><ShieldCheck size={15}/><span>指纹<strong>{fingerprintLabel}</strong></span></div>
+          </div>
+          <button className="button primary import-button" onClick={onImport} disabled={!payload || busy}><Upload size={15}/>{busy ? '正在导入' : accountCount ? `导入 ${accountCount} 个账号` : '导入账号'}</button>
           {importResult && <div className="connection-result ok">导入完成（HTTP {result.upstream_status}）{successCount == null ? '' : `，成功 ${successCount}`}{failedCount == null ? '' : `，失败 ${failedCount}`}</div>}
           {fingerprint && <div className={`connection-result ${fingerprint.unresolved || fingerprint.error ? 'bad' : 'ok'}`}>指纹模式 {fingerprint.mode}：符合 {fingerprint.eligible} 个，已核对 {fingerprint.matched} 个，直接生效 {fingerprint.verified - fingerprint.repaired} 个，补写 {fingerprint.repaired} 个，未匹配 {fingerprint.unresolved} 个{fingerprint.error ? `；核对失败：${fingerprint.error}` : ''}</div>}
         </div>
       </div>
-      <div className="automation-band">
+
+      <div className="automation-console">
         <div className="automation-head">
-          <div><span className="detail-kicker">401 AUTOMATION</span><h2>定时找回与自动导入</h2></div>
-          <div className={`automation-readiness ${automationReady ? 'ready' : ''}`}><ShieldCheck size={15}/>{automationReady ? '配置完整' : '等待代理、分组与指纹配置'}</div>
+          <div><span className="detail-kicker">401 AUTOMATION CONTROL</span><h2>定时找回与自动导入</h2><p>账号健康、找回队列与导入策略</p></div>
+          <div className="automation-head-actions"><span className={`automation-readiness ${automationReady ? 'ready' : ''}`}><ShieldCheck size={15}/>{automationReady ? '自动化就绪' : `${readiness.filter(item => !item.ready).length} 项待配置`}</span><button className="button secondary" onClick={onRunAutomation} disabled={automationBusy || !automation.enabled}><RefreshCw size={15} className={automationBusy ? 'spin' : ''}/>立即检查</button><button className="button primary" onClick={onSaveAutomation} disabled={automationBusy}><Save size={15}/>{automationBusy ? '处理中' : '保存策略'}</button></div>
         </div>
-        <div className="automation-controls">
-          <label className="automation-toggle"><button className={`switch ${automation.enabled ? 'on' : ''}`} role="switch" aria-checked={automation.enabled} title={automation.enabled ? '关闭自动监控' : '开启自动监控'} disabled={!automation.enabled && !automationReady} onClick={() => onAutomationChange(current => ({...current, enabled: !current.enabled}))}><span/></button><span><strong>自动监控 401</strong><small>仅处理明确的 401 授权错误</small></span></label>
-          <label className="automation-toggle"><input type="checkbox" checked={automation.auto_import} onChange={event => onAutomationChange(current => ({...current, auto_import: event.target.checked}))}/><span><strong>找回后自动导入</strong><small>使用上方代理、分组和指纹设置</small></span></label>
-          <label className="automation-interval"><span>监控间隔</span><div><input type="number" min="10" max="86400" value={automation.interval_seconds} onChange={event => onAutomationChange(current => ({...current, interval_seconds: Math.max(10, Math.min(86400, Number(event.target.value) || 10))}))} inputMode="numeric"/><span>秒</span></div></label>
-          <div className="automation-actions"><button className="button primary" onClick={onSaveAutomation} disabled={automationBusy}><Save size={15}/>{automationBusy ? '正在处理' : '保存自动化'}</button><button className="button secondary" onClick={onRunAutomation} disabled={automationBusy || !automation.enabled}><RefreshCw size={15} className={automationBusy ? 'spin' : ''}/>立即检查</button></div>
+
+        <div className="automation-metrics">
+          <div><span>账号总量</span><strong>{monitor.total_accounts ?? '--'}</strong><small>{platforms.length} 个平台</small></div>
+          <div><span>可调度</span><strong className="positive">{monitor.schedulable_accounts ?? '--'}</strong><small>{monitor.unschedulable_accounts ?? 0} 个不可调度</small></div>
+          <div><span>账号异常</span><strong className={monitor.error_accounts ? 'negative' : ''}>{monitor.error_accounts ?? '--'}</strong><small>{monitor.expiring_accounts ?? 0} 个 7 日内到期</small></div>
+          <div><span>限流 / 过载</span><strong className={monitor.rate_limited_accounts ? 'warning' : ''}>{monitor.rate_limited_accounts ?? '--'}</strong><small>含临时不可调度</small></div>
+          <div><span>代理异常</span><strong className={monitor.unhealthy_proxies ? 'negative' : ''}>{monitor.unhealthy_proxies ?? '--'}</strong><small>{monitor.active_proxies ?? 0} 个活跃</small></div>
+          <div><span>找回队列</span><strong>{automationState?.pending_card_codes?.length ?? 0}</strong><small>{automationResult?.downloaded ?? 0} 个最近下载</small></div>
         </div>
-        <div className={`automation-status ${automationState?.last_error ? 'bad' : automationResult ? 'ok' : ''}`}>
-          <span>最近运行：{automationState?.last_run ? compactTime(automationState.last_run) : '尚未运行'}</span>
-          {automationState?.last_error ? <strong>{automationState.last_error}</strong> : automationResult ? <strong>扫描 {automationResult.scanned_accounts ?? 0} 个 · 401 {automationResult.accounts_401 ?? 0} 个 · 下载 {automationResult.downloaded ?? 0} 个 · {automationResult.imported ? '已自动导入' : '无需导入'}</strong> : <strong>等待首次检查</strong>}
-          {automationState?.pending_card_codes?.length > 0 && <small>{automationState.pending_card_codes.length} 个卡密正在等待找回</small>}
+
+        <div className="automation-workspace">
+          <section className="automation-setting-card">
+            <div className="automation-card-head"><TimerReset size={17}/><span><strong>运行计划</strong><small>{automation.enabled ? '自动执行中' : '自动执行已关闭'}</small></span></div>
+            <div className="automation-toggle-row"><span><strong>401 定时监控</strong><small>明确授权错误进入找回队列</small></span><button className={`switch ${automation.enabled ? 'on' : ''}`} role="switch" aria-checked={automation.enabled} title={automation.enabled ? '关闭自动监控' : '开启自动监控'} disabled={!automation.enabled && !automationReady} onClick={() => onAutomationChange(current => ({...current, enabled: !current.enabled}))}><span/></button></div>
+            <label className="automation-check-row"><input type="checkbox" checked={automation.auto_import} onChange={event => onAutomationChange(current => ({...current, auto_import: event.target.checked}))}/><span><strong>找回后自动导入</strong><small>应用右侧固定分配策略</small></span></label>
+            <label className="automation-interval"><span>检查间隔</span><div><input type="number" min="10" max="86400" value={automation.interval_seconds} onChange={event => onAutomationChange(current => ({...current, interval_seconds: Math.max(10, Math.min(86400, Number(event.target.value) || 10))}))} inputMode="numeric"/><span>秒</span></div></label>
+            <div className="interval-presets">{[60, 300, 900, 3600].map(seconds => <button className={Number(automation.interval_seconds) === seconds ? 'active' : ''} key={seconds} onClick={() => onAutomationChange(current => ({...current, interval_seconds: seconds}))}>{intervalLabel(seconds)}</button>)}</div>
+            <div className="automation-readiness-grid">{readiness.map(item => <span className={item.ready ? 'ready' : ''} key={item.label}>{item.ready ? <Check size={13}/> : <AlertCircle size={13}/>} {item.label}</span>)}</div>
+          </section>
+
+          <section className="automation-setting-card assignment-card">
+            <div className="automation-card-head"><Network size={17}/><span><strong>代理、分组与指纹</strong><small>手动导入与自动导入共用</small></span><button className="icon-button" title="刷新代理和分组" aria-label="刷新代理和分组" onClick={onLoadOptions} disabled={optionsBusy}><RefreshCw size={15} className={optionsBusy ? 'spin' : ''}/></button></div>
+            <label><span>固定代理</span><select value={proxyChoice} onChange={event => onProxyChoice(event.target.value)}><option value="json">JSON 自带代理（仅手动导入）</option><option value="none">不绑定代理</option>{options.proxies.map(proxy => <option value={`proxy:${proxy.id}`} key={proxy.id}>{proxy.name} · {proxy.status || 'unknown'}{proxy.latency_ms == null ? '' : ` · ${proxy.latency_ms}ms`}</option>)}</select></label>
+            {selectedProxy && <div className="selected-proxy-meta"><span>{selectedProxy.protocol}://{selectedProxy.host}:{selectedProxy.port}</span><span>{selectedProxy.account_count} 个账号</span><span>{selectedProxy.quality_grade || selectedProxy.country_code || '未评级'}</span></div>}
+            <div className="fingerprint-field"><span>Codex 指纹收敛</span><div className="fingerprint-segment" data-testid="codex-fingerprint-mode">{fingerprintModes.map(mode => <button className={codexFingerprintMode === mode.value ? 'active' : ''} key={mode.value} onClick={() => onCodexFingerprintMode(mode.value)}>{mode.label}</button>)}</div></div>
+            <div className="group-picker automation-group-picker"><div className="group-picker-head"><span>导入分组 <strong>{groupIds.length}</strong></span><div><button onClick={selectActiveGroups}>全选活跃</button><button onClick={clearGroups} disabled={!groupIds.length}>清空</button></div></div>{options.groups.length ? <div>{options.groups.map(group => <label className={group.status && group.status !== 'active' ? 'inactive' : ''} key={group.id}><input type="checkbox" checked={groupIds.includes(group.id)} onChange={() => onToggleGroup(group.id)}/><span><strong>{group.name}</strong><small>{group.platform || '通用'} · {group.account_count} 个账号 · {group.status || 'active'}</small></span></label>)}</div> : <p>{options.loaded ? '当前没有可用分组' : '连接后加载分组'}</p>}</div>
+          </section>
+
+          <section className="automation-setting-card runtime-card">
+            <div className="automation-card-head"><Gauge size={17}/><span><strong>运行状态</strong><small>{automationState?.last_error ? '最近执行异常' : automationResult ? '最近执行完成' : '等待首次执行'}</small></span></div>
+            <div className={`runtime-state ${automationState?.last_error ? 'bad' : automationResult ? 'ok' : ''}`}><span className="runtime-dot"/><strong>{automationState?.last_error ? '执行失败' : automation.enabled ? '监控运行中' : '监控已暂停'}</strong></div>
+            <dl className="runtime-details"><div><dt>最近运行</dt><dd>{automationState?.last_run ? compactTime(automationState.last_run) : '--'}</dd></div><div><dt>下次运行</dt><dd>{nextRun && !Number.isNaN(nextRun.getTime()) ? compactTime(nextRun) : '--'}</dd></div><div><dt>扫描账号</dt><dd>{automationResult?.scanned_accounts ?? 0}</dd></div><div><dt>发现 401</dt><dd>{automationResult?.accounts_401 ?? 0}</dd></div><div><dt>完成下载</dt><dd>{automationResult?.downloaded ?? 0}</dd></div><div><dt>自动导入</dt><dd>{automationResult?.imported ? '已完成' : '无'}</dd></div></dl>
+            {automationState?.last_error && <div className="runtime-error"><TriangleAlert size={14}/><span>{automationState.last_error}</span></div>}
+            <div className="platform-health"><span>平台分布</span>{platforms.length ? platforms.slice(0, 5).map(item => <div key={item.platform}><strong>{item.platform}</strong><span><i style={{width: `${Math.max(5, (Number(item.count || 0) / maxPlatformCount) * 100)}%`}}/></span><em>{item.count}{item.errors ? ` / ${item.errors} 异常` : ''}</em></div>) : <small>暂无账号数据</small>}</div>
+          </section>
+        </div>
+
+        <div className="automation-activity-grid">
+          <section className="automation-activity-panel">
+            <div className="activity-panel-head"><div><span className="detail-kicker">RECENT RUNS</span><h3>运行记录</h3></div><span>{runHistory.length} 条</span></div>
+            <div className="automation-run-list">{runHistory.length ? runHistory.slice(0, 6).map((entry, index) => <div className={entry.status === 'error' ? 'bad' : ''} key={`${entry.run_at}-${index}`}><span>{compactTime(entry.run_at)}</span><strong>{entry.status === 'error' ? '失败' : entry.imported ? '找回并导入' : '检查完成'}</strong><small>{entry.status === 'error' ? entry.error : `扫描 ${entry.scanned_accounts ?? 0} · 401 ${entry.accounts_401 ?? 0} · 下载 ${entry.downloaded ?? 0}`}</small></div>) : <div className="compact-empty"><Clock3 size={16}/>暂无运行记录</div>}</div>
+          </section>
+          <section className="automation-activity-panel">
+            <div className="activity-panel-head"><div><span className="detail-kicker">ACCOUNT ALERTS</span><h3>最近账号异常</h3></div><span>{monitor.error_accounts ?? 0} 个</span></div>
+            <div className="account-alert-list">{recentErrors.length ? recentErrors.map(account => <div key={account.id || account.name}><TriangleAlert size={15}/><span><strong>{account.name}</strong><small>{account.platform} · {account.error}</small></span><em>{account.status}</em></div>) : <div className="compact-empty"><ShieldCheck size={16}/>当前没有账号异常</div>}</div>
+          </section>
         </div>
       </div>
     </section>

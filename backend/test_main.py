@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from unittest.mock import patch
 from io import BytesIO
 from pathlib import Path
@@ -1127,6 +1128,38 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual([item["id"] for item in accounts], [1, 2, 3])
 
+    def test_sub2api_monitor_summary_reports_account_and_proxy_health(self):
+        now = datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc)
+        accounts = [
+            {"id": 1, "name": "Ready", "platform": "openai", "status": "active", "schedulable": True},
+            {
+                "id": 2, "name": "Limited", "platform": "openai", "status": "active", "schedulable": False,
+                "rate_limit_reset_at": "2026-08-30T09:00:00Z", "expires_at": 1788253200,
+            },
+            {
+                "id": 3, "name": "Broken", "platform": "anthropic", "status": "error", "schedulable": False,
+                "error_message": "Token revoked (401)", "updated_at": "2026-08-30T07:30:00Z",
+            },
+        ]
+        proxies = [
+            {"status": "active", "latency_status": "success"},
+            {"status": "active", "latency_status": "timeout", "expires_at": "2026-09-02T08:00:00Z"},
+        ]
+        groups = [{"status": "active"}, {"status": "inactive"}]
+
+        result = main._sub2api_monitor_summary(accounts, proxies, groups, now=now)
+
+        self.assertEqual(result["total_accounts"], 3)
+        self.assertEqual(result["active_accounts"], 2)
+        self.assertEqual(result["error_accounts"], 1)
+        self.assertEqual(result["schedulable_accounts"], 1)
+        self.assertEqual(result["rate_limited_accounts"], 1)
+        self.assertEqual(result["unhealthy_proxies"], 1)
+        self.assertEqual(result["expiring_proxies"], 1)
+        self.assertEqual(result["inactive_groups"], 1)
+        self.assertEqual(result["recent_errors"][0]["name"], "Broken")
+        self.assertEqual(result["platforms"][0]["platform"], "openai")
+
     def test_sub2api_automation_requires_import_proxy_group_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "test.db"
@@ -1214,6 +1247,7 @@ class GoodsParserTests(unittest.TestCase):
             "last_result": None,
             "pending_card_codes": ["team-CARD-1"],
             "imported_order_nos": [],
+            "run_history": [],
         }
         reclaim = {
             "ok": True,
@@ -1237,6 +1271,7 @@ class GoodsParserTests(unittest.TestCase):
         self.assertTrue(result["result"]["imported"])
         self.assertEqual(stored[-1]["pending_card_codes"], [])
         self.assertEqual(stored[-1]["imported_order_nos"], [])
+        self.assertEqual(stored[-1]["run_history"][-1]["status"], "success")
 
     def test_sub2api_automation_and_reclaim_progress_routes(self):
         with tempfile.TemporaryDirectory() as directory:
