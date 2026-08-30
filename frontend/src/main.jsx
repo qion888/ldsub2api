@@ -17,8 +17,10 @@ import {
   ListChecks,
   Minus,
   Package,
+  Pin,
   Plus,
   RefreshCw,
+  Search,
   Save,
   KeyRound,
   Upload,
@@ -122,6 +124,103 @@ function IconButton({label, children, tone = '', ...props}) {
   return <button className={`icon-button ${tone}`} title={label} aria-label={label} {...props}>{children}</button>;
 }
 
+function storedFilterValue(key, fallback) {
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const value = window.localStorage.getItem(key);
+    return value === null ? fallback : value;
+  } catch {
+    return fallback;
+  }
+}
+
+function storedSortOrder() {
+  const value = storedFilterValue('ldxp.productFilter.sort', 'default');
+  return ['default', 'asc', 'desc'].includes(value) ? value : 'default';
+}
+
+function productTitle(item) {
+  return String(item?.latest?.title || item?.name || '').trim();
+}
+
+function productNameMatches(item, query) {
+  const terms = String(query || '').toLocaleLowerCase().split(/[\s,，、]+/).filter(Boolean);
+  if (!terms.length) return true;
+  const name = [item?.latest?.title, item?.name].filter(Boolean).join(' ').toLocaleLowerCase();
+  return terms.every(term => name.includes(term));
+}
+
+function productPrice(item) {
+  const rawValue = item?.latest?.price;
+  if (rawValue === null || rawValue === undefined || String(rawValue).trim() === '') return null;
+  const value = Number(rawValue);
+  return Number.isFinite(value) ? value : null;
+}
+
+function productHasStock(item) {
+  const value = Number(item?.latest?.stock);
+  return Number.isFinite(value) && value > 0;
+}
+
+function sortProducts(products, sortOrder) {
+  if (sortOrder === 'default') return products;
+  return products
+    .map((item, index) => ({item, index, price: productPrice(item)}))
+    .sort((left, right) => {
+      if (left.price === null && right.price === null) return left.index - right.index;
+      if (left.price === null) return 1;
+      if (right.price === null) return -1;
+      const difference = sortOrder === 'asc' ? left.price - right.price : right.price - left.price;
+      return difference || left.index - right.index;
+    })
+    .map(entry => entry.item);
+}
+
+function ProductNameFilter({value, onChange, pinned, onTogglePin, matchCount, totalCount, sortOrder, onSortChange, stockOnly, onToggleStock}) {
+  const hasQuery = value.trim().length > 0;
+  const hasFilter = hasQuery || stockOnly;
+  return (
+    <div className={`product-filter ${pinned ? 'pinned' : ''}`}>
+      <div className="product-filter-input">
+        <Search size={16} aria-hidden="true"/>
+        <input
+          type="search"
+          value={value}
+          onChange={event => onChange(event.target.value)}
+          placeholder="按商品名称查找"
+          aria-label="按商品名称查找"
+          spellCheck="false"
+        />
+        {hasQuery && <IconButton label="清除名称筛选" onClick={() => onChange('')}><X size={14}/></IconButton>}
+      </div>
+      <div className="product-filter-actions">
+        <span className="filter-count">{hasFilter ? `匹配 ${matchCount} / ${totalCount}` : `${totalCount} 项商品`}</span>
+        <label className="stock-toggle">
+          <input type="checkbox" checked={stockOnly} onChange={event => onToggleStock(event.target.checked)} />
+          <span>仅看有货</span>
+        </label>
+        <label className="product-sort">
+          <span>价格</span>
+          <select value={sortOrder} onChange={event => onSortChange(event.target.value)} aria-label="价格排序">
+            <option value="default">默认</option>
+            <option value="asc">价格正序</option>
+            <option value="desc">价格倒序</option>
+          </select>
+        </label>
+        <button
+          type="button"
+          className={`filter-pin ${pinned ? 'active' : ''}`}
+          aria-pressed={pinned}
+          title={pinned ? '取消固定筛选栏' : '固定筛选栏'}
+          onClick={onTogglePin}
+        >
+          <Pin size={14}/><span>{pinned ? '已固定' : '固定筛选'}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [items, setItems] = useState([]);
   const [shops, setShops] = useState([]);
@@ -134,9 +233,15 @@ function App() {
   const [categoryId, setCategoryId] = useState('');
   const [goodsType, setGoodsType] = useState('card');
   const [shopFilter, setShopFilter] = useState(null);
+  const [productSearch, setProductSearch] = useState(() => storedFilterValue('ldxp.productFilter.query', ''));
+  const [filterPinned, setFilterPinned] = useState(() => storedFilterValue('ldxp.productFilter.pinned', 'false') === 'true');
+  const [productSort, setProductSort] = useState(storedSortOrder);
+  const [stockOnly, setStockOnly] = useState(() => storedFilterValue('ldxp.productFilter.stockOnly', 'false') === 'true');
   const [checkedIds, setCheckedIds] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [history, setHistory] = useState([]);
+  const [historyWatchId, setHistoryWatchId] = useState(null);
+  const historyRequestId = useRef(0);
   const [cart, setCart] = useState([]);
   const [contact, setContact] = useState({contact: '', note: ''});
   const [queryPassword, setQueryPassword] = useState('');
@@ -226,11 +331,15 @@ function App() {
   };
 
   const loadHistory = async id => {
-    if (!id) return setHistory([]);
+    const requestId = ++historyRequestId.current;
+    setHistory([]);
+    setHistoryWatchId(id ?? null);
+    if (!id) return;
     try {
-      setHistory(await request(`/watches/${id}/history?limit=60`));
+      const nextHistory = await request(`/watches/${id}/history?limit=60`);
+      if (historyRequestId.current === requestId) setHistory(nextHistory);
     } catch {
-      setHistory([]);
+      if (historyRequestId.current === requestId) setHistory([]);
     }
   };
 
@@ -246,6 +355,17 @@ function App() {
     request('/sub2api/config').then(config => setSub2apiConfig(config)).catch(() => {});
     loadSub2ApiAutomation({syncSettings: true});
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('ldxp.productFilter.query', productSearch);
+      window.localStorage.setItem('ldxp.productFilter.pinned', String(filterPinned));
+      window.localStorage.setItem('ldxp.productFilter.sort', productSort);
+      window.localStorage.setItem('ldxp.productFilter.stockOnly', String(stockOnly));
+    } catch {
+      // Filtering remains available when local storage is disabled.
+    }
+  }, [filterPinned, productSearch, productSort, stockOnly]);
 
   useEffect(() => {
     if (activeView === 'sub2api' && sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
@@ -274,14 +394,33 @@ function App() {
 
   const selected = items.find(item => item.id === selectedId) || null;
   const latest = selected?.latest;
+  const visibleHistory = historyWatchId === selectedId ? history : [];
   const monitored = items.filter(item => item.enabled).length;
   const saleCount = items.filter(item => item.latest?.sale_status === 'on_sale').length;
   const changes = items.filter(item => item.price_changed).length;
   const failures = items.filter(item => item.last_attempt?.status === 'error').length;
   const shopFailures = shops.filter(shop => shop.last_attempt?.status === 'error').length;
-  const visibleItems = shopFilter
-    ? items.filter(item => item.shops?.some(shop => shop.id === shopFilter))
-    : items;
+  const searchedItems = useMemo(
+    () => sortProducts(items.filter(item => productNameMatches(item, productSearch) && (!stockOnly || productHasStock(item))), productSort),
+    [items, productSearch, productSort, stockOnly],
+  );
+  const shopItems = useMemo(
+    () => shopFilter ? items.filter(item => item.shops?.some(shop => shop.id === shopFilter)) : items,
+    [items, shopFilter],
+  );
+  const visibleItems = useMemo(
+    () => sortProducts(shopItems.filter(item => productNameMatches(item, productSearch) && (!stockOnly || productHasStock(item))), productSort),
+    [productSearch, productSort, shopItems, stockOnly],
+  );
+
+  useEffect(() => {
+    const visibleIds = new Set(visibleItems.map(item => item.id));
+    setCheckedIds(current => {
+      const next = current.filter(id => visibleIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [visibleItems]);
+
   const totalCart = cart.reduce((sum, entry) => sum + entry.quantity, 0);
   const estimatedTotal = cart.reduce((sum, entry) => {
     const item = items.find(candidate => candidate.id === entry.watch_id);
@@ -291,6 +430,16 @@ function App() {
   const allVisibleChecked = visibleItems.length > 0 && visibleCheckedIds.length === visibleItems.length;
   const preorderByWatch = new Map(preorders.map(entry => [entry.watch_id, entry]));
   const displayedPreorders = preorders.filter(entry => entry.status !== 'cancelled');
+  const selectionItems = activeView === 'monitor' ? visibleItems : activeView === 'history' ? searchedItems : items;
+
+  useEffect(() => {
+    if (!items.length) {
+      setSelectedId(null);
+      return;
+    }
+    if (selectedId && selectionItems.some(item => item.id === selectedId)) return;
+    setSelectedId(selectionItems[0]?.id ?? null);
+  }, [items.length, selectionItems, selectedId]);
 
   const addWatch = async event => {
     event.preventDefault();
@@ -403,7 +552,6 @@ function App() {
     try {
       const result = await request(`/watches/${id}/fetch`, {method: 'POST'});
       await loadItems({quiet: true});
-      await loadHistory(id);
       notify(result.price_changed
         ? `价格发生变化：${money(result.previous_price)} → ${money(result.price)}`
         : result.refresh_source === 'shop' ? `所属店铺已同步，当前库存 ${result.stock_label}` : '商品信息已更新');
@@ -1175,11 +1323,12 @@ function App() {
             <div className="content-layout">
               <section className="monitor-panel">
                 <div className="section-heading"><div><h2>{shopFilter ? `${shops.find(shop => shop.id === shopFilter)?.name || '店铺'}商品` : '商品目录'}</h2><p>{visibleItems.length ? `最近状态已同步，共 ${visibleItems.length} 项` : '添加商品或同步店铺后会显示在这里'}</p></div><span className="count-badge">{visibleItems.length}</span></div>
+                <ProductNameFilter value={productSearch} onChange={setProductSearch} pinned={filterPinned} onTogglePin={() => setFilterPinned(current => !current)} matchCount={visibleItems.length} totalCount={shopItems.length} sortOrder={productSort} onSortChange={setProductSort} stockOnly={stockOnly} onToggleStock={setStockOnly}/>
                 {visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
                 {!!displayedPreorders.length && <div className="preorder-list" aria-label="自动预购任务">{displayedPreorders.map(preorder => <div className={`preorder-row ${preorder.status}`} key={preorder.id}><span className="preorder-icon"><Clock3 size={15}/></span><div className="preorder-copy"><strong>{preorder.title}</strong><small>目标 {preorder.quantity} 件 · 每 {preorder.interval_seconds} 秒检查 · 当前库存 {preorder.stock_label}</small>{preorder.last_error && <small className="negative">{preorder.last_error}</small>}</div><span className={`pill ${preorder.status === 'triggered' ? 'live' : preorder.status === 'error' ? 'error' : 'neutral'}`}>{preorder.status === 'watching' ? '预购监控中' : preorder.status === 'processing' ? '正在创建订单' : preorder.status === 'triggered' ? '支付链接已创建' : '预购失败'}</span>{preorder.payment_url ? <a className="button official preorder-pay-link" href={preorder.payment_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>打开支付链接</a> : preorder.status === 'watching' || preorder.status === 'error' ? <IconButton label="停止自动预购" tone="danger" onClick={() => cancelPreorder(preorder)}><X size={15}/></IconButton> : <span/>}</div>)}</div>}
                 <div className="table-head"><label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label><span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控</span><span>操作</span></div>
                 <div className="product-list">
-                  {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>暂无商品数据</strong><span>在上方添加店铺或商品链接</span></div> : visibleItems.map(item => (
+                  {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>{productSearch.trim() || stockOnly ? '没有匹配的商品' : '暂无商品数据'}</strong><span>{productSearch.trim() || stockOnly ? '调整名称或库存筛选条件' : '在上方添加店铺或商品链接'}</span></div> : visibleItems.map(item => (
                     <div className={`product-row ${selectedId === item.id ? 'selected' : ''} ${checkedIds.includes(item.id) ? 'checked' : ''}`} key={item.id} onClick={() => setSelectedId(item.id)}>
                       <label className="check-wrap checkbox-cell" title="选择商品" onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedIds.includes(item.id)} onChange={() => toggleChecked(item.id)}/></label>
                       <div className="product-cell"><ProductImage item={item}/><div className="product-copy"><strong>{item.latest?.title || item.name || '等待首次抓取'}</strong><span>{item.shops?.length ? `${item.shops[0].name || item.shops[0].token} · ${item.url}` : item.name && item.latest ? item.name : item.url}</span><small>{compactTime(item.last_attempt?.fetched_at)}</small></div></div>
@@ -1212,8 +1361,8 @@ function App() {
           </>
         ) : activeView === 'history' ? (
           <section className="history-view">
-            <div className="history-sidebar"><div className="section-heading"><div><h2>商品</h2><p>选择查看记录</p></div></div>{items.map(item => <button className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => setSelectedId(item.id)}><ProductImage item={item}/><span><strong>{item.latest?.title || item.name}</strong><small>{money(item.latest?.price)}</small></span><ChevronRight size={16}/></button>)}</div>
-            <div className="history-main"><div className="history-top"><div><span>最近 60 次记录</span><h2>{latest?.title || '请选择商品'}</h2></div><strong>{money(latest?.price)}</strong></div><PriceBars history={history}/><div className="history-table"><div className="history-row head"><span>抓取时间</span><span>价格</span><span>在售状态</span><span>结果</span></div>{[...history].reverse().map((point, index) => <div className="history-row" key={`${point.id}-${index}`}><span>{compactTime(point.fetched_at)}</span><strong>{money(point.price)}</strong><span>{point.sale_status === 'on_sale' ? '在售' : point.sale_status === 'off_sale' ? '已下架' : '--'}</span><span className={point.status === 'success' ? 'positive' : 'negative'}>{point.status === 'success' ? '成功' : point.error || '失败'}</span></div>)}</div></div>
+            <div className="history-sidebar"><div className="section-heading"><div><h2>商品</h2><p>选择查看记录</p></div><span className="count-badge">{searchedItems.length}</span></div><ProductNameFilter value={productSearch} onChange={setProductSearch} pinned={filterPinned} onTogglePin={() => setFilterPinned(current => !current)} matchCount={searchedItems.length} totalCount={items.length} sortOrder={productSort} onSortChange={setProductSort} stockOnly={stockOnly} onToggleStock={setStockOnly}/>{searchedItems.length ? searchedItems.map(item => <button className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => setSelectedId(item.id)}><ProductImage item={item}/><span><strong>{productTitle(item)}</strong><small>{money(item.latest?.price)}</small></span><ChevronRight size={16}/></button>) : <div className="history-filter-empty"><Search size={18}/><span>没有匹配的商品</span></div>}</div>
+            <div className="history-main"><div className="history-top"><div><span>最近 60 次记录</span><h2>{latest?.title || '请选择商品'}</h2></div><strong>{money(latest?.price)}</strong></div><PriceBars history={visibleHistory}/><div className="history-table"><div className="history-row head"><span>抓取时间</span><span>价格</span><span>在售状态</span><span>结果</span></div>{[...visibleHistory].reverse().map((point, index) => <div className="history-row" key={`${point.id}-${index}`}><span>{compactTime(point.fetched_at)}</span><strong>{money(point.price)}</strong><span>{point.sale_status === 'on_sale' ? '在售' : point.sale_status === 'off_sale' ? '已下架' : '--'}</span><span className={point.status === 'success' ? 'positive' : 'negative'}>{point.status === 'success' ? '成功' : point.error || '失败'}</span></div>)}</div></div>
           </section>
         ) : activeView === 'reclaim' ? (
           <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
