@@ -156,12 +156,14 @@ index 321a7c4..2ccde03 100644
            tested={testedAccounts}
            onRefresh={onLoadAccounts}
 diff --git a/start.ps1 b/start.ps1
-index 97e5d4b..6e5340f 100644
+index 97e5d4b..7fd3845 100644
 --- a/start.ps1
 +++ b/start.ps1
-@@ -4,6 +4,22 @@ $backendDirectory = Join-Path $PSScriptRoot 'backend'
+@@ -3,7 +3,24 @@ $ErrorActionPreference = 'Stop'
+ $backendDirectory = Join-Path $PSScriptRoot 'backend'
  $frontendDirectory = Join-Path $PSScriptRoot 'frontend'
  $nodeModules = Join-Path $frontendDirectory 'node_modules'
++$viteCommand = Join-Path $nodeModules '.bin\vite.cmd'
  $requirements = Join-Path $backendDirectory 'requirements.txt'
 +$runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
 +$backendPidFile = Join-Path $runtimeDirectory 'backend.pid'
@@ -182,7 +184,7 @@ index 97e5d4b..6e5340f 100644
  
  function Stop-StaleLdxpProcesses {
      $root = $PSScriptRoot.ToLowerInvariant()
-@@ -37,11 +53,30 @@ function Get-FreeLocalPort([int]$StartPort) {
+@@ -37,11 +54,30 @@ function Get-FreeLocalPort([int]$StartPort) {
      throw "No available local port found after $StartPort"
  }
  
@@ -203,7 +205,8 @@ index 97e5d4b..6e5340f 100644
 +    throw 'Backend readiness check failed: Sub2API account-list route was not loaded'
 +}
 +
- if (-not (Test-Path $nodeModules)) {
+-if (-not (Test-Path $nodeModules)) {
++if (-not (Test-Path -LiteralPath $viteCommand)) {
      Write-Host 'Installing frontend dependencies...'
      npm --prefix $frontendDirectory install
  }
@@ -213,7 +216,7 @@ index 97e5d4b..6e5340f 100644
  Stop-StaleLdxpProcesses
  
  if (Test-Path $requirements) {
-@@ -67,6 +102,8 @@ $backendProcess = Start-Process python `
+@@ -67,6 +103,8 @@ $backendProcess = Start-Process python `
      -PassThru
  
  try {
@@ -222,7 +225,7 @@ index 97e5d4b..6e5340f 100644
      $env:LDXP_API_TARGET = "http://127.0.0.1:$backendPort"
      Write-Host ''
      Write-Host '========================================' -ForegroundColor DarkGray
-@@ -74,6 +111,7 @@ try {
+@@ -74,6 +112,7 @@ try {
      Write-Host "Frontend:      http://127.0.0.1:$frontendPort" -ForegroundColor Cyan
      Write-Host "Backend API:   http://127.0.0.1:$backendPort" -ForegroundColor Cyan
      Write-Host "Health check:  http://127.0.0.1:$backendPort/api/health" -ForegroundColor Cyan
@@ -230,7 +233,7 @@ index 97e5d4b..6e5340f 100644
      Write-Host "Ports:         frontend=$frontendPort  backend=$backendPort" -ForegroundColor Yellow
      Write-Host 'Press Ctrl+C to stop both services.' -ForegroundColor DarkGray
      Write-Host '========================================' -ForegroundColor DarkGray
-@@ -83,4 +121,5 @@ finally {
+@@ -83,4 +122,5 @@ finally {
      if (-not $backendProcess.HasExited) {
          Stop-Process -Id $backendProcess.Id
      }

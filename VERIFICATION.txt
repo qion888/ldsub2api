@@ -1,5 +1,5 @@
 Branch: codex/sub2api-account-route-fix
-Changed field: backend/main.py sub2api_accounts health capability; start.ps1 Wait-LdxpBackend readiness gate
+Changed field: backend/main.py sub2api_accounts health capability; start.ps1 Wait-LdxpBackend readiness gate and Vite executable dependency check
 
 Artifacts:
 - E:\soft\java\ldxp\MODIFIED_FILE
@@ -55,7 +55,7 @@ Restored E:\soft\java\ldxp-sub2api-account-route-fix\rollback-test-account-route
 Result: exit 0
 Restored hash: 03690E6B992EA0EDF5E2AD613BAA79D67CBC23169E9B567A0D1B60A46FFCF3F5
 Baseline hash: 03690E6B992EA0EDF5E2AD613BAA79D67CBC23169E9B567A0D1B60A46FFCF3F5
-Modified artifact hash left changed: B04F561FF3EA38036400B9D01402CB2A89C1F1BC8DC631BE3AEC237801F01F5B
+Modified artifact hash left changed: 66D04AC6529336A3F24317D38B99E9E276F2D9584E63BBFCD2F4DEFC54C9ECA2
 Restored behavior/status: rollback-test-account-route matches the original start.ps1 byte-for-byte and no longer requires the Sub2API account-list health capability; MODIFIED_FILE retains the readiness gate.
 
 Upstream contract reference:

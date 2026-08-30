@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $backendDirectory = Join-Path $PSScriptRoot 'backend'
 $frontendDirectory = Join-Path $PSScriptRoot 'frontend'
 $nodeModules = Join-Path $frontendDirectory 'node_modules'
+$viteCommand = Join-Path $nodeModules '.bin\vite.cmd'
 $requirements = Join-Path $backendDirectory 'requirements.txt'
 $runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
 $backendPidFile = Join-Path $runtimeDirectory 'backend.pid'
@@ -70,7 +71,7 @@ function Wait-LdxpBackend([int]$Port, $Process) {
     throw 'Backend readiness check failed: Sub2API account-list route was not loaded'
 }
 
-if (-not (Test-Path $nodeModules)) {
+if (-not (Test-Path -LiteralPath $viteCommand)) {
     Write-Host 'Installing frontend dependencies...'
     npm --prefix $frontendDirectory install
 }
