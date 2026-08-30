@@ -591,6 +591,15 @@ class Sub2ApiModuleTests(unittest.TestCase):
         ))
         self.assertEqual(responses[-1], (200, {"id": 7, "status": "success"}))
         self.assertTrue(routes.handle_post(
+            "/api/sub2api/card-import-records/delete",
+            {"id": 7},
+            **common_write,
+            card_import_history_deleter=lambda record_id: {
+                "ok": True, "deleted_count": 1, "deleted_ids": [record_id],
+            },
+        ))
+        self.assertEqual(responses[-1][1]["deleted_ids"], [7])
+        self.assertTrue(routes.handle_post(
             "/api/sub2api/card-import-records/batch-delete",
             {"ids": [7, 8]},
             **common_write,

@@ -62,3 +62,13 @@ export function buildSub2ApiImportNotice(result) {
     duration: type === 'success' ? 9000 : 12000,
   };
 }
+
+export function sub2ApiHistoryDeleteErrorMessage(error, batch = false) {
+  const detail = String(error?.message || '').trim();
+  if (Number(error?.status) === 404 && /接口不存在/.test(detail)) {
+    return batch
+      ? '批量删除接口尚未加载，请重启本项目服务后重试'
+      : '单条删除接口尚未加载，请重启本项目服务后重试';
+  }
+  return detail || (batch ? '批量删除导入记录失败' : '删除导入记录失败');
+}

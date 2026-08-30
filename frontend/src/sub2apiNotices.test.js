@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {buildSub2ApiImportNotice} from './sub2apiNotices.js';
+import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
 
 test('builds separate import and fingerprint sections for a confirmed import', () => {
   const notice = buildSub2ApiImportNotice({
@@ -34,4 +34,21 @@ test('uses a warning notice when imported accounts are not fully matched', () =>
   assert.equal(notice.type, 'warning');
   assert.match(notice.message, /1\/2/);
   assert.equal(notice.sections[1].metrics.at(-1).tone, 'negative');
+});
+
+test('distinguishes unavailable single and batch history deletion routes', () => {
+  const missingRoute = Object.assign(new Error('接口不存在'), {status: 404});
+
+  assert.equal(
+    sub2ApiHistoryDeleteErrorMessage(missingRoute),
+    '单条删除接口尚未加载，请重启本项目服务后重试',
+  );
+  assert.equal(
+    sub2ApiHistoryDeleteErrorMessage(missingRoute, true),
+    '批量删除接口尚未加载，请重启本项目服务后重试',
+  );
+  assert.equal(
+    sub2ApiHistoryDeleteErrorMessage(Object.assign(new Error('卡密导入记录不存在'), {status: 404})),
+    '卡密导入记录不存在',
+  );
 });

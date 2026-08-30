@@ -917,6 +917,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "sub2api_automation_worker": AUTOMATION_WORKER.is_alive(),
                 "sub2api_accounts": True,
                 "sub2api_card_import_history": True,
+                "sub2api_card_import_history_delete": True,
                 "order_query": True,
             })
         if path == "/api/watches":
@@ -1091,6 +1092,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             test_account=test_sub2api_account,
             card_import_history_creator=create_sub2api_card_import_record,
             card_import_history_retry=retry_sub2api_card_import_record,
+            card_import_history_deleter=delete_sub2api_card_import_record,
             card_import_history_batch_deleter=delete_sub2api_card_import_records,
         ):
             return

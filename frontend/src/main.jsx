@@ -46,7 +46,7 @@ import {
   Zap,
 } from 'lucide-react';
 import './style.css';
-import {buildSub2ApiImportNotice} from './sub2apiNotices.js';
+import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
 import {
   CARD_RECLAIM_POLL_TIMEOUT_MS,
   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
@@ -2428,12 +2428,16 @@ function App() {
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ids: recordIds}),
         })
-        : await request(`/sub2api/card-import-records/${recordIds[0]}`, {method: 'DELETE'});
+        : await request('/sub2api/card-import-records/delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({id: recordIds[0]}),
+        });
       await loadSub2ApiCardHistory({quiet: true});
       notify(batch ? `已删除 ${result.deleted_count} 条导入记录` : `导入记录 #${recordIds[0]} 已删除`);
       return true;
     } catch (error) {
-      notify(error.message, 'error');
+      notify(sub2ApiHistoryDeleteErrorMessage(error, batch), 'error');
       await loadSub2ApiCardHistory({quiet: true});
       return false;
     } finally {

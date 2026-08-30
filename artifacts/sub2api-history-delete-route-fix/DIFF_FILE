@@ -1,0 +1,206 @@
+diff --git a/backend/main.py b/backend/main.py
+index 920d13d..74378b6 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -917,6 +917,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+                 "sub2api_automation_worker": AUTOMATION_WORKER.is_alive(),
+                 "sub2api_accounts": True,
+                 "sub2api_card_import_history": True,
++                "sub2api_card_import_history_delete": True,
+                 "order_query": True,
+             })
+         if path == "/api/watches":
+@@ -1091,6 +1092,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             test_account=test_sub2api_account,
+             card_import_history_creator=create_sub2api_card_import_record,
+             card_import_history_retry=retry_sub2api_card_import_record,
++            card_import_history_deleter=delete_sub2api_card_import_record,
+             card_import_history_batch_deleter=delete_sub2api_card_import_records,
+         ):
+             return
+diff --git a/backend/sub2api/routes.py b/backend/sub2api/routes.py
+index 43e6973..100a878 100644
+--- a/backend/sub2api/routes.py
++++ b/backend/sub2api/routes.py
+@@ -78,8 +78,20 @@ def handle_post(
+     test_account: Callable[[int], dict[str, Any]] | None = None,
+     card_import_history_creator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+     card_import_history_retry: Callable[[int], dict[str, Any]] | None = None,
++    card_import_history_deleter: Callable[[int], dict[str, Any]] | None = None,
+     card_import_history_batch_deleter: Callable[[list[int]], dict[str, Any]] | None = None,
+ ) -> bool:
++    if path == "/api/sub2api/card-import-records/delete":
++        if card_import_history_deleter is None:
++            return False
++        try:
++            send_json(card_import_history_deleter(data.get("id")), 200)
++        except LookupError as exc:
++            send_json({"detail": str(exc)}, 404)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        return True
++
+     if path == "/api/sub2api/card-import-records/batch-delete":
+         if card_import_history_batch_deleter is None:
+             return False
+diff --git a/backend/test_main.py b/backend/test_main.py
+index 4dde9b6..e148252 100644
+--- a/backend/test_main.py
++++ b/backend/test_main.py
+@@ -1271,11 +1271,13 @@ class GoodsParserTests(unittest.TestCase):
+             "search": ["account"],
+         })
+ 
+-    def test_health_advertises_sub2api_account_list_capability(self):
++    def test_health_advertises_sub2api_capabilities(self):
+         status, payload = self.request_api("GET", "/api/health", {})
+ 
+         self.assertEqual(status, 200)
+         self.assertTrue(payload["sub2api_accounts"])
++        self.assertTrue(payload["sub2api_card_import_history"])
++        self.assertTrue(payload["sub2api_card_import_history_delete"])
+ 
+     def test_sub2api_card_import_history_http_lifecycle(self):
+         with tempfile.TemporaryDirectory() as directory:
+@@ -1331,10 +1333,15 @@ class GoodsParserTests(unittest.TestCase):
+                 self.assertTrue(retried["ok"])
+                 self.assertEqual(retried["record"]["success_count"], 2)
+                 status, deleted = self.request_api(
+-                    "DELETE", f"/api/sub2api/card-import-records/{created['id']}", {}
++                    "POST", "/api/sub2api/card-import-records/delete", {"id": created["id"]}
+                 )
+                 self.assertEqual(status, 200)
+                 self.assertEqual(deleted["deleted_ids"], [created["id"]])
++                status, missing = self.request_api(
++                    "POST", "/api/sub2api/card-import-records/delete", {"id": created["id"]}
++                )
++                self.assertEqual(status, 404)
++                self.assertEqual(missing["detail"], "卡密导入记录不存在")
+                 batch_ids = []
+                 for code in ("CARD-C", "CARD-D"):
+                     create_status, record = self.request_api(
+diff --git a/backend/test_sub2api_modules.py b/backend/test_sub2api_modules.py
+index eaa6522..0fd90e0 100644
+--- a/backend/test_sub2api_modules.py
++++ b/backend/test_sub2api_modules.py
+@@ -590,6 +590,15 @@ class Sub2ApiModuleTests(unittest.TestCase):
+             card_import_history_updater=lambda record_id, payload: {"id": record_id, **payload},
+         ))
+         self.assertEqual(responses[-1], (200, {"id": 7, "status": "success"}))
++        self.assertTrue(routes.handle_post(
++            "/api/sub2api/card-import-records/delete",
++            {"id": 7},
++            **common_write,
++            card_import_history_deleter=lambda record_id: {
++                "ok": True, "deleted_count": 1, "deleted_ids": [record_id],
++            },
++        ))
++        self.assertEqual(responses[-1][1]["deleted_ids"], [7])
+         self.assertTrue(routes.handle_post(
+             "/api/sub2api/card-import-records/batch-delete",
+             {"ids": [7, 8]},
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 8f05766..b8db94b 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -46,7 +46,7 @@ import {
+   Zap,
+ } from 'lucide-react';
+ import './style.css';
+-import {buildSub2ApiImportNotice} from './sub2apiNotices.js';
++import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+ import {
+   CARD_RECLAIM_POLL_TIMEOUT_MS,
+   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
+@@ -2428,12 +2428,16 @@ function App() {
+           headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify({ids: recordIds}),
+         })
+-        : await request(`/sub2api/card-import-records/${recordIds[0]}`, {method: 'DELETE'});
++        : await request('/sub2api/card-import-records/delete', {
++          method: 'POST',
++          headers: {'Content-Type': 'application/json'},
++          body: JSON.stringify({id: recordIds[0]}),
++        });
+       await loadSub2ApiCardHistory({quiet: true});
+       notify(batch ? `已删除 ${result.deleted_count} 条导入记录` : `导入记录 #${recordIds[0]} 已删除`);
+       return true;
+     } catch (error) {
+-      notify(error.message, 'error');
++      notify(sub2ApiHistoryDeleteErrorMessage(error, batch), 'error');
+       await loadSub2ApiCardHistory({quiet: true});
+       return false;
+     } finally {
+diff --git a/frontend/src/sub2apiNotices.js b/frontend/src/sub2apiNotices.js
+index 7ff51e8..c31354d 100644
+--- a/frontend/src/sub2apiNotices.js
++++ b/frontend/src/sub2apiNotices.js
+@@ -62,3 +62,13 @@ export function buildSub2ApiImportNotice(result) {
+     duration: type === 'success' ? 9000 : 12000,
+   };
+ }
++
++export function sub2ApiHistoryDeleteErrorMessage(error, batch = false) {
++  const detail = String(error?.message || '').trim();
++  if (Number(error?.status) === 404 && /接口不存在/.test(detail)) {
++    return batch
++      ? '批量删除接口尚未加载，请重启本项目服务后重试'
++      : '单条删除接口尚未加载，请重启本项目服务后重试';
++  }
++  return detail || (batch ? '批量删除导入记录失败' : '删除导入记录失败');
++}
+diff --git a/frontend/src/sub2apiNotices.test.js b/frontend/src/sub2apiNotices.test.js
+index eb4f4af..388f69e 100644
+--- a/frontend/src/sub2apiNotices.test.js
++++ b/frontend/src/sub2apiNotices.test.js
+@@ -1,7 +1,7 @@
+ import assert from 'node:assert/strict';
+ import test from 'node:test';
+ 
+-import {buildSub2ApiImportNotice} from './sub2apiNotices.js';
++import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+ 
+ test('builds separate import and fingerprint sections for a confirmed import', () => {
+   const notice = buildSub2ApiImportNotice({
+@@ -35,3 +35,20 @@ test('uses a warning notice when imported accounts are not fully matched', () =>
+   assert.match(notice.message, /1\/2/);
+   assert.equal(notice.sections[1].metrics.at(-1).tone, 'negative');
+ });
++
++test('distinguishes unavailable single and batch history deletion routes', () => {
++  const missingRoute = Object.assign(new Error('接口不存在'), {status: 404});
++
++  assert.equal(
++    sub2ApiHistoryDeleteErrorMessage(missingRoute),
++    '单条删除接口尚未加载，请重启本项目服务后重试',
++  );
++  assert.equal(
++    sub2ApiHistoryDeleteErrorMessage(missingRoute, true),
++    '批量删除接口尚未加载，请重启本项目服务后重试',
++  );
++  assert.equal(
++    sub2ApiHistoryDeleteErrorMessage(Object.assign(new Error('卡密导入记录不存在'), {status: 404})),
++    '卡密导入记录不存在',
++  );
++});
+diff --git a/start.ps1 b/start.ps1
+index 752bebe..20bcf5b 100644
+--- a/start.ps1
++++ b/start.ps1
+@@ -119,14 +119,14 @@ function Wait-LdxpBackend([int]$Port, $Process) {
+         }
+         try {
+             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
+-            if ($health.ok -and $health.sub2api_accounts) {
++            if ($health.ok -and $health.sub2api_accounts -and $health.sub2api_card_import_history_delete) {
+                 return
+             }
+         }
+         catch {}
+         Start-Sleep -Milliseconds 200
+     }
+-    throw 'Backend readiness check failed: Sub2API account-list route was not loaded'
++    throw 'Backend readiness check failed: Sub2API account-list or import-history deletion route was not loaded'
+ }
+ 
+ if (-not (Test-Path -LiteralPath $viteCommand)) {

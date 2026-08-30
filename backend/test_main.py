@@ -1271,11 +1271,13 @@ class GoodsParserTests(unittest.TestCase):
             "search": ["account"],
         })
 
-    def test_health_advertises_sub2api_account_list_capability(self):
+    def test_health_advertises_sub2api_capabilities(self):
         status, payload = self.request_api("GET", "/api/health", {})
 
         self.assertEqual(status, 200)
         self.assertTrue(payload["sub2api_accounts"])
+        self.assertTrue(payload["sub2api_card_import_history"])
+        self.assertTrue(payload["sub2api_card_import_history_delete"])
 
     def test_sub2api_card_import_history_http_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1331,10 +1333,15 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertTrue(retried["ok"])
                 self.assertEqual(retried["record"]["success_count"], 2)
                 status, deleted = self.request_api(
-                    "DELETE", f"/api/sub2api/card-import-records/{created['id']}", {}
+                    "POST", "/api/sub2api/card-import-records/delete", {"id": created["id"]}
                 )
                 self.assertEqual(status, 200)
                 self.assertEqual(deleted["deleted_ids"], [created["id"]])
+                status, missing = self.request_api(
+                    "POST", "/api/sub2api/card-import-records/delete", {"id": created["id"]}
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(missing["detail"], "卡密导入记录不存在")
                 batch_ids = []
                 for code in ("CARD-C", "CARD-D"):
                     create_status, record = self.request_api(

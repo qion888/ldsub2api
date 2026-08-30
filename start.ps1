@@ -119,14 +119,14 @@ function Wait-LdxpBackend([int]$Port, $Process) {
         }
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
-            if ($health.ok -and $health.sub2api_accounts) {
+            if ($health.ok -and $health.sub2api_accounts -and $health.sub2api_card_import_history_delete) {
                 return
             }
         }
         catch {}
         Start-Sleep -Milliseconds 200
     }
-    throw 'Backend readiness check failed: Sub2API account-list route was not loaded'
+    throw 'Backend readiness check failed: Sub2API account-list or import-history deletion route was not loaded'
 }
 
 if (-not (Test-Path -LiteralPath $viteCommand)) {

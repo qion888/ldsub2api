@@ -78,8 +78,20 @@ def handle_post(
     test_account: Callable[[int], dict[str, Any]] | None = None,
     card_import_history_creator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     card_import_history_retry: Callable[[int], dict[str, Any]] | None = None,
+    card_import_history_deleter: Callable[[int], dict[str, Any]] | None = None,
     card_import_history_batch_deleter: Callable[[list[int]], dict[str, Any]] | None = None,
 ) -> bool:
+    if path == "/api/sub2api/card-import-records/delete":
+        if card_import_history_deleter is None:
+            return False
+        try:
+            send_json(card_import_history_deleter(data.get("id")), 200)
+        except LookupError as exc:
+            send_json({"detail": str(exc)}, 404)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        return True
+
     if path == "/api/sub2api/card-import-records/batch-delete":
         if card_import_history_batch_deleter is None:
             return False
