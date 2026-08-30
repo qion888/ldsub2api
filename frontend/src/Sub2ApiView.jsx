@@ -93,6 +93,24 @@ function formatSub2ApiDateTime(value) {
   }).format(date);
 }
 
+function formatSub2ApiResetCountdown(value, remainingSeconds) {
+  const hasRemainingSeconds = remainingSeconds !== null && remainingSeconds !== undefined && remainingSeconds !== '';
+  const providedSeconds = hasRemainingSeconds ? Number(remainingSeconds) : NaN;
+  const resetTimestamp = value ? new Date(value).getTime() : NaN;
+  const seconds = Number.isFinite(providedSeconds) && providedSeconds >= 0
+    ? providedSeconds
+    : Number.isFinite(resetTimestamp) ? Math.max(0, (resetTimestamp - Date.now()) / 1000) : NaN;
+  if (!Number.isFinite(seconds)) return '未提供重置时间';
+  if (seconds <= 0) return '即将重置';
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `剩余 ${days} 天 ${hours} 小时`;
+  if (hours > 0) return `剩余 ${hours} 小时 ${minutes} 分钟`;
+  if (minutes > 0) return `剩余 ${minutes} 分钟`;
+  return `剩余 ${Math.max(1, Math.ceil(seconds))} 秒`;
+}
+
 function sub2ApiFutureTime(value, now = Date.now()) {
   if (!value) return false;
   const timestamp = new Date(value).getTime();
@@ -138,14 +156,13 @@ function sub2ApiAccountState(account) {
   return {key: 'unknown', label: account.status || '未知', tone: 'muted', detail: '等待 Sub2API 返回明确状态'};
 }
 
-function Sub2ApiProgress({label, utilization, used, limit, resetsAt, stats, testId}) {
+function Sub2ApiProgress({label, used, limit, resetsAt, testId}) {
   const numericUsed = Number(used);
   const numericLimit = Number(limit);
-  const numericUtilization = Number(utilization);
   const ratio = Number.isFinite(numericLimit) && numericLimit > 0 && Number.isFinite(numericUsed)
     ? (numericUsed / numericLimit) * 100
     : null;
-  const rawPercent = Number.isFinite(numericUtilization) ? numericUtilization : ratio;
+  const rawPercent = ratio;
   const hasPercent = Number.isFinite(rawPercent);
   const displayPercent = hasPercent ? Math.max(0, rawPercent) : 0;
   const meterPercent = Math.min(displayPercent, 100);
@@ -153,23 +170,10 @@ function Sub2ApiProgress({label, utilization, used, limit, resetsAt, stats, test
   const exactValue = Number.isFinite(numericLimit) && numericLimit > 0
     ? `${formatSub2ApiNumber(numericUsed || 0)} / ${formatSub2ApiNumber(numericLimit)}`
     : hasPercent ? `${formatSub2ApiNumber(displayPercent, 1)}%` : '未设置';
-  const statsParts = [];
-  if (stats && typeof stats === 'object') {
-    if (Number(stats.requests) > 0) statsParts.push(`${formatSub2ApiCompactNumber(stats.requests)} 次请求`);
-    if (Number(stats.tokens) > 0) statsParts.push(`${formatSub2ApiCompactNumber(stats.tokens)} Token`);
-  }
-  const costParts = [];
-  if (stats && typeof stats === 'object') {
-    if (stats.cost !== null && stats.cost !== undefined && Number.isFinite(Number(stats.cost))) costParts.push(`账号 $${Number(stats.cost).toFixed(2)}`);
-    if (stats.standard_cost !== null && stats.standard_cost !== undefined && Number.isFinite(Number(stats.standard_cost))) costParts.push(`标准 $${Number(stats.standard_cost).toFixed(2)}`);
-    if (stats.user_cost !== null && stats.user_cost !== undefined && Number.isFinite(Number(stats.user_cost))) costParts.push(`用户 $${Number(stats.user_cost).toFixed(2)}`);
-  }
   return <div className={`account-progress ${tone}`} data-testid={testId}>
     <div className="account-progress-head"><span>{label}</span><strong>{exactValue}</strong></div>
     <div className="account-progress-track" role="progressbar" aria-label={`${label}使用率`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(meterPercent)} aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '未设置'}><span style={{width: `${meterPercent}%`}}/></div>
     <div className="account-progress-meta"><span>{hasPercent ? `${displayPercent.toFixed(1)}%` : '--'}</span><small>{resetsAt ? `${compactTime(resetsAt)} 重置` : '无重置时间'}</small></div>
-    {statsParts.length > 0 && <small className="account-usage-stats">{statsParts.join(' · ')}</small>}
-    {costParts.length > 0 && <Tooltip label="账号费用含账号倍率；标准费用不含倍率；用户费用按 API Key 与分组倍率结算"><small className="account-usage-costs">{costParts.join(' · ')}</small></Tooltip>}
   </div>;
 }
 
@@ -181,15 +185,76 @@ function Sub2ApiQuotaStack({account}) {
   </div>;
 }
 
+function Sub2ApiUsageWindow({label, window, tone, testId}) {
+  const stats = window?.window_stats && typeof window.window_stats === 'object' ? window.window_stats : {};
+  const numericUtilization = Number(window?.utilization ?? window?.used_percent);
+  const numericUsed = Number(window?.used_requests ?? window?.used);
+  const numericLimit = Number(window?.limit_requests ?? window?.limit);
+  const ratio = Number.isFinite(numericLimit) && numericLimit > 0 && Number.isFinite(numericUsed)
+    ? (numericUsed / numericLimit) * 100
+    : null;
+  const rawPercent = Number.isFinite(numericUtilization) ? numericUtilization : ratio;
+  const hasPercent = Number.isFinite(rawPercent);
+  const displayPercent = hasPercent ? Math.max(0, rawPercent) : 0;
+  const meterPercent = Math.min(displayPercent, 100);
+  const state = displayPercent >= 100 ? 'danger' : displayPercent >= 80 ? 'warning' : 'normal';
+  const hasNumber = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+  const requests = hasNumber(stats.requests) ? stats.requests : hasNumber(window?.used_requests) ? window.used_requests : null;
+  const requestValue = hasNumber(requests)
+    ? hasNumber(window?.limit_requests) && Number(window.limit_requests) > 0
+      ? `${formatSub2ApiCompactNumber(requests)} / ${formatSub2ApiCompactNumber(window.limit_requests)}`
+      : formatSub2ApiCompactNumber(requests)
+    : null;
+  const detailItems = [
+    requestValue && {label: '请求', value: requestValue},
+    hasNumber(stats.tokens) && {label: 'Token', value: formatSub2ApiCompactNumber(stats.tokens)},
+    hasNumber(stats.cost) && {label: '账号费用', value: `$${Number(stats.cost).toFixed(2)}`},
+    hasNumber(stats.user_cost) && {label: '用户费用', value: `$${Number(stats.user_cost).toFixed(2)}`},
+  ].filter(Boolean);
+  const resetsAt = window?.resets_at ?? window?.reset_at;
+  const hasWindowData = hasPercent || detailItems.length > 0 || Boolean(resetsAt);
+  const resetLabel = formatSub2ApiResetCountdown(resetsAt, window?.remaining_seconds);
+  const exactResetLabel = resetsAt ? `准确重置时间：${formatSub2ApiDateTime(resetsAt)}` : resetLabel;
+  return <section className={`account-usage-window ${tone} ${state}`} data-testid={testId}>
+    <div className="account-usage-window-head">
+      <span><Clock3 size={15}/><strong>{label}</strong></span>
+      <strong className="account-usage-percent">{hasPercent ? `${displayPercent.toFixed(1)}%` : '--'}</strong>
+    </div>
+    {hasWindowData ? <>
+      <div
+        className="account-usage-track"
+        role="progressbar"
+        aria-label={`${label}使用率`}
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={hasPercent ? Math.round(meterPercent) : undefined}
+        aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '暂无使用率'}
+      ><span style={{width: `${meterPercent}%`}}/></div>
+      <Tooltip label={exactResetLabel}><span className="account-usage-reset"><TimerReset size={13}/>{resetLabel}</span></Tooltip>
+      {detailItems.length > 0
+        ? <dl className="account-usage-details">{detailItems.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>
+        : <div className="account-usage-window-empty">暂无请求与费用明细</div>}
+      {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-standard">标准成本 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
+    </> : <div className="account-usage-window-empty">暂未返回此窗口数据</div>}
+  </section>;
+}
+
 function Sub2ApiUsageStack({account, usage, usageError}) {
   const accountUsage = usage[String(account.id)] || usage[account.id] || {};
-  const windowFor = key => accountUsage?.[key] || account?.[key] || {};
+  const windowFor = key => ({...(account?.[key] || {}), ...(accountUsage?.[key] || {})});
   const fiveHour = windowFor('five_hour');
   const sevenDay = windowFor('seven_day');
-  return <div className="account-progress-stack upstream">
-    <Sub2ApiProgress label="5 小时" utilization={fiveHour.utilization ?? fiveHour.used_percent} used={fiveHour.used_requests ?? fiveHour.used} limit={fiveHour.limit_requests ?? fiveHour.limit} resetsAt={fiveHour.resets_at ?? fiveHour.reset_at} stats={fiveHour.window_stats} testId={`usage-5h-${account.id}`}/>
-    <Sub2ApiProgress label="7 天" utilization={sevenDay.utilization ?? sevenDay.used_percent} used={sevenDay.used_requests ?? sevenDay.used} limit={sevenDay.limit_requests ?? sevenDay.limit} resetsAt={sevenDay.resets_at ?? sevenDay.reset_at} stats={sevenDay.window_stats} testId={`usage-7d-${account.id}`}/>
-    {usageError && <small className="account-usage-error"><AlertCircle size={12}/>{usageError}</small>}
+  const sourceLabels = {active: '主动查询', live: '主动查询', passive: '被动采样'};
+  const sourceLabel = sourceLabels[String(accountUsage.source || '').toLowerCase()] || (Object.keys(accountUsage).length ? '上游数据' : '账号快照');
+  const updatedAt = accountUsage.updated_at || account.updated_at;
+  return <div className="account-usage-stack upstream">
+    <div className="account-usage-stack-meta">
+      <span><Activity size={13}/>{sourceLabel}</span>
+      {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
+    </div>
+    <Sub2ApiUsageWindow label="5 小时窗口" window={fiveHour} tone="five-hour" testId={`usage-5h-${account.id}`}/>
+    <Sub2ApiUsageWindow label="7 天窗口" window={sevenDay} tone="seven-day" testId={`usage-7d-${account.id}`}/>
+    {usageError && <small className="account-usage-error"><AlertCircle size={13}/>{usageError}</small>}
   </div>;
 }
 
