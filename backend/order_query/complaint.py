@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
+import math
 import re
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -38,6 +41,28 @@ MAX_COMPLAINT_IMAGE_BYTES = 5 * 1024 * 1024
 COMPLAINT_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 MAX_UPLOAD_BYTES = MAX_COMPLAINT_IMAGE_BYTES
 ALLOWED_UPLOAD_MIME_TYPES = COMPLAINT_IMAGE_MIME_TYPES
+
+# The history page renders these values directly. Keep the allowlists small
+# so an upstream response cannot smuggle arbitrary fields or destinations into
+# the local UI.
+COMPLAINT_HISTORY_STATUS_LABELS = {
+    -1: "已撤销",
+    0: "待处理",
+    1: "平台标记已完成",
+}
+COMPLAINT_MESSAGE_IDENTITY_LABELS = {
+    "platform": "平台",
+    "user": "商家",
+    "parent": "货源商",
+    "buyer": "买家",
+}
+MAX_HISTORY_TEXT_LENGTH = 20_000
+MAX_HISTORY_REASON_LENGTH = 240
+MAX_HISTORY_CONTACT_LENGTH = 254
+MAX_HISTORY_IMAGES = 12
+MAX_HISTORY_MESSAGES = 100
+MAX_HISTORY_URL_LENGTH = 1_000
+_NON_PUBLIC_HOST_SUFFIXES = (".internal", ".invalid", ".lan", ".local", ".localhost", ".test")
 
 
 def _text_field(
@@ -205,3 +230,196 @@ def decode_complaint_upload(data: Any) -> tuple[str, str, bytes]:
     if not signatures[mime_type]:
         raise OrderComplaintInputError("图片内容与声明格式不一致")
     return name, mime_type, content
+
+
+def _history_text(value: Any, limit: int) -> str:
+    """Convert scalar upstream values to bounded display text."""
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""
+    if value is None:
+        return ""
+    return str(value).strip()[:limit]
+
+
+def _history_integer(value: Any, fallback: int = 0) -> int:
+    # ``bool`` is intentionally excluded: the upstream contract uses numeric
+    # status/content codes, not truthy values.
+    if isinstance(value, bool) or type(value) not in (int, float, str):
+        return fallback
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def _history_timestamp(value: Any) -> str:
+    text = _history_text(value, 80)
+    if not text:
+        return ""
+    try:
+        stamp = int(text)
+        if stamp <= 0:
+            return ""
+        if stamp > 10_000_000_000:
+            stamp //= 1000
+        return datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        return parsed.isoformat(timespec="seconds")
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _history_https_url(value: Any) -> str:
+    """Allow only public HTTPS URLs suitable for an image/message preview."""
+    candidate = _history_text(value, MAX_HISTORY_URL_LENGTH)
+    if not candidate or any(char.isspace() for char in candidate):
+        return ""
+    try:
+        parsed = urlparse(candidate)
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return ""
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.fragment
+        or hostname == "localhost"
+        or hostname.endswith(_NON_PUBLIC_HOST_SUFFIXES)
+    ):
+        return ""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        return ""
+    if address is None and "." not in hostname:
+        return ""
+    return parsed.geturl()
+
+
+def _history_images(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("complaint history images must be a list")
+    images: list[str] = []
+    seen: set[str] = set()
+    for raw in value[:MAX_HISTORY_IMAGES]:
+        url = _history_https_url(raw)
+        if url and url not in seen:
+            seen.add(url)
+            images.append(url)
+    return images
+
+
+def _history_message(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    identity = _history_text(value.get("identity"), 24).lower()
+    identity_label = COMPLAINT_MESSAGE_IDENTITY_LABELS.get(identity)
+    if identity_label is None:
+        return None
+    content_type = _history_integer(value.get("content_type"), -1)
+    if content_type == 0:
+        content = _history_text(value.get("content"), MAX_HISTORY_TEXT_LENGTH)
+    elif content_type == 1:
+        content = _history_https_url(value.get("content"))
+        if not content:
+            return None
+    else:
+        return None
+    created_at = value.get("create_time")
+    if created_at is None:
+        # The client contract uses ``created_at`` after its first normalization;
+        # accepting it here keeps service-level validation idempotent.
+        created_at = value.get("created_at")
+    return {
+        "identity": identity,
+        "identity_label": identity_label,
+        "content_type": content_type,
+        "content": content,
+        "created_at": _history_timestamp(created_at),
+    }
+
+
+def _history_data(payload: Any) -> dict[str, Any]:
+    """Extract the official ``data`` object while enforcing its shape."""
+    if not isinstance(payload, dict):
+        raise ValueError("complaint history response must be an object")
+    if "data" in payload and ("code" in payload or "msg" in payload):
+        code = payload.get("code")
+        try:
+            valid_code = (
+                type(code) in (int, float)
+                and not isinstance(code, bool)
+                and math.isfinite(float(code))
+                and code == 1
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_code = False
+        if not valid_code:
+            raise ValueError("complaint history response code is not successful")
+        payload = payload.get("data")
+    if not isinstance(payload, dict):
+        raise ValueError("complaint history data must be an object")
+    return payload
+
+
+def normalize_complaint_history(
+    payload: Any,
+    *,
+    expected_trade_no: str,
+) -> dict[str, Any]:
+    """Return the small, display-safe complaint history contract."""
+    data = _history_data(payload)
+    requested_trade_no = _history_text(expected_trade_no, 160)
+    returned_trade_no = _history_text(data.get("trade_no"), 160)
+    if returned_trade_no and returned_trade_no != requested_trade_no:
+        raise ValueError("complaint history trade number mismatch")
+
+    status = _history_integer(data.get("status"), -1)
+    messages: list[dict[str, Any]] = []
+    raw_messages = data.get("messages")
+    if raw_messages is not None and not isinstance(raw_messages, list):
+        raise ValueError("complaint history messages must be a list")
+    for raw_message in (raw_messages or [])[:MAX_HISTORY_MESSAGES]:
+        normalized = _history_message(raw_message)
+        if normalized is not None:
+            messages.append(normalized)
+
+    created_at = data.get("create_time")
+    if created_at is None:
+        # ``OrderQueryClient`` returns the normalized contract, while injected
+        # clients and fixtures may still provide the upstream field name.
+        created_at = data.get("created_at")
+
+    return {
+        "status": status,
+        "status_label": COMPLAINT_HISTORY_STATUS_LABELS.get(status, "未知状态"),
+        "reason": _history_text(data.get("reason"), MAX_HISTORY_REASON_LENGTH),
+        "content": _history_text(data.get("content"), MAX_HISTORY_TEXT_LENGTH),
+        "images": _history_images(data.get("images")),
+        "contact": _history_text(data.get("contact"), MAX_HISTORY_CONTACT_LENGTH),
+        "created_at": _history_timestamp(created_at),
+        "collect_image": _history_https_url(data.get("collect_image")),
+        "messages": messages,
+        "can_complaint": (
+            data.get("can_complaint")
+            if isinstance(data.get("can_complaint"), bool)
+            else _history_integer(data.get("can_complaint"), 0) == 1
+        ),
+    }
+
+
+# Compatibility alias matching the upstream page terminology.
+normalize_complaint_info = normalize_complaint_history

@@ -84,7 +84,17 @@ export function complaintActionForOrder(order = {}) {
   const status = complaintStatusMeta(order.complaint_status);
   const canApply = Boolean(order.trade_no && order.can_complaint);
   if (status.key === null && canApply) return {kind: 'apply', label: '申请售后', status};
-  if (status.key === -1 && canApply) return {kind: 'apply', label: '重新申请', status};
+  if (status.key === -1 && order.trade_no) {
+    return {
+      kind: 'history',
+      label: '查看记录',
+      status,
+      canReapply: canApply,
+      reapplyLabel: '重新申请',
+    };
+  }
+  if (status.key === 0) return {kind: 'history', label: '查看记录', status};
+  if (status.key === 1) return {kind: 'history', label: '售后完成', status};
   if (status.key === null) return {kind: 'none', label: '', status};
   return {kind: 'status', label: status.label, status};
 }
@@ -226,6 +236,100 @@ export function safeOrderContentUrl(value) {
   } catch {
     return '';
   }
+}
+
+const COMPLAINT_IDENTITY_LABELS = Object.freeze({
+  platform: '平台',
+  user: '商家',
+  parent: '货源商',
+  buyer: '买家',
+});
+
+function complaintHistoryText(value, limit) {
+  if (typeof value !== 'string' && typeof value !== 'number') return '';
+  return String(value).trim().slice(0, limit);
+}
+
+function complaintHistoryImageList(value, limit = 24) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, limit).map(safeOrderContentUrl).filter(Boolean);
+}
+
+function complaintMessageKind(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return value === 1 || normalized === '1' || normalized === 'image' ? 'image' : 'text';
+}
+
+export function normalizeComplaintHistoryResponse(payload = {}, fallback = {}) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const rawComplaint = source.complaint && typeof source.complaint === 'object'
+    ? source.complaint
+    : null;
+  const tradeNo = complaintHistoryText(source.trade_no, 160)
+    || normalizedText(fallback.trade_no);
+  const complaint = rawComplaint ? (() => {
+    const status = complaintStatusMeta(rawComplaint.status);
+    const messages = Array.isArray(rawComplaint.messages)
+      ? rawComplaint.messages.slice(0, 200).map(rawMessage => {
+        const message = rawMessage && typeof rawMessage === 'object' ? rawMessage : {};
+        const contentType = complaintMessageKind(message.content_type);
+        const content = contentType === 'image'
+          ? safeOrderContentUrl(message.content)
+          : complaintHistoryText(message.content, 4000);
+        const identity = complaintHistoryText(message.identity, 32).toLowerCase();
+        return {
+          identity: Object.hasOwn(COMPLAINT_IDENTITY_LABELS, identity) ? identity : 'unknown',
+          identity_label: complaintHistoryText(message.identity_label, 40)
+            || COMPLAINT_IDENTITY_LABELS[identity]
+            || '协商方',
+          content_type: contentType,
+          content,
+          created_at: complaintHistoryText(message.created_at, 80),
+        };
+      }).filter(message => Boolean(message.content))
+      : [];
+    return {
+      status: status.key,
+      status_label: complaintHistoryText(rawComplaint.status_label, 80) || status.label,
+      status_tone: status.tone,
+      reason: complaintHistoryText(rawComplaint.reason, 80),
+      content: complaintHistoryText(rawComplaint.content, 4000),
+      images: complaintHistoryImageList(rawComplaint.images),
+      contact: complaintHistoryText(rawComplaint.contact, 254),
+      created_at: complaintHistoryText(rawComplaint.created_at, 80),
+      collect_image: safeOrderContentUrl(rawComplaint.collect_image),
+      messages,
+      can_complaint: rawComplaint.can_complaint === true || Number(rawComplaint.can_complaint) === 1,
+    };
+  })() : null;
+
+  return {
+    session_id: complaintHistoryText(source.session_id, 128),
+    expires_in: Math.max(0, Math.floor(finiteNumber(source.expires_in, 0))),
+    trade_no: tradeNo,
+    need_query_password: source.need_query_password === true || Number(source.need_query_password) === 1,
+    complaint,
+  };
+}
+
+export function complaintHistoryErrorState(error = {}) {
+  const code = normalizedText(error.code || error.payload?.code);
+  const sessionExpired = Number(error.status) === 410 || code === 'order_query_session_expired';
+  const passwordRequired = code === 'order_query_password_required';
+  const passwordInvalid = code === 'order_query_password_invalid';
+  const fallback = sessionExpired
+    ? '订单查询会话已失效，请重新查询订单后再查看记录'
+    : passwordRequired
+      ? '请输入订单安全密码'
+      : passwordInvalid
+        ? '订单安全密码错误，请重新输入'
+        : '售后记录读取失败，请重试';
+  return {
+    sessionExpired,
+    passwordRequired,
+    passwordInvalid,
+    message: normalizedText(error.message) || fallback,
+  };
 }
 
 function plainText(value, fallback = '') {

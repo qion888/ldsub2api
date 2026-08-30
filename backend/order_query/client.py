@@ -14,24 +14,39 @@ from decimal import Decimal, InvalidOperation
 from http.cookiejar import CookieJar
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired
 
 from .captcha import captcha_sign
+from .complaint import normalize_complaint_history
 from .detail import normalize_order_detail
-from .errors import CaptchaVerificationExpired, UpstreamOrderError
+from .errors import (
+    CaptchaVerificationExpired,
+    OrderQueryDetailNotFound,
+    OrderQueryPasswordInvalid,
+    OrderQuerySessionExpired,
+    UpstreamOrderError,
+)
 
 BASE_URL = f"https://{ALLOWED_HOST}"
 CAPTCHA_START_PATH = "/shopApi/Common/captchaStart"
 ORDER_LIST_PATH = "/shopApi/Order/list"
 ORDER_DETAIL_PATH = "/shopApi/Order/info"
 COMPLAINT_INFO_PATH = "/shopApi/Order/info"
+COMPLAINT_PASSWORD_CHECK_PATH = "/shopApi/Order/checkNeedComplaintPwd"
+COMPLAINT_HISTORY_PATH = "/shopApi/Order/complaintInfo"
 COMPLAINT_UPLOAD_PATH = "/shopApi/upload/file"
 COMPLAINT_SUBMIT_PATH = "/shopApi/Order/complaintOrder"
 # Public aliases used by route-level tests and integrations.
 COMPLAINT_INFO_ENDPOINT = COMPLAINT_INFO_PATH
+COMPLAINT_PASSWORD_CHECK_ENDPOINT = COMPLAINT_PASSWORD_CHECK_PATH
+COMPLAINT_HISTORY_ENDPOINT = COMPLAINT_HISTORY_PATH
+COMPLAINT_CHECK_NEED_PASSWORD_PATH = COMPLAINT_PASSWORD_CHECK_PATH
+COMPLAINT_CHECK_NEED_PASSWORD_ENDPOINT = COMPLAINT_PASSWORD_CHECK_PATH
+COMPLAINT_INFO_HISTORY_PATH = COMPLAINT_HISTORY_PATH
+COMPLAINT_INFO_HISTORY_ENDPOINT = COMPLAINT_HISTORY_PATH
 COMPLAINT_UPLOAD_ENDPOINT = COMPLAINT_UPLOAD_PATH
 COMPLAINT_SUBMIT_ENDPOINT = COMPLAINT_SUBMIT_PATH
 MAX_JSON_BYTES = 2 * 1024 * 1024
@@ -269,6 +284,13 @@ class OrderQueryClient:
         if not isinstance(result, dict):
             raise UpstreamOrderError("订单接口响应格式无效", code="invalid_order_response")
         return result
+
+    def _form_request(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send an official form-encoded request using the current cookie/session context."""
+        headers = self._headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        encoded = urlencode(payload, doseq=True, encoding="utf-8").encode("utf-8")
+        return self._request_json_with_headers(url, encoded, headers=headers)
 
     @staticmethod
     def _response_json(raw: bytes, content_type: str) -> dict[str, Any]:
@@ -539,3 +561,78 @@ class OrderQueryClient:
             },
         )
         return normalize_order_detail(result, expected_trade_no=trade_no)
+
+    def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
+        """Read whether the official complaint history requires a password."""
+        result = self._form_request(
+            f"{BASE_URL}{COMPLAINT_PASSWORD_CHECK_PATH}",
+            {"trade_no": trade_no},
+        )
+        if not self._strict_numeric_code(result.get("code"), 1) or not isinstance(result.get("data"), dict):
+            raise UpstreamOrderError(
+                self._response_message(result, "投诉查询密码状态获取失败"),
+                code="complaint_history_password_check_failed",
+                retryable=True,
+            )
+        data = result["data"]
+        returned_trade_no = _safe_text(data.get("trade_no"), 160)
+        if returned_trade_no and returned_trade_no != _safe_text(trade_no, 160):
+            raise UpstreamOrderError(
+                "投诉历史订单号与请求不一致",
+                code="complaint_history_context_mismatch",
+            )
+        # The official Vue code uses ``need_pwd === 1``. Reject missing,
+        # boolean, string, and out-of-range values rather than failing open.
+        need_pwd = data.get("need_pwd")
+        if not self._is_numeric_code(need_pwd) or need_pwd not in (0, 1):
+            raise UpstreamOrderError(
+                "投诉查询密码状态响应格式无效",
+                code="invalid_complaint_history_password_response",
+            )
+        return {"need_pwd": int(need_pwd)}
+
+    @staticmethod
+    def _complaint_history_error(result: dict[str, Any]) -> None:
+        message = _safe_text(result.get("msg") or result.get("message"), 240)
+        if any(token in message for token in ("安全密码", "查询密码", "密码错误", "密码不正确")):
+            raise OrderQueryPasswordInvalid()
+        if any(token in message for token in ("重新查询", "会话已过期", "验证码已过期")):
+            raise OrderQuerySessionExpired()
+        if any(token in message for token in ("订单不存在", "未找到订单", "订单号不存在")):
+            raise OrderQueryDetailNotFound()
+        raise UpstreamOrderError(
+            message or "投诉历史获取失败",
+            code="complaint_history_failed",
+            retryable=True,
+        )
+
+    def get_complaint_history(
+        self,
+        *,
+        trade_no: str,
+        query_password: str = "",
+    ) -> dict[str, Any]:
+        """Fetch and normalize the official complaint history (read-only)."""
+        result = self._form_request(
+            f"{BASE_URL}{COMPLAINT_HISTORY_PATH}",
+            {"trade_no": trade_no, "query_pwd": query_password},
+        )
+        if not self._strict_numeric_code(result.get("code"), 1):
+            self._complaint_history_error(result)
+        try:
+            return normalize_complaint_history(
+                result.get("data"),
+                expected_trade_no=trade_no,
+            )
+        except ValueError as exc:
+            raise UpstreamOrderError(
+                "投诉历史响应格式无效",
+                code="invalid_complaint_history_response",
+            ) from exc
+
+    # Compatibility names mirror the endpoint names used in the official JS.
+    checkNeedComplaintPwd = check_need_complaint_password
+    check_complaint_password = check_need_complaint_password
+    complaintInfo = get_complaint_history
+    complaint_info = get_complaint_history
+    get_complaint_info_history = get_complaint_history

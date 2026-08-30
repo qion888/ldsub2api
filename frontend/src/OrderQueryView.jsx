@@ -15,7 +15,9 @@ import {
   ImagePlus,
   KeyRound,
   Link2,
+  Maximize2,
   MessageSquareWarning,
+  MessagesSquare,
   Package,
   ReceiptText,
   RefreshCw,
@@ -34,11 +36,13 @@ import {
   ORDER_STATUS_OPTIONS,
   canOpenProtectedOrderDetail,
   complaintActionForOrder,
+  complaintHistoryErrorState,
   createComplaintDraft,
   formatOrderDateTime,
   formatOrderCardsForCopy,
   formatOrderMoney,
   normalizeOrderDetail,
+  normalizeComplaintHistoryResponse,
   normalizeOrderResponse,
   orderDeliveryKindLabel,
   orderDetailErrorState,
@@ -75,6 +79,22 @@ function revokeComplaintPreview(url) {
 
 function QueryIconButton({label, children, ...props}) {
   return <button className="icon-button" type="button" aria-label={label} title={label} {...props}>{children}</button>;
+}
+
+// Complaint evidence is rendered as a button so mouse, keyboard, and assistive
+// technology users receive the same preview affordance.
+function ComplaintImageButton({src, alt = '售后图片', label = '查看图片', onOpen, className = ''}) {
+  if (!src) return null;
+  return <button
+    type="button"
+    className={`complaint-image-button ${className}`.trim()}
+    aria-label={label}
+    title={label}
+    onClick={event => onOpen?.(src, alt, event.currentTarget)}
+  >
+    <img src={src} alt={alt}/>
+    <span className="complaint-image-expand" aria-hidden="true"><Maximize2 size={13}/></span>
+  </button>;
 }
 
 function OrderImage({order}) {
@@ -298,9 +318,11 @@ function ComplaintDropZone({label, hint, multiple = false, disabled = false, inv
   </label>;
 }
 
-function ComplaintUploadItem({item, label, onRetry, onRemove}) {
+function ComplaintUploadItem({item, label, onRetry, onRemove, onPreview}) {
   return <div className={`order-complaint-upload ${item.status}`} role="listitem" aria-busy={item.status === 'uploading'}>
-    <img src={item.previewUrl || undefined} alt={`${label}预览`}/>
+    {item.previewUrl
+      ? <ComplaintImageButton src={item.previewUrl} alt={`${label}预览`} label={`查看${label}`} onOpen={onPreview}/>
+      : <span className="complaint-image-placeholder" aria-hidden="true"><Image size={18}/></span>}
     <div><strong title={item.name}>{label}</strong><span>{item.status === 'uploading' ? '上传中' : item.status === 'done' ? '已上传' : '上传失败'}</span></div>
     {item.status === 'uploading' && <RefreshCw className="spin" size={15} role="progressbar" aria-label={`${label}正在上传`}/>}
     {item.status === 'error' && <QueryIconButton label={`重试上传${label}`} onClick={() => onRetry(item)}><RotateCcw size={14}/></QueryIconButton>}
@@ -321,7 +343,7 @@ function readComplaintFile(file) {
 function ComplaintDialog({
   order, draft, errors, error, phase, uploads, snapshot, dialogRef, onChange, onFiles,
   onRetryUpload, onRemoveUpload, onEditSubmit, onConfirmSubmit, onRetryContext,
-  onBack, onClose, onCopyOrder, resultMessage, submissionUnknown,
+  onBack, onClose, onCopyOrder, resultMessage, submissionUnknown, onPreview,
 }) {
   const submitting = phase === 'submitting';
   const phaseKnown = COMPLAINT_PHASES.has(phase);
@@ -378,14 +400,14 @@ function ComplaintDialog({
           <fieldset className="order-complaint-images">
             <legend>图片凭证 <em>选填，最多 3 张</em></legend>
             <ComplaintDropZone label="选择或拖入凭证图" hint="PNG / JPEG / WebP，单张不超过 5 MB" multiple disabled={uploads.evidence.length >= 3} invalid={Boolean(errors.images)} errorId="complaint-images-error" onFiles={files => onFiles('evidence', files)}/>
-            {uploads.evidence.length > 0 && <div className="order-complaint-upload-list evidence" role="list" aria-live="polite">{uploads.evidence.map((item, index) => <ComplaintUploadItem item={item} label={`凭证图 ${index + 1}`} onRetry={value => onRetryUpload('evidence', value)} onRemove={value => onRemoveUpload('evidence', value)} key={item.id}/>)}</div>}
+            {uploads.evidence.length > 0 && <div className="order-complaint-upload-list evidence" role="list" aria-live="polite">{uploads.evidence.map((item, index) => <ComplaintUploadItem item={item} label={`凭证图 ${index + 1}`} onRetry={value => onRetryUpload('evidence', value)} onRemove={value => onRemoveUpload('evidence', value)} onPreview={onPreview} key={item.id}/>)}</div>}
             <ComplaintFieldError id="complaint-images-error" message={errors.images}/>
           </fieldset>
 
           <fieldset className="order-complaint-collect-image">
             <legend>退款二维码 <em>选填，最多 1 张</em></legend>
             <ComplaintDropZone label={uploads.collect.length ? '替换退款二维码' : '选择或拖入退款二维码'} hint="PNG / JPEG / WebP，单张不超过 5 MB" invalid={Boolean(errors.collect_image)} errorId="complaint-collect-error" onFiles={files => onFiles('collect', files)}/>
-            {uploads.collect.length > 0 && <div className="order-complaint-upload-list collect" role="list" aria-live="polite"><ComplaintUploadItem item={uploads.collect[0]} label="退款二维码" onRetry={value => onRetryUpload('collect', value)} onRemove={value => onRemoveUpload('collect', value)}/></div>}
+            {uploads.collect.length > 0 && <div className="order-complaint-upload-list collect" role="list" aria-live="polite"><ComplaintUploadItem item={uploads.collect[0]} label="退款二维码" onRetry={value => onRetryUpload('collect', value)} onRemove={value => onRemoveUpload('collect', value)} onPreview={onPreview}/></div>}
             <ComplaintFieldError id="complaint-collect-error" message={errors.collect_image}/>
           </fieldset>
         </div>
@@ -400,7 +422,7 @@ function ComplaintDialog({
         <div className="order-complaint-confirm-warning" data-complaint-phase-focus tabIndex={-1}><TriangleAlert size={18}/><div><strong>提交后本订单不能再次申请</strong><span>请确认投诉类型、说明、邮箱和图片无误。</span></div></div>
         {error && <div className="order-complaint-error" role="alert"><TriangleAlert size={15}/><span>{error}</span>{submissionUnknown && <button className="button secondary" type="button" onClick={onRetryContext}><RotateCcw size={14}/>刷新状态</button>}</div>}
         <dl className="order-complaint-confirm-facts"><div><dt>投诉类型</dt><dd>{snapshot.reason}</dd></div><div><dt>通知邮箱</dt><dd>{snapshot.contact}</dd></div><div className="wide"><dt>补充说明</dt><dd>{snapshot.content}</dd></div><div><dt>图片凭证</dt><dd>{snapshot.images.length} 张</dd></div><div><dt>退款二维码</dt><dd>{snapshot.collect_image ? '已上传' : '未上传'}</dd></div></dl>
-        {(uploads.evidence.length > 0 || uploads.collect.length > 0) && <div className="order-complaint-confirm-images">{[...uploads.evidence, ...uploads.collect].filter(item => item.status === 'done').map(item => <img src={item.previewUrl} alt="待提交图片" key={item.id}/>)}</div>}
+        {(uploads.evidence.length > 0 || uploads.collect.length > 0) && <div className="order-complaint-confirm-images">{[...uploads.evidence, ...uploads.collect].filter(item => item.status === 'done').map(item => <ComplaintImageButton src={item.previewUrl} alt="待提交图片" label="查看待提交图片" onOpen={onPreview} key={item.id}/>)}</div>}
         <div className="modal-foot order-complaint-foot">
           <span><ShieldCheck size={14}/>将提交到 pay.ldxp.cn</span>
           <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onBack} disabled={submitting || submissionUnknown}><ChevronLeft size={15}/>返回修改</button><button className="button primary danger" type="button" onClick={onConfirmSubmit} disabled={submitting || submissionUnknown}>{submitting ? <RefreshCw className="spin" size={15}/> : <Send size={15}/>} {submitting ? '正在提交' : '确认提交售后'}</button></div>
@@ -412,7 +434,99 @@ function ComplaintDialog({
   </div>;
 }
 
-function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint}) {
+function ComplaintHistoryDialog({
+  order,
+  history,
+  phase,
+  password,
+  passwordVisible,
+  busy,
+  error,
+  sessionExpired,
+  dialogRef,
+  passwordInputRef,
+  onPassword,
+  onTogglePassword,
+  onSubmit,
+  onClose,
+  onRetry,
+  onRequery,
+  onPreview,
+}) {
+  const complaint = history?.complaint;
+  const messages = Array.isArray(complaint?.messages) ? complaint.messages : [];
+  const evidence = Array.isArray(complaint?.images) ? complaint.images : [];
+  const hasSummary = Boolean(complaint?.reason || complaint?.content || complaint?.contact || evidence.length || complaint?.collect_image);
+  const waiting = phase === 'loading' || busy;
+  const showPassword = phase === 'password';
+  const showError = phase === 'error';
+  return <div className="modal-backdrop order-history-backdrop" onMouseDown={event => event.target === event.currentTarget && !waiting && onClose()}>
+    <div ref={dialogRef} className="checkout-modal order-history-modal" role="dialog" aria-modal="true" aria-labelledby="order-history-title" tabIndex={-1}>
+      <div className="modal-head order-history-head">
+        <div><span>AFTER-SALES HISTORY</span><h2 id="order-history-title">售后记录</h2></div>
+        <QueryIconButton label="关闭售后记录" onClick={onClose} disabled={waiting}><X size={17}/></QueryIconButton>
+      </div>
+
+      <div className="order-history-order">
+        <div><span>当前订单</span><strong>{order?.goods_name || '订单'}</strong><small>{order?.trade_no || history?.trade_no || '--'}</small></div>
+        {complaint?.status_label && <span className={`order-status ${complaint.status_tone}`}>{complaint.status_label}</span>}
+      </div>
+
+      {waiting && <div className="order-history-state" data-history-phase-focus tabIndex={-1} role="status" aria-live="polite" aria-busy="true"><RefreshCw className="spin" size={21}/><strong>正在读取售后记录</strong><span>正在从官方售后通道获取对话和凭证</span></div>}
+
+      {showPassword && <form className="order-history-password" onSubmit={onSubmit}>
+        <div className="order-history-state compact" data-history-phase-focus tabIndex={-1}><KeyRound size={21}/><strong>需要订单安全密码</strong><span>该订单的售后记录受安全密码保护</span></div>
+        {error && <div className="order-password-error" role="alert"><TriangleAlert size={15}/><span>{error}</span></div>}
+        <label className="order-password-label" htmlFor="order-history-password">安全密码</label>
+        <div className={`order-password-control ${error ? 'invalid' : ''}`}>
+          <KeyRound size={16}/>
+          <input id="order-history-password" ref={passwordInputRef} type={passwordVisible ? 'text' : 'password'} value={password} onChange={event => onPassword(event.target.value)} autoComplete="off" maxLength={160} aria-invalid={Boolean(error)} disabled={busy}/>
+          <QueryIconButton label={passwordVisible ? '隐藏安全密码' : '显示安全密码'} onClick={onTogglePassword} disabled={busy}>{passwordVisible ? <EyeOff size={15}/> : <Eye size={15}/>}</QueryIconButton>
+        </div>
+        <div className="order-history-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={busy || !password.trim()}><ShieldCheck size={15}/>{busy ? '正在验证' : '验证并查看'}</button></div>
+      </form>}
+
+      {showError && <div className="order-history-state error" data-history-phase-focus tabIndex={-1} role="alert">
+        <TriangleAlert size={21}/><strong>{sessionExpired ? '查询会话已失效' : '售后记录暂时不可用'}</strong><span>{error || '售后记录读取失败，请重试'}</span>
+        <div className="order-history-actions">{sessionExpired ? <button className="button primary" type="button" onClick={onRequery}><RefreshCw size={15}/>关闭并重新查询</button> : <button className="button secondary" type="button" onClick={onRetry}><RotateCcw size={15}/>重试</button>}<button className="button secondary" type="button" onClick={onClose}>关闭</button></div>
+      </div>}
+
+      {phase === 'ready' && <div className="order-history-scroll">
+        {!complaint && <div className="order-history-empty" data-history-phase-focus tabIndex={-1}><MessagesSquare size={24}/><strong>暂无售后记录</strong><span>该订单当前没有可展示的售后对话或凭证</span></div>}
+        {complaint && <>
+          {hasSummary && <section className="order-history-summary">
+            <div className="order-history-section-head"><div><span>REQUEST</span><h3>申请信息</h3></div>{complaint.created_at && <time>{formatOrderDateTime(complaint.created_at)}</time>}</div>
+            <dl className="order-history-facts">
+              {complaint.reason && <div><dt>投诉类型</dt><dd>{complaint.reason}</dd></div>}
+              {complaint.contact && <div><dt>通知邮箱</dt><dd>{complaint.contact}</dd></div>}
+              {complaint.content && <div className="wide"><dt>补充说明</dt><dd>{complaint.content}</dd></div>}
+            </dl>
+            {evidence.length > 0 && <div className="order-history-gallery">
+              {evidence.map((src, index) => <ComplaintImageButton src={src} alt={`售后凭证 ${index + 1}`} label={`查看售后凭证 ${index + 1}`} onOpen={onPreview} key={`${src}-${index}`}/>) }
+            </div>}
+            <div className="order-history-refund-qr">
+              <div className="order-history-refund-head"><div><span>REFUND QR</span><strong>买家退款二维码</strong></div><em>{complaint.collect_image ? '点击图片查看' : '未上传'}</em></div>
+              {complaint.collect_image
+                ? <ComplaintImageButton src={complaint.collect_image} alt="退款二维码" label="查看退款二维码" onOpen={onPreview} className="collect"/>
+                : <div className="order-history-no-image"><Image size={18}/><span>暂无退款二维码</span></div>}
+            </div>
+          </section>}
+          <section className="order-history-conversation" aria-live="polite">
+            <div className="order-history-section-head"><div><span>CONVERSATION</span><h3>协商记录</h3></div><span className="order-history-count">{messages.length} 条</span></div>
+            {messages.length > 0 ? <div className="order-history-messages">{messages.map((message, index) => <article className={`order-history-message ${message.identity || 'unknown'}`} key={`${message.created_at || 'message'}-${index}`}>
+              <div className="order-history-message-meta"><strong>{message.identity_label || '协商方'}</strong>{message.created_at && <time>{formatOrderDateTime(message.created_at)}</time>}</div>
+              {message.content_type === 'image' ? <ComplaintImageButton src={message.content} alt={`${message.identity_label || '协商方'}发送的图片`} label={`查看${message.identity_label || '协商方'}发送的图片`} onOpen={onPreview} className="message-image"/> : <p>{message.content}</p>}
+            </article>)}</div> : <div className="order-history-empty compact"><MessagesSquare size={20}/><span>暂无文字或图片消息</span></div>}
+          </section>
+        </>}
+      </div>}
+
+      {phase === 'ready' && <div className="order-dialog-foot order-history-foot"><span><ShieldCheck size={14}/>记录来自 pay.ldxp.cn</span><button className="button primary" type="button" onClick={onClose}>关闭</button></div>}
+    </div>
+  </div>;
+}
+
+function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint, onComplaintHistory}) {
   const complaintAction = complaintActionForOrder(order);
   return <tr>
     <td data-label="商品">
@@ -427,6 +541,8 @@ function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint}) {
       {canOpenProtectedOrderDetail(order) && <button className="button secondary order-result-link order-password-button" type="button" onClick={event => onOpenProtectedDetail(order, event.currentTarget)}><KeyRound size={14}/>安全密码</button>}
       {order.status === 1 && order.result_url && !order.need_query_password && <a className="button secondary order-result-link" href={order.result_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>{order.goods_action_label}</a>}
       {complaintAction.kind === 'apply' && <button className="button secondary order-complaint-button" type="button" onClick={event => onComplaint(order, event.currentTarget)}><MessageSquareWarning size={14}/>{complaintAction.label}</button>}
+      {complaintAction.kind === 'history' && <button className={`button secondary order-complaint-button history ${complaintAction.status.tone}`} type="button" onClick={event => onComplaintHistory(order, event.currentTarget)}><MessagesSquare size={14}/>{complaintAction.label}</button>}
+      {complaintAction.kind === 'history' && complaintAction.canReapply && <button className="button secondary order-complaint-button" type="button" onClick={event => onComplaint(order, event.currentTarget)}><MessageSquareWarning size={14}/>{complaintAction.reapplyLabel}</button>}
       {complaintAction.kind === 'status' && <span className={`order-complaint-state ${complaintAction.status.tone}`}>{complaintAction.label}</span>}
     </div></td>
   </tr>;
@@ -468,6 +584,15 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const [complaintSnapshot, setComplaintSnapshot] = useState(null);
   const [complaintResultMessage, setComplaintResultMessage] = useState('订单已进入售后待处理状态。');
   const [complaintSubmissionUnknown, setComplaintSubmissionUnknown] = useState(false);
+  const [historyOrder, setHistoryOrder] = useState(null);
+  const [historyData, setHistoryData] = useState(null);
+  const [historyPassword, setHistoryPassword] = useState('');
+  const [historyPasswordVisible, setHistoryPasswordVisible] = useState(false);
+  const [historyPhase, setHistoryPhase] = useState('closed');
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historySessionExpired, setHistorySessionExpired] = useState(false);
+  const [imagePreview, setImagePreview] = useState(null);
   const requestVersion = useRef(0);
   const detailRequestVersion = useRef(0);
   const detailAbortController = useRef(null);
@@ -484,8 +609,17 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const complaintGeneration = useRef(0);
   const complaintSubmitLock = useRef(false);
   const complaintUploadsRef = useRef(complaintUploads);
+  const historyTrigger = useRef(null);
+  const historyDialog = useRef(null);
+  const historyPasswordInput = useRef(null);
+  const historyRequest = useRef(null);
+  const historyGeneration = useRef(0);
+  const runSearchRef = useRef(null);
+  const imagePreviewDialog = useRef(null);
+  const imagePreviewTrigger = useRef(null);
   complaintUploadsRef.current = complaintUploads;
   const complaintOpen = Boolean(complaintOrder && complaintDraft);
+  const historyOpen = Boolean(historyOrder);
 
   const revokeComplaintUploadUrls = useCallback((uploads) => {
     [...(uploads?.evidence || []), ...(uploads?.collect || [])].forEach(item => {
@@ -517,6 +651,158 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
     complaintSubmitLock.current = false;
   }, [complaintPhase, revokeComplaintUploadUrls]);
 
+  const openImagePreview = useCallback((src, alt = '售后图片', trigger = null) => {
+    if (typeof src !== 'string' || !src.trim()) return;
+    imagePreviewTrigger.current = trigger || document.activeElement;
+    setImagePreview({src: src.trim(), alt: String(alt || '售后图片')});
+  }, []);
+
+  const closeImagePreview = useCallback(() => {
+    setImagePreview(null);
+    const trigger = imagePreviewTrigger.current;
+    imagePreviewTrigger.current = null;
+    window.requestAnimationFrame(() => {
+      if (trigger?.isConnected) trigger.focus();
+    });
+  }, []);
+
+  const loadComplaintHistory = useCallback(async (order, password = '') => {
+    if (!order?.trade_no) return false;
+    const generation = historyGeneration.current + 1;
+    historyGeneration.current = generation;
+    historyRequest.current?.abort();
+    const controller = new AbortController();
+    historyRequest.current = controller;
+    const queryPassword = String(password || '');
+    setHistoryBusy(true);
+    setHistoryPhase('loading');
+    setHistoryError('');
+    setHistorySessionExpired(false);
+    if (!sessionId || !submittedKeywords) {
+      if (generation === historyGeneration.current) {
+        setHistoryBusy(false);
+        setHistoryPhase('error');
+        setHistorySessionExpired(true);
+        setHistoryError('Order query session expired. Run a new order search before viewing history.');
+      }
+      if (historyRequest.current === controller) historyRequest.current = null;
+      return false;
+    }
+    try {
+      const response = await request('/order-query/complaints/history', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          keywords: submittedKeywords,
+          session_id: sessionId,
+          trade_no: order.trade_no,
+          query_password: queryPassword,
+        }),
+        signal: controller.signal,
+      });
+      if (generation !== historyGeneration.current || controller.signal.aborted) return false;
+      const normalized = normalizeComplaintHistoryResponse(response, {trade_no: order.trade_no});
+      setHistoryData(normalized);
+      if (response && response.session_id) setSessionId(String(response.session_id));
+      if (response && response.expires_in !== undefined) setExpiresIn(Math.max(0, Number(response.expires_in) || 0));
+      if (normalized.need_query_password && !normalized.complaint && !queryPassword.trim()) {
+        setHistoryPhase('password');
+        setHistoryPassword('');
+        setHistoryPasswordVisible(false);
+        setHistoryError('');
+        window.requestAnimationFrame(() => historyPasswordInput.current?.focus());
+        return false;
+      }
+      setHistoryPassword('');
+      setHistoryPasswordVisible(false);
+      setHistoryError('');
+      setHistorySessionExpired(false);
+      setHistoryPhase('ready');
+      return true;
+    } catch (requestError) {
+      if (controller.signal.aborted || requestError?.name === 'AbortError' || generation !== historyGeneration.current) return false;
+      const state = complaintHistoryErrorState(requestError);
+      if (state.sessionExpired) {
+        setSessionId('');
+        setVerification(null);
+        setExpiresIn(0);
+      }
+      if (state.passwordRequired || state.passwordInvalid) {
+        setHistoryPhase('password');
+        setHistorySessionExpired(false);
+        setHistoryError(state.passwordInvalid ? state.message : '');
+        if (state.passwordInvalid) setHistoryPassword('');
+        window.requestAnimationFrame(() => historyPasswordInput.current?.focus());
+      } else {
+        setHistoryData(null);
+        setHistoryPhase('error');
+        setHistorySessionExpired(state.sessionExpired);
+        setHistoryError(state.message);
+      }
+      return false;
+    } finally {
+      if (historyRequest.current === controller) historyRequest.current = null;
+      if (generation === historyGeneration.current) setHistoryBusy(false);
+    }
+  }, [request, sessionId, submittedKeywords]);
+
+  const closeComplaintHistory = useCallback(() => {
+    historyGeneration.current += 1;
+    historyRequest.current?.abort();
+    historyRequest.current = null;
+    setHistoryOrder(null);
+    setHistoryData(null);
+    setHistoryPassword('');
+    setHistoryPasswordVisible(false);
+    setHistoryPhase('closed');
+    setHistoryBusy(false);
+    setHistoryError('');
+    setHistorySessionExpired(false);
+    setImagePreview(null);
+    imagePreviewTrigger.current = null;
+  }, []);
+
+  const openComplaintHistory = useCallback((order, trigger) => {
+    if (!order || detailOrder || complaintOpen) return;
+    historyGeneration.current += 1;
+    historyRequest.current?.abort();
+    historyRequest.current = null;
+    historyTrigger.current = trigger || document.activeElement;
+    setHistoryOrder(order);
+    setHistoryData(null);
+    setHistoryPassword('');
+    setHistoryPasswordVisible(false);
+    setHistoryError('');
+    setHistorySessionExpired(false);
+    setHistoryPhase('loading');
+    setHistoryBusy(false);
+    if (!sessionId || !submittedKeywords) {
+      setHistoryPhase('error');
+      setHistorySessionExpired(true);
+      setHistoryError('Order query session expired. Run a new order search before viewing history.');
+      return;
+    }
+    loadComplaintHistory(order, '');
+  }, [complaintOpen, detailOrder, loadComplaintHistory, sessionId, submittedKeywords]);
+
+  const submitComplaintHistoryPassword = useCallback(event => {
+    event.preventDefault();
+    if (!historyOrder || historyBusy || historyPhase !== 'password' || !historyPassword.trim()) return;
+    loadComplaintHistory(historyOrder, historyPassword);
+  }, [historyBusy, historyOrder, historyPassword, historyPhase, loadComplaintHistory]);
+
+  const retryComplaintHistory = useCallback(() => {
+    if (!historyOrder || historyBusy) return;
+    loadComplaintHistory(historyOrder, historyPhase === 'password' ? historyPassword : '');
+  }, [historyBusy, historyOrder, historyPassword, historyPhase, loadComplaintHistory]);
+
+  const requeryAfterHistoryExpiry = useCallback(() => {
+    const keyword = submittedKeywords;
+    const page = result.pagination.page || 1;
+    closeComplaintHistory();
+    if (keyword) runSearchRef.current?.({keywordValue: keyword, pageValue: page, reuseSession: false});
+  }, [closeComplaintHistory, result.pagination.page, submittedKeywords]);
+
   const closeOrderDetail = useCallback(() => {
     detailRequestVersion.current += 1;
     detailAbortController.current?.abort();
@@ -545,7 +831,11 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
     complaintUploadControllers.current.clear();
     complaintSubmitController.current?.abort();
     complaintSubmitController.current = null;
+    historyGeneration.current += 1;
+    historyRequest.current?.abort();
+    historyRequest.current = null;
     revokeComplaintUploadUrls(complaintUploadsRef.current);
+    imagePreviewTrigger.current = null;
   }, [revokeComplaintUploadUrls]);
 
   useEffect(() => {
@@ -648,6 +938,91 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       if (trigger?.isConnected) trigger.focus();
     });
   }, [complaintOpen]);
+
+  useEffect(() => {
+    if (!historyOpen) return undefined;
+    document.body.classList.add('order-history-open');
+    const dialog = historyDialog.current;
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (historyPhase === 'password') historyPasswordInput.current?.focus();
+      else dialog?.querySelector('[data-history-phase-focus]')?.focus();
+    });
+    const handleDialogKey = event => {
+      if (imagePreview) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        if (!historyBusy) closeComplaintHistory();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialog) return;
+      const focusable = Array.from(dialog.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const outside = !dialog.contains(document.activeElement);
+      const notTabbable = !focusable.includes(document.activeElement);
+      if ((event.shiftKey && (document.activeElement === first || outside || notTabbable)) || (!event.shiftKey && (document.activeElement === last || outside || notTabbable))) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    };
+    window.addEventListener('keydown', handleDialogKey);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.body.classList.remove('order-history-open');
+      window.removeEventListener('keydown', handleDialogKey);
+    };
+  }, [closeComplaintHistory, historyBusy, historyOpen, historyPhase, imagePreview]);
+
+  useEffect(() => {
+    if (historyOpen || !historyTrigger.current) return;
+    const trigger = historyTrigger.current;
+    historyTrigger.current = null;
+    window.requestAnimationFrame(() => {
+      if (trigger?.isConnected) trigger.focus();
+    });
+  }, [historyOpen]);
+
+  useEffect(() => {
+    if (!imagePreview) return undefined;
+    const dialog = imagePreviewDialog.current;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const focusFrame = window.requestAnimationFrame(() => dialog?.focus());
+    const handleLightboxKey = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeImagePreview();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialog) return;
+      const focusable = Array.from(dialog.querySelectorAll('button:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', handleLightboxKey);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleLightboxKey);
+    };
+  }, [closeImagePreview, imagePreview]);
 
   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
   const manualRequired = verification?.status === 'manual_required';
@@ -765,6 +1140,8 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       if (version === requestVersion.current) setBusy('');
     }
   };
+
+  runSearchRef.current = runSearch;
 
   const submitSearch = event => {
     event.preventDefault();
@@ -1272,7 +1649,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       <div className="order-table-wrap">
         <table className="order-query-table">
           <thead><tr><th>商品 / 下单时间</th><th>订单号</th><th>金额 / 数量</th><th>状态</th><th>商品类型</th><th>操作</th></tr></thead>
-          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} onComplaint={openComplaint} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
+          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} onComplaint={openComplaint} onComplaintHistory={openComplaintHistory} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
         </table>
       </div>
 
@@ -1321,8 +1698,37 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       onConfirmSubmit={confirmComplaintSubmit}
       onRetryContext={retryComplaintContext}
       onBack={() => { setComplaintPhase('edit'); setComplaintError(''); }}
-      onClose={closeComplaint}
-      onCopyOrder={copyOrderNumber}
+       onClose={closeComplaint}
+       onCopyOrder={copyOrderNumber}
+       onPreview={openImagePreview}
+     />}
+    {historyOpen && <ComplaintHistoryDialog
+      order={historyOrder}
+      history={historyData}
+      phase={historyPhase}
+      password={historyPassword}
+      passwordVisible={historyPasswordVisible}
+      busy={historyBusy}
+      error={historyError}
+      sessionExpired={historySessionExpired}
+      dialogRef={historyDialog}
+      passwordInputRef={historyPasswordInput}
+      onPassword={value => {
+        setHistoryPassword(value);
+        if (historyError) setHistoryError('');
+      }}
+      onTogglePassword={() => setHistoryPasswordVisible(current => !current)}
+      onSubmit={submitComplaintHistoryPassword}
+      onClose={closeComplaintHistory}
+      onRetry={retryComplaintHistory}
+      onRequery={requeryAfterHistoryExpiry}
+      onPreview={openImagePreview}
     />}
-  </section>;
+    {imagePreview && <div className="modal-backdrop order-image-preview-backdrop" onMouseDown={event => event.target === event.currentTarget && closeImagePreview()}>
+      <div ref={imagePreviewDialog} className="order-image-preview-dialog" role="dialog" aria-modal="true" aria-label="图片预览" tabIndex={-1}>
+        <QueryIconButton label="关闭图片预览" onClick={closeImagePreview}><X size={17}/></QueryIconButton>
+        <img src={imagePreview.src} alt={imagePreview.alt}/>
+      </div>
+    </div>}
+   </section>;
 }

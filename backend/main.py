@@ -1161,6 +1161,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             detail=ORDER_QUERY_SERVICE.detail,
             complaint_preview=build_complaint_preview,
             complaint_context=getattr(ORDER_QUERY_SERVICE, "complaint_context", None),
+            complaint_history=getattr(ORDER_QUERY_SERVICE, "complaint_history", None),
             complaint_upload=getattr(ORDER_QUERY_SERVICE, "complaint_upload", None),
             complaint_submit=getattr(ORDER_QUERY_SERVICE, "complaint_submit", None),
             complaint_remove_upload=getattr(ORDER_QUERY_SERVICE, "complaint_remove_upload", None),

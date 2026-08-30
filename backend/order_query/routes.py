@@ -15,6 +15,7 @@ ORDER_QUERY_PATH = "/api/order-query/search"
 ORDER_DETAIL_PATH = "/api/order-query/detail"
 ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
 ORDER_COMPLAINT_CONTEXT_PATH = "/api/order-query/complaints/context"
+ORDER_COMPLAINT_HISTORY_PATH = "/api/order-query/complaints/history"
 ORDER_COMPLAINT_UPLOAD_PATH = "/api/order-query/complaints/upload"
 ORDER_COMPLAINT_SUBMIT_PATH = "/api/order-query/complaints/submit"
 ORDER_COMPLAINT_REMOVE_UPLOAD_PATH = "/api/order-query/complaints/upload/remove"
@@ -23,6 +24,7 @@ ORDER_QUERY_POST_PATHS = frozenset({
     ORDER_DETAIL_PATH,
     ORDER_COMPLAINT_PREVIEW_PATH,
     ORDER_COMPLAINT_CONTEXT_PATH,
+    ORDER_COMPLAINT_HISTORY_PATH,
     ORDER_COMPLAINT_UPLOAD_PATH,
     ORDER_COMPLAINT_SUBMIT_PATH,
     ORDER_COMPLAINT_REMOVE_UPLOAD_PATH,
@@ -101,6 +103,7 @@ def handle_post(
     detail: Callable[[dict[str, Any]], dict[str, Any]],
     complaint_preview: Callable[[dict[str, Any]], dict[str, Any]] = build_complaint_preview,
     complaint_context: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    complaint_history: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     complaint_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     complaint_submit: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     complaint_remove_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -113,6 +116,8 @@ def handle_post(
         operation = complaint_preview
     elif path == ORDER_COMPLAINT_CONTEXT_PATH:
         operation = complaint_context
+    elif path == ORDER_COMPLAINT_HISTORY_PATH:
+        operation = complaint_history
     elif path == ORDER_COMPLAINT_UPLOAD_PATH:
         operation = complaint_upload
     elif path == ORDER_COMPLAINT_SUBMIT_PATH:
@@ -146,11 +151,21 @@ def handle_post(
     except RuntimeError as exc:
         is_complaint = path.startswith("/api/order-query/complaints/")
         is_complaint_preview = path == ORDER_COMPLAINT_PREVIEW_PATH
-        fallback_detail = "售后申请参数预览失败" if is_complaint_preview else ("售后申请失败" if is_complaint else "订单查询失败")
+        is_complaint_history = path == ORDER_COMPLAINT_HISTORY_PATH
+        fallback_detail = (
+            "售后历史获取失败"
+            if is_complaint_history
+            else ("售后申请参数预览失败" if is_complaint_preview else ("售后申请失败" if is_complaint else "订单查询失败"))
+        )
+        fallback_code = (
+            "order_complaint_history_failed"
+            if is_complaint_history
+            else ("order_complaint_preview_failed" if is_complaint_preview else ("order_complaint_failed" if is_complaint else "order_query_failed"))
+        )
         send_json(
             {
                 "detail": str(exc)[:240] or fallback_detail,
-                "code": "order_complaint_preview_failed" if is_complaint_preview else ("order_complaint_failed" if is_complaint else "order_query_failed"),
+                "code": fallback_code,
                 "retryable": True,
             },
             502,

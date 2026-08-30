@@ -5,6 +5,7 @@ import {
   COMPLAINT_MAX_IMAGE_BYTES,
   COMPLAINT_REASON_OPTIONS,
   complaintActionForOrder,
+  complaintHistoryErrorState,
   complaintImageFileError,
   complaintStatusMeta,
   createComplaintDraft,
@@ -12,6 +13,7 @@ import {
   formatOrderCardsForCopy,
   formatOrderMoney,
   normalizeOrder,
+  normalizeComplaintHistoryResponse,
   normalizeOrderDetail,
   normalizeOrderResponse,
   orderDeliveryKindLabel,
@@ -64,14 +66,110 @@ test('distinguishes complaint actions and statuses conservatively', () => {
     label: '申请售后',
     status: {key: null, label: '未申请售后', tone: 'neutral'},
   });
-  assert.equal(complaintActionForOrder({...eligible, complaint_status: -1}).label, '重新申请');
-  assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: -1}).kind, 'status');
-  assert.equal(complaintActionForOrder({...eligible, complaint_status: 0}).label, '售后待处理');
-  assert.equal(complaintActionForOrder({...eligible, complaint_status: 1}).label, '售后已完成');
+  assert.deepEqual(complaintActionForOrder({...eligible, complaint_status: -1}), {
+    kind: 'history',
+    label: '查看记录',
+    status: {key: -1, label: '售后已撤销', tone: 'muted'},
+    canReapply: true,
+    reapplyLabel: '重新申请',
+  });
+  assert.deepEqual(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: -1}), {
+    kind: 'history',
+    label: '查看记录',
+    status: {key: -1, label: '售后已撤销', tone: 'muted'},
+    canReapply: false,
+    reapplyLabel: '重新申请',
+  });
+  assert.deepEqual(complaintActionForOrder({...eligible, complaint_status: 0}), {
+    kind: 'history',
+    label: '查看记录',
+    status: {key: 0, label: '售后待处理', tone: 'pending'},
+  });
+  assert.deepEqual(complaintActionForOrder({...eligible, complaint_status: 1}), {
+    kind: 'history',
+    label: '售后完成',
+    status: {key: 1, label: '售后已完成', tone: 'success'},
+  });
   assert.equal(complaintActionForOrder({...eligible, complaint_status: 7}).kind, 'status');
   assert.equal(complaintActionForOrder({...eligible, complaint_status: 'unexpected'}).kind, 'status');
   assert.equal(complaintStatusMeta(7).label, '售后状态未知');
   assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: null}).kind, 'none');
+});
+
+test('normalizes complaint history messages and image fields conservatively', () => {
+  const result = normalizeComplaintHistoryResponse({
+    session_id: ' session-1 ',
+    expires_in: '88.9',
+    trade_no: ' LD-1001 ',
+    need_query_password: 1,
+    complaint: {
+      status: '0',
+      status_label: ' 待平台处理 ',
+      reason: ' 描述不符 ',
+      content: ' 商品内容不一致 ',
+      images: ['https://cdn.example.test/a.png', 'javascript:alert(1)', null],
+      contact: ' buyer@example.test ',
+      created_at: '1710000000',
+      collect_image: 'https://cdn.example.test/qr.png',
+      can_complaint: '1',
+      messages: [
+        {identity: 'buyer', identity_label: '', content_type: 0, content: ' 买家补充 ', created_at: '1710000001'},
+        {identity: 'platform', identity_label: ' 平台客服 ', content_type: 1, content: 'https://cdn.example.test/reply.png', created_at: '1710000002'},
+        {identity: 'user', content_type: 'image', content: 'file:///tmp/leak.png'},
+        {identity: '<unsafe>', content_type: 'text', content: ' 协商回复 '},
+      ],
+      internal_note: 'must-not-leak',
+    },
+    internal: 'must-not-leak',
+  });
+
+  assert.deepEqual(result, {
+    session_id: 'session-1',
+    expires_in: 88,
+    trade_no: 'LD-1001',
+    need_query_password: true,
+    complaint: {
+      status: 0,
+      status_label: '待平台处理',
+      status_tone: 'pending',
+      reason: '描述不符',
+      content: '商品内容不一致',
+      images: ['https://cdn.example.test/a.png'],
+      contact: 'buyer@example.test',
+      created_at: '1710000000',
+      collect_image: 'https://cdn.example.test/qr.png',
+      messages: [
+        {identity: 'buyer', identity_label: '买家', content_type: 'text', content: '买家补充', created_at: '1710000001'},
+        {identity: 'platform', identity_label: '平台客服', content_type: 'image', content: 'https://cdn.example.test/reply.png', created_at: '1710000002'},
+        {identity: 'unknown', identity_label: '协商方', content_type: 'text', content: '协商回复', created_at: ''},
+      ],
+      can_complaint: true,
+    },
+  });
+  assert.equal(JSON.stringify(result).includes('must-not-leak'), false);
+});
+
+test('normalizes empty complaint history and classifies password and expiry errors', () => {
+  assert.deepEqual(normalizeComplaintHistoryResponse({need_query_password: false}, {trade_no: 'LD-FALLBACK'}), {
+    session_id: '',
+    expires_in: 0,
+    trade_no: 'LD-FALLBACK',
+    need_query_password: false,
+    complaint: null,
+  });
+  assert.deepEqual(complaintHistoryErrorState({code: 'order_query_password_required'}), {
+    sessionExpired: false,
+    passwordRequired: true,
+    passwordInvalid: false,
+    message: '请输入订单安全密码',
+  });
+  assert.deepEqual(complaintHistoryErrorState({status: 403, code: 'order_query_password_invalid', message: '密码错误'}), {
+    sessionExpired: false,
+    passwordRequired: false,
+    passwordInvalid: true,
+    message: '密码错误',
+  });
+  assert.equal(complaintHistoryErrorState({status: 410}).sessionExpired, true);
 });
 
 test('creates and normalizes the exact complaint submission payload', () => {

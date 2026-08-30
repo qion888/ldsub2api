@@ -8,6 +8,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+from urllib.parse import parse_qs
 from urllib.request import Request
 
 import main
@@ -279,6 +280,46 @@ class ClientTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "图片响应无效"):
             client.download_captcha(challenge)
+
+    def test_complaint_history_uses_form_encoding_and_retains_visitor_id(self) -> None:
+        opener = FakeOpener([
+            self._json_response({"code": 1, "data": {"need_pwd": 1}}),
+            self._json_response({
+                "code": 1,
+                "data": {
+                    "status": 0,
+                    "reason": "描述不符",
+                    "content": "商品内容不一致",
+                    "images": [],
+                    "messages": [],
+                    "collect_image": None,
+                },
+            }),
+        ])
+        client = OrderQueryClient(opener=opener)
+
+        self.assertEqual(client.check_need_complaint_password(trade_no="ORDER-1"), {"need_pwd": 1})
+        history = client.get_complaint_history(trade_no="ORDER-1", query_password="123456")
+        self.assertEqual(history["status"], 0)
+        self.assertEqual(len(opener.requests), 2)
+        for request in opener.requests:
+            headers = {key.lower(): value for key, value in request.header_items()}
+            self.assertTrue(headers["content-type"].lower().startswith("application/x-www-form-urlencoded"))
+            self.assertEqual(headers["visitorid"], client.visitor_id)
+        self.assertEqual(parse_qs(opener.requests[0].data.decode("utf-8")), {"trade_no": ["ORDER-1"]})
+        self.assertEqual(parse_qs(opener.requests[1].data.decode("utf-8")), {
+            "trade_no": ["ORDER-1"],
+            "query_pwd": ["123456"],
+        })
+
+    def test_complaint_password_check_rejects_missing_or_non_numeric_need_pwd(self) -> None:
+        for value in (None, "1", True, 2, float("nan")):
+            with self.subTest(value=value):
+                data = {} if value is None else {"need_pwd": value}
+                opener = FakeOpener([self._json_response({"code": 1, "data": data})])
+                with self.assertRaisesRegex(UpstreamOrderError, "响应格式无效") as context:
+                    OrderQueryClient(opener=opener).check_need_complaint_password(trade_no="ORDER-1")
+                self.assertEqual(context.exception.code, "invalid_complaint_history_password_response")
 
     def test_order_detail_uses_fixed_endpoint_and_returns_a_strict_allowlist(self) -> None:
         upstream = {
@@ -1171,6 +1212,7 @@ class RouteTests(unittest.TestCase):
     def test_main_http_handler_mounts_all_complaint_workflow_routes(self) -> None:
         endpoints = {
             "/api/order-query/complaints/context": "complaint_context",
+            "/api/order-query/complaints/history": "complaint_history",
             "/api/order-query/complaints/upload": "complaint_upload",
             "/api/order-query/complaints/upload/remove": "complaint_remove_upload",
             "/api/order-query/complaints/submit": "complaint_submit",
@@ -1571,6 +1613,70 @@ class ComplaintWorkflowTests(unittest.TestCase):
         with self.assertRaises(OrderComplaintSubmissionUnknown):
             service.complaint_submit(payload)
         self.assertEqual(len(client.submit_calls), 1)
+
+    def test_complaint_history_accepts_official_password_text_and_returns_normalized_record(self) -> None:
+        class HistoryClient(self.Client):
+            def __init__(self) -> None:
+                super().__init__()
+                self.history_passwords: list[str] = []
+
+            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
+                self.context_calls.append(trade_no)
+                return {"need_pwd": 1}
+
+            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
+                self.history_passwords.append(query_password)
+                return {
+                    "status": 1,
+                    "reason": "描述不符",
+                    "content": "已协商完成",
+                    "images": [],
+                    "contact": "buyer@example.test",
+                    "create_time": 1788134400,
+                    "messages": [{
+                        "identity": "platform",
+                        "content_type": 0,
+                        "content": "平台已处理",
+                        "create_time": 1_788_134_400,
+                    }],
+                    "collect_image": None,
+                }
+
+        client = HistoryClient()
+        service = self._service(client)
+        identity = self._identity(service)
+
+        with self.assertRaises(OrderQueryPasswordRequired):
+            service.complaint_history({**identity, "query_password": ""})
+        for password in ("bad\npassword", "x" * 161):
+            with self.subTest(password=password):
+                with self.assertRaises(OrderComplaintInputError):
+                    service.complaint_history({**identity, "query_password": password})
+        result = service.complaint_history({**identity, "query_password": "123456"})
+        self.assertEqual(result["need_query_password"], True)
+        self.assertEqual(result["complaint"]["status"], 1)
+        self.assertEqual(result["complaint"]["messages"][0]["identity"], "platform")
+        self.assertEqual(result["complaint"]["created_at"], "2026-08-31T00:00:00+00:00")
+        self.assertEqual(result["complaint"]["messages"][0]["created_at"], "2026-08-31T00:00:00+00:00")
+        self.assertEqual(client.history_passwords, ["123456"])
+
+    def test_complaint_history_check_fails_closed_when_need_pwd_is_malformed(self) -> None:
+        class MalformedHistoryClient(self.Client):
+            def __init__(self, value: Any) -> None:
+                super().__init__()
+                self.value = value
+
+            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
+                return {"need_pwd": self.value}
+
+            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
+                raise AssertionError("history must not be requested after malformed password metadata")
+
+        identity_service = self._service(MalformedHistoryClient(None))
+        identity = self._identity(identity_service)
+        with self.assertRaises(UpstreamOrderError) as context:
+            identity_service.complaint_history({**identity, "query_password": ""})
+        self.assertEqual(context.exception.code, "invalid_complaint_history_password_response")
 
 
 if __name__ == "__main__":

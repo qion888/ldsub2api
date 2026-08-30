@@ -13,6 +13,7 @@ from .captcha import CaptchaRecognizer, normalize_captcha_code
 from .client import BASE_URL, CaptchaChallenge, OrderQueryClient
 from .complaint import (
     decode_complaint_upload,
+    normalize_complaint_history,
     validate_complaint_payload,
 )
 from .errors import (
@@ -369,6 +370,23 @@ class OrderQueryService:
         return identity, session
 
     @staticmethod
+    def _validated_complaint_history_request(data: Any) -> dict[str, str]:
+        """Validate the history endpoint's identity and optional password."""
+        if not isinstance(data, dict):
+            raise OrderComplaintInputError("售后历史参数必须是 JSON 对象")
+        allowed = {"keywords", "session_id", "trade_no", "query_password"}
+        unknown = sorted(str(field) for field in data if field not in allowed)
+        if unknown:
+            raise OrderComplaintInputError("售后历史包含未知字段")
+        identity = OrderQueryService._validated_complaint_identity(data)
+        password = data.get("query_password", "")
+        if not isinstance(password, str):
+            raise OrderComplaintInputError("订单安全密码必须是字符串")
+        if len(password) > 160 or any(char in password for char in "\x00\r\n"):
+            raise OrderComplaintInputError("订单安全密码格式无效")
+        return {**identity, "query_password": password}
+
+    @staticmethod
     def _context_flag(value: Any) -> bool:
         if isinstance(value, bool):
             return value
@@ -435,6 +453,121 @@ class OrderQueryService:
                 return self._complaint_context_response(
                     identity, session, context, self.sessions.remaining(session)
                 )
+        finally:
+            self._slots.release()
+
+    @staticmethod
+    def _history_need_password(value: Any) -> bool:
+        """Match the official JavaScript ``need_pwd === 1`` check."""
+        return (
+            type(value) in (int, float)
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and value == 1
+        )
+
+    @staticmethod
+    def _history_check_value(value: Any) -> Any:
+        if not isinstance(value, dict):
+            raise UpstreamOrderError(
+                "投诉查询密码状态响应格式无效",
+                code="invalid_complaint_history_password_response",
+            )
+        # Accommodate a raw official response in test/integration clients while
+        # keeping the value exposed to the frontend strictly normalized.
+        if "data" in value:
+            code = value.get("code")
+            if code is not None and (
+                type(code) not in (int, float)
+                or isinstance(code, bool)
+                or not math.isfinite(float(code))
+                or code != 1
+            ):
+                raise UpstreamOrderError(
+                    "投诉查询密码状态响应格式无效",
+                    code="invalid_complaint_history_password_response",
+                )
+            if not isinstance(value.get("data"), dict):
+                raise UpstreamOrderError(
+                    "投诉查询密码状态响应格式无效",
+                    code="invalid_complaint_history_password_response",
+                )
+            value = value["data"]
+        if "need_pwd" not in value:
+            raise UpstreamOrderError(
+                "投诉查询密码状态响应格式无效",
+                code="invalid_complaint_history_password_response",
+            )
+        need_pwd = value["need_pwd"]
+        if (
+            type(need_pwd) not in (int, float)
+            or isinstance(need_pwd, bool)
+            or not math.isfinite(float(need_pwd))
+            or need_pwd not in (0, 1)
+        ):
+            raise UpstreamOrderError(
+                "投诉查询密码状态响应格式无效",
+                code="invalid_complaint_history_password_response",
+            )
+        return int(need_pwd)
+
+    def _complaint_history(self, data: Any) -> dict[str, Any]:
+        request = self._validated_complaint_history_request(data)
+        identity, session = self._complaint_session(request)
+        with session.lock:
+            try:
+                check_result = session.client.check_need_complaint_password(
+                    trade_no=identity["trade_no"],
+                )
+            except OrderQuerySessionExpired:
+                session.clear_verification()
+                raise
+            need_password = self._history_need_password(self._history_check_value(check_result))
+            password = request["query_password"]
+            if need_password and not password.strip():
+                raise OrderQueryPasswordRequired()
+
+            now = self.sessions.now()
+            if need_password and not session.password_attempt_allowed(identity["trade_no"], now):
+                raise OrderQueryPasswordRateLimited()
+            try:
+                history_result = session.client.get_complaint_history(
+                    trade_no=identity["trade_no"],
+                    query_password=password,
+                )
+            except OrderQueryPasswordInvalid as exc:
+                if need_password and session.record_password_failure(identity["trade_no"], now):
+                    raise OrderQueryPasswordRateLimited() from exc
+                raise
+            except OrderQuerySessionExpired:
+                session.clear_verification()
+                raise
+
+            try:
+                complaint = normalize_complaint_history(
+                    history_result,
+                    expected_trade_no=identity["trade_no"],
+                )
+            except ValueError as exc:
+                raise UpstreamOrderError(
+                    "投诉历史响应格式无效",
+                    code="invalid_complaint_history_response",
+                ) from exc
+            if need_password:
+                session.clear_password_failure(identity["trade_no"])
+            return {
+                "session_id": session.session_id,
+                "expires_in": self.sessions.remaining(session),
+                "trade_no": identity["trade_no"],
+                "need_query_password": need_password,
+                "complaint": complaint,
+            }
+
+    def complaint_history(self, data: Any) -> dict[str, Any]:
+        if not self._slots.acquire(blocking=False):
+            raise OrderQueryBusy()
+        try:
+            return self._complaint_history(data)
         finally:
             self._slots.release()
 
