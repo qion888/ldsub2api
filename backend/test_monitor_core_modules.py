@@ -5,8 +5,9 @@ import unittest
 from pathlib import Path
 
 from monitor_core import database as database_module
-from monitor_core import history, settings
+from monitor_core import history, preorders, settings, storefront
 from monitor_core.browser_verification import BrowserVerificationManager
+from monitor_core.inventory import InventoryService
 from monitor_core.workers import MonitorWorker
 
 
@@ -103,6 +104,70 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
         self.assertFalse(manager._is_waf_html("<main>products</main>"))
+
+    def test_storefront_normalizes_catalog_without_application_globals(self) -> None:
+        product = storefront.normalize_goods_list_item(
+            {
+                "goods_key": "module-test",
+                "name": "模块商品",
+                "real_price": 6.5,
+                "stock": 3,
+                "status": 1,
+                "goods_type": "card",
+                "extend": {"limit_count": 2},
+            },
+            "MODULESHOP",
+        )
+
+        self.assertEqual(product["price"], "6.50")
+        self.assertEqual(product["stock"], 3)
+        self.assertEqual(product["limit_count"], 2)
+        self.assertEqual(storefront.parse_item_url(product["source_url"])[0], "module-test")
+
+    def test_inventory_service_marks_removed_catalog_product_unlisted(self) -> None:
+        service = InventoryService(
+            database=self.database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: {},
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+        )
+        with self.database() as connection:
+            watch = connection.execute(
+                "INSERT INTO watches(url, name, created_at) VALUES(?, ?, ?)",
+                ("https://pay.ldxp.cn/item/removed", "Removed", "2026-08-30T08:00:00+00:00"),
+            )
+            shop = connection.execute(
+                "INSERT INTO shops(url, token, created_at) VALUES(?, ?, ?)",
+                ("https://pay.ldxp.cn/shop/REMOVED", "REMOVED", "2026-08-30T08:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO snapshots(watch_id, title, price, stock, specs, raw_data, sale_status, fetched_at, status) "
+                "VALUES(?, 'Removed', '1.00', '4', '{}', '{}', 'on_sale', ?, 'success')",
+                (watch.lastrowid, "2026-08-30T08:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen) VALUES(?, ?, ?, 0, ?)",
+                (shop.lastrowid, "removed", watch.lastrowid, "2026-08-30T08:00:00+00:00"),
+            )
+            product = service.effective_watch_product(connection, watch.lastrowid)
+
+        self.assertEqual(product["sale_status"], "off_sale")
+        self.assertIsNone(product["stock"])
+
+    def test_preorder_module_rejects_disabled_request_before_storage(self) -> None:
+        with self.assertRaisesRegex(ValueError, "启用自动预购"):
+            preorders.create_preorders(
+                {"enabled": False, "items": [{"watch_id": 1, "quantity": 1}]},
+                database=self.database,
+                settings_loader=lambda: {},
+                interval_normalizer=lambda value, default: default,
+                now=lambda: "2026-08-30T08:00:00+00:00",
+                effective_product=lambda *args: None,
+                list_loader=lambda: [],
+            )
 
 
 if __name__ == "__main__":
