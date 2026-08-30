@@ -109,6 +109,8 @@ async function request(path, options) {
     const error = new Error(payload.detail || '请求失败');
     error.status = response.status;
     error.payload = payload;
+    error.code = payload.code || '';
+    error.retryable = payload.retryable === true;
     throw error;
   }
   return payload;

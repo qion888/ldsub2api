@@ -17,6 +17,7 @@ from .errors import OrderQueryInputError, OrderQuerySessionExpired
 MAX_AUTHORIZED_ORDERS = 500
 MAX_PASSWORD_FAILURES = 5
 PASSWORD_BACKOFF_SECONDS = 60
+MAX_COMPLAINT_UPLOADS = 12
 
 
 @dataclass
@@ -32,6 +33,11 @@ class OrderQuerySession:
     cache: dict[tuple[int, int, int], tuple[float, dict[str, Any]]] = field(default_factory=dict)
     authorized_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
     password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
+    complaint_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    complaint_uploads: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    complaint_submitting: set[str] = field(default_factory=set)
+    complaint_unknown: set[str] = field(default_factory=set)
+    complaint_submitted: dict[str, dict[str, Any]] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def clear_verification(self) -> None:
@@ -93,6 +99,69 @@ class OrderQuerySession:
 
     def clear_password_failure(self, trade_no: str) -> None:
         self.password_failures.pop(trade_no, None)
+
+    def remember_complaint_context(self, trade_no: str, context: dict[str, Any]) -> None:
+        self.complaint_contexts[trade_no] = copy.deepcopy(context)
+
+    def complaint_context(self, trade_no: str) -> dict[str, Any] | None:
+        value = self.complaint_contexts.get(trade_no)
+        return copy.deepcopy(value) if value is not None else None
+
+    def register_complaint_upload(
+        self,
+        trade_no: str,
+        url: str,
+        *,
+        name: str,
+        mime_type: str,
+        size: int,
+    ) -> bool:
+        uploads = self.complaint_uploads.setdefault(trade_no, {})
+        if url not in uploads and len(uploads) >= MAX_COMPLAINT_UPLOADS:
+            return False
+        uploads[url] = {"url": url, "name": name, "mime_type": mime_type, "size": int(size)}
+        return True
+
+    def remove_complaint_upload(self, trade_no: str, url: str) -> bool:
+        uploads = self.complaint_uploads.get(trade_no)
+        if not uploads or url not in uploads:
+            return False
+        uploads.pop(url, None)
+        return True
+
+    def complaint_upload(self, trade_no: str, url: str) -> dict[str, Any] | None:
+        value = self.complaint_uploads.get(trade_no, {}).get(url)
+        return copy.deepcopy(value) if value is not None else None
+
+    def complaint_upload_count(self, trade_no: str) -> int:
+        return len(self.complaint_uploads.get(trade_no, {}))
+
+    def begin_complaint_submission(self, trade_no: str) -> bool:
+        if trade_no in self.complaint_submitted or trade_no in self.complaint_submitting or trade_no in self.complaint_unknown:
+            return False
+        self.complaint_submitting.add(trade_no)
+        return True
+
+    def finish_complaint_submission(self, trade_no: str, result: dict[str, Any]) -> None:
+        self.complaint_submitting.discard(trade_no)
+        self.complaint_submitted[trade_no] = copy.deepcopy(result)
+
+    def fail_complaint_submission(self, trade_no: str) -> None:
+        self.complaint_submitting.discard(trade_no)
+
+    def mark_complaint_unknown(self, trade_no: str) -> None:
+        self.complaint_submitting.discard(trade_no)
+        self.complaint_unknown.add(trade_no)
+
+    def clear_complaint_unknown(self, trade_no: str) -> None:
+        self.complaint_unknown.discard(trade_no)
+
+    def complaint_submission_unknown(self, trade_no: str) -> bool:
+        return trade_no in self.complaint_unknown
+
+    def complaint_submission(self, trade_no: str) -> dict[str, Any] | None:
+        value = self.complaint_submitted.get(trade_no)
+        return copy.deepcopy(value) if value is not None else None
 
     def cached(self, key: tuple[int, int, int], now: float) -> dict[str, Any] | None:
         entry = self.cache.get(key)

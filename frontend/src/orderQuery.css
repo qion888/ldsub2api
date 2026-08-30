@@ -185,6 +185,7 @@
 
 body.order-complaint-open { overflow: hidden; }
 .order-complaint-backdrop { z-index: 45; }
+body.order-complaint-open .toast { display: none; }
 .order-complaint-modal { width: min(720px, 100%); padding: 20px; color: var(--ui-text); background: var(--ui-surface); border-color: var(--ui-border); }
 .order-complaint-head { gap: 14px; }
 .order-complaint-head > div { min-width: 0; }
@@ -209,14 +210,18 @@ body.order-complaint-open { overflow: hidden; }
 .order-complaint-notice svg,
 .order-complaint-error svg { flex: 0 0 auto; }
 .order-complaint-notice p { margin: 0; font-size: 10px; line-height: 1.5; }
-.order-complaint-error span { min-width: 0; overflow-wrap: anywhere; font-size: 10px; }
+.order-complaint-error span { min-width: 0; flex: 1; overflow-wrap: anywhere; font-size: 10px; }
+.order-complaint-error .button { min-height: 30px; flex: 0 0 auto; padding-inline: 8px; font-size: 9px; }
 .order-complaint-fields { margin-top: 13px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px 12px; }
 .order-complaint-fields > label,
-.order-complaint-images { min-width: 0; margin: 0; }
+.order-complaint-images,
+.order-complaint-collect-image { min-width: 0; margin: 0; }
 .order-complaint-fields label > span,
-.order-complaint-images > legend { min-height: 16px; margin: 0 0 5px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ui-text-muted); font-size: 10px; }
+.order-complaint-images > legend,
+.order-complaint-collect-image > legend { min-height: 16px; margin: 0 0 5px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ui-text-muted); font-size: 10px; }
 .order-complaint-fields em,
-.order-complaint-images em { color: var(--ui-text-faint); font-size: 8px; font-style: normal; font-weight: 500; }
+.order-complaint-images em,
+.order-complaint-collect-image em { color: var(--ui-text-faint); font-size: 8px; font-style: normal; font-weight: 500; }
 .order-complaint-fields input,
 .order-complaint-fields select { width: 100%; height: 38px; color: var(--ui-text); background: var(--ui-control); border-color: var(--ui-border); border-radius: 4px; }
 .order-complaint-fields textarea { width: 100%; min-height: 96px; padding: 9px 10px; resize: vertical; color: var(--ui-text); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 4px; outline: 0; font: inherit; font-size: 11px; line-height: 1.55; }
@@ -227,7 +232,9 @@ body.order-complaint-open { overflow: hidden; }
 .order-complaint-images,
 .order-complaint-collect-image { grid-column: 1 / -1; }
 .order-complaint-images { padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; border: 0; }
+.order-complaint-collect-image { padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 7px; border: 0; }
 .order-complaint-images > legend { width: 100%; grid-column: 1 / -1; }
+.order-complaint-collect-image > legend { width: 100%; }
 .order-complaint-images label { min-width: 0; margin: 0; }
 .order-complaint-images label > div,
 .order-complaint-collect-image > div { position: relative; min-width: 0; }
@@ -240,28 +247,64 @@ body.order-complaint-open { overflow: hidden; }
 .order-complaint-foot > span { color: var(--ui-text-faint); }
 .order-complaint-foot .button { white-space: nowrap; }
 
-.order-complaint-preview { margin-top: 12px; }
-.order-complaint-preview-status { min-height: 58px; padding: 11px 12px; display: flex; align-items: center; gap: 10px; color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 9%, var(--ui-surface)); border-left: 3px solid var(--ui-success); }
-.order-complaint-preview-status > div { min-width: 0; }
-.order-complaint-preview-status strong,
-.order-complaint-preview-status span { display: block; }
-.order-complaint-preview-status strong { color: var(--ui-text); font-size: 11px; }
-.order-complaint-preview-status span { margin-top: 5px; color: var(--ui-text-muted); font-size: 9px; }
-.order-complaint-preview-status:focus { outline: 2px solid color-mix(in srgb, var(--ui-success) 55%, transparent); outline-offset: 2px; }
-.order-complaint-target { margin: 12px 0 0; display: grid; grid-template-columns: 120px minmax(0, 1fr); border: 1px solid var(--ui-border-soft); }
-.order-complaint-target > div { min-width: 0; padding: 9px 10px; }
-.order-complaint-target > div + div { border-left: 1px solid var(--ui-border-soft); }
-.order-complaint-target dt { color: var(--ui-text-faint); font-size: 8px; }
-.order-complaint-target dd { margin: 5px 0 0; overflow-wrap: anywhere; color: var(--ui-text); font-size: 10px; font-weight: 700; }
-.order-complaint-payload-head { min-height: 48px; margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.order-complaint-payload-head > div { min-width: 0; }
-.order-complaint-payload-head span,
-.order-complaint-payload-head strong { display: block; }
-.order-complaint-payload-head span { color: var(--ui-text-faint); font-size: 8px; font-weight: 750; }
-.order-complaint-payload-head strong { margin-top: 4px; color: var(--ui-text); font-size: 11px; }
-.order-complaint-payload-head .icon-button { width: 30px; height: 30px; flex: 0 0 30px; }
-.order-complaint-payload { max-height: 280px; margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; line-height: 1.55; }
-.order-complaint-modal .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+/* Local evidence controls mirror the official picture-card workflow while keeping
+   the browser-selected bytes inside the current order session. */
+.order-complaint-form,
+.order-complaint-confirm { min-width: 0; min-height: 0; }
+.order-complaint-drop { min-height: 76px; grid-column: 1 / -1; padding: 12px 14px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--ui-text-muted); background: var(--ui-control); border: 1px dashed var(--ui-border); border-radius: 4px; cursor: pointer; text-align: left; }
+.order-complaint-drop:hover,
+.order-complaint-drop:focus-visible,
+.order-complaint-drop.dragging { color: var(--ui-text); background: var(--ui-surface-muted); border-color: var(--ui-text-muted); outline: 0; box-shadow: inset 0 0 0 1px var(--ui-text-muted); }
+.order-complaint-drop.disabled { cursor: not-allowed; opacity: .55; }
+.order-complaint-drop[aria-invalid="true"] { border-color: var(--ui-danger); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-danger) 40%, transparent); }
+.order-complaint-drop input { display: none; }
+.order-complaint-drop > span { min-width: 0; }
+.order-complaint-drop strong,
+.order-complaint-drop small { display: block; }
+.order-complaint-drop strong { color: inherit; font-size: 10px; }
+.order-complaint-drop small { margin-top: 4px; color: var(--ui-text-faint); font-size: 8px; }
+.order-complaint-upload-list { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.order-complaint-upload-list.collect { grid-template-columns: minmax(0, 1fr); }
+.order-complaint-upload { position: relative; min-width: 0; min-height: 88px; padding: 7px; display: grid; grid-template-columns: 54px minmax(0, 1fr) auto; gap: 7px; align-items: center; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 4px; }
+.order-complaint-upload > img { width: 54px; height: 54px; display: block; object-fit: cover; background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 3px; }
+.order-complaint-upload > div { min-width: 0; }
+.order-complaint-upload strong,
+.order-complaint-upload span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.order-complaint-upload strong { color: var(--ui-text); font-size: 9px; }
+.order-complaint-upload span { margin-top: 4px; color: var(--ui-text-faint); font-size: 8px; }
+.order-complaint-upload.error { border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border)); }
+.order-complaint-upload.error span,
+.order-complaint-upload > small { color: var(--ui-danger); }
+.order-complaint-upload > small { grid-column: 1 / -1; overflow-wrap: anywhere; font-size: 8px; line-height: 1.35; }
+.order-complaint-upload .icon-button { width: 29px; height: 29px; flex: 0 0 29px; }
+.order-complaint-loading,
+.order-complaint-success { min-height: 220px; margin-top: 12px; padding: 28px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--ui-text-muted); text-align: center; }
+.order-complaint-loading strong,
+.order-complaint-success strong { color: var(--ui-text); font-size: 13px; }
+.order-complaint-loading span,
+.order-complaint-success span { color: var(--ui-text-faint); font-size: 9px; line-height: 1.5; }
+.order-complaint-loading small { max-width: 360px; overflow-wrap: anywhere; color: var(--ui-danger); font-size: 9px; line-height: 1.45; }
+.order-complaint-loading.error { color: var(--ui-danger); }
+.order-complaint-loading .button { margin-top: 4px; min-height: 34px; }
+.order-complaint-confirm { margin-top: 12px; }
+.order-complaint-confirm-warning { min-height: 58px; padding: 11px 12px; display: flex; align-items: center; gap: 10px; color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, var(--ui-surface)); border-left: 3px solid var(--ui-warning); }
+.order-complaint-confirm-warning > div { min-width: 0; }
+.order-complaint-confirm-warning strong,
+.order-complaint-confirm-warning span { display: block; }
+.order-complaint-confirm-warning strong { color: var(--ui-text); font-size: 11px; }
+.order-complaint-confirm-warning span { margin-top: 4px; color: var(--ui-text-muted); font-size: 9px; line-height: 1.4; }
+.order-complaint-confirm-warning:focus { outline: 2px solid color-mix(in srgb, var(--ui-warning) 55%, transparent); outline-offset: 2px; }
+.order-complaint-confirm-facts { margin: 12px 0 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); border-left: 1px solid var(--ui-border-soft); }
+.order-complaint-confirm-facts > div { min-width: 0; min-height: 52px; padding: 9px 10px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
+.order-complaint-confirm-facts > div.wide { grid-column: 1 / -1; }
+.order-complaint-confirm-facts dt { color: var(--ui-text-faint); font-size: 8px; }
+.order-complaint-confirm-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; color: var(--ui-text); font-size: 10px; line-height: 1.45; }
+.order-complaint-confirm-images { margin-top: 10px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.order-complaint-confirm-images img { width: 100%; aspect-ratio: 1; display: block; object-fit: cover; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; }
+.order-complaint-success { margin-top: 12px; color: var(--ui-success); }
+.order-complaint-success .button { margin-top: 7px; min-width: 100px; }
+.order-complaint-modal .button.danger { color: #fff; background: var(--ui-danger); border-color: var(--ui-danger); }
+.order-complaint-modal .button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-danger) 82%, #000); border-color: color-mix(in srgb, var(--ui-danger) 82%, #000); }
 
 .order-empty-state { min-height: 210px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); text-align: center; }
 .order-empty-state strong { margin-top: 3px; color: var(--ui-text-muted); font-size: 12px; }
@@ -440,18 +483,33 @@ body.order-complaint-open { overflow: hidden; }
   .order-pagination > span { max-width: 210px; line-height: 1.5; }
   .order-update-indicator { right: 12px; bottom: 65px; }
   .order-complaint-backdrop { padding: 8px; }
-  .order-complaint-modal { width: 100%; max-height: calc(100dvh - 16px); padding: 14px; }
+  .order-complaint-modal { width: 100%; max-height: calc(100dvh - 16px); padding: 14px; overflow-x: hidden; }
   .order-complaint-fields { grid-template-columns: 1fr; gap: 10px; }
   .order-complaint-content,
   .order-complaint-images,
   .order-complaint-collect-image { grid-column: 1; }
   .order-complaint-images { grid-template-columns: 1fr; }
   .order-complaint-images > legend { grid-column: 1; }
-  .order-complaint-target { grid-template-columns: 1fr; }
-  .order-complaint-target > div + div { border-top: 1px solid var(--ui-border-soft); border-left: 0; }
-  .order-complaint-payload { max-height: 220px; }
   .order-complaint-foot { align-items: stretch; flex-direction: column; gap: 9px; }
   .order-complaint-foot > span { display: none; }
-  .order-complaint-foot .modal-foot-actions { width: 100%; display: flex; flex-wrap: nowrap; gap: 6px; }
-  .order-complaint-foot .button { min-width: 0; flex: 1; padding-inline: 7px; }
+  .order-complaint-foot .modal-foot-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .order-complaint-foot .button { min-width: 0; width: 100%; padding-inline: 7px; white-space: normal; line-height: 1.25; }
+  .order-complaint-upload-list { grid-template-columns: 1fr; }
+  .order-complaint-upload { min-height: 0; padding: 6px; grid-template-columns: 54px minmax(0, 1fr) auto auto; gap: 5px; }
+  .order-complaint-upload > img { width: 100%; height: auto; aspect-ratio: 1; grid-column: 1 / -1; }
+  .order-complaint-upload .icon-button { width: 30px; height: 30px; }
+  .order-complaint-confirm-facts { grid-template-columns: 1fr; }
+  .order-complaint-confirm-facts > div.wide { grid-column: 1; }
+  .order-complaint-confirm-images { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 390px) {
+  .order-complaint-backdrop { padding: 0; place-items: stretch; }
+  .order-complaint-modal { min-height: 100dvh; max-height: 100dvh; padding: 12px; border-width: 0; }
+  .order-complaint-order small { overflow-wrap: anywhere; }
+  .order-complaint-drop { min-height: 68px; padding: 10px; }
+  .order-complaint-error { align-items: flex-start; flex-wrap: wrap; }
+  .order-complaint-error .button { width: 100%; }
+  .order-complaint-upload > img { width: 54px; height: 54px; grid-column: 1; }
+  .order-complaint-confirm-images { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

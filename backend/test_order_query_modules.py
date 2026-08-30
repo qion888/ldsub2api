@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import threading
 import unittest
 from io import BytesIO
 from types import SimpleNamespace
@@ -21,12 +23,15 @@ from order_query.detail import normalize_order_detail
 from order_query.errors import (
     CaptchaRecognizerUnavailable,
     OrderComplaintInputError,
+    OrderComplaintSubmissionConflict,
     OrderQueryDetailNotFound,
     OrderQueryInputError,
     OrderQueryPasswordInvalid,
     OrderQueryPasswordRateLimited,
     OrderQueryPasswordRequired,
     OrderQuerySessionExpired,
+    OrderComplaintSubmissionUnknown,
+    UpstreamOrderError,
 )
 from order_query.service import OrderQueryService
 from order_query.sessions import OrderQuerySessionStore
@@ -482,6 +487,99 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn("127.0.0.1", json.dumps(detail, ensure_ascii=False))
         self.assertNotIn("169.254.169.254", json.dumps(detail, ensure_ascii=False))
 
+    def test_complaint_context_normalizes_flags_and_rejects_mismatched_trade(self) -> None:
+        opener = FakeOpener([
+            self._json_response({
+                "code": 1,
+                "data": {
+                    "trade_no": "ORDER-1",
+                    "can_complaint": 1,
+                    "complaint": None,
+                },
+            }),
+        ])
+        context = OrderQueryClient(opener=opener).get_complaint_context("ORDER-1")
+        self.assertEqual(context, {
+            "can_complaint": True,
+            "complaint_status": -1,
+        })
+        self.assertTrue(getattr(context, "status_known"))
+        self.assertEqual(len(opener.requests), 1)
+
+        missing_status = FakeOpener([
+            self._json_response({"code": 1, "data": {"trade_no": "ORDER-1", "can_complaint": 1}}),
+        ])
+        missing_context = OrderQueryClient(opener=missing_status).get_complaint_context("ORDER-1")
+        self.assertEqual(missing_context["complaint_status"], -1)
+        self.assertTrue(getattr(missing_context, "status_known"))
+
+        top_level_status = FakeOpener([
+            self._json_response({
+                "code": 1,
+                "data": {
+                    "trade_no": "ORDER-1",
+                    "can_complaint": 1,
+                    "complaint_status": 0,
+                },
+            }),
+        ])
+        existing_context = OrderQueryClient(opener=top_level_status).get_complaint_context("ORDER-1")
+        self.assertEqual(existing_context["complaint_status"], 0)
+        self.assertTrue(getattr(existing_context, "status_known"))
+
+        mismatch = FakeOpener([
+            self._json_response({"code": 1, "data": {"trade_no": "OTHER", "can_complaint": 1}}),
+        ])
+        with self.assertRaisesRegex(RuntimeError, "不一致"):
+            OrderQueryClient(opener=mismatch).get_complaint_context("ORDER-1")
+
+    def test_complaint_upload_is_multipart_file_and_requires_https_result(self) -> None:
+        opener = FakeOpener([
+            self._json_response({"code": 1, "data": {"url": "https://pay.ldxp.cn/uploads/a.png"}}),
+        ])
+        client = OrderQueryClient(opener=opener)
+        url = client.upload_complaint_file(b"fixture", "a.png", "image/png")
+        self.assertEqual(url, "https://pay.ldxp.cn/uploads/a.png")
+        request = opener.requests[0]
+        content_type = request.get_header("Content-type") or ""
+        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
+        self.assertIn(b'name="file"', request.data)
+        self.assertIn(b"fixture", request.data)
+
+        insecure = FakeOpener([
+            self._json_response({"code": 1, "data": {"url": "http://pay.ldxp.cn/uploads/a.png"}}),
+        ])
+        with self.assertRaisesRegex(RuntimeError, "有效地址"):
+            OrderQueryClient(opener=insecure).upload_complaint_file(b"fixture", "a.png", "image/png")
+
+    def test_complaint_writes_follow_official_nonzero_numeric_code_rules(self) -> None:
+        opener = FakeOpener([
+            self._json_response({"code": 2, "data": {"url": "https://pay.ldxp.cn/uploads/a.png"}}),
+            self._json_response({"code": 2}),
+        ])
+        client = OrderQueryClient(opener=opener)
+        self.assertEqual(
+            client.upload_complaint_file(b"fixture", "a.png", "image/png"),
+            "https://pay.ldxp.cn/uploads/a.png",
+        )
+        self.assertEqual(client.submit_complaint({"trade_no": "ORDER-1"})["code"], 2)
+
+        failed_upload = FakeOpener([self._json_response({"code": 0, "msg": "failed"})])
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            OrderQueryClient(opener=failed_upload).upload_complaint_file(b"fixture", "a.png", "image/png")
+        failed_submit = FakeOpener([self._json_response({"code": 0, "msg": "failed"})])
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            OrderQueryClient(opener=failed_submit).submit_complaint({"trade_no": "ORDER-1"})
+
+        for malformed in ({}, {"code": "1"}, {"code": True}, {"code": float("nan")}, {"code": float("inf")}):
+            with self.subTest(malformed=malformed):
+                upload = FakeOpener([self._json_response({**malformed, "data": {"url": "https://pay.ldxp.cn/u/a.png"}})])
+                with self.assertRaisesRegex(RuntimeError, "上传失败"):
+                    OrderQueryClient(opener=upload).upload_complaint_file(b"fixture", "a.png", "image/png")
+                submit = FakeOpener([self._json_response(malformed)])
+                with self.assertRaisesRegex(RuntimeError, "响应格式无效"):
+                    OrderQueryClient(opener=submit).submit_complaint({"trade_no": "ORDER-1"})
+
 
 class ComplaintPreviewTests(unittest.TestCase):
     @staticmethod
@@ -497,7 +595,7 @@ class ComplaintPreviewTests(unittest.TestCase):
             ],
             "collect_image": "https://pay.ldxp.cn/uploads/complaint/refund.png",
             "query_pwd": "012345",
-            "email_code": "A1B2C3",
+            "email_code": "",
         }
 
     def test_preview_normalizes_exact_official_payload_without_submitting(self) -> None:
@@ -510,7 +608,7 @@ class ComplaintPreviewTests(unittest.TestCase):
             "images": [f" {url} " for url in payload["images"]],
             "collect_image": f" {payload['collect_image']} ",
             "query_pwd": f" {payload['query_pwd']} ",
-            "email_code": f" {payload['email_code']} ",
+            "email_code": "",
         })
 
         result = build_complaint_preview(payload)
@@ -520,12 +618,6 @@ class ComplaintPreviewTests(unittest.TestCase):
         self.assertEqual(result["target"], {
             "method": "POST",
             "url": COMPLAINT_PREVIEW_TARGET,
-        })
-        self.assertEqual(result["requirements"], {
-            "email_code": {
-                "required_when": "order.order_complaint_email_verify == 1",
-                "provided": True,
-            },
         })
         self.assertEqual(list(result["payload"]), [
             "trade_no",
@@ -565,7 +657,6 @@ class ComplaintPreviewTests(unittest.TestCase):
         self.assertEqual(result["payload"]["images"], [])
         self.assertEqual(result["payload"]["collect_image"], "")
         self.assertEqual(result["payload"]["email_code"], "")
-        self.assertEqual(result["requirements"]["email_code"]["provided"], False)
 
     def test_preview_rejects_invalid_or_unofficial_fields(self) -> None:
         invalid_payloads: list[tuple[str, Any, str]] = [
@@ -578,7 +669,7 @@ class ComplaintPreviewTests(unittest.TestCase):
             ("contact", {**self.valid_payload(), "contact": "not-an-email"}, "邮箱地址"),
             ("password", {**self.valid_payload(), "query_pwd": "12345"}, "6 位数字"),
             ("unicode_password", {**self.valid_payload(), "query_pwd": "１２３４５６"}, "6 位数字"),
-            ("email_code", {**self.valid_payload(), "email_code": "bad code"}, "email_code 格式"),
+            ("email_code", {**self.valid_payload(), "email_code": "A1B2"}, "不使用邮箱验证码"),
             ("images_type", {**self.valid_payload(), "images": "https://example.test/a.png"}, "URL 数组"),
             ("images_count", {**self.valid_payload(), "images": ["https://example.test/a.png"] * 4}, "最多允许 3"),
             ("image_url", {**self.valid_payload(), "images": ["file:///tmp/a.png"]}, r"http\(s\) URL"),
@@ -1077,6 +1168,37 @@ class RouteTests(unittest.TestCase):
         preview.assert_called_once_with(payload)
         self.assertEqual(responses, [(200, expected)])
 
+    def test_main_http_handler_mounts_all_complaint_workflow_routes(self) -> None:
+        endpoints = {
+            "/api/order-query/complaints/context": "complaint_context",
+            "/api/order-query/complaints/upload": "complaint_upload",
+            "/api/order-query/complaints/upload/remove": "complaint_remove_upload",
+            "/api/order-query/complaints/submit": "complaint_submit",
+        }
+        self.assertNotIn("/api/order-query/complaints/email-code", routes.ORDER_QUERY_POST_PATHS)
+        for path, method_name in endpoints.items():
+            with self.subTest(path=path):
+                body = b"{}"
+                handler = object.__new__(main.ApiHandler)
+                handler.path = path
+                handler.headers = {
+                    "Content-Length": str(len(body)),
+                    "Content-Type": "application/json",
+                    "Origin": "http://127.0.0.1:5173",
+                }
+                handler.rfile = BytesIO(body)
+                responses: list[tuple[int, Any]] = []
+                calls: list[dict[str, Any]] = []
+                handler._send_json = lambda value, status=200: responses.append((status, value))
+                service = SimpleNamespace(search=lambda data: {}, detail=lambda data: {})
+                setattr(service, method_name, lambda data, name=method_name: calls.append(data) or {"route": name})
+
+                with patch.object(main, "ORDER_QUERY_SERVICE", service):
+                    handler.do_POST()
+
+                self.assertEqual(calls, [{}])
+                self.assertEqual(responses, [(200, {"route": method_name})])
+
     def test_complaint_preview_request_guard_rejects_bad_content_type_and_origin(self) -> None:
         cases = (
             (
@@ -1181,6 +1303,274 @@ class RouteTests(unittest.TestCase):
             "code": "untrusted_origin",
             "retryable": False,
         })])
+
+
+class ComplaintWorkflowTests(unittest.TestCase):
+    class Client(FakeOrderClient):
+        def __init__(self, *, submit_error: Exception | None = None, status_known: bool = True) -> None:
+            super().__init__()
+            self.submit_error = submit_error
+            self.status_known = status_known
+            self.context_calls: list[str] = []
+            self.upload_calls: list[dict[str, Any]] = []
+            self.submit_calls: list[dict[str, Any]] = []
+
+        def list_orders(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "orders": [{"trade_no": "ORDER-1", "status": 1, "need_query_password": False}],
+                "pagination": {"page": 1, "page_size": 10, "total": 1, "pages": 1},
+            }
+
+        def get_complaint_context(self, *, trade_no: str) -> dict[str, Any]:
+            self.context_calls.append(trade_no)
+            result = {
+                "can_complaint": True,
+                "complaint_status": -1,
+            }
+            if self.status_known:
+                result["complaint_status_known"] = True
+            return result
+
+        def upload_complaint_file(self, **kwargs: Any) -> str:
+            self.upload_calls.append(kwargs)
+            return f"https://pay.ldxp.cn/uploads/{len(self.upload_calls)}.png"
+
+        def submit_complaint(self, payload: dict[str, Any]) -> dict[str, Any]:
+            self.submit_calls.append(payload)
+            if self.submit_error is not None:
+                raise self.submit_error
+            return {"code": 1}
+
+    @staticmethod
+    def _identity(service: OrderQueryService) -> dict[str, str]:
+        result = service.search({"keywords": "buyer"})
+        return {"keywords": "buyer", "session_id": result["session_id"], "trade_no": "ORDER-1"}
+
+    @staticmethod
+    def _service(client: Any, recognizer: Any = None) -> OrderQueryService:
+        return OrderQueryService(
+            client_factory=lambda: client,
+            recognizer=recognizer or FakeRecognizer(["AB12"]),
+            sessions=OrderQuerySessionStore(ttl_seconds=120, cache_seconds=0),
+        )
+
+    def test_context_upload_and_submit_use_authorized_session_and_exact_payload(self) -> None:
+        client = self.Client()
+        service = self._service(client)
+        identity = self._identity(service)
+        context_response = service.complaint_context(identity)
+        self.assertIs(context_response["complaint_status_known"], True)
+        image = b"\x89PNG\r\n\x1a\nfixture"
+        uploaded = service.complaint_upload({
+            **identity,
+            "name": "evidence.png",
+            "mime_type": "image/png",
+            "data_base64": base64.b64encode(image).decode("ascii"),
+        })
+        reason = next(iter(COMPLAINT_REASONS))
+        payload = {
+            **identity,
+            "reason": reason,
+            "content": "商品描述与收到内容不一致",
+            "contact": "buyer@example.test",
+            "images": [uploaded["url"]],
+            "collect_image": "",
+            "query_pwd": "012345",
+            "email_code": "",
+        }
+        result = service.complaint_submit(payload)
+        self.assertEqual(result["submitted"], True)
+        self.assertEqual(client.submit_calls, [{
+            "trade_no": "ORDER-1",
+            "reason": reason,
+            "content": "商品描述与收到内容不一致",
+            "contact": "buyer@example.test",
+            "images": [uploaded["url"]],
+            "collect_image": "",
+            "query_pwd": "012345",
+            "email_code": "",
+        }])
+        self.assertEqual(client.context_calls, ["ORDER-1", "ORDER-1"])
+        with self.assertRaisesRegex(Exception, "重复提交"):
+            service.complaint_submit(payload)
+        self.assertEqual(len(client.submit_calls), 1)
+
+    def test_existing_top_level_complaint_status_blocks_submit(self) -> None:
+        class ExistingComplaintClient(self.Client):
+            def get_complaint_context(self, *, trade_no: str) -> dict[str, Any]:
+                self.context_calls.append(trade_no)
+                return {
+                    "can_complaint": True,
+                    "complaint_status": 0,
+                    "complaint_status_known": True,
+                }
+
+        client = ExistingComplaintClient()
+        service = self._service(client)
+        identity = self._identity(service)
+        with self.assertRaises(OrderComplaintSubmissionConflict):
+            service.complaint_submit(identity)
+        self.assertEqual(client.context_calls, ["ORDER-1"])
+        self.assertEqual(client.submit_calls, [])
+
+    def test_unknown_official_status_blocks_upload_and_submit(self) -> None:
+        client = self.Client(status_known=False)
+        service = self._service(client)
+        identity = self._identity(service)
+        image = b"\x89PNG\r\n\x1a\nfixture"
+        with self.assertRaisesRegex(RuntimeError, "状态无法确认"):
+            service.complaint_upload({
+                **identity,
+                "name": "evidence.png",
+                "mime_type": "image/png",
+                "data_base64": base64.b64encode(image).decode("ascii"),
+            })
+        with self.assertRaisesRegex(RuntimeError, "状态无法确认"):
+            service.complaint_submit({
+                **identity,
+                "reason": next(iter(COMPLAINT_REASONS)),
+                "content": "x",
+                "contact": "buyer@example.test",
+                "images": [],
+                "collect_image": "",
+                "query_pwd": "012345",
+                "email_code": "",
+            })
+        self.assertEqual(client.upload_calls, [])
+        self.assertEqual(client.submit_calls, [])
+
+    def test_two_sessions_cannot_submit_the_same_trade_concurrently(self) -> None:
+        context_barrier = threading.Barrier(2)
+
+        class RacingClient(self.Client):
+            def get_complaint_context(self, *, trade_no: str) -> dict[str, Any]:
+                context_barrier.wait(2)
+                return super().get_complaint_context(trade_no=trade_no)
+
+        client = RacingClient()
+        service = self._service(client, FakeRecognizer(["AB12", "AB12"]))
+        first_identity = self._identity(service)
+        second_identity = self._identity(service)
+        reason = next(iter(COMPLAINT_REASONS))
+
+        def payload(identity: dict[str, str]) -> dict[str, Any]:
+            return {
+                **identity,
+                "reason": reason,
+                "content": "x",
+                "contact": "buyer@example.test",
+                "images": [],
+                "collect_image": "",
+                "query_pwd": "012345",
+                "email_code": "",
+            }
+
+        results: list[dict[str, Any]] = []
+        errors: list[Exception] = []
+
+        def submit(identity: dict[str, str]) -> None:
+            try:
+                results.append(service.complaint_submit(payload(identity)))
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=submit, args=(first_identity,)),
+            threading.Thread(target=submit, args=(second_identity,)),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(3)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], OrderComplaintSubmissionConflict)
+        self.assertEqual(len(client.submit_calls), 1)
+
+    def test_unknown_submit_is_locked_until_context_refresh(self) -> None:
+        client = self.Client(submit_error=RuntimeError("network"))
+        service = self._service(client)
+        identity = self._identity(service)
+        image = b"\x89PNG\r\n\x1a\nfixture"
+        uploaded = service.complaint_upload({
+            **identity,
+            "name": "evidence.png",
+            "mime_type": "image/png",
+            "data_base64": base64.b64encode(image).decode("ascii"),
+        })
+        payload = {
+            **identity,
+            "reason": next(iter(COMPLAINT_REASONS)),
+            "content": "x",
+            "contact": "buyer@example.test",
+            "images": [uploaded["url"]],
+            "collect_image": "",
+            "query_pwd": "012345",
+            "email_code": "",
+        }
+        with self.assertRaises(OrderComplaintSubmissionUnknown):
+            service.complaint_submit(payload)
+        with self.assertRaises(OrderComplaintSubmissionUnknown):
+            service.complaint_submit(payload)
+        self.assertEqual(len(client.submit_calls), 1)
+        service.complaint_context(identity)
+        with self.assertRaises(OrderComplaintSubmissionUnknown):
+            service.complaint_submit(payload)
+        self.assertEqual(len(client.submit_calls), 2)
+
+    def test_unparseable_submit_responses_lock_without_a_second_request(self) -> None:
+        for code in ("invalid_order_response", "upstream_response_too_large"):
+            with self.subTest(code=code):
+                client = self.Client(submit_error=UpstreamOrderError("bad response", code=code))
+                service = self._service(client)
+                identity = self._identity(service)
+                payload = {
+                    **identity,
+                    "reason": next(iter(COMPLAINT_REASONS)),
+                    "content": "x",
+                    "contact": "buyer@example.test",
+                    "images": [],
+                    "collect_image": "",
+                    "query_pwd": "012345",
+                    "email_code": "",
+                }
+                with self.assertRaises(OrderComplaintSubmissionUnknown):
+                    service.complaint_submit(payload)
+                with self.assertRaises(OrderComplaintSubmissionUnknown):
+                    service.complaint_submit(payload)
+                self.assertEqual(len(client.submit_calls), 1)
+
+    def test_unknown_submit_is_not_cleared_by_context_without_explicit_status(self) -> None:
+        client = self.Client(submit_error=RuntimeError("network"))
+        service = self._service(client)
+        identity = self._identity(service)
+        image = b"\x89PNG\r\n\x1a\nfixture"
+        uploaded = service.complaint_upload({
+            **identity,
+            "name": "evidence.png",
+            "mime_type": "image/png",
+            "data_base64": base64.b64encode(image).decode("ascii"),
+        })
+        payload = {
+            **identity,
+            "reason": next(iter(COMPLAINT_REASONS)),
+            "content": "x",
+            "contact": "buyer@example.test",
+            "images": [uploaded["url"]],
+            "collect_image": "",
+            "query_pwd": "012345",
+            "email_code": "",
+        }
+        with self.assertRaises(OrderComplaintSubmissionUnknown):
+            service.complaint_submit(payload)
+        client.status_known = False
+        context_response = service.complaint_context(identity)
+        self.assertIs(context_response["complaint_status_known"], False)
+        with self.assertRaises(OrderComplaintSubmissionUnknown):
+            service.complaint_submit(payload)
+        self.assertEqual(len(client.submit_calls), 1)
 
 
 if __name__ == "__main__":

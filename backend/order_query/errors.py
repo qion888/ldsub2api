@@ -29,6 +29,26 @@ class OrderComplaintInputError(OrderQueryError):
         super().__init__(detail, code="invalid_order_complaint", status=400)
 
 
+class OrderComplaintUnavailable(OrderQueryError):
+    def __init__(self, detail: str = "当前订单暂不支持申请售后") -> None:
+        super().__init__(detail, code="order_complaint_unavailable", status=409)
+
+
+class OrderComplaintSubmissionConflict(OrderQueryError):
+    def __init__(self, detail: str = "该订单已提交售后申请，请勿重复提交") -> None:
+        super().__init__(detail, code="order_complaint_submission_conflict", status=409)
+
+
+class OrderComplaintSubmissionUnknown(OrderQueryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "提交结果暂时无法确认，请刷新订单状态后再决定是否重试",
+            code="order_complaint_submission_unknown",
+            status=503,
+            retryable=True,
+        )
+
+
 class OrderQuerySessionExpired(OrderQueryError):
     def __init__(self) -> None:
         super().__init__(

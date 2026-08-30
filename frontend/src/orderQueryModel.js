@@ -16,6 +16,9 @@ export const COMPLAINT_REASON_OPTIONS = Object.freeze([
   '描述不符',
 ]);
 
+export const COMPLAINT_IMAGE_TYPES = Object.freeze(['image/png', 'image/jpeg', 'image/webp']);
+export const COMPLAINT_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
 const COMPLAINT_STATUS_META = Object.freeze({
   '-1': {label: '售后已撤销', tone: 'muted'},
   0: {label: '售后待处理', tone: 'pending'},
@@ -92,6 +95,8 @@ export function createComplaintDraft(order = {}, contact = '') {
     reason: '',
     content: '',
     contact: normalizedText(contact),
+    // Keep three empty slots in the model for callers that still consume the
+    // legacy draft shape; the upload UI stores completed URLs in these slots.
     images: ['', '', ''],
     collect_image: '',
     query_pwd: '',
@@ -111,7 +116,8 @@ export function normalizeComplaintPayload(raw = {}) {
     images,
     collect_image: normalizedText(raw.collect_image),
     query_pwd: normalizedText(raw.query_pwd),
-    email_code: normalizedText(raw.email_code),
+    // The platform accepts an empty email_code when email verification is disabled.
+    email_code: '',
   };
 }
 
@@ -126,11 +132,35 @@ export function validateComplaintPayload(raw = {}) {
   if (!payload.contact) errors.contact = '请输入通知邮箱';
   else if (payload.contact.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.contact)) errors.contact = '请输入正确的邮箱地址';
   if (!/^\d{6}$/.test(payload.query_pwd)) errors.query_pwd = '查询密码必须为 6 位数字';
-  if (payload.email_code && !/^[A-Za-z0-9]{1,32}$/.test(payload.email_code)) errors.email_code = '邮箱验证码只能包含 1 至 32 位字母或数字';
-  if (payload.images.length > 3) errors.images = '图片凭证最多填写 3 个 URL';
-  else if (payload.images.some(value => !isHttpUrl(value))) errors.images = '图片凭证必须使用有效的 HTTP 或 HTTPS URL';
-  if (payload.collect_image && !isHttpUrl(payload.collect_image)) errors.collect_image = '退款二维码必须使用有效的 HTTP 或 HTTPS URL';
+  if (payload.images.length > 3) errors.images = '图片凭证最多上传 3 张';
+  else if (payload.images.some(value => !isHttpUrl(value))) errors.images = '图片凭证尚未上传完成';
+  if (payload.collect_image && !isHttpUrl(payload.collect_image)) errors.collect_image = '退款二维码尚未上传完成';
   return {valid: Object.keys(errors).length === 0, errors, payload};
+}
+
+export function complaintImageFileError(file) {
+  if (!file || !COMPLAINT_IMAGE_TYPES.includes(String(file.type || '').toLowerCase())) {
+    return '仅支持 PNG、JPEG 或 WebP 图片';
+  }
+  const size = Number(file.size || 0);
+  if (!Number.isFinite(size) || size <= 0) return '图片文件为空';
+  if (size > COMPLAINT_MAX_IMAGE_BYTES) return '单张图片不能超过 5 MB';
+  return '';
+}
+
+export function selectComplaintImageFiles(files, {currentCount = 0, limit = 3} = {}) {
+  const accepted = [];
+  const errors = [];
+  for (const file of Array.from(files || [])) {
+    if (currentCount + accepted.length >= limit) {
+      errors.push(`最多上传 ${limit} 张图片`);
+      break;
+    }
+    const error = complaintImageFileError(file);
+    if (error) errors.push(`${String(file?.name || '图片')}：${error}`);
+    else accepted.push(file);
+  }
+  return {accepted, errors};
 }
 
 export function orderStatusMeta(value, upstreamLabel = '') {

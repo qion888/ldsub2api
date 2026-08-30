@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canOpenProtectedOrderDetail,
+  COMPLAINT_MAX_IMAGE_BYTES,
   COMPLAINT_REASON_OPTIONS,
   complaintActionForOrder,
+  complaintImageFileError,
   complaintStatusMeta,
   createComplaintDraft,
   formatOrderDateTime,
@@ -20,6 +22,7 @@ import {
   orderStatusMeta,
   safeOrderContentUrl,
   safeOfficialOrderUrl,
+  selectComplaintImageFiles,
   summarizeOrders,
   validateComplaintPayload,
   verificationLabel,
@@ -71,7 +74,7 @@ test('distinguishes complaint actions and statuses conservatively', () => {
   assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: null}).kind, 'none');
 });
 
-test('creates and normalizes the exact complaint preview payload', () => {
+test('creates and normalizes the exact complaint submission payload', () => {
   const draft = createComplaintDraft({trade_no: ' LD-1001 '}, ' buyer@example.com ');
   assert.deepEqual(draft.images, ['', '', '']);
   const payload = normalizeComplaintPayload({
@@ -92,7 +95,7 @@ test('creates and normalizes the exact complaint preview payload', () => {
     images: ['https://cdn.example.test/one.png', 'https://cdn.example.test/two.png'],
     collect_image: 'https://cdn.example.test/qr.png',
     query_pwd: '123456',
-    email_code: '9988',
+    email_code: '',
   });
 });
 
@@ -122,13 +125,73 @@ test('validates complaint fields, limits and URL schemes', () => {
   assert.ok(validateComplaintPayload({...valid, query_pwd: '1234567'}).errors.query_pwd);
   assert.ok(validateComplaintPayload({...valid, query_pwd: '１２３４５６'}).errors.query_pwd);
   assert.ok(validateComplaintPayload({...valid, query_pwd: 'abc123'}).errors.query_pwd);
-  assert.ok(validateComplaintPayload({...valid, email_code: 'code-with-symbols'}).errors.email_code);
-  assert.equal(validateComplaintPayload({...valid, email_code: 'Code123'}).valid, true);
   assert.ok(validateComplaintPayload({...valid, images: ['https://a.test/1', 'https://a.test/2', 'https://a.test/3', 'https://a.test/4']}).errors.images);
   assert.ok(validateComplaintPayload({...valid, images: ['javascript:alert(1)']}).errors.images);
   assert.ok(validateComplaintPayload({...valid, images: ['https://user:secret@a.test/image.png']}).errors.images);
   assert.ok(validateComplaintPayload({...valid, images: [`https://a.test/${'x'.repeat(1000)}`]}).errors.images);
   assert.ok(validateComplaintPayload({...valid, collect_image: 'file:///tmp/qr.png'}).errors.collect_image);
+});
+
+test('validates complaint image MIME types and size boundaries', () => {
+  const validFiles = [
+    {name: 'proof.png', type: 'image/png', size: 1},
+    {name: 'proof.jpg', type: 'IMAGE/JPEG', size: COMPLAINT_MAX_IMAGE_BYTES},
+    {name: 'proof.webp', type: 'image/webp', size: 1024},
+  ];
+  validFiles.forEach(file => assert.equal(complaintImageFileError(file), ''));
+
+  assert.equal(
+    complaintImageFileError({name: 'proof.gif', type: 'image/gif', size: 1}),
+    '仅支持 PNG、JPEG 或 WebP 图片',
+  );
+  assert.equal(
+    complaintImageFileError({name: 'empty.png', type: 'image/png', size: 0}),
+    '图片文件为空',
+  );
+  assert.equal(
+    complaintImageFileError({name: 'large.png', type: 'image/png', size: COMPLAINT_MAX_IMAGE_BYTES + 1}),
+    '单张图片不能超过 5 MB',
+  );
+  assert.equal(
+    complaintImageFileError({name: 'missing-type', size: 10}),
+    '仅支持 PNG、JPEG 或 WebP 图片',
+  );
+});
+
+test('selects complaint image files while retaining valid files and reporting limits', () => {
+  const png = {name: 'proof.png', type: 'image/png', size: 1024};
+  const jpeg = {name: 'proof.jpg', type: 'image/jpeg', size: 2048};
+  const webp = {name: 'proof.webp', type: 'image/webp', size: 4096};
+  const invalid = {name: 'proof.gif', type: 'image/gif', size: 1024};
+  const oversized = {name: 'large.webp', type: 'image/webp', size: COMPLAINT_MAX_IMAGE_BYTES + 1};
+
+  const selected = selectComplaintImageFiles([png, invalid, jpeg, oversized, webp]);
+  assert.deepEqual(selected.accepted, [png, jpeg, webp]);
+  assert.deepEqual(selected.errors, [
+    'proof.gif：仅支持 PNG、JPEG 或 WebP 图片',
+    'large.webp：单张图片不能超过 5 MB',
+  ]);
+
+  const limited = selectComplaintImageFiles([png, jpeg, webp], {currentCount: 2});
+  assert.deepEqual(limited.accepted, [png]);
+  assert.deepEqual(limited.errors, ['最多上传 3 张图片']);
+});
+
+test('always submits a blank email code when verification is disabled', () => {
+  const base = {
+    trade_no: 'LD-1001',
+    reason: COMPLAINT_REASON_OPTIONS[0],
+    content: '补充说明',
+    contact: 'buyer@example.com',
+    images: [],
+    collect_image: '',
+    query_pwd: '123456',
+    email_code: '',
+  };
+
+  const result = validateComplaintPayload({...base, email_code: 'ignored-value'});
+  assert.equal(result.valid, true);
+  assert.equal(result.payload.email_code, '');
 });
 
 test('normalizes pagination and computes current page summary', () => {

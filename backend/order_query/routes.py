@@ -14,10 +14,18 @@ SendJson = Callable[[Any, int], Any]
 ORDER_QUERY_PATH = "/api/order-query/search"
 ORDER_DETAIL_PATH = "/api/order-query/detail"
 ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
+ORDER_COMPLAINT_CONTEXT_PATH = "/api/order-query/complaints/context"
+ORDER_COMPLAINT_UPLOAD_PATH = "/api/order-query/complaints/upload"
+ORDER_COMPLAINT_SUBMIT_PATH = "/api/order-query/complaints/submit"
+ORDER_COMPLAINT_REMOVE_UPLOAD_PATH = "/api/order-query/complaints/upload/remove"
 ORDER_QUERY_POST_PATHS = frozenset({
     ORDER_QUERY_PATH,
     ORDER_DETAIL_PATH,
     ORDER_COMPLAINT_PREVIEW_PATH,
+    ORDER_COMPLAINT_CONTEXT_PATH,
+    ORDER_COMPLAINT_UPLOAD_PATH,
+    ORDER_COMPLAINT_SUBMIT_PATH,
+    ORDER_COMPLAINT_REMOVE_UPLOAD_PATH,
 })
 LOCAL_DEVELOPMENT_HOSTS = {"127.0.0.1", "localhost"}
 
@@ -92,6 +100,10 @@ def handle_post(
     search: Callable[[dict[str, Any]], dict[str, Any]],
     detail: Callable[[dict[str, Any]], dict[str, Any]],
     complaint_preview: Callable[[dict[str, Any]], dict[str, Any]] = build_complaint_preview,
+    complaint_context: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    complaint_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    complaint_submit: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    complaint_remove_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> bool:
     if path == ORDER_QUERY_PATH:
         operation = search
@@ -99,19 +111,29 @@ def handle_post(
         operation = detail
     elif path == ORDER_COMPLAINT_PREVIEW_PATH:
         operation = complaint_preview
+    elif path == ORDER_COMPLAINT_CONTEXT_PATH:
+        operation = complaint_context
+    elif path == ORDER_COMPLAINT_UPLOAD_PATH:
+        operation = complaint_upload
+    elif path == ORDER_COMPLAINT_SUBMIT_PATH:
+        operation = complaint_submit
+    elif path == ORDER_COMPLAINT_REMOVE_UPLOAD_PATH:
+        operation = complaint_remove_upload
     else:
+        return False
+    if operation is None:
         return False
     try:
         send_json(operation(data), 200)
     except OrderQueryError as exc:
-        send_json(
-            {
-                "detail": exc.detail,
-                "code": exc.code,
-                "retryable": exc.retryable,
-            },
-            exc.status,
-        )
+        payload = {
+            "detail": exc.detail,
+            "code": exc.code,
+            "retryable": exc.retryable,
+        }
+        if hasattr(exc, "seconds"):
+            payload["cooldown_seconds"] = int(getattr(exc, "seconds"))
+        send_json(payload, exc.status)
     except WafChallengeRequired as exc:
         send_json(
             {
@@ -122,12 +144,13 @@ def handle_post(
             409,
         )
     except RuntimeError as exc:
+        is_complaint = path.startswith("/api/order-query/complaints/")
         is_complaint_preview = path == ORDER_COMPLAINT_PREVIEW_PATH
-        fallback_detail = "售后申请参数预览失败" if is_complaint_preview else "订单查询失败"
+        fallback_detail = "售后申请参数预览失败" if is_complaint_preview else ("售后申请失败" if is_complaint else "订单查询失败")
         send_json(
             {
                 "detail": str(exc)[:240] or fallback_detail,
-                "code": "order_complaint_preview_failed" if is_complaint_preview else "order_query_failed",
+                "code": "order_complaint_preview_failed" if is_complaint_preview else ("order_complaint_failed" if is_complaint else "order_query_failed"),
                 "retryable": True,
             },
             502,

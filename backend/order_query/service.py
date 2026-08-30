@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import base64
+import math
 import re
 import threading
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from .captcha import CaptchaRecognizer, normalize_captcha_code
-from .client import CaptchaChallenge, OrderQueryClient
+from .client import BASE_URL, CaptchaChallenge, OrderQueryClient
+from .complaint import (
+    decode_complaint_upload,
+    validate_complaint_payload,
+)
 from .errors import (
     CaptchaRecognizerUnavailable,
     CaptchaVerificationExpired,
@@ -20,6 +26,11 @@ from .errors import (
     OrderQueryPasswordRateLimited,
     OrderQueryPasswordRequired,
     OrderQuerySessionExpired,
+    OrderComplaintInputError,
+    OrderComplaintSubmissionConflict,
+    OrderComplaintSubmissionUnknown,
+    OrderComplaintUnavailable,
+    UpstreamOrderError,
 )
 from .sessions import OrderQuerySession, OrderQuerySessionStore
 
@@ -43,6 +54,10 @@ class OrderQueryService:
         self.sessions = sessions or OrderQuerySessionStore()
         self.max_ocr_attempts = max(1, min(3, int(max_ocr_attempts)))
         self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent)))
+        self._complaint_state_lock = threading.Lock()
+        self._complaint_submitted_trades: set[str] = set()
+        self._complaint_inflight_trades: set[str] = set()
+        self._complaint_unknown_trades: set[str] = set()
 
     @staticmethod
     def _validated_request(data: Any) -> dict[str, Any]:
@@ -324,5 +339,305 @@ class OrderQueryService:
             raise OrderQueryBusy()
         try:
             return self._detail(data)
+        finally:
+            self._slots.release()
+
+    @staticmethod
+    def _validated_complaint_identity(data: Any) -> dict[str, str]:
+        if not isinstance(data, dict):
+            raise OrderComplaintInputError("售后申请参数必须是 JSON 对象")
+        if any(not isinstance(data.get(field), str) for field in ("keywords", "session_id", "trade_no")):
+            raise OrderComplaintInputError("售后申请身份参数格式无效")
+        keywords = data["keywords"].strip()
+        session_id = data["session_id"].strip()
+        trade_no = data["trade_no"].strip()
+        if not keywords or len(keywords) > 160:
+            raise OrderComplaintInputError("售后申请缺少有效的查询内容")
+        if not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise OrderComplaintInputError("售后申请缺少有效的查询会话")
+        if not TRADE_NO_PATTERN.fullmatch(trade_no):
+            raise OrderComplaintInputError("订单号格式无效")
+        return {"keywords": keywords, "session_id": session_id, "trade_no": trade_no}
+
+    def _complaint_session(self, data: Any) -> tuple[dict[str, str], OrderQuerySession]:
+        identity = self._validated_complaint_identity(data)
+        session = self.sessions.get(identity["session_id"], identity["keywords"])
+        if not session.ticket:
+            raise OrderQuerySessionExpired()
+        if session.authorized_order(identity["trade_no"]) is None:
+            raise OrderQueryDetailNotFound()
+        return identity, session
+
+    @staticmethod
+    def _context_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        try:
+            return int(value) == 1
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _is_numeric_code(value: Any) -> bool:
+        if type(value) not in (int, float) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _strict_success_code(value: Any) -> bool:
+        return OrderQueryService._is_numeric_code(value) and value != 0
+
+    @staticmethod
+    def _context_status_known(context: dict[str, Any]) -> bool:
+        """Return whether the upstream complaint status was explicitly resolved."""
+        value = getattr(context, "status_known", context.get("complaint_status_known", False))
+        return value is True or (
+            type(value) in (int, float)
+            and not isinstance(value, bool)
+            and value == 1
+        )
+
+    @staticmethod
+    def _complaint_context_response(
+        identity: dict[str, str], session: OrderQuerySession, context: dict[str, Any], remaining: int
+    ) -> dict[str, Any]:
+        try:
+            complaint_status = int(context.get("complaint_status", -1))
+        except (TypeError, ValueError):
+            complaint_status = -1
+        return {
+            "session_id": session.session_id,
+            "expires_in": remaining,
+            "trade_no": identity["trade_no"],
+            "can_complaint": OrderQueryService._context_flag(context.get("can_complaint")),
+            "complaint_status": complaint_status,
+            "complaint_status_known": OrderQueryService._context_status_known(context),
+        }
+
+    def complaint_context(self, data: Any) -> dict[str, Any]:
+        if not self._slots.acquire(blocking=False):
+            raise OrderQueryBusy()
+        try:
+            identity, session = self._complaint_session(data)
+            with session.lock:
+                context = session.client.get_complaint_context(trade_no=identity["trade_no"])
+                if not isinstance(context, dict):
+                    raise UpstreamOrderError("售后上下文响应格式无效", code="invalid_complaint_context_response")
+                session.remember_complaint_context(identity["trade_no"], context)
+                if self._context_status_known(context):
+                    with self._complaint_state_lock:
+                        # Only an explicit upstream status resolves an uncertain submit.
+                        self._complaint_unknown_trades.discard(identity["trade_no"])
+                    session.clear_complaint_unknown(identity["trade_no"])
+                return self._complaint_context_response(
+                    identity, session, context, self.sessions.remaining(session)
+                )
+        finally:
+            self._slots.release()
+
+    @staticmethod
+    def _context_or_fetch(
+        session: OrderQuerySession,
+        trade_no: str,
+    ) -> dict[str, Any]:
+        context = session.complaint_context(trade_no)
+        if context is None:
+            context = session.client.get_complaint_context(trade_no=trade_no)
+            if not isinstance(context, dict):
+                raise UpstreamOrderError("售后上下文响应格式无效", code="invalid_complaint_context_response")
+            session.remember_complaint_context(trade_no, context)
+        return context
+
+    def complaint_upload(self, data: Any) -> dict[str, Any]:
+        if not self._slots.acquire(blocking=False):
+            raise OrderQueryBusy()
+        try:
+            identity, session = self._complaint_session(data)
+            # Decode before taking the session lock so malformed large requests do not block queries.
+            if isinstance(data, dict):
+                unknown = set(data) - {
+                    "keywords", "session_id", "trade_no", "name", "filename",
+                    "mime_type", "mime", "type", "data_base64", "base64", "data", "data_url",
+                }
+                if unknown:
+                    raise OrderComplaintInputError("图片上传包含未知字段")
+            name, mime_type, content = decode_complaint_upload(data)
+            with session.lock:
+                context = self._context_or_fetch(session, identity["trade_no"])
+                if not self._context_status_known(context):
+                    raise UpstreamOrderError(
+                        "官方售后状态无法确认，请刷新后重试",
+                        code="complaint_context_unknown",
+                        status=409,
+                        retryable=True,
+                    )
+                if not self._context_flag(context.get("can_complaint")):
+                    raise OrderComplaintUnavailable()
+                try:
+                    context_status = int(context.get("complaint_status", -1))
+                except (TypeError, ValueError):
+                    context_status = -1
+                if context_status != -1:
+                    raise OrderComplaintSubmissionConflict()
+                if session.complaint_upload_count(identity["trade_no"]) >= 12:
+                    raise OrderComplaintInputError("每个订单最多登记 12 个上传文件")
+                uploaded = session.client.upload_complaint_file(
+                    content=content,
+                    filename=name,
+                    mime_type=mime_type,
+                )
+                if isinstance(uploaded, dict) and "code" in uploaded and not self._strict_success_code(uploaded.get("code")):
+                    raise UpstreamOrderError(str(uploaded.get("msg") or "图片上传失败"), code="complaint_upload_failed", retryable=True)
+                url = uploaded.get("url") if isinstance(uploaded, dict) else uploaded
+                if not isinstance(url, str) or not url:
+                    raise UpstreamOrderError("图片上传响应格式无效", code="invalid_complaint_upload_response")
+                if url.startswith("/") and not url.startswith("//") and ".." not in url.split("/"):
+                    url = f"{BASE_URL}{url}"
+                try:
+                    parsed_url = urlparse(url)
+                    parsed_url.port
+                except (UnicodeError, ValueError) as exc:
+                    raise UpstreamOrderError("图片上传地址无效", code="invalid_complaint_upload_response") from exc
+                if (
+                    parsed_url.scheme != "https"
+                    or not parsed_url.hostname
+                    or parsed_url.username is not None
+                    or parsed_url.password is not None
+                    or parsed_url.fragment
+                ):
+                    raise UpstreamOrderError("图片上传地址必须使用 HTTPS", code="invalid_complaint_upload_response")
+                if not session.register_complaint_upload(
+                    identity["trade_no"],
+                    url,
+                    name=name,
+                    mime_type=mime_type,
+                    size=len(content),
+                ):
+                    raise OrderComplaintInputError("每个订单最多登记 12 个上传文件")
+                return {"url": url, "name": name, "mime_type": mime_type, "size": len(content)}
+        finally:
+            self._slots.release()
+
+    def complaint_remove_upload(self, data: Any) -> dict[str, Any]:
+        if not self._slots.acquire(blocking=False):
+            raise OrderQueryBusy()
+        try:
+            identity, session = self._complaint_session(data)
+            url = str(data.get("url") or "").strip() if isinstance(data, dict) else ""
+            if not url:
+                raise OrderComplaintInputError("缺少要移除的图片地址")
+            with session.lock:
+                removed = session.remove_complaint_upload(identity["trade_no"], url)
+                if not removed:
+                    raise OrderComplaintInputError("图片地址未登记")
+                return {"removed": True, "url": url}
+        finally:
+            self._slots.release()
+
+    def complaint_submit(self, data: Any) -> dict[str, Any]:
+        if not self._slots.acquire(blocking=False):
+            raise OrderQueryBusy()
+        try:
+            identity, session = self._complaint_session(data)
+            with session.lock:
+                with self._complaint_state_lock:
+                    if identity["trade_no"] in self._complaint_unknown_trades or session.complaint_submission_unknown(identity["trade_no"]):
+                        raise OrderComplaintSubmissionUnknown()
+                    if (
+                        identity["trade_no"] in self._complaint_submitted_trades
+                        or identity["trade_no"] in self._complaint_inflight_trades
+                        or session.complaint_submission(identity["trade_no"]) is not None
+                    ):
+                        raise OrderComplaintSubmissionConflict()
+                # Re-read immediately before reserving the trade number so a
+                # complaint created after the dialog opened cannot be duplicated.
+                context = session.client.get_complaint_context(trade_no=identity["trade_no"])
+                if not isinstance(context, dict):
+                    raise UpstreamOrderError(
+                        "售后上下文响应格式无效",
+                        code="invalid_complaint_context_response",
+                    )
+                session.remember_complaint_context(identity["trade_no"], context)
+                if not self._context_status_known(context):
+                    raise UpstreamOrderError(
+                        "官方售后状态无法确认，请刷新后重试",
+                        code="complaint_context_unknown",
+                        status=409,
+                        retryable=True,
+                    )
+                if not self._context_flag(context.get("can_complaint")):
+                    raise OrderComplaintUnavailable()
+                try:
+                    status = int(context.get("complaint_status", -1))
+                except (TypeError, ValueError):
+                    status = -1
+                if status != -1:
+                    raise OrderComplaintSubmissionConflict()
+                complaint_data = {
+                    key: value
+                    for key, value in (data.items() if isinstance(data, dict) else [])
+                    if key not in {"keywords", "session_id"}
+                }
+                payload = validate_complaint_payload(complaint_data)
+                for url in payload["images"]:
+                    if session.complaint_upload(identity["trade_no"], url) is None:
+                        raise OrderComplaintInputError("证据图片必须先通过本地上传")
+                if payload["collect_image"] and session.complaint_upload(identity["trade_no"], payload["collect_image"]) is None:
+                    raise OrderComplaintInputError("退款二维码必须先通过本地上传")
+                with self._complaint_state_lock:
+                    # Context fetching and payload validation happen outside the
+                    # global lock, so re-check before reserving the trade number.
+                    # Separate query sessions can authorize the same order.
+                    if identity["trade_no"] in self._complaint_unknown_trades:
+                        raise OrderComplaintSubmissionUnknown()
+                    if (
+                        identity["trade_no"] in self._complaint_submitted_trades
+                        or identity["trade_no"] in self._complaint_inflight_trades
+                    ):
+                        raise OrderComplaintSubmissionConflict()
+                    if not session.begin_complaint_submission(identity["trade_no"]):
+                        raise OrderComplaintSubmissionConflict()
+                    self._complaint_inflight_trades.add(identity["trade_no"])
+                try:
+                    submit_result = session.client.submit_complaint(payload)
+                    if not isinstance(submit_result, dict):
+                        raise OrderComplaintSubmissionUnknown()
+                    code = submit_result.get("code")
+                    if not self._is_numeric_code(code):
+                        raise OrderComplaintSubmissionUnknown()
+                    if not self._strict_success_code(code):
+                        raise UpstreamOrderError(str(submit_result.get("msg") or "售后申请提交失败"), code="complaint_submit_failed", retryable=True)
+                except UpstreamOrderError as exc:
+                    if exc.code != "complaint_submit_failed":
+                        session.mark_complaint_unknown(identity["trade_no"])
+                        with self._complaint_state_lock:
+                            self._complaint_inflight_trades.discard(identity["trade_no"])
+                            self._complaint_unknown_trades.add(identity["trade_no"])
+                        raise OrderComplaintSubmissionUnknown() from exc
+                    session.fail_complaint_submission(identity["trade_no"])
+                    with self._complaint_state_lock:
+                        self._complaint_inflight_trades.discard(identity["trade_no"])
+                    raise
+                except Exception:
+                    # Any non-domain exception leaves the upstream outcome unknown.
+                    session.mark_complaint_unknown(identity["trade_no"])
+                    with self._complaint_state_lock:
+                        self._complaint_inflight_trades.discard(identity["trade_no"])
+                        self._complaint_unknown_trades.add(identity["trade_no"])
+                    raise OrderComplaintSubmissionUnknown()
+                result = {
+                    "submitted": True,
+                    "trade_no": identity["trade_no"],
+                    "complaint_status": 0,
+                    "message": "售后申请提交成功",
+                }
+                session.finish_complaint_submission(identity["trade_no"], result)
+                with self._complaint_state_lock:
+                    self._complaint_inflight_trades.discard(identity["trade_no"])
+                    self._complaint_submitted_trades.add(identity["trade_no"])
+                return result
         finally:
             self._slots.release()

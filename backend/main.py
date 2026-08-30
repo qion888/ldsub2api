@@ -1057,6 +1057,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "sub2api_card_import_history": True,
                 "sub2api_card_import_history_delete": True,
                 "order_query": True,
+                "order_complaint_submit": True,
             })
         if path == "/api/watches":
             return self._send_json(list_watches())
@@ -1159,6 +1160,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             search=ORDER_QUERY_SERVICE.search,
             detail=ORDER_QUERY_SERVICE.detail,
             complaint_preview=build_complaint_preview,
+            complaint_context=getattr(ORDER_QUERY_SERVICE, "complaint_context", None),
+            complaint_upload=getattr(ORDER_QUERY_SERVICE, "complaint_upload", None),
+            complaint_submit=getattr(ORDER_QUERY_SERVICE, "complaint_submit", None),
+            complaint_remove_upload=getattr(ORDER_QUERY_SERVICE, "complaint_remove_upload", None),
         ):
             return
 

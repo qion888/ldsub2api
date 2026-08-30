@@ -10,16 +10,21 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
+  FileUp,
   Image,
+  ImagePlus,
   KeyRound,
   Link2,
   MessageSquareWarning,
   Package,
   ReceiptText,
   RefreshCw,
+  RotateCcw,
   Search,
+  Send,
   ShieldCheck,
   Store,
+  Trash2,
   TriangleAlert,
   X,
 } from 'lucide-react';
@@ -33,11 +38,11 @@ import {
   formatOrderCardsForCopy,
   formatOrderMoney,
   normalizeOrderDetail,
-  normalizeComplaintPayload,
   normalizeOrderResponse,
   orderDeliveryKindLabel,
   orderDetailErrorState,
   orderQueryContextChanged,
+  selectComplaintImageFiles,
   summarizeOrders,
   validateComplaintPayload,
   verificationLabel,
@@ -45,7 +50,27 @@ import {
 import './orderQuery.css';
 
 const EMPTY_RESULT = {orders: [], pagination: {page: 1, page_size: 10, total: 0, pages: 1}};
-const COMPLAINT_TARGET = Object.freeze({method: 'POST', url: 'https://pay.ldxp.cn/shopApi/Order/complaintOrder'});
+const COMPLAINT_ACCEPT = '.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp';
+const COMPLAINT_PHASES = new Set(['loading', 'error', 'edit', 'confirm', 'submitting', 'success']);
+
+function complaintPreviewUrl(file) {
+  try {
+    return typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+      ? URL.createObjectURL(file)
+      : '';
+  } catch {
+    return '';
+  }
+}
+
+function revokeComplaintPreview(url) {
+  if (!url || !String(url).startsWith('blob:')) return;
+  try {
+    URL.revokeObjectURL(url);
+  } catch {
+    // The URL may already have been revoked by the browser.
+  }
+}
 
 function QueryIconButton({label, children, ...props}) {
   return <button className="icon-button" type="button" aria-label={label} title={label} {...props}>{children}</button>;
@@ -243,14 +268,69 @@ function ComplaintFieldError({id, message}) {
   return message ? <small className="order-complaint-field-error" id={id}>{message}</small> : null;
 }
 
-function ComplaintDialog({order, draft, errors, busy, error, preview, dialogRef, onChange, onImageChange, onSubmit, onCopy, onBack, onClose, onCopyOrder}) {
-  const previewText = preview ? JSON.stringify(preview.payload, null, 2) : '';
-  const emailCodeRequirement = preview?.requirements?.email_code;
-  return <div className="modal-backdrop order-complaint-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
-    <div ref={dialogRef} className="checkout-modal order-complaint-modal" role="dialog" aria-modal="true" aria-labelledby="order-complaint-title">
+function ComplaintDropZone({label, hint, multiple = false, disabled = false, invalid = false, errorId, onFiles}) {
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef(null);
+  const selectFiles = files => {
+    if (!disabled && files?.length) onFiles(files);
+    if (inputRef.current) inputRef.current.value = '';
+  };
+  return <label
+    className={`order-complaint-drop ${dragging ? 'dragging' : ''} ${disabled ? 'disabled' : ''}`}
+    tabIndex={disabled ? -1 : 0}
+    aria-disabled={disabled}
+    aria-invalid={invalid}
+    aria-describedby={invalid ? errorId : undefined}
+    onKeyDown={event => {
+      if (!disabled && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault();
+        inputRef.current?.click();
+      }
+    }}
+    onDragEnter={event => { event.preventDefault(); if (!disabled) setDragging(true); }}
+    onDragOver={event => event.preventDefault()}
+    onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }}
+    onDrop={event => { event.preventDefault(); setDragging(false); selectFiles(event.dataTransfer.files); }}
+  >
+    <input ref={inputRef} type="file" accept={COMPLAINT_ACCEPT} multiple={multiple} disabled={disabled} onChange={event => selectFiles(event.target.files)}/>
+    <ImagePlus size={19}/><span><strong>{label}</strong><small>{hint}</small></span>
+  </label>;
+}
+
+function ComplaintUploadItem({item, label, onRetry, onRemove}) {
+  return <div className={`order-complaint-upload ${item.status}`} role="listitem" aria-busy={item.status === 'uploading'}>
+    <img src={item.previewUrl || undefined} alt={`${label}预览`}/>
+    <div><strong title={item.name}>{label}</strong><span>{item.status === 'uploading' ? '上传中' : item.status === 'done' ? '已上传' : '上传失败'}</span></div>
+    {item.status === 'uploading' && <RefreshCw className="spin" size={15} role="progressbar" aria-label={`${label}正在上传`}/>}
+    {item.status === 'error' && <QueryIconButton label={`重试上传${label}`} onClick={() => onRetry(item)}><RotateCcw size={14}/></QueryIconButton>}
+    <QueryIconButton label={`删除${label}`} onClick={() => onRemove(item)}><Trash2 size={14}/></QueryIconButton>
+    {item.error && <small role="alert">{item.error}</small>}
+  </div>;
+}
+
+function readComplaintFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('无法读取图片文件'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function ComplaintDialog({
+  order, draft, errors, error, phase, uploads, snapshot, dialogRef, onChange, onFiles,
+  onRetryUpload, onRemoveUpload, onEditSubmit, onConfirmSubmit, onRetryContext,
+  onBack, onClose, onCopyOrder, resultMessage, submissionUnknown,
+}) {
+  const submitting = phase === 'submitting';
+  const phaseKnown = COMPLAINT_PHASES.has(phase);
+  const title = phase === 'confirm' || submitting ? '确认售后申请' : phase === 'success' ? '售后申请已提交' : '申请售后';
+  const uploadBusy = [...uploads.evidence, ...uploads.collect].some(item => item.status === 'uploading');
+  return <div className="modal-backdrop order-complaint-backdrop" onMouseDown={event => event.target === event.currentTarget && !submitting && onClose()}>
+    <div ref={dialogRef} className="checkout-modal order-complaint-modal" role="dialog" aria-modal="true" aria-labelledby="order-complaint-title" tabIndex={-1}>
       <div className="modal-head order-complaint-head">
-        <div><span>AFTER-SALES PREVIEW</span><h2 id="order-complaint-title">{preview ? '售后申请参数' : '申请售后'}</h2></div>
-        <QueryIconButton label="关闭售后弹窗" onClick={onClose}><X size={17}/></QueryIconButton>
+        <div><span>AFTER-SALES REQUEST</span><h2 id="order-complaint-title">{title}</h2></div>
+        <QueryIconButton label="关闭售后弹窗" onClick={onClose} disabled={submitting}><X size={17}/></QueryIconButton>
       </div>
 
       <div className="order-complaint-order">
@@ -258,8 +338,12 @@ function ComplaintDialog({order, draft, errors, busy, error, preview, dialogRef,
         <QueryIconButton label={`复制订单号 ${order.trade_no}`} onClick={() => onCopyOrder(order.trade_no)}><Clipboard size={14}/></QueryIconButton>
       </div>
 
-      {!preview ? <form className="order-complaint-form" onSubmit={onSubmit} noValidate>
-        <div className="order-complaint-notice"><ShieldCheck size={17}/><p>仅在本地校验并生成参数预览，不会上传图片或向官方站点提交。</p></div>
+      {(phase === 'loading' || phase === 'error' || !phaseKnown) && <div className={`order-complaint-loading ${phase === 'error' || !phaseKnown ? 'error' : ''}`} data-complaint-phase-focus tabIndex={-1} role={phase === 'loading' ? 'status' : 'alert'} aria-busy={phase === 'loading'}>
+        {phase === 'loading' && <RefreshCw className="spin" size={20}/>} {phase !== 'loading' && <TriangleAlert size={20}/>}<strong>{phase === 'loading' ? '正在读取官方售后状态' : '售后状态暂时无法确认'}</strong><span>{phase === 'loading' ? '确认订单是否仍可申请售后' : '请刷新订单状态后重试'}</span>{error && <small>{error}</small>}{(phase !== 'loading' || error) && <button className="button secondary" type="button" onClick={onRetryContext}><RotateCcw size={15}/>重试</button>}
+      </div>}
+
+      {phase === 'edit' && <form className="order-complaint-form" onSubmit={onEditSubmit} noValidate>
+        <div className="order-complaint-notice"><ShieldCheck size={17}/><p>官方售后通道已确认，图片会先上传到平台，最终申请将在二次确认后提交。</p></div>
         {error && <div className="order-complaint-error" role="alert"><TriangleAlert size={15}/><span>{error}</span></div>}
 
         <div className="order-complaint-fields">
@@ -290,42 +374,39 @@ function ComplaintDialog({order, draft, errors, busy, error, preview, dialogRef,
             <ComplaintFieldError id="complaint-password-error" message={errors.query_pwd}/>
           </label>
 
-          <label>
-            <span>邮箱验证码 <em>按官方配置条件必填</em></span>
-            <input value={draft.email_code} onChange={event => onChange('email_code', event.target.value)} placeholder="官方启用邮箱验证时填写" autoComplete="one-time-code" spellCheck="false" maxLength={32} aria-invalid={Boolean(errors.email_code)} aria-describedby={errors.email_code ? 'complaint-email-code-error' : undefined}/>
-            <ComplaintFieldError id="complaint-email-code-error" message={errors.email_code}/>
-          </label>
-
           <fieldset className="order-complaint-images">
-            <legend>图片凭证 URL <em>选填，最多 3 个</em></legend>
-            {draft.images.map((value, index) => <label key={index}>
-              <span className="sr-only">图片凭证 URL {index + 1}</span>
-              <div><Link2 size={14}/><input value={value} onChange={event => onImageChange(index, event.target.value)} placeholder={`https://.../evidence-${index + 1}.png`} inputMode="url" spellCheck="false" aria-invalid={Boolean(errors.images)} aria-describedby={errors.images ? 'complaint-images-error' : undefined}/></div>
-            </label>)}
+            <legend>图片凭证 <em>选填，最多 3 张</em></legend>
+            <ComplaintDropZone label="选择或拖入凭证图" hint="PNG / JPEG / WebP，单张不超过 5 MB" multiple disabled={uploads.evidence.length >= 3} invalid={Boolean(errors.images)} errorId="complaint-images-error" onFiles={files => onFiles('evidence', files)}/>
+            {uploads.evidence.length > 0 && <div className="order-complaint-upload-list evidence" role="list" aria-live="polite">{uploads.evidence.map((item, index) => <ComplaintUploadItem item={item} label={`凭证图 ${index + 1}`} onRetry={value => onRetryUpload('evidence', value)} onRemove={value => onRemoveUpload('evidence', value)} key={item.id}/>)}</div>}
             <ComplaintFieldError id="complaint-images-error" message={errors.images}/>
           </fieldset>
 
-          <label className="order-complaint-collect-image">
-            <span>退款二维码 URL <em>选填</em></span>
-            <div><Link2 size={14}/><input value={draft.collect_image} onChange={event => onChange('collect_image', event.target.value)} placeholder="https://.../refund-qr.png" inputMode="url" spellCheck="false" aria-invalid={Boolean(errors.collect_image)} aria-describedby={errors.collect_image ? 'complaint-collect-error' : undefined}/></div>
+          <fieldset className="order-complaint-collect-image">
+            <legend>退款二维码 <em>选填，最多 1 张</em></legend>
+            <ComplaintDropZone label={uploads.collect.length ? '替换退款二维码' : '选择或拖入退款二维码'} hint="PNG / JPEG / WebP，单张不超过 5 MB" invalid={Boolean(errors.collect_image)} errorId="complaint-collect-error" onFiles={files => onFiles('collect', files)}/>
+            {uploads.collect.length > 0 && <div className="order-complaint-upload-list collect" role="list" aria-live="polite"><ComplaintUploadItem item={uploads.collect[0]} label="退款二维码" onRetry={value => onRetryUpload('collect', value)} onRemove={value => onRemoveUpload('collect', value)}/></div>}
             <ComplaintFieldError id="complaint-collect-error" message={errors.collect_image}/>
-          </label>
+          </fieldset>
         </div>
 
         <div className="modal-foot order-complaint-foot">
-          <span><ShieldCheck size={14}/>目标参数只读预览</span>
-          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={busy}>{busy ? <RefreshCw className="spin" size={15}/> : <ShieldCheck size={15}/>}<span>{busy ? '正在校验' : '生成参数预览'}</span></button></div>
+          <span><FileUp size={14}/>{uploadBusy ? '图片正在上传' : '图片经本地服务上传'}</span>
+          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={uploadBusy}><ShieldCheck size={15}/><span>核对并继续</span></button></div>
         </div>
-      </form> : <div className="order-complaint-preview" aria-live="polite">
-        <div className="order-complaint-preview-status" data-complaint-preview-focus tabIndex={-1}><Check size={18}/><div><strong>本地字段格式已校验，未向官方提交</strong><span>submitted: false · mode: preview</span><span>邮箱验证码：{emailCodeRequirement?.provided ? '已填写' : '官方启用邮箱验证时仍需填写'}</span></div></div>
-        <dl className="order-complaint-target"><div><dt>目标方法</dt><dd>{COMPLAINT_TARGET.method}</dd></div><div><dt>目标地址</dt><dd>{COMPLAINT_TARGET.url}</dd></div></dl>
-        <div className="order-complaint-payload-head"><div><span>REQUEST PAYLOAD</span><strong>官方字段预览</strong></div><QueryIconButton label="复制售后参数" onClick={() => onCopy(previewText)}><Clipboard size={15}/></QueryIconButton></div>
-        <pre className="order-complaint-payload">{previewText}</pre>
+      </form>}
+
+      {(phase === 'confirm' || submitting) && <div className="order-complaint-confirm" aria-live="polite">
+        <div className="order-complaint-confirm-warning" data-complaint-phase-focus tabIndex={-1}><TriangleAlert size={18}/><div><strong>提交后本订单不能再次申请</strong><span>请确认投诉类型、说明、邮箱和图片无误。</span></div></div>
+        {error && <div className="order-complaint-error" role="alert"><TriangleAlert size={15}/><span>{error}</span>{submissionUnknown && <button className="button secondary" type="button" onClick={onRetryContext}><RotateCcw size={14}/>刷新状态</button>}</div>}
+        <dl className="order-complaint-confirm-facts"><div><dt>投诉类型</dt><dd>{snapshot.reason}</dd></div><div><dt>通知邮箱</dt><dd>{snapshot.contact}</dd></div><div className="wide"><dt>补充说明</dt><dd>{snapshot.content}</dd></div><div><dt>图片凭证</dt><dd>{snapshot.images.length} 张</dd></div><div><dt>退款二维码</dt><dd>{snapshot.collect_image ? '已上传' : '未上传'}</dd></div></dl>
+        {(uploads.evidence.length > 0 || uploads.collect.length > 0) && <div className="order-complaint-confirm-images">{[...uploads.evidence, ...uploads.collect].filter(item => item.status === 'done').map(item => <img src={item.previewUrl} alt="待提交图片" key={item.id}/>)}</div>}
         <div className="modal-foot order-complaint-foot">
-          <span><ShieldCheck size={14}/>本地预览已完成</span>
-          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onBack}><ChevronLeft size={15}/>返回编辑</button><button className="button secondary" type="button" onClick={onClose}>关闭</button><button className="button primary" type="button" onClick={() => onCopy(previewText)}><Clipboard size={15}/>复制参数</button></div>
+          <span><ShieldCheck size={14}/>将提交到 pay.ldxp.cn</span>
+          <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onBack} disabled={submitting || submissionUnknown}><ChevronLeft size={15}/>返回修改</button><button className="button primary danger" type="button" onClick={onConfirmSubmit} disabled={submitting || submissionUnknown}>{submitting ? <RefreshCw className="spin" size={15}/> : <Send size={15}/>} {submitting ? '正在提交' : '确认提交售后'}</button></div>
         </div>
       </div>}
+
+      {phase === 'success' && <div className="order-complaint-success" aria-live="polite" data-complaint-phase-focus tabIndex={-1}><Check size={24}/><strong>售后申请已提交</strong><span>{resultMessage}</span><button className="button primary" type="button" onClick={onClose}>完成</button></div>}
     </div>
   </div>;
 }
@@ -375,9 +456,13 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   const [complaintOrder, setComplaintOrder] = useState(null);
   const [complaintDraft, setComplaintDraft] = useState(null);
   const [complaintErrors, setComplaintErrors] = useState({});
-  const [complaintBusy, setComplaintBusy] = useState(false);
   const [complaintError, setComplaintError] = useState('');
-  const [complaintPreview, setComplaintPreview] = useState(null);
+  const [complaintPhase, setComplaintPhase] = useState('closed');
+  const [complaintContext, setComplaintContext] = useState(null);
+  const [complaintUploads, setComplaintUploads] = useState({evidence: [], collect: []});
+  const [complaintSnapshot, setComplaintSnapshot] = useState(null);
+  const [complaintResultMessage, setComplaintResultMessage] = useState('订单已进入售后待处理状态。');
+  const [complaintSubmissionUnknown, setComplaintSubmissionUnknown] = useState(false);
   const requestVersion = useRef(0);
   const detailRequestVersion = useRef(0);
   const detailAbortController = useRef(null);
@@ -389,18 +474,43 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   const complaintTrigger = useRef(null);
   const complaintDialog = useRef(null);
   const complaintRequest = useRef(null);
+  const complaintUploadControllers = useRef(new Map());
+  const complaintSubmitController = useRef(null);
+  const complaintGeneration = useRef(0);
+  const complaintSubmitLock = useRef(false);
+  const complaintUploadsRef = useRef(complaintUploads);
+  complaintUploadsRef.current = complaintUploads;
   const complaintOpen = Boolean(complaintOrder && complaintDraft);
 
+  const revokeComplaintUploadUrls = useCallback((uploads) => {
+    [...(uploads?.evidence || []), ...(uploads?.collect || [])].forEach(item => {
+      revokeComplaintPreview(item?.previewUrl);
+    });
+  }, []);
+
   const closeComplaint = useCallback(() => {
+    if (complaintPhase === 'submitting') return;
+    complaintGeneration.current += 1;
     complaintRequest.current?.abort();
     complaintRequest.current = null;
-    setComplaintBusy(false);
+    complaintSubmitController.current?.abort();
+    complaintSubmitController.current = null;
+    complaintUploadControllers.current.forEach(controller => controller.abort());
+    complaintUploadControllers.current.clear();
+    revokeComplaintUploadUrls(complaintUploadsRef.current);
     setComplaintOrder(null);
     setComplaintDraft(null);
     setComplaintErrors({});
     setComplaintError('');
-    setComplaintPreview(null);
-  }, []);
+    setComplaintPhase('closed');
+    setComplaintContext(null);
+    complaintUploadsRef.current = {evidence: [], collect: []};
+    setComplaintUploads({evidence: [], collect: []});
+    setComplaintSnapshot(null);
+    setComplaintResultMessage('订单已进入售后待处理状态。');
+    setComplaintSubmissionUnknown(false);
+    complaintSubmitLock.current = false;
+  }, [complaintPhase, revokeComplaintUploadUrls]);
 
   const closeOrderDetail = useCallback(() => {
     detailRequestVersion.current += 1;
@@ -424,7 +534,14 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     detailRequestVersion.current += 1;
     detailAbortController.current?.abort();
     detailAbortController.current = null;
-  }, []);
+    complaintGeneration.current += 1;
+    complaintRequest.current?.abort();
+    complaintUploadControllers.current.forEach(controller => controller.abort());
+    complaintUploadControllers.current.clear();
+    complaintSubmitController.current?.abort();
+    complaintSubmitController.current = null;
+    revokeComplaintUploadUrls(complaintUploadsRef.current);
+  }, [revokeComplaintUploadUrls]);
 
   useEffect(() => {
     if (initialKeywordsApplied.current || !initialKeywords) return;
@@ -478,22 +595,27 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     document.body.classList.add('order-complaint-open');
     const dialog = complaintDialog.current;
     const focusFrame = window.requestAnimationFrame(() => {
-      const selector = complaintPreview ? '[data-complaint-preview-focus]' : '[data-complaint-form-focus]';
+      const selector = complaintPhase === 'edit' ? '[data-complaint-form-focus]' : '[data-complaint-phase-focus]';
       dialog?.querySelector(selector)?.focus();
     });
     const handleDialogKey = event => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        closeComplaint();
+        if (complaintPhase !== 'submitting') closeComplaint();
         return;
       }
       if (event.key !== 'Tab' || !dialog) return;
       const focusable = Array.from(dialog.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
-      if (!focusable.length) return;
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
       const focusIsOutside = !dialog.contains(document.activeElement);
-      if ((event.shiftKey && (document.activeElement === first || focusIsOutside)) || (!event.shiftKey && (document.activeElement === last || focusIsOutside))) {
+      const focusIsNotTabbable = !focusable.includes(document.activeElement);
+      if ((event.shiftKey && (document.activeElement === first || focusIsOutside || focusIsNotTabbable)) || (!event.shiftKey && (document.activeElement === last || focusIsOutside || focusIsNotTabbable))) {
         event.preventDefault();
         (event.shiftKey ? last : first).focus();
       }
@@ -504,13 +626,15 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
       document.body.classList.remove('order-complaint-open');
       window.removeEventListener('keydown', handleDialogKey);
     };
-  }, [complaintOpen, complaintPreview, closeComplaint]);
+  }, [complaintOpen, complaintPhase, closeComplaint]);
 
   useEffect(() => {
     if (complaintOpen || !complaintTrigger.current) return;
     const trigger = complaintTrigger.current;
     complaintTrigger.current = null;
-    window.requestAnimationFrame(() => trigger.focus());
+    window.requestAnimationFrame(() => {
+      if (trigger?.isConnected) trigger.focus();
+    });
   }, [complaintOpen]);
 
   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
@@ -754,18 +878,229 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
 
   const copyOrderNumber = tradeNo => copyDetailValue(tradeNo, '订单号');
 
+  const complaintIdentity = useCallback((tradeNo = complaintOrder?.trade_no) => ({
+    keywords: submittedKeywords,
+    session_id: sessionId,
+    trade_no: tradeNo,
+  }), [complaintOrder?.trade_no, sessionId, submittedKeywords]);
+
+  const setUploadItem = (kind, id, patch) => {
+    const predicted = complaintUploadsRef.current;
+    complaintUploadsRef.current = {
+      ...predicted,
+      [kind]: (predicted[kind] || []).map(item => item.id === id ? {...item, ...patch} : item),
+    };
+    setComplaintUploads(current => {
+      const items = current[kind] || [];
+      if (!items.some(item => item.id === id)) return current;
+      const next = {...current, [kind]: items.map(item => item.id === id ? {...item, ...patch} : item)};
+      complaintUploadsRef.current = next;
+      return next;
+    });
+  };
+
+  const isCurrentComplaintUpload = (kind, item) => (complaintUploadsRef.current[kind] || [])
+    .some(value => value.id === item?.id && value.file === item?.file);
+
+  const uploadComplaintItem = async (kind, item, generation = complaintGeneration.current) => {
+    if (!item || generation !== complaintGeneration.current || !isCurrentComplaintUpload(kind, item)) return;
+    const controller = new AbortController();
+    complaintUploadControllers.current.get(item.id)?.abort();
+    complaintUploadControllers.current.set(item.id, controller);
+    setUploadItem(kind, item.id, {status: 'uploading', error: ''});
+    try {
+      const dataUrl = await readComplaintFile(item.file);
+      if (generation !== complaintGeneration.current || controller.signal.aborted || !isCurrentComplaintUpload(kind, item)) return;
+      const response = await request('/order-query/complaints/upload', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...complaintIdentity(), name: item.name, mime_type: item.mimeType, data_url: dataUrl}),
+        signal: controller.signal,
+      });
+      if (generation !== complaintGeneration.current || controller.signal.aborted || !isCurrentComplaintUpload(kind, item)) return;
+      if (!response?.url) throw new Error('上传响应缺少图片地址');
+      setUploadItem(kind, item.id, {status: 'done', url: String(response.url), error: ''});
+      setComplaintError('');
+      setComplaintDraft(current => {
+        if (!current) return current;
+        if (kind === 'evidence') {
+          const nextImages = [...current.images].filter(Boolean);
+          nextImages.push(String(response.url));
+          return {...current, images: nextImages.slice(0, 3)};
+        }
+        return {...current, collect_image: String(response.url)};
+      });
+      setComplaintErrors(current => {
+        const next = {...current};
+        delete next[kind === 'evidence' ? 'images' : 'collect_image'];
+        return next;
+      });
+    } catch (requestError) {
+      if (controller.signal.aborted || requestError?.name === 'AbortError' || generation !== complaintGeneration.current || !isCurrentComplaintUpload(kind, item)) return;
+      setUploadItem(kind, item.id, {status: 'error', error: requestError.message || '图片上传失败'});
+      setComplaintError(requestError.message || '图片上传失败');
+    } finally {
+      if (complaintUploadControllers.current.get(item.id) === controller) complaintUploadControllers.current.delete(item.id);
+    }
+  };
+
+  const removeComplaintUpload = (kind, item) => {
+    if (!item || !isCurrentComplaintUpload(kind, item)) return;
+    complaintUploadControllers.current.get(item.id)?.abort();
+    complaintUploadControllers.current.delete(item.id);
+    revokeComplaintPreview(item.previewUrl);
+    const currentUploads = complaintUploadsRef.current;
+    const nextUploads = {
+      ...currentUploads,
+      [kind]: (currentUploads[kind] || []).filter(value => value.id !== item.id),
+    };
+    complaintUploadsRef.current = nextUploads;
+    setComplaintUploads(current => {
+      const next = {...current, [kind]: (current[kind] || []).filter(value => value.id !== item.id)};
+      complaintUploadsRef.current = next;
+      return next;
+    });
+    setComplaintDraft(current => {
+      if (!current) return current;
+      if (kind === 'evidence') return {...current, images: current.images.filter(value => value !== item.url)};
+      return {...current, collect_image: ''};
+    });
+    if (item.url && sessionId && submittedKeywords) {
+      request('/order-query/complaints/upload/remove', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...complaintIdentity(), url: item.url}),
+      }).catch(() => {});
+    }
+    if (!nextUploads[kind].some(value => value.status === 'error')) {
+      setComplaintErrors(current => {
+        const next = {...current};
+        delete next[kind === 'evidence' ? 'images' : 'collect_image'];
+        return next;
+      });
+    }
+    setComplaintError('');
+  };
+
+  const onComplaintFiles = (kind, files) => {
+    if (!complaintDraft || complaintPhase !== 'edit') return;
+    const currentUploads = complaintUploadsRef.current;
+    const currentCount = kind === 'evidence' ? (currentUploads.evidence || []).length : 0;
+    const selection = selectComplaintImageFiles(files, {currentCount, limit: kind === 'evidence' ? 3 : 1});
+    if (selection.errors.length) {
+      const message = selection.errors.join('；');
+      const field = kind === 'evidence' ? 'images' : 'collect_image';
+      setComplaintErrors(current => ({...current, [field]: message}));
+      setComplaintError(message);
+    }
+    if (!selection.accepted.length) return;
+    const generation = complaintGeneration.current;
+    if (kind === 'collect' && currentUploads.collect?.[0]) removeComplaintUpload('collect', currentUploads.collect[0]);
+    const items = selection.accepted.map(file => ({
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`,
+      file,
+      name: String(file.name || 'image'),
+      mimeType: String(file.type || '').toLowerCase(),
+      previewUrl: complaintPreviewUrl(file),
+      status: 'queued',
+      url: '',
+      error: '',
+    }));
+    const latestUploads = complaintUploadsRef.current;
+    const nextUploads = {
+      ...latestUploads,
+      [kind]: kind === 'collect' ? items.slice(0, 1) : [...(latestUploads.evidence || []), ...items].slice(0, 3),
+    };
+    complaintUploadsRef.current = nextUploads;
+    setComplaintUploads(nextUploads);
+    if (kind === 'collect') setComplaintDraft(current => current ? {...current, collect_image: ''} : current);
+    items.forEach(item => uploadComplaintItem(kind, item, generation));
+  };
+
   const openComplaint = (order, trigger) => {
     if (detailOrder) return;
-    const contact = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(submittedKeywords.trim()) ? submittedKeywords.trim() : '';
+    complaintGeneration.current += 1;
+    const generation = complaintGeneration.current;
     complaintRequest.current?.abort();
     complaintRequest.current = null;
+    complaintSubmitController.current?.abort();
+    complaintSubmitController.current = null;
+    complaintUploadControllers.current.forEach(controller => controller.abort());
+    complaintUploadControllers.current.clear();
+    revokeComplaintUploadUrls(complaintUploadsRef.current);
+    complaintSubmitLock.current = false;
+    const contact = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(submittedKeywords.trim()) ? submittedKeywords.trim() : '';
     complaintTrigger.current = trigger;
-    setComplaintBusy(false);
     setComplaintOrder(order);
     setComplaintDraft(createComplaintDraft(order, contact));
     setComplaintErrors({});
     setComplaintError('');
-    setComplaintPreview(null);
+    setComplaintPhase('loading');
+    setComplaintContext(null);
+    complaintUploadsRef.current = {evidence: [], collect: []};
+    setComplaintUploads({evidence: [], collect: []});
+    setComplaintSnapshot(null);
+    setComplaintResultMessage('订单已进入售后待处理状态。');
+    setComplaintSubmissionUnknown(false);
+    if (!sessionId || !submittedKeywords) {
+      setComplaintPhase('error');
+      setComplaintError('订单查询会话已失效，请重新查询后再申请售后');
+      return;
+    }
+    const controller = new AbortController();
+    complaintRequest.current = controller;
+    request('/order-query/complaints/context', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({keywords: submittedKeywords, session_id: sessionId, trade_no: order.trade_no}),
+      signal: controller.signal,
+    }).then(response => {
+      if (generation !== complaintGeneration.current || controller.signal.aborted) return;
+      if (!response || typeof response !== 'object') throw new Error('售后配置响应格式无效');
+      const rawStatus = response.complaint_status;
+      const status = (typeof rawStatus === 'number' && Number.isInteger(rawStatus))
+        || (typeof rawStatus === 'string' && /^-?\d+$/.test(rawStatus.trim()))
+        ? Number(rawStatus)
+        : NaN;
+      const rawCanComplaint = response.can_complaint;
+      const canComplaint = rawCanComplaint === true || rawCanComplaint === 1 || rawCanComplaint === '1';
+      // A sentinel -1 is actionable only when the upstream explicitly
+      // confirms that the complaint status is known.
+      const complaintStatusKnown = response.complaint_status_known === true;
+      if (!Number.isInteger(status) || ![-1, 0, 1].includes(status) || !complaintStatusKnown) {
+        setComplaintPhase('error');
+        setComplaintError('官方售后状态无法确认，请重试');
+        return;
+      }
+      setSessionId(String(response.session_id || sessionId));
+      setExpiresIn(Number(response.expires_in || expiresIn));
+      const context = {
+        ...response,
+        can_complaint: canComplaint,
+        complaint_status: status,
+        complaint_status_known: complaintStatusKnown,
+      };
+      setComplaintContext(context);
+      if (!canComplaint || status !== -1) {
+        setComplaintPhase('error');
+        setComplaintError(status !== -1 ? '该订单已有售后记录，不能重复申请' : '当前订单已超过售后期限');
+        return;
+      }
+      setComplaintPhase('edit');
+    }).catch(requestError => {
+      if (controller.signal.aborted || requestError?.name === 'AbortError' || generation !== complaintGeneration.current) return;
+      setComplaintPhase('error');
+      setComplaintError(requestError.message || '读取官方售后配置失败');
+    }).finally(() => {
+      if (complaintRequest.current === controller) complaintRequest.current = null;
+    });
+  };
+
+  const retryComplaintContext = () => {
+    if (!complaintOrder) return;
+    const order = complaintOrder;
+    const trigger = complaintTrigger.current;
+    openComplaint(order, trigger);
   };
 
   const updateComplaintField = (field, value) => {
@@ -779,77 +1114,79 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     setComplaintError('');
   };
 
-  const updateComplaintImage = (index, value) => {
-    setComplaintDraft(current => {
-      if (!current) return current;
-      const images = [...current.images];
-      images[index] = value;
-      return {...current, images};
-    });
-    setComplaintErrors(current => {
-      if (!current.images) return current;
-      const next = {...current};
-      delete next.images;
-      return next;
-    });
-    setComplaintError('');
-  };
-
-  const submitComplaintPreview = async event => {
+  const submitComplaintEdit = event => {
     event.preventDefault();
-    if (!complaintDraft || complaintBusy) return;
-    const validation = validateComplaintPayload(complaintDraft);
-    setComplaintErrors(validation.errors);
+    if (!complaintDraft || !complaintContext || complaintPhase !== 'edit') return;
+    const evidencePending = complaintUploads.evidence.some(item => item.status !== 'done');
+    const collectPending = complaintUploads.collect.some(item => item.status !== 'done');
+    const nextDraft = {
+      ...complaintDraft,
+      images: complaintUploads.evidence.filter(item => item.status === 'done' && item.url).map(item => item.url),
+      collect_image: complaintUploads.collect.find(item => item.status === 'done' && item.url)?.url || '',
+    };
+    const validation = validateComplaintPayload(nextDraft);
+    const errors = {...validation.errors};
+    if (evidencePending) errors.images = '请等待凭证图上传完成，失败图片可重试';
+    if (collectPending) errors.collect_image = '请等待退款二维码上传完成，失败图片可重试';
+    setComplaintErrors(errors);
     setComplaintError('');
-    if (!validation.valid) {
-      setComplaintError('请检查标记字段后重新生成预览');
+    if (Object.keys(errors).length) {
+      setComplaintError('请检查标记字段后再继续');
       window.requestAnimationFrame(() => document.querySelector('.order-complaint-modal [aria-invalid="true"]')?.focus());
       return;
     }
-
-    const controller = new AbortController();
-    complaintRequest.current?.abort();
-    complaintRequest.current = controller;
-    setComplaintBusy(true);
-    try {
-      const response = await request('/order-query/complaints/preview', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(validation.payload),
-        signal: controller.signal,
-      });
-      if (complaintRequest.current !== controller) return;
-      if (response?.submitted !== false) throw new Error('本地预览响应缺少未提交标记');
-      setComplaintPreview({
-        submitted: false,
-        mode: 'preview',
-        target: COMPLAINT_TARGET,
-        requirements: response.requirements || {
-          email_code: {
-            required_when: 'order.order_complaint_email_verify == 1',
-            provided: Boolean(validation.payload.email_code),
-          },
-        },
-        payload: normalizeComplaintPayload(response.payload || validation.payload),
-      });
-      notify({type: 'success', title: '售后参数格式已校验', message: '已生成本地预览，未向官方提交', duration: 4200});
-    } catch (requestError) {
-      if (complaintRequest.current !== controller || requestError.name === 'AbortError') return;
-      setComplaintError(requestError.message || '售后参数校验失败');
-    } finally {
-      if (complaintRequest.current === controller) {
-        complaintRequest.current = null;
-        setComplaintBusy(false);
-      }
-    }
+    setComplaintDraft(nextDraft);
+    setComplaintSnapshot(validation.payload);
+    setComplaintSubmissionUnknown(false);
+    setComplaintPhase('confirm');
   };
 
-  const copyComplaintPayload = async text => {
+  const confirmComplaintSubmit = async () => {
+    if (!complaintSnapshot || !complaintOrder || complaintPhase !== 'confirm' || complaintSubmitLock.current || complaintSubmissionUnknown || !sessionId || !submittedKeywords) return;
+    complaintSubmitLock.current = true;
+    const generation = complaintGeneration.current;
+    const controller = new AbortController();
+    complaintSubmitController.current = controller;
+    setComplaintError('');
+    setComplaintPhase('submitting');
     try {
-      await navigator.clipboard.writeText(text);
-      notify({type: 'success', title: '售后参数已复制', message: '已复制规范化请求 payload', duration: 3200});
-    } catch {
-      notify('无法访问剪贴板，请检查浏览器权限', 'error');
+      const response = await request('/order-query/complaints/submit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...complaintSnapshot, ...complaintIdentity()}),
+        signal: controller.signal,
+      });
+      if (response?.submitted !== true) {
+        setComplaintError('提交结果暂时无法确认，请刷新订单状态后再决定是否重试');
+        setComplaintSubmissionUnknown(true);
+        setComplaintPhase('confirm');
+        return;
+      }
+      setComplaintResultMessage(response.message || '订单已进入售后待处理状态。');
+      setComplaintPhase('success');
+      setResult(current => ({...current, orders: current.orders.map(order => order.trade_no === complaintOrder.trade_no ? {...order, complaint_status: 0, can_complaint: false} : order)}));
+      notify({type: 'success', title: '售后申请已提交', message: response.message || '订单已进入售后待处理状态', duration: 5200});
+    } catch (requestError) {
+      if (controller.signal.aborted || requestError?.name === 'AbortError') {
+        if (generation === complaintGeneration.current) {
+          complaintSubmitLock.current = false;
+          setComplaintPhase('confirm');
+        }
+        return;
+      }
+      if (!requestError?.code || ['order_complaint_submission_unknown', 'order_complaint_submission_conflict'].includes(requestError.code)) {
+        setComplaintError(requestError?.code === 'order_complaint_submission_conflict'
+          ? '该订单可能已经提交售后，请刷新订单状态确认'
+          : '提交结果暂时无法确认，请刷新订单状态后再决定是否重试');
+        setComplaintSubmissionUnknown(true);
+        setComplaintPhase('confirm');
+        return;
+      }
+      setComplaintError(requestError.message || '售后提交失败，可检查后重试');
+      setComplaintPhase('confirm');
+      complaintSubmitLock.current = false;
+    } finally {
+      if (complaintSubmitController.current === controller) complaintSubmitController.current = null;
     }
   };
 
@@ -941,15 +1278,21 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
       order={complaintOrder}
       draft={complaintDraft}
       errors={complaintErrors}
-      busy={complaintBusy}
       error={complaintError}
-      preview={complaintPreview}
+      phase={complaintPhase}
+      uploads={complaintUploads}
+      snapshot={complaintSnapshot || complaintDraft}
+      resultMessage={complaintResultMessage}
+      submissionUnknown={complaintSubmissionUnknown}
       dialogRef={complaintDialog}
       onChange={updateComplaintField}
-      onImageChange={updateComplaintImage}
-      onSubmit={submitComplaintPreview}
-      onCopy={copyComplaintPayload}
-      onBack={() => { setComplaintPreview(null); setComplaintError(''); }}
+      onFiles={onComplaintFiles}
+      onRetryUpload={uploadComplaintItem}
+      onRemoveUpload={removeComplaintUpload}
+      onEditSubmit={submitComplaintEdit}
+      onConfirmSubmit={confirmComplaintSubmit}
+      onRetryContext={retryComplaintContext}
+      onBack={() => { setComplaintPhase('edit'); setComplaintError(''); }}
       onClose={closeComplaint}
       onCopyOrder={copyOrderNumber}
     />}
