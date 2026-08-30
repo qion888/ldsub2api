@@ -1,70 +1,25 @@
 #!/usr/bin/env powershell
-param(
-  [Parameter(Position = 0)]
-  [string]$TargetRoot = '.'
-)
-
+param([string]$TargetRoot = '.')
 $ErrorActionPreference = 'Stop'
-$artifactRoot = if ($MyInvocation.MyCommand.Path) {
-  Split-Path -Parent $MyInvocation.MyCommand.Path
-} else {
-  (Get-Location).Path
+$artifactRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$target = [IO.Path]::GetFullPath($TargetRoot)
+if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw "Target root does not exist: $target" }
+$archive = Join-Path $artifactRoot 'ROLLBACK_BASELINE'
+if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw "Missing rollback archive: $archive" }
+tar -xf $archive -C $target
+if ($LASTEXITCODE -ne 0) { throw "Rollback archive extraction failed with exit $LASTEXITCODE" }
+$expected = @{
+  'backend/main.py' = '373C2078ED58331634E001568EC7A22332FEAC6273742B574619B23841CEE953'
+  'backend/monitor_core/settings.py' = 'D4D1273380C601EC3A69A3ED3E2B84E9104EA929BD32E786E0F06D2EC875A827'
+  'backend/monitor_core/preorders.py' = 'F5408F5F3353D5D2CB7FC9CBA629619031B07B4D3465DDAB57460DC776AA33EE'
+  'backend/test_main.py' = 'ACF8CFF88213C814446FC40C3054BA2D912E9670C61D2599FCD8D75EAAE65875'
+  'frontend/src/main.jsx' = 'F77222831689AD60936578ADA3F3D17CE85BC26045D12761859F322E5C3D9B70'
+  'frontend/src/OrderQueryView.jsx' = '0091FEDE2A77007706A3E88C6E85B595E50B826E46A14127881524EB89279128'
+  'frontend/src/orderQuery.css' = 'D58953E6E8B4459745B8BFB1E5692F642A8C8D80084F7833AD15544DE67D1430'
 }
-$baselineArchive = Join-Path $artifactRoot 'ROLLBACK_BASELINE'
-if (-not (Test-Path -LiteralPath $baselineArchive -PathType Leaf)) {
-  throw "Missing rollback archive: $baselineArchive"
+foreach ($path in $expected.Keys) {
+  $actualPath = Join-Path $target $path
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $actualPath).Hash
+  if ($actual -ne $expected[$path]) { throw "Rollback verification failed for ${path}: $actual" }
 }
-
-$targetRootPath = [IO.Path]::GetFullPath($TargetRoot)
-if (-not (Test-Path -LiteralPath $targetRootPath -PathType Container)) {
-  throw "Target root does not exist: $targetRootPath"
-}
-$rootPrefix = $targetRootPath.TrimEnd(
-  [IO.Path]::DirectorySeparatorChar,
-  [IO.Path]::AltDirectorySeparatorChar
-) + [IO.Path]::DirectorySeparatorChar
-
-function Resolve-TargetFile([string]$RelativePath) {
-  $candidate = [IO.Path]::GetFullPath((Join-Path $targetRootPath $RelativePath))
-  if (-not $candidate.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Rollback path escapes target root: $RelativePath"
-  }
-  return $candidate
-}
-
-tar -xf $baselineArchive -C $targetRootPath
-if ($LASTEXITCODE -ne 0) {
-  throw "Rollback archive extraction failed with exit $LASTEXITCODE"
-}
-
-$createdFile = Resolve-TargetFile 'backend/order_query/detail.py'
-if (Test-Path -LiteralPath $createdFile -PathType Leaf) {
-  Remove-Item -LiteralPath $createdFile -Force
-}
-
-$expectedHashes = @{
-  'backend/main.py' = '1F255D654CBD3BD086230FDA5AB879D863E28C9F29F093CC8928881D6F848D50'
-  'backend/order_query/client.py' = '0212C09FF5206853C37C30A7A1FA52CA483325192D7068998DC7BC1961A1EA5F'
-  'backend/order_query/errors.py' = '03522AA8D9EB61DCA85EBEDBB495E1EF11D86E1DAEA5EAC2B33451DD10FD2A5B'
-  'backend/order_query/routes.py' = 'DC22B67CF6A1940432A50385056C5B30BFD6D26673B3A07F8EEEE8BA1DC2EDAB'
-  'backend/order_query/service.py' = '81503D2722238CFE1B151ADB7211C0D2E609FB4C75285FCC9B120A9FB620CFED'
-  'backend/order_query/sessions.py' = '066713266FC5052B8A4C62267EE0E08EFD3B3E8BCF673CC55A3A2E4DDC0FEA16'
-  'backend/test_order_query_modules.py' = '6BAA6B090FAE2FD64AE51B341F61E93907E080D145575DA5AD94074CB239EFD9'
-  'frontend/src/OrderQueryView.jsx' = 'B475E6BDFDA86ABD748BA582B3DA5A989C29FFB076F21BB4D0E8291044CB7860'
-  'frontend/src/orderQuery.css' = 'C24BB923C512BBEBEED8FBE085A29C2A21CCA3696C8442D272D3720FDF722352'
-  'frontend/src/orderQueryModel.js' = '72BA317193DE0C44C5E86EDF1A80D520C5A6AE847D3ADA7E29D574BEA20309CB'
-  'frontend/src/orderQueryModel.test.js' = 'E21C78B3F8F3D048C558CFD9BF6E763FFBA88A1940E5882FCFD5F30B59206E39'
-}
-
-foreach ($relativePath in $expectedHashes.Keys) {
-  $targetPath = Resolve-TargetFile $relativePath
-  $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetPath).Hash
-  if ($actualHash -ne $expectedHashes[$relativePath]) {
-    throw "Rollback verification failed for ${relativePath}: expected $($expectedHashes[$relativePath]), got $actualHash"
-  }
-}
-if (Test-Path -LiteralPath $createdFile) {
-  throw 'Rollback verification failed: backend/order_query/detail.py still exists'
-}
-
-Write-Output "Restored $targetRootPath to main c9650eb; removed backend/order_query/detail.py; verified $($expectedHashes.Count) files"
+Write-Output "Restored $target; verified $($expected.Count) files"

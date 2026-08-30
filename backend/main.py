@@ -1480,6 +1480,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                             "official_url": watch["url"],
                             "shop_token": shop_row["token"] if shop_row else "",
                             "query_password_required": product["query_password_required"],
+                            "coupon_supported": any(tag.get("key") == "coupon" for tag in product.get("commerce_tags", [])),
                         }
                     )
             return self._send_json(
@@ -1632,6 +1633,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             contact = str(data.get("contact") or "").strip()[:160]
             note = str(data.get("note") or "").strip()[:160]
             query_password = str(data.get("query_password") or "")[:160]
+            coupon_code = str(data.get("coupon_code") or "").strip()[:120]
+            storage_mode = str(data.get("storage_mode") or "local").strip().lower()
+            if storage_mode not in {"local", "browser"}:
+                return self._send_json({"detail": "存储方式无效"}, 400)
             try:
                 channel_id = int(data.get("channel_id", 1))
             except (TypeError, ValueError):
@@ -1643,6 +1648,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "note": note,
                 "query_password": query_password,
                 "channel_id": channel_id,
+                "coupon_code": coupon_code,
+                "storage_mode": storage_mode,
             }
             with database() as connection:
                 connection.execute(

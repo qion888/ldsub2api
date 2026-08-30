@@ -643,6 +643,26 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertEqual(saved["channel_id"], 4)
                 self.assertEqual(json.loads(row["value"]), saved)
 
+    def test_checkout_settings_accepts_storage_mode_and_coupon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                status, saved = self.request_api(
+                    "PUT", "/api/settings/checkout",
+                    {
+                        "contact": "buyer@example.test",
+                        "query_password": "secret",
+                        "coupon_code": "WELCOME10",
+                        "storage_mode": "browser",
+                        "channel_id": 1,
+                    },
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(saved["coupon_code"], "WELCOME10")
+                self.assertEqual(saved["storage_mode"], "browser")
+                self.assertEqual(main.checkout_settings()["storage_mode"], "browser")
+
     def test_preorder_requires_explicit_enable(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "test.db"

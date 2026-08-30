@@ -20,6 +20,7 @@ import {
   ReceiptText,
   RefreshCw,
   RotateCcw,
+  Save,
   Search,
   Send,
   ShieldCheck,
@@ -431,7 +432,7 @@ function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint}) {
   </tr>;
 }
 
-export default function OrderQueryView({request, notify, initialKeywords = ''}) {
+export default function OrderQueryView({request, notify, initialKeywords = '', checkoutProfile = null, onSaveCheckout = null}) {
   const [keywords, setKeywords] = useState(initialKeywords || '');
   const [submittedKeywords, setSubmittedKeywords] = useState('');
   const [activeStatus, setActiveStatus] = useState(999);
@@ -453,6 +454,10 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   const [detailBusy, setDetailBusy] = useState(false);
   const [detailError, setDetailError] = useState('');
   const [detailSessionExpired, setDetailSessionExpired] = useState(false);
+  const [profileContact, setProfileContact] = useState(checkoutProfile?.contact || initialKeywords || '');
+  const [profilePassword, setProfilePassword] = useState(checkoutProfile?.query_password || '');
+  const [profileStorageMode, setProfileStorageMode] = useState(checkoutProfile?.storage_mode || 'local');
+  const [profileBusy, setProfileBusy] = useState(false);
   const [complaintOrder, setComplaintOrder] = useState(null);
   const [complaintDraft, setComplaintDraft] = useState(null);
   const [complaintErrors, setComplaintErrors] = useState({});
@@ -548,6 +553,13 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     initialKeywordsApplied.current = true;
     setKeywords(current => current || initialKeywords);
   }, [initialKeywords]);
+
+  useEffect(() => {
+    if (!checkoutProfile) return;
+    setProfileContact(checkoutProfile.contact || '');
+    setProfilePassword(checkoutProfile.query_password || '');
+    setProfileStorageMode(checkoutProfile.storage_mode || 'local');
+  }, [checkoutProfile]);
 
   useEffect(() => {
     if (!detailOrder) return undefined;
@@ -759,6 +771,19 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     runSearch({keywordValue: keywords, pageValue: 1, reuseSession: !manualRequired});
   };
 
+  const saveProfile = async event => {
+    event.preventDefault();
+    if (!onSaveCheckout) return;
+    setProfileBusy(true);
+    try {
+      await onSaveCheckout({contact: profileContact, query_password: profilePassword, storage_mode: profileStorageMode});
+    } catch {
+      // Parent displays the persistence error.
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
   const submitManualCaptcha = event => {
     event.preventDefault();
     runSearch({manualCode: captchaCode.trim(), pageValue: 1});
@@ -773,7 +798,7 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
     detailTriggerRef.current = trigger || document.activeElement;
     setDetailOrder(order);
     setOrderDetail(null);
-    setDetailPassword('');
+    setDetailPassword(checkoutProfile?.query_password || '');
     setDetailPasswordVisible(false);
     setDetailBusy(false);
     setDetailError(sessionAvailable ? '' : '订单查询会话已失效，请重新查询订单后再验证');
@@ -1201,12 +1226,15 @@ export default function OrderQueryView({request, notify, initialKeywords = ''}) 
   return <section className="order-query-view">
     <section className="order-query-console">
       <div className="order-query-form-panel">
-        <div className="order-section-heading"><div><span>LDXP ORDER LOOKUP</span><h2>链动小铺订单查询</h2><p>使用购买时预留的联系方式或订单号查询</p></div><a className="icon-button" href="https://pay.ldxp.cn/order" target="_blank" rel="noreferrer" aria-label="打开官方订单查询" title="打开官方订单查询"><ArrowUpRight size={16}/></a></div>
+        <div className="order-section-heading"><div><span>LDXP ORDER LOOKUP</span><h2>链动小铺订单查询</h2><p>使用购买时预留的联系方式或订单号查询</p></div><span className="order-query-badge"><ShieldCheck size={14}/>安全查询</span></div>
         <form className="order-search-form" onSubmit={submitSearch}>
           <label><span>联系方式 / 订单号</span><div><Search size={16}/><input value={keywords} onChange={event => setKeywords(event.target.value)} placeholder="邮箱、手机号、QQ 或订单号" autoComplete="off" spellCheck="false"/></div></label>
           <button className="button primary" type="submit" disabled={Boolean(busy) || !keywords.trim()}><ShieldCheck size={16}/>{busy === 'search' ? '正在查询' : '自动验证并查询'}</button>
         </form>
-        <div className="order-query-source"><span><ShieldCheck size={13}/>数据来源</span><strong>pay.ldxp.cn/order</strong>{submittedKeywords && <em>当前查询：{submittedKeywords}</em>}</div>
+        <form className="order-profile-form" onSubmit={saveProfile}>
+          <div><span>购买配置</span><input value={profileContact} onChange={event => setProfileContact(event.target.value)} placeholder="联系方式" autoComplete="email"/><input type="password" value={profilePassword} onChange={event => setProfilePassword(event.target.value)} placeholder="安全密码（可选）" autoComplete="off"/><select value={profileStorageMode} onChange={event => setProfileStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select><button className="button secondary" type="submit" disabled={profileBusy || !profileContact.trim()}><Save size={14}/>{profileBusy ? '正在保存' : '保存配置'}</button></div>
+          <small>保存后可在商品购买页面直接复用</small>
+        </form>
         {error && <div className="order-query-error"><TriangleAlert size={15}/><span>{error}</span><button type="button" onClick={() => runSearch({pageValue: result.pagination.page || 1})}>重试</button></div>}
       </div>
       <VerificationPanel

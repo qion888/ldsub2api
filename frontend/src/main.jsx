@@ -59,6 +59,7 @@ import {
 } from './sub2apiRecoveryModel.js';
 
 const API = '/api';
+const CHECKOUT_PROFILE_KEY = 'ldxp-checkout-profile-v1';
 const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
 const ProductDetailPriceChart = React.lazy(() => import('./PriceHistoryChart.jsx').then(module => ({default: module.ProductDetailPriceChart})));
 const loadOrderQueryView = () => import('./OrderQueryView.jsx');
@@ -939,7 +940,10 @@ function App() {
   const [cart, setCart] = useState([]);
   const [contact, setContact] = useState({contact: '', note: ''});
   const [queryPassword, setQueryPassword] = useState('');
-  const [savedCheckout, setSavedCheckout] = useState({contact: '', note: '', query_password: '', channel_id: 1});
+  const [savedCheckout, setSavedCheckout] = useState({contact: '', note: '', query_password: '', channel_id: 1, coupon_code: '', storage_mode: 'local'});
+  const [couponCode, setCouponCode] = useState('');
+  const [checkoutStorageMode, setCheckoutStorageMode] = useState('local');
+  const [checkoutPrompt, setCheckoutPrompt] = useState(null);
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [review, setReview] = useState(null);
   const [officialOrder, setOfficialOrder] = useState(null);
@@ -1219,10 +1223,28 @@ function App() {
       try {
         const config = await request('/settings/checkout');
         if (cancelled) return;
-        setContact({contact: config.contact || '', note: config.note || ''});
-        setQueryPassword(config.query_password || '');
-        setPaymentChannel(Number(config.channel_id || 1));
-        setSavedCheckout(config);
+        let browserConfig = null;
+        try {
+          const raw = window.localStorage.getItem(CHECKOUT_PROFILE_KEY);
+          browserConfig = raw ? JSON.parse(raw) : null;
+        } catch {
+          browserConfig = null;
+        }
+        const selected = browserConfig?.storage_mode === 'browser' ? browserConfig : config;
+        const profile = {
+          contact: selected.contact || '',
+          note: selected.note || '',
+          query_password: selected.query_password || '',
+          channel_id: Number(selected.channel_id || 1),
+          coupon_code: selected.coupon_code || '',
+          storage_mode: selected.storage_mode === 'browser' ? 'browser' : 'local',
+        };
+        setContact({contact: profile.contact, note: profile.note});
+        setQueryPassword(profile.query_password);
+        setPaymentChannel(profile.channel_id);
+        setCouponCode(profile.coupon_code);
+        setCheckoutStorageMode(profile.storage_mode);
+        setSavedCheckout(profile);
       } catch {
         // Checkout settings are optional for browsing the monitoring workspace.
       }
@@ -1727,6 +1749,7 @@ function App() {
           enabled: true,
           interval_seconds: preorderDraft.interval_seconds,
           items: eligible.map(entry => ({watch_id: entry.watch_id, quantity: entry.quantity})),
+          ...(checkoutStorageMode === 'browser' ? {checkout_profile: {...savedCheckout, contact: contact.contact || savedCheckout.contact, query_password: queryPassword || savedCheckout.query_password, channel_id: paymentChannel}} : {}),
         }),
       });
       setPreorderDraft(null);
@@ -1806,25 +1829,69 @@ function App() {
     }
   };
 
-  const saveCheckout = async () => {
-    try {
-      const saved = await request('/settings/checkout', {
+  const persistCheckout = async (overrides = {}) => {
+    const profile = {
+      contact: String(overrides.contact ?? contact.contact ?? '').trim(),
+      note: String(overrides.note ?? contact.note ?? '').trim(),
+      query_password: String(overrides.query_password ?? queryPassword ?? ''),
+      channel_id: Number(overrides.channel_id ?? paymentChannel ?? 1),
+      coupon_code: String(overrides.coupon_code ?? couponCode ?? '').trim(),
+      storage_mode: (overrides.storage_mode !== undefined ? overrides.storage_mode : checkoutStorageMode) === 'browser' ? 'browser' : 'local',
+    };
+    if (!profile.contact) throw new Error('请先填写联系方式');
+    if (profile.storage_mode === 'browser') {
+      window.localStorage.setItem(CHECKOUT_PROFILE_KEY, JSON.stringify(profile));
+    } else {
+      await request('/settings/checkout', {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({...contact, query_password: queryPassword, channel_id: paymentChannel}),
+        body: JSON.stringify(profile),
       });
-      setContact({contact: saved.contact, note: saved.note});
-      setQueryPassword(saved.query_password || '');
-      setPaymentChannel(Number(saved.channel_id || 1));
-      setSavedCheckout(saved);
-      notify('购买配置已保存到本机');
+      window.localStorage.removeItem(CHECKOUT_PROFILE_KEY);
+    }
+    setContact({contact: profile.contact, note: profile.note});
+    setQueryPassword(profile.query_password);
+    setPaymentChannel(profile.channel_id);
+    setCouponCode(profile.coupon_code);
+    setCheckoutStorageMode(profile.storage_mode);
+    setSavedCheckout(profile);
+    return profile;
+  };
+
+  const saveCheckout = async () => {
+    try {
+      await persistCheckout();
+      notify(checkoutStorageMode === 'browser' ? '购买配置已保存到浏览器缓存' : '购买配置已保存到本机');
     } catch (error) {
       notify(error.message, 'error');
     }
   };
 
-  const prepareCheckout = async () => {
+  const requiresCheckoutPassword = target => {
+    if (target?.latest?.query_password_required) return true;
+    if (target?.items) return target.items.some(entry => entry.query_password_required);
+    return cart.some(entry => items.find(item => item.id === entry.watch_id)?.latest?.query_password_required);
+  };
+
+  const ensureCheckoutProfile = target => {
+    const profile = {
+      ...savedCheckout,
+      contact: contact.contact || savedCheckout.contact,
+      note: contact.note || savedCheckout.note,
+      query_password: queryPassword || savedCheckout.query_password,
+      channel_id: paymentChannel || savedCheckout.channel_id,
+      coupon_code: couponCode || savedCheckout.coupon_code,
+    };
+    if (!profile.contact || (requiresCheckoutPassword(target) && !profile.query_password)) {
+      setCheckoutPrompt({target, requiresPassword: requiresCheckoutPassword(target)});
+      return false;
+    }
+    return true;
+  };
+
+  const prepareCheckout = async (profileOverride = null) => {
     if (!cart.length) return notify('请先加入商品', 'error');
+    if (!profileOverride && !ensureCheckoutProfile({items: cart.map(entry => ({...entry, query_password_required: items.find(item => item.id === entry.watch_id)?.latest?.query_password_required}))})) return;
     setBusy(value => ({...value, checkout: true}));
     try {
       const result = await request('/checkout/prepare', {
@@ -1870,6 +1937,7 @@ function App() {
         channel_id: config.channel_id,
         contact: config.contact,
         query_password: item.query_password_required ? config.query_password : '',
+        coupon_code: config.coupon_code || '',
         juuid: identity.juuid,
         referer: item.official_url,
         visitor_id: getVisitorId(),
@@ -1895,6 +1963,7 @@ function App() {
       await placeOfficialOrder(review, {
         ...contact,
         query_password: queryPassword,
+        coupon_code: couponCode,
         channel_id: paymentChannel,
       }, paymentWindow.current);
     } catch (error) {
@@ -1905,12 +1974,9 @@ function App() {
     }
   };
 
-  const oneClickBuy = async item => {
+  const oneClickBuy = async (item, profileOverride = null) => {
     if (!itemPurchasable(item)) return notify(itemStock(item).key === 'out' ? '该商品当前缺货，可设置自动预购' : '该商品当前不可购买', 'error');
-    if (!savedCheckout.contact) return notify('请先在购买配置中保存联系方式', 'error');
-    if (item.latest?.query_password_required && !savedCheckout.query_password) {
-      return notify('该商品需要查询密码，请先在购买配置中保存', 'error');
-    }
+    if (!profileOverride && !ensureCheckoutProfile(item)) return;
     const minimum = Math.max(1, Number(item.latest?.limit_count || 1));
     const openedWindow = window.open('', '_blank');
     if (openedWindow) openedWindow.opener = null;
@@ -1928,12 +1994,30 @@ function App() {
       setReview(checkout);
       setPaymentChannels(channels);
       setPaymentChannel(channelId);
-      await placeOfficialOrder(checkout, {...savedCheckout, channel_id: channelId}, openedWindow);
+      const profile = profileOverride || {...savedCheckout, contact: contact.contact || savedCheckout.contact, query_password: queryPassword || savedCheckout.query_password, coupon_code: couponCode || savedCheckout.coupon_code};
+      await placeOfficialOrder(checkout, {...profile, channel_id: channelId}, openedWindow);
     } catch (error) {
       if (openedWindow && !openedWindow.closed) openedWindow.close();
       notify(error.message, 'error');
     } finally {
       setBusy(value => ({...value, [`buy-${item.id}`]: false}));
+    }
+  };
+
+  const submitCheckoutPrompt = async () => {
+    try {
+      const profile = await persistCheckout();
+      const target = checkoutPrompt?.target;
+      setCheckoutPrompt(null);
+      if (target?.id) {
+        await oneClickBuy(target, profile);
+      } else if (cart.length) {
+        await prepareCheckout(profile);
+      }
+      return profile;
+    } catch (error) {
+      notify(error.message, 'error');
+      return null;
     }
   };
 
@@ -2999,7 +3083,7 @@ function App() {
 
               </section>
 
-              <PurchasePanel items={items} cart={cart} setCart={setCart} totalCart={totalCart} estimatedTotal={estimatedTotal} setQuantity={setQuantity} contact={contact} setContact={setContact} saveCheckout={saveCheckout} queryPassword={queryPassword} setQueryPassword={setQueryPassword} passwordVisible={passwordVisible} setPasswordVisible={setPasswordVisible} paymentChannel={paymentChannel} setPaymentChannel={setPaymentChannel} prepareCheckout={prepareCheckout} busy={busy}/>
+              <PurchasePanel items={items} cart={cart} setCart={setCart} totalCart={totalCart} estimatedTotal={estimatedTotal} setQuantity={setQuantity} contact={contact} setContact={setContact} saveCheckout={saveCheckout} queryPassword={queryPassword} setQueryPassword={setQueryPassword} passwordVisible={passwordVisible} setPasswordVisible={setPasswordVisible} paymentChannel={paymentChannel} setPaymentChannel={setPaymentChannel} couponCode={couponCode} setCouponCode={setCouponCode} checkoutStorageMode={checkoutStorageMode} setCheckoutStorageMode={setCheckoutStorageMode} prepareCheckout={prepareCheckout} busy={busy}/>
             </div>
           </>
         ) : activeView === 'history' ? (
@@ -3021,7 +3105,7 @@ function App() {
           />
         ) : activeView === 'orders' ? (
           <React.Suspense fallback={<FeatureLoadingState feature="订单查询界面" state={{status: 'loading'}}/>}>
-            <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact}/>
+            <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact} checkoutProfile={savedCheckout} onSaveCheckout={async profile => { try { const saved = await persistCheckout(profile); notify(saved.storage_mode === 'browser' ? '购买配置已保存到浏览器缓存' : '购买配置已保存到本机'); } catch (error) { notify(error.message, 'error'); throw error; } }}/>
           </React.Suspense>
         ) : activeView === 'reclaim' ? featureLoadState.reclaim.status !== 'ready' ? (
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
@@ -3063,6 +3147,7 @@ function App() {
       <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={fetchOne} onDirect={openDirectProduct}/>
 
       {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
+      {checkoutPrompt && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setCheckoutPrompt(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="完善购买配置"><div className="modal-head"><div><span>CHECKOUT PROFILE</span><h2>完善购买配置</h2></div><IconButton label="关闭" onClick={() => setCheckoutPrompt(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>购买前需要联系方式{checkoutPrompt.requiresPassword ? '和安全密码' : ''}，支付渠道与优惠券可按商品支持情况使用。</p></div><div className="purchase-form"><label><span>联系方式</span><input value={contact.contact} onChange={event => setContact({...contact, contact: event.target.value})} placeholder="邮箱、手机号或其他联系方式" autoComplete="email"/></label>{checkoutPrompt.requiresPassword && <label><span>安全密码</span><input type={passwordVisible ? 'text' : 'password'} value={queryPassword} onChange={event => setQueryPassword(event.target.value)} placeholder="用于查询订单详情" autoComplete="off"/></label>}<label><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><label><span>优惠券 <small>可选</small></span><input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="输入优惠券码" autoComplete="off"/></label><label><span>配置保存位置</span><select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select></label></div><div className="modal-foot"><span><ShieldCheck size={14}/>保存后会用于后续购买和订单查询</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setCheckoutPrompt(null)}>取消</button><button className="button official" onClick={submitCheckoutPrompt}><Save size={15}/>保存并继续</button></div></div></div></div>}
       {review && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setReview(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="购买确认"><div className="modal-head"><div><span>DIRECT CHECKOUT</span><h2>支付链接已准备</h2></div><IconButton label="关闭" onClick={() => setReview(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>{review.notice} 创建成功后会自动打开支付页面；下方仍保留“打开支付链接”入口，方便重复打开。</p></div><div className="review-list">{review.items.map(item => <div className="review-item" key={item.watch_id}><div><strong>{item.title}</strong><span>{money(item.unit_price)} × {item.quantity}</span><a className="payment-link" href={item.official_url} target="_blank" rel="noreferrer"><Link2 size={13}/>{item.official_url}</a></div><strong>{money(item.subtotal)}</strong><div className="review-actions"><button className="button secondary" onClick={() => copyPaymentLink(item)}><Clipboard size={15}/>复制商品链接</button></div></div>)}</div>{officialOrder && <div className="payment-order-result"><div><span>官方订单</span><strong>{officialOrder.trade_no}</strong></div><a href={officialOrder.payment_url} target="_blank" rel="noreferrer"><Link2 size={14}/>{officialOrder.payment_url}</a><small>{officialOrder.notice} 渠道：{officialOrder.channel === 'alipay' ? '支付宝' : '微信支付'}，金额：{money(officialOrder.amount)}</small><button className="button official" onClick={() => window.open(officialOrder.payment_url, '_blank', 'noopener,noreferrer')}><ArrowUpRight size={15}/>打开支付链接</button></div>}<div className="review-total"><span>清单合计</span><strong>{money(review.total)}</strong></div><div className="modal-foot"><span><ShieldCheck size={14}/>支付前请核对订单金额</span><div className="modal-foot-actions"><label className="payment-channel"><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><button className="button official auto-pay-button" onClick={createOfficialOrder} disabled={busy.officialOrder}><Package size={15}/>{busy.officialOrder ? '正在创建并跳转' : '创建订单并自动跳转'}</button><button className="button secondary" onClick={() => setReview(null)}>返回修改</button></div></div></div></div>}
       {toast && <div className={`toast ${toast.type} ${toast.sections?.length ? 'detailed' : ''}`} role={toast.type === 'error' ? 'alert' : 'status'} aria-live={toast.type === 'error' ? 'assertive' : 'polite'} aria-atomic="true" key={toast.id}>
         <span className="toast-icon">{toast.type === 'error' ? <AlertCircle size={18}/> : toast.type === 'warning' ? <TriangleAlert size={18}/> : toast.type === 'info' ? <BellRing size={18}/> : <Check size={18}/>}</span>
@@ -3082,7 +3167,7 @@ function App() {
   );
 }
 
-function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuantity, contact, setContact, saveCheckout, queryPassword, setQueryPassword, passwordVisible, setPasswordVisible, paymentChannel, setPaymentChannel, prepareCheckout, busy}) {
+function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuantity, contact, setContact, saveCheckout, queryPassword, setQueryPassword, passwordVisible, setPasswordVisible, paymentChannel, setPaymentChannel, couponCode, setCouponCode, checkoutStorageMode, setCheckoutStorageMode, prepareCheckout, busy}) {
   const requiresPassword = cart.some(entry => items.find(item => item.id === entry.watch_id)?.latest?.query_password_required);
   return (
     <aside className="purchase-panel">
@@ -3149,7 +3234,18 @@ function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuan
         <div><span>预计合计</span><strong>{money(estimatedTotal)}</strong></div>
       </div>
       <button className="button checkout" onClick={prepareCheckout} disabled={!cart.length || busy.checkout}><ShieldCheck size={17}/>{busy.checkout ? '正在校验' : '核对并打开支付链接'}</button>
-      <p className="local-note"><ShieldCheck size={14}/>配置保存在本机 SQLite；商品不要求密码时不会提交密码</p>
+      <label>
+        <span>优惠券 <small>商品支持时生效</small></span>
+        <input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="可选，输入优惠券码" autoComplete="off"/>
+      </label>
+      <label>
+        <span>配置保存位置</span>
+        <select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}>
+          <option value="local">本机数据库</option>
+          <option value="browser">浏览器缓存</option>
+        </select>
+      </label>
+      <p className="local-note"><ShieldCheck size={14}/>联系方式与安全密码会按所选位置保存，商品不要求密码时不会提交密码</p>
     </aside>
   );
 }

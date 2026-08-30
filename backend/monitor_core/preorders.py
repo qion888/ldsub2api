@@ -55,6 +55,13 @@ def create_preorders(
     if not isinstance(entries, list) or not entries or len(entries) > 100:
         raise ValueError("预购清单应包含 1 到 100 个商品")
     config = settings_loader()
+    supplied_profile = payload.get("checkout_profile")
+    if isinstance(supplied_profile, dict):
+        config = {**config, **{
+            "contact": supplied_profile.get("contact", config.get("contact")),
+            "query_password": supplied_profile.get("query_password", config.get("query_password")),
+            "channel_id": supplied_profile.get("channel_id", config.get("channel_id")),
+        }}
     try:
         interval = interval_normalizer(payload.get("interval_seconds"), 1)
         channel_id = int(config.get("channel_id", 1))

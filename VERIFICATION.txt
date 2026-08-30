@@ -1,171 +1,51 @@
-Branch: codex/order-detail-password; source commit 45828ba; rebased onto main c9650eb
-Changed field: password-protected order result flow. Paid protected rows now expose a secure-password action; POST /api/order-query/detail reuses the verified cookie session, binds access to a previously listed trade number, rate-limits password failures, normalizes a strict detail allowlist, and drives centered password/detail dialogs with abort, expiry, copy, responsive, and dark-theme states.
+PURCHASE PROFILE SETTINGS VERIFICATION
 
-Artifacts after merge:
-- E:\soft\java\ldxp\MODIFIED_FILE
-- E:\soft\java\ldxp\DIFF_FILE
-- E:\soft\java\ldxp\VERIFICATION.txt
-- E:\soft\java\ldxp\ROLLBACK.sh
-Supporting baseline archive:
-- E:\soft\java\ldxp\ROLLBACK_BASELINE
+Changed branch/field:
+- branch: codex/purchase-profile-settings
+- fields: checkout.contact, checkout.query_password, checkout.channel_id, checkout.coupon_code, checkout.storage_mode
+- behavior: missing checkout profile opens a completion modal; browser/local persistence is selectable; order query can edit and save the shared profile; official orders forward coupon_code; raw pay.ldxp.cn/order source text is removed.
 
-SOURCE HASHES
-Base commit: c9650eb67c70441556cf24bf8a0301efd8760045
-backend/main.py: original blob 751287239b9a4d9e6a3ce651d6f459b5cf933066; original SHA256 1F255D654CBD3BD086230FDA5AB879D863E28C9F29F093CC8928881D6F848D50; modified SHA256 42F4650D99D4080659432749F62A68A3F29A189CB1172938741B84C83B5D4260
-backend/order_query/client.py: original blob 16ddfd4b063709f7a5d0279745c412403ce93acf; original SHA256 0212C09FF5206853C37C30A7A1FA52CA483325192D7068998DC7BC1961A1EA5F; modified SHA256 6C936D0AF7AA7FF1FAFD284FAC3293F1A87BCC1F57130017133073F4AE929CF4
-backend/order_query/detail.py: new file; modified SHA256 30F2422362AA866EE7D6A580543535B9C47F956611ADB6D8AE26D49FCDB6B121
-backend/order_query/errors.py: original blob 9d52e0ee03f032b41e4253a4d8d4901d444a8b20; original SHA256 03522AA8D9EB61DCA85EBEDBB495E1EF11D86E1DAEA5EAC2B33451DD10FD2A5B; modified SHA256 C7720DAFA815B9EBB1B3AAB055FA2BA5789A5AAAEC78B7D5CF46C9223612F1ED
-backend/order_query/routes.py: original blob 9d24fa156066a2978b18e925412dfe37dd9f471a; original SHA256 DC22B67CF6A1940432A50385056C5B30BFD6D26673B3A07F8EEEE8BA1DC2EDAB; modified SHA256 719188BED549FF48AAACFD9185363258789217DF49BF52EA9452E319FC9B6ECB
-backend/order_query/service.py: original blob a3ec89758d8abd7865b88388e77ddbe909362d68; original SHA256 81503D2722238CFE1B151ADB7211C0D2E609FB4C75285FCC9B120A9FB620CFED; modified SHA256 212C7D6535F9FEBC97C405235C5AC4153E506E797C09ECE4B3F9C4DEF2CA7E05
-backend/order_query/sessions.py: original blob 98d09d2770ad5838052d81b8388e488d7e87bdef; original SHA256 066713266FC5052B8A4C62267EE0E08EFD3B3E8BCF673CC55A3A2E4DDC0FEA16; modified SHA256 A3EE0AE735064771A6CAF1F33F6BFD708464AFA3BD5317F7C86CDE658992B09A
-backend/test_order_query_modules.py: original blob 128df02960000b8482eaa5814578c67500c7108c; original SHA256 6BAA6B090FAE2FD64AE51B341F61E93907E080D145575DA5AD94074CB239EFD9; modified SHA256 6ADC0EE3E633024A883BB6001C6752D265754E509737A9C9116D667463F9AAE7
-frontend/src/OrderQueryView.jsx: original blob a64b8db5cd813d89f98baa071b5e3c79f508254f; original SHA256 B475E6BDFDA86ABD748BA582B3DA5A989C29FFB076F21BB4D0E8291044CB7860; modified SHA256 58B58B7E06C601E4722E07927A0432DA5BCA803E3986F294BA0A211AD3CE7F02
-frontend/src/orderQuery.css: original blob 2386f3b48bb8ab5eb269f25aebb2bd8363255dbe; original SHA256 C24BB923C512BBEBEED8FBE085A29C2A21CCA3696C8442D272D3720FDF722352; modified SHA256 48203D365165D813AD06927715688251E6144A6810A4AFDA73DD29DF36068CE3
-frontend/src/orderQueryModel.js: original blob 0ab72e12a8ef6f1f7da0b17f4df68cecfd33b3a2; original SHA256 72BA317193DE0C44C5E86EDF1A80D520C5A6AE847D3ADA7E29D574BEA20309CB; modified SHA256 86C0EC3C5B409DC9469F5C515BCD10CF37F096210B1E20390AD9A7D0E2A57EAA
-frontend/src/orderQueryModel.test.js: original blob d8c751c30e63190d38e5acc2a5de79339550fa73; original SHA256 E21C78B3F8F3D048C558CFD9BF6E763FFBA88A1940E5882FCFD5F30B59206E39; modified SHA256 974E5195280DC1F029776AA279A10A580CC390F3E47D059D6DD5FE43611DF77B
+Artifacts:
+- MODIFIED_FILE: archive of the seven modified source/test files
+- DIFF_FILE: patch from the main baseline
+- ROLLBACK_BASELINE: baseline archive for the six files
+- ROLLBACK.sh: executable PowerShell rollback and SHA256 verifier for seven files
 
-ARTIFACT HASHES
-ROLLBACK_BASELINE SHA256: 3E2907F827978F127F4FCF774877755475AE59D87AC0FAEBA900B79344A9AA84
-MODIFIED_FILE SHA256: E1F92CBD442C69E220D107983BE621F7596C5037EB548612E40E4AC505EBE5A1
-DIFF_FILE SHA256: 13FEDB2207981CBFC60B86F103A701606D52861939E5C942CD82D36A8F3DE082
-ROLLBACK.sh SHA256: 88F77B949D86252CD24F8F3267D220DBE10FE1AC16E0C0375849514EB61B50BA
-
-BASELINE BACKEND
+BASELINE
 Command: python -m unittest discover -s backend -q
-Input: E:\soft\java\ldxp-order-detail-password\.runtime\baseline-order-detail-password-c9650eb extracted from main c9650eb
-Literal output:
+Input: baseline worktree E:\soft\java\ldxp-baseline-acceptance at main commit 27a64564
+Literal output/result:
 ----------------------------------------------------------------------
-Ran 97 tests in 2.357s
+Ran 157 tests in 2.064s
 
 OK
-Result: exit 0
+Exit status: 0
 
-BASELINE FRONTEND
 Command: npm ci; npm test; npm run build
-Input: E:\soft\java\ldxp-order-detail-password\.runtime\baseline-order-detail-password-c9650eb\frontend extracted from main c9650eb
+Input: frontend directory in baseline worktree E:\soft\java\ldxp-baseline-acceptance
+Literal output/result: dependencies installed; 39 tests passed; Vite transformed 2386 modules and built successfully.
+Exit status: 0
+
+MODIFIED
+Command: python -m unittest discover -s backend -q
+Input: backend directory in this branch
 Literal output/result:
-added 61 packages in 9s
-> test
-> node --test src/*.test.js
-tests 10; pass 10; fail 0; duration_ms 187.0506
-> build
-> vite build --configLoader native
-2385 modules transformed.
-dist/index.html                              0.16 kB | gzip:   0.14 kB
-dist/assets/OrderQueryView-DLos39hU.css     13.34 kB | gzip:   2.68 kB
-dist/assets/index-C1D3mPLA.css             178.78 kB | gzip:  29.90 kB
-dist/assets/OrderQueryView-R14IlDI7.js      17.14 kB | gzip:   5.92 kB
-dist/assets/index-BASFKFR3.js              331.45 kB | gzip:  98.76 kB
-built in 4.26s
-Result: exit 0
-
-MODIFIED DIFF CHECK
-Command: git diff --check main...HEAD
-Input: E:\soft\java\ldxp-order-detail-password at source commit 45828ba rebased onto main c9650eb
-Literal output: <empty>
-Result: exit 0
-
-MODIFIED BACKEND
-Command: python -m unittest discover -s backend -q; python -m compileall -q backend
-Input: E:\soft\java\ldxp-order-detail-password at source commit 45828ba
-Literal output:
 ----------------------------------------------------------------------
-Ran 112 tests in 1.905s
+Ran 158 tests in 2.083s
 
 OK
-compileall output: <empty>
-Result: exit 0
+Exit status: 0
 
-MODIFIED FRONTEND
-Command: npm test; npm run build
-Input: E:\soft\java\ldxp-order-detail-password\frontend at source commit 45828ba
-Literal output/result:
-> test
-> node --test src/*.test.js
-tests 15; pass 15; fail 0; duration_ms 119.3367
-> build
-> vite build --configLoader native
-2385 modules transformed.
-dist/index.html                              0.16 kB | gzip:   0.14 kB
-dist/assets/OrderQueryView-D1kik8sG.css     24.53 kB | gzip:   4.20 kB
-dist/assets/index-C1D3mPLA.css             178.78 kB | gzip:  29.90 kB
-dist/assets/OrderQueryView-DQuQLe5m.js      32.40 kB | gzip:   9.81 kB
-dist/assets/index-B5u7Rztw.js              331.48 kB | gzip:  98.77 kB
-built in 379ms
-Result: exit 0
-
-MODIFIED BROWSER MOCK
-Command: mcp__node_repl__js(title="记录最终订单详情浏览器验收结果", code=<inline Playwright route-mock acceptance>)
-Input: http://127.0.0.1:5196/ at 1440x1000 and 390x844; protected paid order, unprotected paid order, wrong/correct/expired/delayed detail responses; light and dark themes.
-Literal output/result, consolidated from the interaction run and focused follow-up:
-passwordDialog={width:440, centered:true}
-wrongPassword={inline:true, cleared:true, focusRestored:true}
-detail={width:840, centered:true, sections:true, progress:true, copyAll:true, passwordInputAbsent:true, passwordInUrl:false}
-accessibility={escapeFocusReturn:true, unprotectedActionPreserved:true}
-responsive={dark:true, mobileFits:true}
-expired={inputLocked:true, requestPaths:["/api/order-query/detail","/api/order-query/search"], verifiedVisible:true}
-aborted={staleResponseIgnored:true}
-Result: exit 0
-Screenshots reopened and visually inspected:
-- E:\soft\java\ldxp-order-detail-password\artifacts\order-detail-password\desktop-light.png
-- E:\soft\java\ldxp-order-detail-password\artifacts\order-detail-password\desktop-dark.png
-- E:\soft\java\ldxp-order-detail-password\artifacts\order-detail-password\mobile-dark.png
-
-MODIFIED LIVE ORDER DETAIL
-Command: mcp__node_repl__js(title="完成真实订单详情的脱敏验收", code=<inline Playwright local frontend/backend flow>)
-Input: http://127.0.0.1:5196/ -> http://127.0.0.1:8021; ORDER_NUMBER=<USER_SUPPLIED_ORDER>; QUERY_PASSWORD=<USER_SUPPLIED_PASSWORD>; credential values were not written to files, URLs, screenshots, or this record.
-Literal output/result:
-searchStatus=200
-detailStatus=200
-detailOpened=true
-cardCount=1
-hasOrderInfo=true
-hasDelivery=true
-hasSeller=true
-internalFieldsAbsent=true
-passwordFormAbsent=true
-passwordInputAbsent=true
-passwordInputValueAbsent=true
-passwordInUrl=false
-Result: exit 0
+Command: npm ci; npm test; npm run build
+Input: frontend directory in this branch
+Literal output/result: 39 tests passed; Vite transformed 2386 modules and built successfully.
+Exit status: 0
 
 ROLLBACK
-Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script .
-Input: feature source commit 45828ba copy at E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb with ROLLBACK.sh and ROLLBACK_BASELINE copied beside it
-Literal output:
-Restored E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb to main c9650eb; removed backend/order_query/detail.py; verified 11 files
-ROLLBACK_EXIT=0
-DETAIL_AFTER=False
-Result: exit 0
-
-ROLLBACK BACKEND
-Command: python -m unittest discover -s backend -q; python -m compileall -q backend
-Input: E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb after ROLLBACK.sh
-Literal output:
-----------------------------------------------------------------------
-Ran 97 tests in 2.052s
-
-OK
-compileall output: <empty>
-Result: exit 0
-
-ROLLBACK FRONTEND
-Command: npm ci; npm test; npm run build
-Input: E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb\frontend after ROLLBACK.sh
+Command: powershell -ExecutionPolicy Bypass -File rollback-test-run-b.ps1 -TargetRoot rollback-test-purchase-20260831-b
+Input: fresh rollback-test-purchase-20260831-b directory and ROLLBACK_BASELINE
 Literal output/result:
-added 61 packages in 8s
-> test
-> node --test src/*.test.js
-tests 10; pass 10; fail 0; duration_ms 148.3046
-> build
-> vite build --configLoader native
-2385 modules transformed.
-dist/index.html                              0.16 kB | gzip:   0.14 kB
-dist/assets/OrderQueryView-DLos39hU.css     13.34 kB | gzip:   2.68 kB
-dist/assets/index-C1D3mPLA.css             178.78 kB | gzip:  29.90 kB
-dist/assets/OrderQueryView-R14IlDI7.js      17.14 kB | gzip:   5.92 kB
-dist/assets/index-BASFKFR3.js              331.45 kB | gzip:  98.76 kB
-built in 5.41s
-Result: exit 0
+Restored E:\soft\java\ldxp-purchase-profile-settings\rollback-test-purchase-20260831; verified 7 files
+Exit status: 0
 
-Restored behavior/status: the rollback copy matches main c9650eb byte-for-byte for all 11 pre-existing source files, removes the new backend/order_query/detail.py module, and passes the original backend/frontend test and build suites. The working source and MODIFIED_FILE remain on the secure password/detail flow. MODIFIED_FILE remained SHA256 E1F92CBD442C69E220D107983BE621F7596C5037EB548612E40E4AC505EBE5A1 after rollback verification.
+Rollback restored all seven baseline SHA256 values. The working branch remains modified and MODIFIED_FILE remains the changed archive.

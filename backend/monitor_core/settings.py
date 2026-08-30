@@ -23,8 +23,17 @@ def read_checkout(database: DatabaseFactory) -> dict[str, Any]:
         row = connection.execute("SELECT value FROM settings WHERE key = 'checkout'").fetchone()
         legacy = connection.execute("SELECT value FROM settings WHERE key = 'contact'").fetchone()
     fallback = json_value(legacy["value"] if legacy else None, {"contact": "", "note": ""})
-    fallback.update({"query_password": "", "channel_id": 1})
-    return json_value(row["value"] if row else None, fallback)
+    fallback.update({"query_password": "", "channel_id": 1, "coupon_code": "", "storage_mode": "local"})
+    value = json_value(row["value"] if row else None, fallback)
+    if not isinstance(value, dict):
+        value = dict(fallback)
+    value.setdefault("contact", "")
+    value.setdefault("note", "")
+    value.setdefault("query_password", "")
+    value.setdefault("channel_id", 1)
+    value.setdefault("coupon_code", "")
+    value.setdefault("storage_mode", "local")
+    return value
 
 
 def read_json(database: DatabaseFactory, key: str, fallback: dict[str, Any]) -> dict[str, Any]:
