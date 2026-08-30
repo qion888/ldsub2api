@@ -1,168 +1,171 @@
-Branch: codex/sub2api-usage-window-ui-v2; commit 5db09e1; rebased onto main a7a02e3
-Changed field: frontend/src/Sub2ApiView.jsx dedicated 5-hour/7-day upstream usage windows, reset countdown/tooltip, source/update metadata, request/token/account-cost/user-cost detail and empty states; frontend/src/style.css Sub2API-only type scale, spacing, account table widths, usage-window hierarchy, and coordinated card-import/history/automation typography.
+Branch: codex/order-detail-password; source commit 45828ba; rebased onto main c9650eb
+Changed field: password-protected order result flow. Paid protected rows now expose a secure-password action; POST /api/order-query/detail reuses the verified cookie session, binds access to a previously listed trade number, rate-limits password failures, normalizes a strict detail allowlist, and drives centered password/detail dialogs with abort, expiry, copy, responsive, and dark-theme states.
 
-Artifacts:
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\MODIFIED_FILE
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\DIFF_FILE
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\VERIFICATION.txt
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\ROLLBACK.sh
+Artifacts after merge:
+- E:\soft\java\ldxp\MODIFIED_FILE
+- E:\soft\java\ldxp\DIFF_FILE
+- E:\soft\java\ldxp\VERIFICATION.txt
+- E:\soft\java\ldxp\ROLLBACK.sh
 Supporting baseline archive:
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\ROLLBACK_BASELINE
+- E:\soft\java\ldxp\ROLLBACK_BASELINE
 
 SOURCE HASHES
-Original input: main a7a02e3
-Original frontend/src/Sub2ApiView.jsx git blob: 5291719e0c3f0aa22c3a2a1652d53e6db628d2f8
-Original frontend/src/Sub2ApiView.jsx SHA256: A410D7251BE00FDF381F12213676F0ABC09955D3535C247B27683858CA746AC7
-Original frontend/src/style.css git blob: fad34af2f136b3907ddfc7e59fd1c54311ad6a3a
-Original frontend/src/style.css SHA256: DCE5204CD22EB848E666FA16EC2F897F6AE1C39748C8D1D10DCD828E8BA52F18
-Modified frontend/src/Sub2ApiView.jsx git blob: a088577586cc21a9d901484fb14664d540c66bc3
-Modified frontend/src/Sub2ApiView.jsx SHA256: 6DCD4283437F30652E68FC3C7A683D3A5E772C0AED96E9A624F11B3367069EAF
-Modified frontend/src/style.css git blob: f924a928c34649f4baac237a46589f0263d03089
-Modified frontend/src/style.css SHA256: D0573D65B6D889BECDFA82CD5A2093F88C91E788C91D0FBBEDFA610A0F38E68C
-ROLLBACK_BASELINE SHA256: 52E6D49AB50B84169EB8D43E738E7E8DFEB233E7AA4F5617373D1EAE40AFD740
-MODIFIED_FILE SHA256: 28D842E9A7D0DB60702000F6335B82403B92FD11EF0889501AF7F0DC4458E785
-DIFF_FILE SHA256: 58A3F87BB5904EB737CBF2ADC329DC8BD8363BD85373501D4D4206294A9AC4F1
-ROLLBACK.sh SHA256: F628AB00CF14C0D4D75D2D7A0FDD99FA3B64C7BB1B6A1F2FE961EC4935D83A18
+Base commit: c9650eb67c70441556cf24bf8a0301efd8760045
+backend/main.py: original blob 751287239b9a4d9e6a3ce651d6f459b5cf933066; original SHA256 1F255D654CBD3BD086230FDA5AB879D863E28C9F29F093CC8928881D6F848D50; modified SHA256 42F4650D99D4080659432749F62A68A3F29A189CB1172938741B84C83B5D4260
+backend/order_query/client.py: original blob 16ddfd4b063709f7a5d0279745c412403ce93acf; original SHA256 0212C09FF5206853C37C30A7A1FA52CA483325192D7068998DC7BC1961A1EA5F; modified SHA256 6C936D0AF7AA7FF1FAFD284FAC3293F1A87BCC1F57130017133073F4AE929CF4
+backend/order_query/detail.py: new file; modified SHA256 30F2422362AA866EE7D6A580543535B9C47F956611ADB6D8AE26D49FCDB6B121
+backend/order_query/errors.py: original blob 9d52e0ee03f032b41e4253a4d8d4901d444a8b20; original SHA256 03522AA8D9EB61DCA85EBEDBB495E1EF11D86E1DAEA5EAC2B33451DD10FD2A5B; modified SHA256 C7720DAFA815B9EBB1B3AAB055FA2BA5789A5AAAEC78B7D5CF46C9223612F1ED
+backend/order_query/routes.py: original blob 9d24fa156066a2978b18e925412dfe37dd9f471a; original SHA256 DC22B67CF6A1940432A50385056C5B30BFD6D26673B3A07F8EEEE8BA1DC2EDAB; modified SHA256 719188BED549FF48AAACFD9185363258789217DF49BF52EA9452E319FC9B6ECB
+backend/order_query/service.py: original blob a3ec89758d8abd7865b88388e77ddbe909362d68; original SHA256 81503D2722238CFE1B151ADB7211C0D2E609FB4C75285FCC9B120A9FB620CFED; modified SHA256 212C7D6535F9FEBC97C405235C5AC4153E506E797C09ECE4B3F9C4DEF2CA7E05
+backend/order_query/sessions.py: original blob 98d09d2770ad5838052d81b8388e488d7e87bdef; original SHA256 066713266FC5052B8A4C62267EE0E08EFD3B3E8BCF673CC55A3A2E4DDC0FEA16; modified SHA256 A3EE0AE735064771A6CAF1F33F6BFD708464AFA3BD5317F7C86CDE658992B09A
+backend/test_order_query_modules.py: original blob 128df02960000b8482eaa5814578c67500c7108c; original SHA256 6BAA6B090FAE2FD64AE51B341F61E93907E080D145575DA5AD94074CB239EFD9; modified SHA256 6ADC0EE3E633024A883BB6001C6752D265754E509737A9C9116D667463F9AAE7
+frontend/src/OrderQueryView.jsx: original blob a64b8db5cd813d89f98baa071b5e3c79f508254f; original SHA256 B475E6BDFDA86ABD748BA582B3DA5A989C29FFB076F21BB4D0E8291044CB7860; modified SHA256 58B58B7E06C601E4722E07927A0432DA5BCA803E3986F294BA0A211AD3CE7F02
+frontend/src/orderQuery.css: original blob 2386f3b48bb8ab5eb269f25aebb2bd8363255dbe; original SHA256 C24BB923C512BBEBEED8FBE085A29C2A21CCA3696C8442D272D3720FDF722352; modified SHA256 48203D365165D813AD06927715688251E6144A6810A4AFDA73DD29DF36068CE3
+frontend/src/orderQueryModel.js: original blob 0ab72e12a8ef6f1f7da0b17f4df68cecfd33b3a2; original SHA256 72BA317193DE0C44C5E86EDF1A80D520C5A6AE847D3ADA7E29D574BEA20309CB; modified SHA256 86C0EC3C5B409DC9469F5C515BCD10CF37F096210B1E20390AD9A7D0E2A57EAA
+frontend/src/orderQueryModel.test.js: original blob d8c751c30e63190d38e5acc2a5de79339550fa73; original SHA256 E21C78B3F8F3D048C558CFD9BF6E763FFBA88A1940E5882FCFD5F30B59206E39; modified SHA256 974E5195280DC1F029776AA279A10A580CC390F3E47D059D6DD5FE43611DF77B
+
+ARTIFACT HASHES
+ROLLBACK_BASELINE SHA256: 3E2907F827978F127F4FCF774877755475AE59D87AC0FAEBA900B79344A9AA84
+MODIFIED_FILE SHA256: E1F92CBD442C69E220D107983BE621F7596C5037EB548612E40E4AC505EBE5A1
+DIFF_FILE SHA256: 13FEDB2207981CBFC60B86F103A701606D52861939E5C942CD82D36A8F3DE082
+ROLLBACK.sh SHA256: 88F77B949D86252CD24F8F3267D220DBE10FE1AC16E0C0375849514EB61B50BA
 
 BASELINE BACKEND
 Command: python -m unittest discover -s backend -q
-Input: E:\soft\java\ldxp-sub2api-usage-window-ui-v2\.runtime\baseline-lazy-ui-v2 extracted from main a7a02e3
+Input: E:\soft\java\ldxp-order-detail-password\.runtime\baseline-order-detail-password-c9650eb extracted from main c9650eb
 Literal output:
 ----------------------------------------------------------------------
-Ran 75 tests in 1.505s
+Ran 97 tests in 2.357s
 
 OK
 Result: exit 0
 
 BASELINE FRONTEND
 Command: npm ci; npm test; npm run build
-Input: E:\soft\java\ldxp-sub2api-usage-window-ui-v2\.runtime\baseline-lazy-ui-v2\frontend extracted from main a7a02e3
-Literal output:
-added 61 packages in 8s
-9 packages are looking for funding
-  run `npm fund` for details
-
+Input: E:\soft\java\ldxp-order-detail-password\.runtime\baseline-order-detail-password-c9650eb\frontend extracted from main c9650eb
+Literal output/result:
+added 61 packages in 9s
 > test
 > node --test src/*.test.js
-
-2 tests; 2 pass; 0 fail; duration_ms 140.6131
-
+tests 10; pass 10; fail 0; duration_ms 187.0506
 > build
 > vite build --configLoader native
-
-vite v8.2.2 building client environment for production...
-2381 modules transformed.
+2385 modules transformed.
 dist/index.html                              0.16 kB | gzip:   0.14 kB
-dist/assets/index-ByhAHFvB.css             166.35 kB | gzip:  28.16 kB
-dist/assets/file-up-intuOVZi.js              0.34 kB | gzip:   0.23 kB
-dist/assets/ReclaimView-BVP1sBde.js          3.51 kB | gzip:   1.27 kB
-dist/assets/Sub2ApiView-DBgOr1D9.js         41.91 kB | gzip:  11.74 kB
-dist/assets/index-oQId-Yp8.js              325.94 kB | gzip:  96.82 kB
-dist/assets/PriceHistoryChart-Cvmnbwn3.js  417.72 kB | gzip: 118.45 kB
-built in 7.32s
+dist/assets/OrderQueryView-DLos39hU.css     13.34 kB | gzip:   2.68 kB
+dist/assets/index-C1D3mPLA.css             178.78 kB | gzip:  29.90 kB
+dist/assets/OrderQueryView-R14IlDI7.js      17.14 kB | gzip:   5.92 kB
+dist/assets/index-BASFKFR3.js              331.45 kB | gzip:  98.76 kB
+built in 4.26s
 Result: exit 0
 
 MODIFIED DIFF CHECK
 Command: git diff --check main...HEAD
-Input: E:\soft\java\ldxp-sub2api-usage-window-ui-v2 at commit 5db09e1
-Literal output: MODIFIED_DIFF_CHECK_EXIT=0
+Input: E:\soft\java\ldxp-order-detail-password at source commit 45828ba rebased onto main c9650eb
+Literal output: <empty>
 Result: exit 0
 
 MODIFIED BACKEND
-Command: python -m unittest discover -s backend -q
-Input: E:\soft\java\ldxp-sub2api-usage-window-ui-v2 at commit 5db09e1
+Command: python -m unittest discover -s backend -q; python -m compileall -q backend
+Input: E:\soft\java\ldxp-order-detail-password at source commit 45828ba
 Literal output:
 ----------------------------------------------------------------------
-Ran 75 tests in 1.371s
+Ran 112 tests in 1.905s
 
 OK
+compileall output: <empty>
 Result: exit 0
 
 MODIFIED FRONTEND
 Command: npm test; npm run build
-Input: E:\soft\java\ldxp-sub2api-usage-window-ui-v2\frontend at commit 5db09e1
-Literal output:
+Input: E:\soft\java\ldxp-order-detail-password\frontend at source commit 45828ba
+Literal output/result:
 > test
 > node --test src/*.test.js
-
-2 tests; 2 pass; 0 fail; duration_ms 77.1838
-
+tests 15; pass 15; fail 0; duration_ms 119.3367
 > build
 > vite build --configLoader native
-
-vite v8.2.2 building client environment for production...
-2381 modules transformed.
+2385 modules transformed.
 dist/index.html                              0.16 kB | gzip:   0.14 kB
-dist/assets/index-DqtBM0SN.css             170.96 kB | gzip:  28.80 kB
-dist/assets/file-up-D2WmEIg6.js              0.34 kB | gzip:   0.23 kB
-dist/assets/ReclaimView-Cq3dLjDK.js          3.51 kB | gzip:   1.27 kB
-dist/assets/Sub2ApiView-C6Cj8QDF.js         44.05 kB | gzip:  12.37 kB
-dist/assets/index-5b0_dZPV.js              325.94 kB | gzip:  96.82 kB
-dist/assets/PriceHistoryChart-pMBc_01Z.js  417.72 kB | gzip: 118.45 kB
-built in 331ms
+dist/assets/OrderQueryView-D1kik8sG.css     24.53 kB | gzip:   4.20 kB
+dist/assets/index-C1D3mPLA.css             178.78 kB | gzip:  29.90 kB
+dist/assets/OrderQueryView-DQuQLe5m.js      32.40 kB | gzip:   9.81 kB
+dist/assets/index-B5u7Rztw.js              331.48 kB | gzip:  98.77 kB
+built in 379ms
 Result: exit 0
 
-MODIFIED BROWSER
-Command: mcp__node_repl__js(title="记录最终 Sub2API 浏览器验收结果", timeout_ms=120000, code=<inline Playwright route-mock acceptance>)
-Input: http://127.0.0.1:5195/ at 1600x1000 and 390x844; active, future-429, error, and quota-exhausted accounts; passive/active usage sources; 32.5% five-hour and 74.2% seven-day windows; successful card-import history; dynamically loaded Sub2ApiView.jsx.
-Literal output/result:
-{
-  states: ['active:正常', 'limited:限流中', 'error:异常', 'quota:额度耗尽'],
-  windows: ['5 小时窗口32.5%', '7 天窗口74.2%'],
-  sourceModes: ['被动采样', '主动查询', '被动采样', '被动采样'],
-  aria: {now: '33', text: '32.5%', width: '32.5%'},
-  details: ['请求123 / 400', 'Token34.6万', '账号费用$1.23', '用户费用$1.85'],
-  reset: '剩余 2 小时 0 分钟',
-  resetTooltip: '准确重置时间：2026/08/30 21:14',
-  standardCost: '标准成本 $1.02',
-  distinctWindowColors: true,
-  fonts: {button:'14px', input:'14px', heading:'20px', table:'14px', window:'13px', percent:'16px', detail:'13px', history:'13px'},
-  historyVisible: true,
-  metricTextFits: true,
-  lazyModuleLoaded: true,
-  desktop: {noBodyOverflow:true, tableScrolls:true},
-  mobile: {noBodyOverflow:true, tableScrolls:true},
-  errors: []
-}
+MODIFIED BROWSER MOCK
+Command: mcp__node_repl__js(title="记录最终订单详情浏览器验收结果", code=<inline Playwright route-mock acceptance>)
+Input: http://127.0.0.1:5196/ at 1440x1000 and 390x844; protected paid order, unprotected paid order, wrong/correct/expired/delayed detail responses; light and dark themes.
+Literal output/result, consolidated from the interaction run and focused follow-up:
+passwordDialog={width:440, centered:true}
+wrongPassword={inline:true, cleared:true, focusRestored:true}
+detail={width:840, centered:true, sections:true, progress:true, copyAll:true, passwordInputAbsent:true, passwordInUrl:false}
+accessibility={escapeFocusReturn:true, unprotectedActionPreserved:true}
+responsive={dark:true, mobileFits:true}
+expired={inputLocked:true, requestPaths:["/api/order-query/detail","/api/order-query/search"], verifiedVisible:true}
+aborted={staleResponseIgnored:true}
 Result: exit 0
 Screenshots reopened and visually inspected:
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\artifacts\sub2api-usage-window-ui-v2\desktop.png
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\artifacts\sub2api-usage-window-ui-v2\mobile.png
-- E:\soft\java\ldxp-sub2api-usage-window-ui-v2\artifacts\sub2api-usage-window-ui-v2\mobile-usage.png
+- E:\soft\java\ldxp-order-detail-password\artifacts\order-detail-password\desktop-light.png
+- E:\soft\java\ldxp-order-detail-password\artifacts\order-detail-password\desktop-dark.png
+- E:\soft\java\ldxp-order-detail-password\artifacts\order-detail-password\mobile-dark.png
+
+MODIFIED LIVE ORDER DETAIL
+Command: mcp__node_repl__js(title="完成真实订单详情的脱敏验收", code=<inline Playwright local frontend/backend flow>)
+Input: http://127.0.0.1:5196/ -> http://127.0.0.1:8021; ORDER_NUMBER=<USER_SUPPLIED_ORDER>; QUERY_PASSWORD=<USER_SUPPLIED_PASSWORD>; credential values were not written to files, URLs, screenshots, or this record.
+Literal output/result:
+searchStatus=200
+detailStatus=200
+detailOpened=true
+cardCount=1
+hasOrderInfo=true
+hasDelivery=true
+hasSeller=true
+internalFieldsAbsent=true
+passwordFormAbsent=true
+passwordInputAbsent=true
+passwordInputValueAbsent=true
+passwordInUrl=false
+Result: exit 0
 
 ROLLBACK
-Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script .runtime\rollback-lazy-ui-v2
-Input: complete commit 5db09e1 copy at E:\soft\java\ldxp-sub2api-usage-window-ui-v2\.runtime\rollback-lazy-ui-v2
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script .
+Input: feature source commit 45828ba copy at E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb with ROLLBACK.sh and ROLLBACK_BASELINE copied beside it
 Literal output:
-Restored E:\soft\java\ldxp-sub2api-usage-window-ui-v2\.runtime\rollback-lazy-ui-v2 from ROLLBACK_BASELINE; frontend/src/Sub2ApiView.jsx=A410D7251BE00FDF381F12213676F0ABC09955D3535C247B27683858CA746AC7; frontend/src/style.css=DCE5204CD22EB848E666FA16EC2F897F6AE1C39748C8D1D10DCD828E8BA52F18
+Restored E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb to main c9650eb; removed backend/order_query/detail.py; verified 11 files
+ROLLBACK_EXIT=0
+DETAIL_AFTER=False
+Result: exit 0
+
+ROLLBACK BACKEND
+Command: python -m unittest discover -s backend -q; python -m compileall -q backend
+Input: E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb after ROLLBACK.sh
+Literal output:
+----------------------------------------------------------------------
+Ran 97 tests in 2.052s
+
+OK
+compileall output: <empty>
 Result: exit 0
 
 ROLLBACK FRONTEND
 Command: npm ci; npm test; npm run build
-Input: E:\soft\java\ldxp-sub2api-usage-window-ui-v2\.runtime\rollback-lazy-ui-v2\frontend after ROLLBACK.sh
-Literal output:
+Input: E:\soft\java\ldxp-order-detail-password\.runtime\rollback-order-detail-password-c9650eb\frontend after ROLLBACK.sh
+Literal output/result:
 added 61 packages in 8s
-9 packages are looking for funding
-  run `npm fund` for details
-
 > test
 > node --test src/*.test.js
-
-2 tests; 2 pass; 0 fail; duration_ms 108.0254
-
+tests 10; pass 10; fail 0; duration_ms 148.3046
 > build
 > vite build --configLoader native
-
-vite v8.2.2 building client environment for production...
-2381 modules transformed.
+2385 modules transformed.
 dist/index.html                              0.16 kB | gzip:   0.14 kB
-dist/assets/index-ByhAHFvB.css             166.35 kB | gzip:  28.16 kB
-dist/assets/file-up-intuOVZi.js              0.34 kB | gzip:   0.23 kB
-dist/assets/ReclaimView-BVP1sBde.js          3.51 kB | gzip:   1.27 kB
-dist/assets/Sub2ApiView-DBgOr1D9.js         41.91 kB | gzip:  11.74 kB
-dist/assets/index-oQId-Yp8.js              325.94 kB | gzip:  96.82 kB
-dist/assets/PriceHistoryChart-Cvmnbwn3.js  417.72 kB | gzip: 118.45 kB
-built in 4.47s
+dist/assets/OrderQueryView-DLos39hU.css     13.34 kB | gzip:   2.68 kB
+dist/assets/index-C1D3mPLA.css             178.78 kB | gzip:  29.90 kB
+dist/assets/OrderQueryView-R14IlDI7.js      17.14 kB | gzip:   5.92 kB
+dist/assets/index-BASFKFR3.js              331.45 kB | gzip:  98.76 kB
+built in 5.41s
 Result: exit 0
 
-Restored behavior/status: rollback copy matches main a7a02e3 byte-for-byte for both changed source files, retains the feature-level lazy-loaded Sub2ApiView module, and returns to the original compact generic 5-hour/7-day progress rows and original Sub2API type scale. The working source and MODIFIED_FILE remain on the dedicated upstream-window UI with larger typography, usage source/time, countdown tooltip, four detailed metrics, distinct window accents, and coordinated account/import/history/automation styling. MODIFIED_FILE remained SHA256 28D842E9A7D0DB60702000F6335B82403B92FD11EF0889501AF7F0DC4458E785 after rollback verification.
+Restored behavior/status: the rollback copy matches main c9650eb byte-for-byte for all 11 pre-existing source files, removes the new backend/order_query/detail.py module, and passes the original backend/frontend test and build suites. The working source and MODIFIED_FILE remain on the secure password/detail flow. MODIFIED_FILE remained SHA256 E1F92CBD442C69E220D107983BE621F7596C5037EB548612E40E4AC505EBE5A1 after rollback verification.

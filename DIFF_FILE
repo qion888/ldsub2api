@@ -1,485 +1,2232 @@
-diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
-index 5291719..a088577 100644
---- a/frontend/src/Sub2ApiView.jsx
-+++ b/frontend/src/Sub2ApiView.jsx
-@@ -93,6 +93,24 @@ function formatSub2ApiDateTime(value) {
-   }).format(date);
+diff --git a/backend/main.py b/backend/main.py
+index 7512872..920d13d 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1018,6 +1018,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             data,
+             send_json=self._send_json,
+             search=ORDER_QUERY_SERVICE.search,
++            detail=ORDER_QUERY_SERVICE.detail,
+         ):
+             return
+ 
+diff --git a/backend/order_query/client.py b/backend/order_query/client.py
+index 16ddfd4..7c29009 100644
+--- a/backend/order_query/client.py
++++ b/backend/order_query/client.py
+@@ -19,11 +19,13 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
+ from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired
+ 
+ from .captcha import captcha_sign
++from .detail import normalize_order_detail
+ from .errors import CaptchaVerificationExpired, UpstreamOrderError
+ 
+ BASE_URL = f"https://{ALLOWED_HOST}"
+ CAPTCHA_START_PATH = "/shopApi/Common/captchaStart"
+ ORDER_LIST_PATH = "/shopApi/Order/list"
++ORDER_DETAIL_PATH = "/shopApi/Order/info"
+ MAX_JSON_BYTES = 2 * 1024 * 1024
+ MAX_CAPTCHA_BYTES = 512 * 1024
+ STATUS_LABELS = {
+@@ -329,3 +331,14 @@ class OrderQueryClient:
+             },
+         )
+         return normalize_order_list(result, page=page, page_size=page_size)
++
++    def get_order_detail(self, *, trade_no: str, query_password: str) -> dict[str, Any]:
++        result = self._json_request(
++            f"{BASE_URL}{ORDER_DETAIL_PATH}",
++            {
++                "trade_no": trade_no,
++                "query_password": query_password,
++                "dump": 1,
++            },
++        )
++        return normalize_order_detail(result, expected_trade_no=trade_no)
+diff --git a/backend/order_query/detail.py b/backend/order_query/detail.py
+new file mode 100644
+index 0000000..a0aa000
+--- /dev/null
++++ b/backend/order_query/detail.py
+@@ -0,0 +1,403 @@
++"""Strict normalization for password-protected order details."""
++
++from __future__ import annotations
++
++import ipaddress
++import re
++from datetime import datetime, timezone
++from decimal import Decimal, InvalidOperation
++from html.parser import HTMLParser
++from typing import Any
++from urllib.parse import urljoin, urlparse
++
++from monitor_core.storefront import ALLOWED_HOST
++
++from .errors import (
++    OrderQueryDetailNotFound,
++    OrderQueryDetailUnavailable,
++    OrderQueryPasswordInvalid,
++    OrderQuerySessionExpired,
++    UpstreamOrderError,
++)
++
++BASE_URL = f"https://{ALLOWED_HOST}"
++MAX_TEXT_LENGTH = 20_000
++MAX_LINKS = 24
++MAX_LINK_LENGTH = 1_000
++MAX_CARDS = 2_000
++MAX_CARD_LENGTH = 16_384
++MAX_CARD_BYTES = 1_500_000
++MAX_STRUCTURED_DEPTH = 4
++MAX_STRUCTURED_ITEMS = 100
++STATUS_LABELS = {
++    0: "待付款",
++    1: "已付款",
++    2: "已关闭",
++    3: "已退款",
++}
++MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]\r\n]{1,160})\]\(([^\s)]+)\)")
++NON_PUBLIC_HOST_SUFFIXES = (".internal", ".invalid", ".lan", ".local", ".localhost", ".test")
++
++
++def _safe_text(value: Any, limit: int = 240) -> str:
++    if isinstance(value, (dict, list, tuple, set)):
++        return ""
++    return str(value or "").strip()[:limit]
++
++
++def _integer(value: Any, fallback: int = 0) -> int:
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return fallback
++
++
++def _optional_integer(value: Any) -> int | None:
++    if value in (None, ""):
++        return None
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _money(value: Any) -> str:
++    try:
++        return f"{Decimal(str(value)):.2f}"
++    except (InvalidOperation, TypeError, ValueError):
++        return "0.00"
++
++
++def _created_at(value: Any) -> str:
++    text = _safe_text(value, 80)
++    if not text:
++        return ""
++    try:
++        stamp = int(text)
++        if stamp < 1:
++            return ""
++        if stamp > 10_000_000_000:
++            stamp //= 1000
++        return datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="seconds")
++    except (OverflowError, OSError, TypeError, ValueError):
++        pass
++    try:
++        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
++        if parsed.tzinfo is None:
++            return parsed.isoformat(timespec="seconds")
++        return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
++    except ValueError:
++        return text
++
++
++def _public_hostname(value: str) -> bool:
++    hostname = value.rstrip(".").lower()
++    if not hostname or hostname == "localhost" or hostname.endswith(NON_PUBLIC_HOST_SUFFIXES):
++        return False
++    try:
++        return ipaddress.ip_address(hostname).is_global
++    except ValueError:
++        if "." not in hostname or all(char in "0123456789." for char in hostname):
++            return False
++        return True
++
++
++def _safe_http_url(value: Any, *, same_host: bool = False) -> str:
++    candidate = _safe_text(value, MAX_LINK_LENGTH)
++    if not candidate:
++        return ""
++    parsed = urlparse(urljoin(f"{BASE_URL}/", candidate))
++    try:
++        port = parsed.port
++    except ValueError:
++        return ""
++    if (
++        parsed.scheme != "https"
++        or not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or port not in (None, 443)
++        or not _public_hostname(parsed.hostname)
++        or (same_host and parsed.hostname != ALLOWED_HOST)
++    ):
++        return ""
++    return parsed.geturl()
++
++
++def _shop_url(value: Any) -> str:
++    url = _safe_http_url(value, same_host=True)
++    if not url:
++        return ""
++    parsed = urlparse(url)
++    if not re.fullmatch(r"/shop/[A-Za-z0-9_-]{3,80}/?", parsed.path):
++        return ""
++    return parsed._replace(query="", fragment="").geturl()
++
++
++def _avatar_url(value: Any) -> str:
++    url = _safe_http_url(value, same_host=True)
++    if not url:
++        return ""
++    parsed = urlparse(url)
++    path_parts = parsed.path.split("/")
++    if not parsed.path.startswith("/static/") or any(part in {".", ".."} for part in path_parts):
++        return ""
++    return parsed._replace(query="", fragment="").geturl()
++
++
++class _RichTextExtractor(HTMLParser):
++    BLOCK_TAGS = {"br", "div", "li", "p", "section", "tr"}
++    SKIPPED_TAGS = {"script", "style"}
++
++    def __init__(self) -> None:
++        super().__init__(convert_charrefs=True)
++        self.parts: list[str] = []
++        self.links: list[dict[str, Any]] = []
++        self.links_truncated = False
++        self._active_links: list[int] = []
++        self._skipped_depth = 0
++
++    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
++        normalized = tag.lower()
++        if normalized in self.SKIPPED_TAGS:
++            self._skipped_depth += 1
++            return
++        if self._skipped_depth:
++            return
++        if normalized in self.BLOCK_TAGS:
++            self.parts.append("\n")
++        if normalized == "a" and len(self.links) < MAX_LINKS:
++            href = dict(attrs).get("href") or ""
++            self.links.append({"href": href, "parts": []})
++            self._active_links.append(len(self.links) - 1)
++        elif normalized == "a":
++            self.links_truncated = True
++
++    def handle_endtag(self, tag: str) -> None:
++        normalized = tag.lower()
++        if normalized in self.SKIPPED_TAGS:
++            self._skipped_depth = max(0, self._skipped_depth - 1)
++            return
++        if self._skipped_depth:
++            return
++        if normalized == "a" and self._active_links:
++            self._active_links.pop()
++        if normalized in self.BLOCK_TAGS:
++            self.parts.append("\n")
++
++    def handle_data(self, data: str) -> None:
++        if self._skipped_depth:
++            return
++        self.parts.append(data)
++        if self._active_links:
++            self.links[self._active_links[-1]]["parts"].append(data)
++
++
++def _rich_text(value: Any) -> tuple[dict[str, Any], bool]:
++    if not isinstance(value, str) or not value:
++        return {"text": "", "links": []}, False
++    parser = _RichTextExtractor()
++    try:
++        parser.feed(value)
++        parser.close()
++    except (AssertionError, ValueError):
++        return {"text": _safe_text(value, MAX_TEXT_LENGTH), "links": []}, len(value) > MAX_TEXT_LENGTH
++
++    parsed_text = "".join(parser.parts)
++    markdown_links: list[dict[str, str]] = []
++    markdown_links_truncated = False
++
++    def replace_markdown_link(match: re.Match[str]) -> str:
++        nonlocal markdown_links_truncated
++        url = _safe_http_url(match.group(2))
++        if url and len(markdown_links) < MAX_LINKS:
++            markdown_links.append({"label": " ".join(match.group(1).split()), "url": url})
++        elif url:
++            markdown_links_truncated = True
++        return match.group(1)
++
++    parsed_text = MARKDOWN_LINK_PATTERN.sub(replace_markdown_link, parsed_text)
++    lines = [" ".join(line.split()) for line in parsed_text.splitlines()]
++    text = "\n".join(line for line in lines if line)
++    truncated = (
++        len(text) > MAX_TEXT_LENGTH
++        or parser.links_truncated
++        or markdown_links_truncated
++    )
++    text = text[:MAX_TEXT_LENGTH]
++
++    links: list[dict[str, str]] = []
++    seen: set[str] = set()
++    for item in parser.links:
++        url = _safe_http_url(item.get("href"))
++        if not url or url in seen:
++            continue
++        seen.add(url)
++        label = " ".join("".join(item.get("parts") or []).split())[:160] or url
++        links.append({"label": label, "url": url})
++    for item in markdown_links:
++        if len(links) >= MAX_LINKS:
++            truncated = True
++            break
++        if item["url"] in seen:
++            continue
++        seen.add(item["url"])
++        links.append(item)
++    return {"text": text, "links": links}, truncated
++
++
++def _structured_rich_text(value: Any, *, depth: int = 0) -> tuple[dict[str, Any], bool]:
++    if isinstance(value, str):
++        return _rich_text(value)
++    if value is None:
++        return {"text": "", "links": []}, False
++    if isinstance(value, (bool, int, float, Decimal)):
++        return {"text": str(value), "links": []}, False
++    if depth >= MAX_STRUCTURED_DEPTH:
++        return {"text": "", "links": []}, True
++    if not isinstance(value, (dict, list, tuple)):
++        return {"text": "", "links": []}, True
++
++    entries = list(value.items()) if isinstance(value, dict) else list(enumerate(value, 1))
++    truncated = len(entries) > MAX_STRUCTURED_ITEMS
++    parts: list[str] = []
++    links: list[dict[str, str]] = []
++    seen_links: set[str] = set()
++    for key, child in entries[:MAX_STRUCTURED_ITEMS]:
++        rich, child_truncated = _structured_rich_text(child, depth=depth + 1)
++        truncated = truncated or child_truncated
++        child_text = rich["text"]
++        if child_text:
++            label = _safe_text(key, 120) if isinstance(value, dict) else str(key)
++            indented = child_text.replace("\n", "\n  ")
++            parts.append(f"{label}: {indented}")
++        for link in rich["links"]:
++            if len(links) >= MAX_LINKS:
++                truncated = True
++                break
++            if link["url"] in seen_links:
++                continue
++            seen_links.add(link["url"])
++            links.append(link)
++
++    text = "\n".join(parts)
++    if len(text) > MAX_TEXT_LENGTH:
++        text = text[:MAX_TEXT_LENGTH]
++        truncated = True
++    return {"text": text, "links": links}, truncated
++
++
++def _cards(value: Any) -> tuple[list[str], bool]:
++    if value is None:
++        return [], False
++    if not isinstance(value, list):
++        raise UpstreamOrderError(
++            "订单发货内容格式无效",
++            code="invalid_order_detail_response",
++        )
++    cards: list[str] = []
++    total_bytes = 0
++    truncated = len(value) > MAX_CARDS
++    for card in value[:MAX_CARDS]:
++        if not isinstance(card, str):
++            raise UpstreamOrderError(
++                "订单发货内容格式无效",
++                code="invalid_order_detail_response",
++            )
++        encoded_length = len(card.encode("utf-8"))
++        if len(card) > MAX_CARD_LENGTH or total_bytes + encoded_length > MAX_CARD_BYTES:
++            truncated = True
++            break
++        cards.append(card)
++        total_bytes += encoded_length
++    return cards, truncated
++
++
++def _upstream_error(payload: dict[str, Any]) -> None:
++    message = _safe_text(payload.get("msg") or "订单详情获取失败")
++    if "安全密码错误" in message:
++        raise OrderQueryPasswordInvalid()
++    if "请使用联系方式重新查询" in message:
++        raise OrderQuerySessionExpired()
++    if "订单不存在" in message or "未找到订单" in message:
++        raise OrderQueryDetailNotFound()
++    raise UpstreamOrderError(
++        "链动小铺未返回有效订单详情",
++        code="upstream_order_detail_rejected",
++    )
++
++
++def normalize_order_detail(payload: Any, *, expected_trade_no: str) -> dict[str, Any]:
++    """Return only fields needed by the local detail dialog."""
++    if not isinstance(payload, dict):
++        raise UpstreamOrderError(
++            "订单详情接口响应格式无效",
++            code="invalid_order_detail_response",
++        )
++    if payload.get("code") != 1:
++        _upstream_error(payload)
++    data = payload.get("data")
++    if not isinstance(data, dict):
++        raise UpstreamOrderError(
++            "订单详情接口未返回有效数据",
++            code="invalid_order_detail_response",
++        )
++
++    trade_no = _safe_text(data.get("trade_no"), 160)
++    if not trade_no or trade_no != expected_trade_no:
++        raise UpstreamOrderError(
++            "订单详情与请求的订单不匹配",
++            code="invalid_order_detail_response",
++        )
++    status = _integer(data.get("status"), -1)
++    if status != 1:
++        raise OrderQueryDetailUnavailable()
++
++    goods = data.get("goods") if isinstance(data.get("goods"), dict) else {}
++    response = data.get("response") if isinstance(data.get("response"), dict) else {}
++    user = data.get("user") if isinstance(data.get("user"), dict) else {}
++    goods_type = _safe_text(goods.get("goods_type"), 30).lower()
++    instructions, _ = _rich_text(
++        (goods.get("extend") or {}).get("instructions")
++        if isinstance(goods.get("extend"), dict)
++        else ""
++    )
++    delivery_content, content_truncated = _structured_rich_text(response.get("api_data"))
++    cards, cards_truncated = _cards(response.get("cards"))
++
++    return {
++        "trade_no": trade_no,
++        "goods_name": _safe_text(data.get("goods_name"), 240),
++        "goods_key": _safe_text(goods.get("goods_key"), 80),
++        "goods_type": goods_type,
++        "status": status,
++        "status_label": STATUS_LABELS.get(status, "未知状态"),
++        "quantity": max(0, _integer(data.get("quantity"))),
++        "sendout": max(0, _integer(data.get("sendout"))),
++        "total_amount": _money(data.get("total_amount")),
++        "created_at": _created_at(data.get("create_time")),
++        "success_at": _created_at(data.get("success_time")),
++        "coupon_used": _integer(data.get("use_coupon")) == 1,
++        "coupon_price": _money(data.get("coupon_price")),
++        "can_complaint": _integer(data.get("can_complaint")) == 1,
++        "need_query_password": _integer(data.get("need_query_password")) == 1,
++        "contact": _safe_text(data.get("contact"), 240),
++        "seller": {
++            "nickname": _safe_text(user.get("nickname"), 160),
++            "avatar": _avatar_url(user.get("avatar")),
++            "shop_url": _shop_url(user.get("link")),
++            "contact_qq": _safe_text(user.get("contact_qq"), 160),
++            "contact_mobile": _safe_text(user.get("contact_mobile"), 160),
++            "contact_wechat": _safe_text(user.get("contact_wechat"), 500),
++        },
++        "instructions": instructions,
++        "delivery": {
++            "kind": goods_type,
++            "cards": cards,
++            "api_status": _optional_integer(response.get("api_status")),
++            "message": _safe_text(response.get("api_msg"), 2_000),
++            "content": delivery_content["text"],
++            "links": delivery_content["links"],
++            "truncated": cards_truncated or content_truncated,
++        },
++    }
+diff --git a/backend/order_query/errors.py b/backend/order_query/errors.py
+index 9d52e0e..a98e4e8 100644
+--- a/backend/order_query/errors.py
++++ b/backend/order_query/errors.py
+@@ -34,6 +34,53 @@ class OrderQuerySessionExpired(OrderQueryError):
+         )
+ 
+ 
++class OrderQueryPasswordRequired(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "请输入订单安全密码",
++            code="order_query_password_required",
++            status=400,
++        )
++
++
++class OrderQueryPasswordInvalid(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "订单安全密码错误，请重新输入",
++            code="order_query_password_invalid",
++            status=403,
++        )
++
++
++class OrderQueryPasswordRateLimited(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "订单安全密码尝试次数过多，请稍后重试",
++            code="order_query_password_rate_limited",
++            status=429,
++            retryable=True,
++        )
++
++
++class OrderQueryDetailNotFound(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "当前查询结果中没有该订单",
++            code="order_query_detail_not_found",
++            status=404,
++        )
++
++
++class OrderQueryDetailUnavailable(OrderQueryError):
++    def __init__(self) -> None:
++        super().__init__(
++            "订单尚未付款或发货信息暂不可用",
++            code="order_query_detail_unavailable",
++            status=409,
++            retryable=True,
++        )
++
++
+ class OrderQueryBusy(OrderQueryError):
+     def __init__(self) -> None:
+         super().__init__(
+diff --git a/backend/order_query/routes.py b/backend/order_query/routes.py
+index 9d24fa1..ab86a32 100644
+--- a/backend/order_query/routes.py
++++ b/backend/order_query/routes.py
+@@ -11,6 +11,8 @@ from .errors import OrderQueryError
+ 
+ SendJson = Callable[[Any, int], Any]
+ ORDER_QUERY_PATH = "/api/order-query/search"
++ORDER_DETAIL_PATH = "/api/order-query/detail"
++ORDER_QUERY_PATHS = {ORDER_QUERY_PATH, ORDER_DETAIL_PATH}
+ LOCAL_DEVELOPMENT_HOSTS = {"127.0.0.1", "localhost"}
+ 
+ 
+@@ -38,7 +40,7 @@ def request_rejection(
+     frontend_url: str,
+ ) -> tuple[int, dict[str, Any]] | None:
+     """Reject browser requests that could make the local service perform cross-site work."""
+-    if path != ORDER_QUERY_PATH:
++    if path not in ORDER_QUERY_PATHS:
+         return None
+ 
+     content_type = str(headers.get("Content-Type", "")).partition(";")[0].strip().lower()
+@@ -82,11 +84,16 @@ def handle_post(
+     *,
+     send_json: SendJson,
+     search: Callable[[dict[str, Any]], dict[str, Any]],
++    detail: Callable[[dict[str, Any]], dict[str, Any]],
+ ) -> bool:
+-    if path != ORDER_QUERY_PATH:
++    if path == ORDER_QUERY_PATH:
++        operation = search
++    elif path == ORDER_DETAIL_PATH:
++        operation = detail
++    else:
+         return False
+     try:
+-        send_json(search(data), 200)
++        send_json(operation(data), 200)
+     except OrderQueryError as exc:
+         send_json(
+             {
+diff --git a/backend/order_query/service.py b/backend/order_query/service.py
+index a3ec897..c65fc2a 100644
+--- a/backend/order_query/service.py
++++ b/backend/order_query/service.py
+@@ -13,12 +13,19 @@ from .errors import (
+     CaptchaRecognizerUnavailable,
+     CaptchaVerificationExpired,
+     OrderQueryBusy,
++    OrderQueryDetailNotFound,
++    OrderQueryDetailUnavailable,
+     OrderQueryInputError,
++    OrderQueryPasswordInvalid,
++    OrderQueryPasswordRateLimited,
++    OrderQueryPasswordRequired,
++    OrderQuerySessionExpired,
+ )
+ from .sessions import OrderQuerySession, OrderQuerySessionStore
+ 
+ ALLOWED_STATUSES = {999, 0, 1, 2, 3}
+ SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
++TRADE_NO_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,159}")
+ 
+ 
+ class OrderQueryService:
+@@ -82,6 +89,31 @@ class OrderQueryService:
+             raise OrderQueryInputError("手工验证码缺少有效查询会话")
+         return self.sessions.create(request["keywords"], self.client_factory())
+ 
++    @staticmethod
++    def _validated_detail_request(data: Any) -> dict[str, str]:
++        if not isinstance(data, dict):
++            raise OrderQueryInputError("订单详情参数必须是 JSON 对象")
++        keywords = str(data.get("keywords") or "").strip()
++        if not keywords or len(keywords) > 160:
++            raise OrderQueryInputError("订单详情缺少有效的查询内容")
++        session_id = str(data.get("session_id") or "").strip()
++        if not SESSION_ID_PATTERN.fullmatch(session_id):
++            raise OrderQueryInputError("订单详情缺少有效的查询会话")
++        trade_no = str(data.get("trade_no") or "").strip()
++        if not TRADE_NO_PATTERN.fullmatch(trade_no):
++            raise OrderQueryInputError("订单号格式无效")
++        password_value = data.get("query_password", "")
++        if not isinstance(password_value, str):
++            raise OrderQueryInputError("订单安全密码必须是字符串")
++        if len(password_value) > 160 or any(char in password_value for char in "\x00\r\n"):
++            raise OrderQueryInputError("订单安全密码格式无效")
++        return {
++            "keywords": keywords,
++            "session_id": session_id,
++            "trade_no": trade_no,
++            "query_password": password_value,
++        }
++
+     @staticmethod
+     def _image_data_url(image: bytes, mime_type: str) -> str:
+         encoded = base64.b64encode(image).decode("ascii")
+@@ -94,11 +126,10 @@ class OrderQueryService:
+     ) -> tuple[CaptchaChallenge, bytes, str]:
+         challenge = session.client.start_captcha(previous_code)
+         image, mime_type = session.client.download_captcha(challenge)
++        session.clear_verification()
+         session.challenge = challenge
+         session.captcha_image = image
+         session.captcha_mime = mime_type
+-        session.ticket = ""
+-        session.cache.clear()
+         return challenge, image, mime_type
+ 
+     def _manual_required(
+@@ -177,6 +208,7 @@ class OrderQueryService:
+                     cached,
+                     now + self.sessions.cache_seconds,
+                 )
++        session.remember_orders(cached["orders"])
+         return {
+             "session_id": session.session_id,
+             "expires_in": self.sessions.remaining(session),
+@@ -251,3 +283,46 @@ class OrderQueryService:
+             return self._search(data)
+         finally:
+             self._slots.release()
++
++    def _detail(self, data: Any) -> dict[str, Any]:
++        request = self._validated_detail_request(data)
++        session = self.sessions.get(request["session_id"], request["keywords"])
++        with session.lock:
++            if not session.ticket:
++                raise OrderQuerySessionExpired()
++            access = session.authorized_order(request["trade_no"])
++            if access is None:
++                raise OrderQueryDetailNotFound()
++            if access["status"] != 1:
++                raise OrderQueryDetailUnavailable()
++            if access["need_query_password"] and not request["query_password"].strip():
++                raise OrderQueryPasswordRequired()
++            now = self.sessions.now()
++            if not session.password_attempt_allowed(request["trade_no"], now):
++                raise OrderQueryPasswordRateLimited()
++            try:
++                detail = session.client.get_order_detail(
++                    trade_no=request["trade_no"],
++                    query_password=request["query_password"],
++                )
++            except OrderQueryPasswordInvalid as exc:
++                if session.record_password_failure(request["trade_no"], now):
++                    raise OrderQueryPasswordRateLimited() from exc
++                raise
++            except OrderQuerySessionExpired:
++                session.clear_verification()
++                raise
++            session.clear_password_failure(request["trade_no"])
++            return {
++                "session_id": session.session_id,
++                "expires_in": self.sessions.remaining(session),
++                "detail": detail,
++            }
++
++    def detail(self, data: Any) -> dict[str, Any]:
++        if not self._slots.acquire(blocking=False):
++            raise OrderQueryBusy()
++        try:
++            return self._detail(data)
++        finally:
++            self._slots.release()
+diff --git a/backend/order_query/sessions.py b/backend/order_query/sessions.py
+index 98d09d2..eeb9a66 100644
+--- a/backend/order_query/sessions.py
++++ b/backend/order_query/sessions.py
+@@ -14,6 +14,10 @@ from typing import Any, Callable
+ from .client import CaptchaChallenge
+ from .errors import OrderQueryInputError, OrderQuerySessionExpired
+ 
++MAX_AUTHORIZED_ORDERS = 500
++MAX_PASSWORD_FAILURES = 5
++PASSWORD_BACKOFF_SECONDS = 60
++
+ 
+ @dataclass
+ class OrderQuerySession:
+@@ -26,6 +30,8 @@ class OrderQuerySession:
+     captcha_image: bytes = b""
+     captcha_mime: str = "image/png"
+     cache: dict[tuple[int, int, int], tuple[float, dict[str, Any]]] = field(default_factory=dict)
++    authorized_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
++    password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
+     lock: threading.RLock = field(default_factory=threading.RLock)
+ 
+     def clear_verification(self) -> None:
+@@ -33,6 +39,60 @@ class OrderQuerySession:
+         self.challenge = None
+         self.captcha_image = b""
+         self.cache.clear()
++        self.authorized_orders.clear()
++        self.password_failures.clear()
++
++    def remember_orders(self, orders: list[Any]) -> None:
++        for order in orders:
++            if not isinstance(order, dict):
++                continue
++            trade_no = str(order.get("trade_no") or "").strip()
++            if not trade_no:
++                continue
++            try:
++                status = int(order.get("status", -1))
++            except (TypeError, ValueError):
++                status = -1
++            self.authorized_orders.pop(trade_no, None)
++            self.authorized_orders[trade_no] = {
++                "status": status,
++                "need_query_password": order.get("need_query_password") is True,
++                "goods_type": str(order.get("goods_type") or "")[:30],
++            }
++            while len(self.authorized_orders) > MAX_AUTHORIZED_ORDERS:
++                oldest = next(iter(self.authorized_orders))
++                self.authorized_orders.pop(oldest)
++                self.password_failures.pop(oldest, None)
++
++    def authorized_order(self, trade_no: str) -> dict[str, Any] | None:
++        value = self.authorized_orders.get(trade_no)
++        return copy.deepcopy(value) if value is not None else None
++
++    def password_attempt_allowed(self, trade_no: str, now: float) -> bool:
++        failure = self.password_failures.get(trade_no)
++        if failure is None:
++            return True
++        _, blocked_until = failure
++        if blocked_until > now:
++            return False
++        if blocked_until:
++            self.password_failures.pop(trade_no, None)
++        return True
++
++    def record_password_failure(self, trade_no: str, now: float) -> bool:
++        count, blocked_until = self.password_failures.get(trade_no, (0, 0.0))
++        if blocked_until and blocked_until <= now:
++            count = 0
++        count += 1
++        blocked = count >= MAX_PASSWORD_FAILURES
++        self.password_failures[trade_no] = (
++            count,
++            now + PASSWORD_BACKOFF_SECONDS if blocked else 0.0,
++        )
++        return blocked
++
++    def clear_password_failure(self, trade_no: str) -> None:
++        self.password_failures.pop(trade_no, None)
+ 
+     def cached(self, key: tuple[int, int, int], now: float) -> dict[str, Any] | None:
+         entry = self.cache.get(key)
+diff --git a/backend/test_order_query_modules.py b/backend/test_order_query_modules.py
+index 128df02..fe7145c 100644
+--- a/backend/test_order_query_modules.py
++++ b/backend/test_order_query_modules.py
+@@ -12,7 +12,16 @@ import main
+ from order_query import routes
+ from order_query.captcha import CaptchaRecognizer, captcha_sign, normalize_captcha_code
+ from order_query.client import CaptchaChallenge, OrderQueryClient
+-from order_query.errors import CaptchaRecognizerUnavailable, OrderQueryInputError
++from order_query.detail import normalize_order_detail
++from order_query.errors import (
++    CaptchaRecognizerUnavailable,
++    OrderQueryDetailNotFound,
++    OrderQueryInputError,
++    OrderQueryPasswordInvalid,
++    OrderQueryPasswordRateLimited,
++    OrderQueryPasswordRequired,
++    OrderQuerySessionExpired,
++)
+ from order_query.service import OrderQueryService
+ from order_query.sessions import OrderQuerySessionStore
+ 
+@@ -60,6 +69,8 @@ class FakeOrderClient:
+         self.start_count = 0
+         self.check_codes: list[str] = []
+         self.list_calls: list[dict[str, Any]] = []
++        self.detail_calls: list[dict[str, Any]] = []
++        self.detail_error: Exception | None = None
+         self.expire_next_list = False
+ 
+     def start_captcha(self, previous_code: str = "") -> CaptchaChallenge:
+@@ -85,7 +96,12 @@ class FakeOrderClient:
+             self.expire_next_list = False
+             raise CaptchaVerificationExpired()
+         return {
+-            "orders": [{"trade_no": "ORDER-1", "status": kwargs["status"]}],
++            "orders": [{
++                "trade_no": "ORDER-1",
++                "status": 1 if kwargs["status"] == 999 else kwargs["status"],
++                "need_query_password": True,
++                "goods_type": "card",
++            }],
+             "pagination": {
+                 "page": kwargs["page"],
+                 "page_size": kwargs["page_size"],
+@@ -94,6 +110,17 @@ class FakeOrderClient:
+             },
+         }
+ 
++    def get_order_detail(self, **kwargs: Any) -> dict[str, Any]:
++        self.detail_calls.append(kwargs)
++        if self.detail_error is not None:
++            raise self.detail_error
++        return {
++            "trade_no": kwargs["trade_no"],
++            "goods_type": "card",
++            "status": 1,
++            "delivery": {"kind": "card", "cards": ["CARD-SECRET"]},
++        }
++
+ 
+ class CaptchaTests(unittest.TestCase):
+     def test_sign_matches_storefront_javascript(self) -> None:
+@@ -242,6 +269,213 @@ class ClientTests(unittest.TestCase):
+         with self.assertRaisesRegex(RuntimeError, "图片响应无效"):
+             client.download_captcha(challenge)
+ 
++    def test_order_detail_uses_fixed_endpoint_and_returns_a_strict_allowlist(self) -> None:
++        upstream = {
++            "code": 1,
++            "msg": "success",
++            "data": {
++                "trade_no": "LD-DETAIL-1001",
++                "transaction_id": "must-not-leak-transaction",
++                "goods_name": "测试卡密商品",
++                "quantity": 2,
++                "sendout": 1,
++                "total_amount": "46.13",
++                "status": 1,
++                "create_time": 1788056008,
++                "success_time": 1788056027,
++                "use_coupon": 1,
++                "coupon_price": "2.5",
++                "need_query_password": 1,
++                "can_complaint": 1,
++                "contact": "buyer@example.test",
++                "private_contact": "must-not-leak-private",
++                "user": {
++                    "nickname": "测试商家",
++                    "avatar": "https://pay.ldxp.cn/static/images/avatar.png",
++                    "link": "https://pay.ldxp.cn/shop/SHOP123",
++                    "contact_qq": "987654321",
++                    "contact_mobile": "",
++                    "contact_wechat": "merchant-wechat",
++                    "token": "must-not-leak-token",
++                },
++                "goods": {
++                    "goods_key": "GOODS1",
++                    "goods_type": "card",
++                    "link": "https://pay.ldxp.cn/item/GOODS1",
++                    "extend": {
++                        "instructions": (
++                            '<p>使用 <a href="https://docs.example.com/start">文档</a>'
++                            ' 和 [指南](https://guide.example.org/read)'
++                            '、[危险](javascript:bad)</p>'
++                            '<script>must-not-leak-script</script>'
++                            '<a href="javascript:alert(1)">bad</a>'
++                        ),
++                    },
++                },
++                "response": {
++                    "cards": ["CARD-A", "CARD-B"],
++                    "export_cards_url": (
++                        "https://pay.ldxp.cn/shopApi/Order/exportCards?trade_no=LD-DETAIL-1001"
++                    ),
++                    "api_status": 2,
++                    "api_msg": "已发货",
++                    "api_data": (
++                        '<p>打开 [权益页](https://benefit.example.net/start)</p>'
++                    ),
++                },
++            },
++        }
++        opener = FakeOpener([self._json_response(upstream)])
++        client = OrderQueryClient(opener=opener)
++
++        detail = client.get_order_detail(
++            trade_no="LD-DETAIL-1001",
++            query_password="test-password",
++        )
++
++        self.assertEqual(opener.requests[0].full_url, "https://pay.ldxp.cn/shopApi/Order/info")
++        self.assertEqual(json.loads(opener.requests[0].data.decode("utf-8")), {
++            "trade_no": "LD-DETAIL-1001",
++            "query_password": "test-password",
++            "dump": 1,
++        })
++        self.assertEqual(detail["total_amount"], "46.13")
++        self.assertEqual(detail["success_at"], "2026-08-30T02:13:47+00:00")
++        self.assertEqual(detail["contact"], "buyer@example.test")
++        self.assertEqual(detail["seller"], {
++            "nickname": "测试商家",
++            "avatar": "https://pay.ldxp.cn/static/images/avatar.png",
++            "shop_url": "https://pay.ldxp.cn/shop/SHOP123",
++            "contact_qq": "987654321",
++            "contact_mobile": "",
++            "contact_wechat": "merchant-wechat",
++        })
++        self.assertEqual(detail["instructions"], {
++            "text": "使用 文档 和 指南、危险\nbad",
++            "links": [
++                {"label": "文档", "url": "https://docs.example.com/start"},
++                {"label": "指南", "url": "https://guide.example.org/read"},
++            ],
++        })
++        self.assertEqual(detail["delivery"], {
++            "kind": "card",
++            "cards": ["CARD-A", "CARD-B"],
++            "api_status": 2,
++            "message": "已发货",
++            "content": "打开 权益页",
++            "links": [
++                {"label": "权益页", "url": "https://benefit.example.net/start"},
++            ],
++            "truncated": False,
++        })
++        serialized = json.dumps(detail, ensure_ascii=False)
++        for secret in (
++            "must-not-leak-transaction",
++            "must-not-leak-private",
++            "must-not-leak-token",
++            "must-not-leak-script",
++            "exportCards",
++            "javascript:",
++        ):
++            self.assertNotIn(secret, serialized)
++
++    def test_order_detail_maps_password_and_session_errors_before_data_parsing(self) -> None:
++        with self.assertRaises(OrderQueryPasswordInvalid):
++            normalize_order_detail(
++                {"code": 0, "msg": "安全密码错误，请使用联系方式重新查询后操作"},
++                expected_trade_no="LD-DETAIL-1001",
++            )
++        with self.assertRaises(OrderQuerySessionExpired):
++            normalize_order_detail(
++                {"code": 0, "msg": "请使用联系方式重新查询后操作"},
++                expected_trade_no="LD-DETAIL-1001",
++            )
++
++    def test_order_detail_rejects_a_mismatched_trade_number(self) -> None:
++        with self.assertRaisesRegex(RuntimeError, "不匹配"):
++            normalize_order_detail(
++                {"code": 1, "data": {"trade_no": "OTHER-ORDER", "status": 1}},
++                expected_trade_no="LD-DETAIL-1001",
++            )
++
++    def test_equity_detail_flattens_bounded_structured_delivery_data(self) -> None:
++        detail = normalize_order_detail(
++            {
++                "code": 1,
++                "data": {
++                    "trade_no": "LD-EQUITY-100",
++                    "status": 1,
++                    "goods": {
++                        "goods_key": "EQUITY1",
++                        "goods_type": "equity",
++                        "extend": {},
++                    },
++                    "response": {
++                        "api_status": 2,
++                        "api_msg": "权益已发放",
++                        "api_data": {
++                            "account": {
++                                "name": "buyer",
++                                "portal": "[打开](https://benefit.example.net/account)",
++                            },
++                            "steps": [
++                                "第一步",
++                                '<a href="https://docs.example.com/equity">第二步</a>',
++                            ],
++                        },
++                    },
++                },
++            },
++            expected_trade_no="LD-EQUITY-100",
++        )
++
++        self.assertEqual(
++            detail["delivery"]["content"],
++            "account: name: buyer\n  portal: 打开\nsteps: 1: 第一步\n  2: 第二步",
++        )
++        self.assertEqual(detail["delivery"]["links"], [
++            {"label": "打开", "url": "https://benefit.example.net/account"},
++            {"label": "第二步", "url": "https://docs.example.com/equity"},
++        ])
++        self.assertFalse(detail["delivery"]["truncated"])
++
++    def test_detail_links_reject_non_https_and_non_public_targets(self) -> None:
++        detail = normalize_order_detail(
++            {
++                "code": 1,
++                "data": {
++                    "trade_no": "LD-DETAIL-LINKS",
++                    "status": 1,
++                    "user": {
++                        "avatar": "https://cdn.example.com/avatar.png",
++                        "link": "https://pay.ldxp.cn/shop/SHOP123",
++                    },
++                    "goods": {
++                        "goods_type": "card",
++                        "extend": {
++                            "instructions": (
++                                "[公开](https://docs.example.com/start) "
++                                "[本机](https://127.0.0.1/admin) "
++                                "[私网](https://10.0.0.8/secret) "
++                                "[链路本地](https://169.254.169.254/latest) "
++                                "[明文](http://docs.example.com/unsafe)"
++                            ),
++                        },
++                    },
++                    "response": {"cards": []},
++                },
++            },
++            expected_trade_no="LD-DETAIL-LINKS",
++        )
++
++        self.assertEqual(detail["seller"]["avatar"], "")
++        self.assertEqual(detail["seller"]["shop_url"], "https://pay.ldxp.cn/shop/SHOP123")
++        self.assertEqual(detail["instructions"]["links"], [
++            {"label": "公开", "url": "https://docs.example.com/start"},
++        ])
++        self.assertNotIn("127.0.0.1", json.dumps(detail, ensure_ascii=False))
++        self.assertNotIn("169.254.169.254", json.dumps(detail, ensure_ascii=False))
++
+ 
+ class ServiceTests(unittest.TestCase):
+     @staticmethod
+@@ -372,6 +606,167 @@ class ServiceTests(unittest.TestCase):
+                 "captcha_code": "123",
+             })
+ 
++    def test_detail_reuses_verified_cookie_client_and_does_not_cache_password(self) -> None:
++        client = FakeOrderClient()
++        service = self.service(client, FakeRecognizer(["AB12"]))
++        search = service.search({
++            "keywords": "buyer",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++        })
++
++        result = service.detail({
++            "keywords": "buyer",
++            "session_id": search["session_id"],
++            "trade_no": "ORDER-1",
++            "query_password": "secret-password",
++        })
++
++        self.assertEqual(result["detail"]["trade_no"], "ORDER-1")
++        self.assertEqual(client.detail_calls, [{
++            "trade_no": "ORDER-1",
++            "query_password": "secret-password",
++        }])
++        session = service.sessions.get(search["session_id"], "buyer")
++        self.assertNotIn("query_password", session.__dict__)
++        self.assertNotIn("secret-password", repr(session.cache))
++
++    def test_detail_requires_password_and_rejects_orders_not_seen_in_the_session(self) -> None:
++        client = FakeOrderClient()
++        service = self.service(client, FakeRecognizer(["AB12"]))
++        search = service.search({
++            "keywords": "buyer",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++        })
++        base = {
++            "keywords": "buyer",
++            "session_id": search["session_id"],
++            "query_password": "",
++        }
++
++        with self.assertRaises(OrderQueryPasswordRequired):
++            service.detail({**base, "trade_no": "ORDER-1"})
++        with self.assertRaises(OrderQueryDetailNotFound):
++            service.detail({
++                **base,
++                "trade_no": "OTHER-ORDER",
++                "query_password": "secret-password",
++            })
++        self.assertEqual(client.detail_calls, [])
++
++    def test_upstream_detail_session_expiry_clears_local_authorization(self) -> None:
++        client = FakeOrderClient()
++        service = self.service(client, FakeRecognizer(["AB12"]))
++        search = service.search({
++            "keywords": "buyer",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++        })
++        client.detail_error = OrderQuerySessionExpired()
++
++        with self.assertRaises(OrderQuerySessionExpired):
++            service.detail({
++                "keywords": "buyer",
++                "session_id": search["session_id"],
++                "trade_no": "ORDER-1",
++                "query_password": "secret-password",
++            })
++
++        session = service.sessions.get(search["session_id"], "buyer")
++        self.assertEqual(session.ticket, "")
++        self.assertEqual(session.authorized_orders, {})
++
++    def test_five_invalid_passwords_apply_per_order_backoff(self) -> None:
++        client = FakeOrderClient()
++        service = self.service(client, FakeRecognizer(["AB12"]))
++        search = service.search({
++            "keywords": "buyer",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++        })
++        client.detail_error = OrderQueryPasswordInvalid()
++        request = {
++            "keywords": "buyer",
++            "session_id": search["session_id"],
++            "trade_no": "ORDER-1",
++            "query_password": "wrong-password",
++        }
++
++        for _ in range(4):
++            with self.assertRaises(OrderQueryPasswordInvalid):
++                service.detail(request)
++        with self.assertRaises(OrderQueryPasswordRateLimited):
++            service.detail(request)
++        with self.assertRaises(OrderQueryPasswordRateLimited):
++            service.detail(request)
++
++        self.assertEqual(len(client.detail_calls), 5)
++        session = service.sessions.get(search["session_id"], "buyer")
++        self.assertEqual(session.password_failures["ORDER-1"][0], 5)
++
++    def test_successful_password_clears_previous_failure_count(self) -> None:
++        client = FakeOrderClient()
++        service = self.service(client, FakeRecognizer(["AB12"]))
++        search = service.search({
++            "keywords": "buyer",
++            "status": 999,
++            "page": 1,
++            "page_size": 10,
++        })
++        request = {
++            "keywords": "buyer",
++            "session_id": search["session_id"],
++            "trade_no": "ORDER-1",
++            "query_password": "password",
++        }
++        client.detail_error = OrderQueryPasswordInvalid()
++        with self.assertRaises(OrderQueryPasswordInvalid):
++            service.detail(request)
++        session = service.sessions.get(search["session_id"], "buyer")
++        self.assertEqual(session.password_failures["ORDER-1"][0], 1)
++
++        client.detail_error = None
++        service.detail(request)
++
++        self.assertNotIn("ORDER-1", session.password_failures)
++
++    def test_password_backoff_expires_and_verification_clear_removes_failures(self) -> None:
++        clock = [100.0]
++        store = OrderQuerySessionStore(
++            ttl_seconds=120,
++            cache_seconds=0,
++            clock=lambda: clock[0],
++        )
++        session = store.create("buyer", FakeOrderClient())
++        for _ in range(4):
++            self.assertFalse(session.record_password_failure("ORDER-1", store.now()))
++        self.assertTrue(session.record_password_failure("ORDER-1", store.now()))
++        self.assertFalse(session.password_attempt_allowed("ORDER-1", store.now()))
++
++        clock[0] += 61
++        self.assertTrue(session.password_attempt_allowed("ORDER-1", store.now()))
++        self.assertNotIn("ORDER-1", session.password_failures)
++
++        session.record_password_failure("ORDER-1", store.now())
++        session.clear_verification()
++        self.assertEqual(session.password_failures, {})
++
++    def test_detail_rejects_non_string_or_control_character_passwords(self) -> None:
++        for password in (987654, "secret\npassword", "x" * 161):
++            with self.subTest(password_type=type(password).__name__):
++                with self.assertRaises(OrderQueryInputError):
++                    OrderQueryService._validated_detail_request({
++                        "keywords": "buyer",
++                        "session_id": "abcdefghijklmnop",
++                        "trade_no": "ORDER-1",
++                        "query_password": password,
++                    })
++
+ 
+ class RouteTests(unittest.TestCase):
+     def test_manual_required_is_a_successful_route_result(self) -> None:
+@@ -387,6 +782,7 @@ class RouteTests(unittest.TestCase):
+             {"keywords": "buyer"},
+             send_json=lambda value, status=200: responses.append((status, value)),
+             search=lambda data: payload,
++            detail=lambda data: {},
+         )
+         self.assertTrue(handled)
+         self.assertEqual(responses, [(200, payload)])
+@@ -402,6 +798,7 @@ class RouteTests(unittest.TestCase):
+             {},
+             send_json=lambda value, status=200: responses.append((status, value)),
+             search=fail,
++            detail=lambda data: {},
+         )
+         self.assertEqual(responses, [(400, {
+             "detail": "bad query",
+@@ -409,6 +806,27 @@ class RouteTests(unittest.TestCase):
+             "retryable": False,
+         })])
+ 
++    def test_detail_route_returns_a_specific_password_error(self) -> None:
++        responses: list[tuple[int, Any]] = []
++
++        def fail(data: dict[str, Any]) -> dict[str, Any]:
++            raise OrderQueryPasswordInvalid()
++
++        handled = routes.handle_post(
++            "/api/order-query/detail",
++            {"trade_no": "ORDER-1"},
++            send_json=lambda value, status=200: responses.append((status, value)),
++            search=lambda data: {},
++            detail=fail,
++        )
++
++        self.assertTrue(handled)
++        self.assertEqual(responses, [(403, {
++            "detail": "订单安全密码错误，请重新输入",
++            "code": "order_query_password_invalid",
++            "retryable": False,
++        })])
++
+     def test_main_http_handler_mounts_order_query_route(self) -> None:
+         body = json.dumps({
+             "keywords": "buyer",
+@@ -439,7 +857,7 @@ class RouteTests(unittest.TestCase):
+                 handler.rfile = BytesIO(body)
+                 responses: list[tuple[int, Any]] = []
+                 handler._send_json = lambda value, status=200: responses.append((status, value))
+-                service = SimpleNamespace(search=lambda data: expected)
++                service = SimpleNamespace(search=lambda data: expected, detail=lambda data: {})
+ 
+                 with patch.object(main, "FRONTEND_URL", frontend_url), \
+                      patch.object(main, "ORDER_QUERY_SERVICE", service):
+@@ -447,6 +865,40 @@ class RouteTests(unittest.TestCase):
+ 
+                 self.assertEqual(responses, [(200, expected)])
+ 
++    def test_main_http_handler_mounts_order_detail_route(self) -> None:
++        body = json.dumps({
++            "keywords": "buyer",
++            "session_id": "abcdefghijklmnop",
++            "trade_no": "ORDER-1",
++            "query_password": "secret-password",
++        }).encode("utf-8")
++        expected = {
++            "session_id": "abcdefghijklmnop",
++            "expires_in": 120,
++            "detail": {"trade_no": "ORDER-1", "delivery": {"cards": ["CARD"]}},
++        }
++        handler = object.__new__(main.ApiHandler)
++        handler.path = "/api/order-query/detail"
++        handler.headers = {
++            "Content-Length": str(len(body)),
++            "Content-Type": "application/json",
++            "Origin": "http://127.0.0.1:5173",
++        }
++        handler.rfile = BytesIO(body)
++        responses: list[tuple[int, Any]] = []
++        handler._send_json = lambda value, status=200: responses.append((status, value))
++        calls: list[dict[str, Any]] = []
++        service = SimpleNamespace(
++            search=lambda data: {},
++            detail=lambda data: calls.append(data) or expected,
++        )
++
++        with patch.object(main, "ORDER_QUERY_SERVICE", service):
++            handler.do_POST()
++
++        self.assertEqual(calls, [json.loads(body)])
++        self.assertEqual(responses, [(200, expected)])
++
+     def test_order_query_request_guard_does_not_apply_to_other_routes(self) -> None:
+         rejection = routes.request_rejection(
+             "/api/preorders",
+@@ -455,6 +907,21 @@ class RouteTests(unittest.TestCase):
+         )
+         self.assertIsNone(rejection)
+ 
++    def test_order_detail_request_guard_requires_json_and_a_trusted_origin(self) -> None:
++        unsupported = routes.request_rejection(
++            "/api/order-query/detail",
++            {"Content-Type": "text/plain", "Origin": "http://127.0.0.1:5173"},
++            frontend_url="http://127.0.0.1:5173/",
++        )
++        untrusted = routes.request_rejection(
++            "/api/order-query/detail",
++            {"Content-Type": "application/json", "Origin": "https://untrusted.example"},
++            frontend_url="http://127.0.0.1:5173/",
++        )
++
++        self.assertEqual(unsupported[0], 415)
++        self.assertEqual(untrusted[0], 403)
++
+     def test_main_http_handler_rejects_order_query_with_wrong_content_type(self) -> None:
+         body = json.dumps({"keywords": "buyer"}).encode("utf-8")
+         handler = object.__new__(main.ApiHandler)
+@@ -469,7 +936,11 @@ class RouteTests(unittest.TestCase):
+         handler._send_json = lambda value, status=200: responses.append((status, value))
+         calls: list[dict[str, Any]] = []
+ 
+-        with patch.object(main, "ORDER_QUERY_SERVICE", SimpleNamespace(search=calls.append)):
++        with patch.object(
++            main,
++            "ORDER_QUERY_SERVICE",
++            SimpleNamespace(search=calls.append, detail=calls.append),
++        ):
+             handler.do_POST()
+ 
+         self.assertEqual(calls, [])
+@@ -493,7 +964,11 @@ class RouteTests(unittest.TestCase):
+         handler._send_json = lambda value, status=200: responses.append((status, value))
+         calls: list[dict[str, Any]] = []
+ 
+-        with patch.object(main, "ORDER_QUERY_SERVICE", SimpleNamespace(search=calls.append)):
++        with patch.object(
++            main,
++            "ORDER_QUERY_SERVICE",
++            SimpleNamespace(search=calls.append, detail=calls.append),
++        ):
+             handler.do_POST()
+ 
+         self.assertEqual(calls, [])
+diff --git a/frontend/src/OrderQueryView.jsx b/frontend/src/OrderQueryView.jsx
+index a64b8db..9d8d49a 100644
+--- a/frontend/src/OrderQueryView.jsx
++++ b/frontend/src/OrderQueryView.jsx
+@@ -1,4 +1,4 @@
+-import React, {useEffect, useMemo, useRef, useState} from 'react';
++import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+ import {
+   AlertCircle,
+   ArrowUpRight,
+@@ -6,22 +6,32 @@ import {
+   ChevronLeft,
+   ChevronRight,
+   Clipboard,
+-  Clock3,
+   Database,
++  Eye,
++  EyeOff,
+   ExternalLink,
+   Image,
++  KeyRound,
++  Link2,
+   Package,
+   ReceiptText,
+   RefreshCw,
+   Search,
+   ShieldCheck,
++  Store,
+   TriangleAlert,
++  X,
+ } from 'lucide-react';
+ import {
+   ORDER_STATUS_OPTIONS,
++  canOpenProtectedOrderDetail,
+   formatOrderDateTime,
++  formatOrderCardsForCopy,
+   formatOrderMoney,
++  normalizeOrderDetail,
+   normalizeOrderResponse,
++  orderDeliveryKindLabel,
++  orderDetailErrorState,
+   orderQueryContextChanged,
+   summarizeOrders,
+   verificationLabel,
+@@ -73,7 +83,156 @@ function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaC
+   </section>;
  }
  
-+function formatSub2ApiResetCountdown(value, remainingSeconds) {
-+  const hasRemainingSeconds = remainingSeconds !== null && remainingSeconds !== undefined && remainingSeconds !== '';
-+  const providedSeconds = hasRemainingSeconds ? Number(remainingSeconds) : NaN;
-+  const resetTimestamp = value ? new Date(value).getTime() : NaN;
-+  const seconds = Number.isFinite(providedSeconds) && providedSeconds >= 0
-+    ? providedSeconds
-+    : Number.isFinite(resetTimestamp) ? Math.max(0, (resetTimestamp - Date.now()) / 1000) : NaN;
-+  if (!Number.isFinite(seconds)) return '未提供重置时间';
-+  if (seconds <= 0) return '即将重置';
-+  const days = Math.floor(seconds / 86400);
-+  const hours = Math.floor((seconds % 86400) / 3600);
-+  const minutes = Math.floor((seconds % 3600) / 60);
-+  if (days > 0) return `剩余 ${days} 天 ${hours} 小时`;
-+  if (hours > 0) return `剩余 ${hours} 小时 ${minutes} 分钟`;
-+  if (minutes > 0) return `剩余 ${minutes} 分钟`;
-+  return `剩余 ${Math.max(1, Math.ceil(seconds))} 秒`;
+-function OrderRow({order, onCopy}) {
++function SellerAvatar({seller}) {
++  const [failed, setFailed] = useState(false);
++  useEffect(() => setFailed(false), [seller.avatar]);
++  if (!seller.avatar || failed) return <span className="order-seller-avatar fallback"><Store size={18}/></span>;
++  return <img className="order-seller-avatar" src={seller.avatar} alt="" onError={() => setFailed(true)}/>;
 +}
 +
- function sub2ApiFutureTime(value, now = Date.now()) {
-   if (!value) return false;
-   const timestamp = new Date(value).getTime();
-@@ -138,14 +156,13 @@ function sub2ApiAccountState(account) {
-   return {key: 'unknown', label: account.status || '未知', tone: 'muted', detail: '等待 Sub2API 返回明确状态'};
- }
- 
--function Sub2ApiProgress({label, utilization, used, limit, resetsAt, stats, testId}) {
-+function Sub2ApiProgress({label, used, limit, resetsAt, testId}) {
-   const numericUsed = Number(used);
-   const numericLimit = Number(limit);
--  const numericUtilization = Number(utilization);
-   const ratio = Number.isFinite(numericLimit) && numericLimit > 0 && Number.isFinite(numericUsed)
-     ? (numericUsed / numericLimit) * 100
-     : null;
--  const rawPercent = Number.isFinite(numericUtilization) ? numericUtilization : ratio;
-+  const rawPercent = ratio;
-   const hasPercent = Number.isFinite(rawPercent);
-   const displayPercent = hasPercent ? Math.max(0, rawPercent) : 0;
-   const meterPercent = Math.min(displayPercent, 100);
-@@ -153,23 +170,10 @@ function Sub2ApiProgress({label, utilization, used, limit, resetsAt, stats, test
-   const exactValue = Number.isFinite(numericLimit) && numericLimit > 0
-     ? `${formatSub2ApiNumber(numericUsed || 0)} / ${formatSub2ApiNumber(numericLimit)}`
-     : hasPercent ? `${formatSub2ApiNumber(displayPercent, 1)}%` : '未设置';
--  const statsParts = [];
--  if (stats && typeof stats === 'object') {
--    if (Number(stats.requests) > 0) statsParts.push(`${formatSub2ApiCompactNumber(stats.requests)} 次请求`);
--    if (Number(stats.tokens) > 0) statsParts.push(`${formatSub2ApiCompactNumber(stats.tokens)} Token`);
--  }
--  const costParts = [];
--  if (stats && typeof stats === 'object') {
--    if (stats.cost !== null && stats.cost !== undefined && Number.isFinite(Number(stats.cost))) costParts.push(`账号 $${Number(stats.cost).toFixed(2)}`);
--    if (stats.standard_cost !== null && stats.standard_cost !== undefined && Number.isFinite(Number(stats.standard_cost))) costParts.push(`标准 $${Number(stats.standard_cost).toFixed(2)}`);
--    if (stats.user_cost !== null && stats.user_cost !== undefined && Number.isFinite(Number(stats.user_cost))) costParts.push(`用户 $${Number(stats.user_cost).toFixed(2)}`);
--  }
-   return <div className={`account-progress ${tone}`} data-testid={testId}>
-     <div className="account-progress-head"><span>{label}</span><strong>{exactValue}</strong></div>
-     <div className="account-progress-track" role="progressbar" aria-label={`${label}使用率`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(meterPercent)} aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '未设置'}><span style={{width: `${meterPercent}%`}}/></div>
-     <div className="account-progress-meta"><span>{hasPercent ? `${displayPercent.toFixed(1)}%` : '--'}</span><small>{resetsAt ? `${compactTime(resetsAt)} 重置` : '无重置时间'}</small></div>
--    {statsParts.length > 0 && <small className="account-usage-stats">{statsParts.join(' · ')}</small>}
--    {costParts.length > 0 && <Tooltip label="账号费用含账号倍率；标准费用不含倍率；用户费用按 API Key 与分组倍率结算"><small className="account-usage-costs">{costParts.join(' · ')}</small></Tooltip>}
-   </div>;
- }
- 
-@@ -181,15 +185,76 @@ function Sub2ApiQuotaStack({account}) {
-   </div>;
- }
- 
-+function Sub2ApiUsageWindow({label, window, tone, testId}) {
-+  const stats = window?.window_stats && typeof window.window_stats === 'object' ? window.window_stats : {};
-+  const numericUtilization = Number(window?.utilization ?? window?.used_percent);
-+  const numericUsed = Number(window?.used_requests ?? window?.used);
-+  const numericLimit = Number(window?.limit_requests ?? window?.limit);
-+  const ratio = Number.isFinite(numericLimit) && numericLimit > 0 && Number.isFinite(numericUsed)
-+    ? (numericUsed / numericLimit) * 100
-+    : null;
-+  const rawPercent = Number.isFinite(numericUtilization) ? numericUtilization : ratio;
-+  const hasPercent = Number.isFinite(rawPercent);
-+  const displayPercent = hasPercent ? Math.max(0, rawPercent) : 0;
-+  const meterPercent = Math.min(displayPercent, 100);
-+  const state = displayPercent >= 100 ? 'danger' : displayPercent >= 80 ? 'warning' : 'normal';
-+  const hasNumber = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
-+  const requests = hasNumber(stats.requests) ? stats.requests : hasNumber(window?.used_requests) ? window.used_requests : null;
-+  const requestValue = hasNumber(requests)
-+    ? hasNumber(window?.limit_requests) && Number(window.limit_requests) > 0
-+      ? `${formatSub2ApiCompactNumber(requests)} / ${formatSub2ApiCompactNumber(window.limit_requests)}`
-+      : formatSub2ApiCompactNumber(requests)
-+    : null;
-+  const detailItems = [
-+    requestValue && {label: '请求', value: requestValue},
-+    hasNumber(stats.tokens) && {label: 'Token', value: formatSub2ApiCompactNumber(stats.tokens)},
-+    hasNumber(stats.cost) && {label: '账号费用', value: `$${Number(stats.cost).toFixed(2)}`},
-+    hasNumber(stats.user_cost) && {label: '用户费用', value: `$${Number(stats.user_cost).toFixed(2)}`},
-+  ].filter(Boolean);
-+  const resetsAt = window?.resets_at ?? window?.reset_at;
-+  const hasWindowData = hasPercent || detailItems.length > 0 || Boolean(resetsAt);
-+  const resetLabel = formatSub2ApiResetCountdown(resetsAt, window?.remaining_seconds);
-+  const exactResetLabel = resetsAt ? `准确重置时间：${formatSub2ApiDateTime(resetsAt)}` : resetLabel;
-+  return <section className={`account-usage-window ${tone} ${state}`} data-testid={testId}>
-+    <div className="account-usage-window-head">
-+      <span><Clock3 size={15}/><strong>{label}</strong></span>
-+      <strong className="account-usage-percent">{hasPercent ? `${displayPercent.toFixed(1)}%` : '--'}</strong>
-+    </div>
-+    {hasWindowData ? <>
-+      <div
-+        className="account-usage-track"
-+        role="progressbar"
-+        aria-label={`${label}使用率`}
-+        aria-valuemin="0"
-+        aria-valuemax="100"
-+        aria-valuenow={hasPercent ? Math.round(meterPercent) : undefined}
-+        aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '暂无使用率'}
-+      ><span style={{width: `${meterPercent}%`}}/></div>
-+      <Tooltip label={exactResetLabel}><span className="account-usage-reset"><TimerReset size={13}/>{resetLabel}</span></Tooltip>
-+      {detailItems.length > 0
-+        ? <dl className="account-usage-details">{detailItems.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>
-+        : <div className="account-usage-window-empty">暂无请求与费用明细</div>}
-+      {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-standard">标准成本 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
-+    </> : <div className="account-usage-window-empty">暂未返回此窗口数据</div>}
-+  </section>;
++function DetailCopyButton({label, value, onCopy}) {
++  return <QueryIconButton label={`复制${label}`} onClick={() => onCopy(value, label)} disabled={!value}><Clipboard size={13}/></QueryIconButton>;
 +}
 +
- function Sub2ApiUsageStack({account, usage, usageError}) {
-   const accountUsage = usage[String(account.id)] || usage[account.id] || {};
--  const windowFor = key => accountUsage?.[key] || account?.[key] || {};
-+  const windowFor = key => ({...(account?.[key] || {}), ...(accountUsage?.[key] || {})});
-   const fiveHour = windowFor('five_hour');
-   const sevenDay = windowFor('seven_day');
--  return <div className="account-progress-stack upstream">
--    <Sub2ApiProgress label="5 小时" utilization={fiveHour.utilization ?? fiveHour.used_percent} used={fiveHour.used_requests ?? fiveHour.used} limit={fiveHour.limit_requests ?? fiveHour.limit} resetsAt={fiveHour.resets_at ?? fiveHour.reset_at} stats={fiveHour.window_stats} testId={`usage-5h-${account.id}`}/>
--    <Sub2ApiProgress label="7 天" utilization={sevenDay.utilization ?? sevenDay.used_percent} used={sevenDay.used_requests ?? sevenDay.used} limit={sevenDay.limit_requests ?? sevenDay.limit} resetsAt={sevenDay.resets_at ?? sevenDay.reset_at} stats={sevenDay.window_stats} testId={`usage-7d-${account.id}`}/>
--    {usageError && <small className="account-usage-error"><AlertCircle size={12}/>{usageError}</small>}
-+  const sourceLabels = {active: '主动查询', live: '主动查询', passive: '被动采样'};
-+  const sourceLabel = sourceLabels[String(accountUsage.source || '').toLowerCase()] || (Object.keys(accountUsage).length ? '上游数据' : '账号快照');
-+  const updatedAt = accountUsage.updated_at || account.updated_at;
-+  return <div className="account-usage-stack upstream">
-+    <div className="account-usage-stack-meta">
-+      <span><Activity size={13}/>{sourceLabel}</span>
-+      {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
-+    </div>
-+    <Sub2ApiUsageWindow label="5 小时窗口" window={fiveHour} tone="five-hour" testId={`usage-5h-${account.id}`}/>
-+    <Sub2ApiUsageWindow label="7 天窗口" window={sevenDay} tone="seven-day" testId={`usage-7d-${account.id}`}/>
-+    {usageError && <small className="account-usage-error"><AlertCircle size={13}/>{usageError}</small>}
-   </div>;
- }
- 
-diff --git a/frontend/src/style.css b/frontend/src/style.css
-index fad34af..f924a92 100644
---- a/frontend/src/style.css
-+++ b/frontend/src/style.css
-@@ -2217,99 +2217,165 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
- /* Keep the Sub2API console dense while using desktop-readable type and controls. */
- .sub2api-view { gap: 14px; }
- .sub2api-view .detail-kicker { font-size: 11px; }
--.sub2api-view .button { min-height: 38px; padding-inline: 15px; font-size: 13px; }
--.sub2api-view input, .sub2api-view select { height: 40px; padding-inline: 12px; font-size: 13px; }
-+.sub2api-view .button { min-height: 40px; padding-inline: 16px; font-size: 14px; }
-+.sub2api-view input, .sub2api-view select { height: 42px; padding-inline: 13px; font-size: 14px; }
- .sub2api-service-strip { min-height: 68px; grid-template-columns: minmax(270px, 1.5fr) repeat(3, minmax(82px, .45fr)) minmax(165px, .8fr) 44px; }
- .sub2api-service-strip > div { padding: 12px 15px; }
--.sub2api-service-strip > div > span { font-size: 11px; }
--.sub2api-service-strip > div > strong { margin-top: 6px; font-size: 15px; }
-+.sub2api-service-strip > div > span { font-size: 12px; }
-+.sub2api-service-strip > div > strong { margin-top: 6px; font-size: 16px; }
- .sub2api-service-strip .sub2api-service-state { grid-template-columns: 34px minmax(0, 1fr); gap: 11px; padding-inline: 16px; }
--.sub2api-service-state strong { font-size: 14px; }
--.sub2api-service-state small { margin-top: 5px; font-size: 11px; }
-+.sub2api-service-state strong { font-size: 15px; }
-+.sub2api-service-state small { margin-top: 5px; font-size: 12px; }
- 
- .sub2api-primary-grid { gap: 14px; }
- .sub2api-primary-grid .tool-panel { padding: 20px; }
- .sub2api-primary-grid .section-heading { min-height: 42px; }
--.sub2api-primary-grid .section-heading h2 { font-size: 18px; }
--.sub2api-primary-grid .section-heading p { font-size: 12px; }
--.sub2api-primary-grid label > span { margin-bottom: 7px; font-size: 12px; }
-+.sub2api-primary-grid .section-heading h2 { font-size: 20px; }
-+.sub2api-primary-grid .section-heading p { font-size: 13px; }
-+.sub2api-primary-grid label > span { margin-bottom: 7px; font-size: 13px; }
- .compact-actions { margin-top: 14px; }
- .compact-actions .button, .sub2api-import-panel .import-button { min-height: 38px; }
- .sub2api-capability-grid { margin-top: 15px; }
- .sub2api-capability-grid > div { min-height: 62px; padding: 10px; grid-template-columns: 9px minmax(0, 1fr); column-gap: 7px; }
- .sub2api-capability-grid div > span { width: 8px; height: 8px; margin-top: 4px; }
--.sub2api-capability-grid small { font-size: 10px; }
--.sub2api-capability-grid strong { margin-top: 4px; font-size: 12px; }
-+.sub2api-capability-grid small { font-size: 12px; }
-+.sub2api-capability-grid strong { margin-top: 4px; font-size: 14px; }
- .sub2api-file-drop { min-height: 116px; margin-top: 15px !important; padding: 16px 20px; grid-template-columns: 32px minmax(0, 1fr); column-gap: 12px; }
--.sub2api-file-drop strong { font-size: 14px; }
-+.sub2api-file-drop strong { font-size: 15px; }
- .sub2api-file-drop small { font-size: 12px; }
- .import-strategy-summary { margin-top: 13px; }
- .import-strategy-summary > div { min-height: 60px; padding: 10px 11px; grid-template-columns: 21px minmax(0, 1fr); gap: 8px; }
--.import-strategy-summary span { font-size: 11px; }
--.import-strategy-summary strong { margin-top: 5px; font-size: 12px; }
-+.import-strategy-summary span { font-size: 12px; }
-+.import-strategy-summary strong { margin-top: 5px; font-size: 14px; }
- .sub2api-import-panel .import-button { margin-top: 13px; }
--.sub2api-view .connection-result { font-size: 12px; }
-+.sub2api-view .connection-result { font-size: 13px; }
++function OrderDetailDialog({
++  order,
++  detail,
++  password,
++  passwordVisible,
++  busy,
++  error,
++  sessionExpired,
++  dialogRef,
++  passwordInputRef,
++  onPassword,
++  onTogglePassword,
++  onSubmit,
++  onClose,
++  onCopy,
++  onRequery,
++}) {
++  const showingDetail = Boolean(detail);
++  const dialogTitle = showingDetail ? '订单详情' : '安全密码验证';
++  const seller = detail?.seller || {};
++  const sellerContacts = detail ? [
++    {label: '卖家 QQ', value: seller.contact_qq},
++    {label: '卖家微信', value: seller.contact_wechat},
++    {label: '卖家手机', value: seller.contact_mobile},
++  ].filter(item => item.value) : [];
++  const hasSeller = Boolean(seller.nickname || seller.avatar || seller.shop_url || sellerContacts.length);
++  const delivery = detail?.delivery || {};
++  const hasDelivery = Boolean(delivery.cards?.length || delivery.content || delivery.message || delivery.links?.length);
++  const detailFacts = detail ? [
++    {label: '订单号', value: detail.trade_no || '--', copy: Boolean(detail.trade_no)},
++    {label: '下单时间', value: detail.created_at ? formatOrderDateTime(detail.created_at) : '--'},
++    {label: '支付时间', value: detail.success_at ? formatOrderDateTime(detail.success_at) : '--'},
++    {label: '购买数量', value: `${detail.quantity} 件`},
++    {label: '实付金额', value: formatOrderMoney(detail.total_amount)},
++    {label: '发货进度', value: detail.sendout === null ? '--' : `已发 ${detail.sendout} / ${detail.quantity} 件`},
++    {label: '买家联系方式', value: detail.contact || '--', copy: Boolean(detail.contact)},
++    {label: '售后服务', value: detail.can_complaint ? '支持申诉' : '暂不支持申诉'},
++  ] : [];
 +
-+.card-import-head { min-height: 78px; padding: 15px 19px; }
-+.card-import-head h2 { font-size: 20px; }
-+.card-import-head p, .card-import-head > a { font-size: 12px; }
-+.card-import-inputs, .card-import-control { padding: 18px 19px 19px; }
-+.card-import-inputs label > span, .card-mode-head > span { font-size: 13px; }
-+.card-import-inputs label > span small { font-size: 11px; }
-+.card-service-field { grid-template-columns: minmax(0, 1fr) 42px; }
-+.card-service-field .icon-button { width: 42px; height: 42px; }
-+.card-import-inputs textarea { min-height: 126px; padding: 12px 13px; font-size: 14px; }
-+.card-mode-segment { height: 42px; }
-+.card-mode-segment button { font-size: 13px; }
-+.card-flow-steps { margin-top: 15px; }
-+.card-flow-steps > div { min-height: 66px; padding: 10px 11px; grid-template-columns: 27px minmax(0, 1fr); column-gap: 9px; }
-+.card-flow-steps > div > span { width: 26px; height: 26px; font-size: 11px; }
-+.card-flow-steps strong { font-size: 13px; }
-+.card-flow-steps small { margin-top: 4px; font-size: 11px; }
-+.card-flow-summary { margin-top: 11px; }
-+.card-flow-summary > div { min-height: 54px; padding: 9px 11px; }
-+.card-flow-summary span { font-size: 11px; }
-+.card-flow-summary strong { margin-top: 5px; font-size: 14px; }
-+.card-flow-notice { min-height: 38px; margin-top: 10px; padding: 8px 10px; font-size: 12px; }
-+.card-import-actions { padding-top: 14px; gap: 9px; }
-+.card-import-actions .button { min-height: 40px; }
-+.card-history-head { min-height: 78px; padding: 15px 19px; }
-+.card-history-head h3 { font-size: 18px; }
-+.card-history-head p { font-size: 12px; }
-+.card-history-summary > div { min-height: 78px; padding: 12px 16px; }
-+.card-history-summary span { font-size: 12px; }
-+.card-history-summary strong { margin-top: 6px; font-size: 21px; }
-+.card-history-summary small { margin-top: 4px; font-size: 11px; }
-+.card-history-toolbar { min-height: 58px; padding: 9px 19px; }
-+.card-history-toolbar > span { font-size: 12px; }
-+.card-history-filters button { min-width: 86px; height: 38px; padding-inline: 12px; font-size: 12px; }
-+.card-history-filters button span { min-width: 21px; height: 20px; font-size: 11px; }
-+.card-history-table { min-width: 980px; }
-+.card-history-row { min-height: 68px; grid-template-columns: 145px 185px 160px 205px minmax(245px, 1fr); }
-+.card-history-row.head { min-height: 40px; font-size: 12px; }
-+.card-history-row > span { padding: 10px 13px; }
-+.card-history-row:not(.head) strong { font-size: 13px; }
-+.card-history-row:not(.head) small { margin-top: 5px; font-size: 11px; }
-+.card-history-empty { min-height: 120px; font-size: 12px; }
++  return <div className="modal-backdrop order-detail-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
++    <div
++      className={`checkout-modal ${showingDetail ? 'order-detail-modal' : 'order-password-modal'}`}
++      role="dialog"
++      aria-modal="true"
++      aria-labelledby="order-detail-dialog-title"
++      aria-describedby={showingDetail ? undefined : 'order-password-description'}
++      ref={dialogRef}
++      tabIndex={-1}
++    >
++      <div className="modal-head order-dialog-head">
++        <div><span>{showingDetail ? 'ORDER DETAIL' : 'SECURE ORDER'}</span><h2 id="order-detail-dialog-title">{dialogTitle}</h2></div>
++        <QueryIconButton label="关闭订单详情" onClick={onClose}><X size={17}/></QueryIconButton>
++      </div>
++
++      {!showingDetail ? <form className="order-password-form" onSubmit={onSubmit}>
++        <div className="order-password-context">
++          <span className="order-password-context-icon"><KeyRound size={20}/></span>
++          <div><strong>{order.goods_name}</strong><small>{order.trade_no}</small></div>
++          <span className={`order-status ${order.status_tone}`}>{order.status_label}</span>
++        </div>
++        <p id="order-password-description" className="order-password-description">此订单的交付内容受安全密码保护</p>
++        <label className="order-password-label" htmlFor="order-query-password">安全密码</label>
++        <div className={`order-password-control ${error ? 'invalid' : ''}`}>
++          <KeyRound size={16}/>
++          <input
++            id="order-query-password"
++            ref={passwordInputRef}
++            type={passwordVisible ? 'text' : 'password'}
++            value={password}
++            onChange={event => onPassword(event.target.value)}
++            placeholder="请输入安全密码"
++            autoComplete="off"
++            maxLength={128}
++            aria-invalid={Boolean(error)}
++            aria-describedby={error ? 'order-password-error' : 'order-password-description'}
++            disabled={busy || sessionExpired}
++          />
++          <QueryIconButton label={passwordVisible ? '隐藏安全密码' : '显示安全密码'} onClick={onTogglePassword} disabled={busy || sessionExpired}>{passwordVisible ? <EyeOff size={15}/> : <Eye size={15}/>}</QueryIconButton>
++        </div>
++        {error && <div className="order-password-error" id="order-password-error" role="alert"><TriangleAlert size={15}/><span>{error}</span></div>}
++        <div className="order-dialog-foot">
++          <span>{sessionExpired ? <TriangleAlert size={14}/> : <ShieldCheck size={14}/>} {sessionExpired ? '查询验证会话已失效' : '密码仅用于本次订单验证'}</span>
++          <div>
++            <button className="button secondary" type="button" onClick={onClose}>取消</button>
++            {sessionExpired
++              ? <button className="button primary" type="button" onClick={onRequery}><RefreshCw size={15}/>关闭并重新查询</button>
++              : <button className="button primary" type="submit" disabled={busy || !password.length}><ShieldCheck size={15}/>{busy ? '正在验证' : '验证并查看'}</button>}
++          </div>
++        </div>
++      </form> : <>
++        <div className="order-detail-scroll">
++          <section className="order-detail-identity">
++            <OrderImage order={order}/>
++            <div><span>{detail.goods_type_label}</span><strong>{detail.goods_name}</strong><small>{detail.trade_no}</small></div>
++            <span className={`order-status ${detail.status_tone}`}>{detail.status_label}</span>
++          </section>
++
++          <section className="order-detail-section">
++            <div className="order-detail-section-head"><div><span>ORDER INFORMATION</span><h3>订单信息</h3></div></div>
++            <dl className="order-detail-facts">
++              {detailFacts.map(item => <div key={item.label}><dt>{item.label}</dt><dd><span>{item.value}</span>{item.copy && <DetailCopyButton label={item.label} value={item.value} onCopy={onCopy}/>}</dd></div>)}
++            </dl>
++          </section>
++
++          {hasSeller && <section className="order-detail-section">
++            <div className="order-detail-section-head"><div><span>SELLER</span><h3>卖家信息</h3></div>{seller.shop_url && <a className="icon-button" href={seller.shop_url} target="_blank" rel="noreferrer" aria-label="打开卖家店铺" title="打开卖家店铺"><ExternalLink size={14}/></a>}</div>
++            <div className="order-seller-row"><SellerAvatar seller={seller}/><div><strong>{seller.nickname || '链动小铺卖家'}</strong><small>{sellerContacts.length ? '可通过以下方式联系卖家' : '卖家店铺信息'}</small></div></div>
++            {sellerContacts.length > 0 && <dl className="order-seller-contacts">{sellerContacts.map(item => <div key={item.label}><dt>{item.label}</dt><dd><span>{item.value}</span><DetailCopyButton label={item.label} value={item.value} onCopy={onCopy}/></dd></div>)}</dl>}
++          </section>}
++
++          {(detail.instructions.text || detail.instructions.links.length > 0) && <section className="order-detail-section">
++            <div className="order-detail-section-head"><div><span>INSTRUCTIONS</span><h3>使用说明</h3></div></div>
++            {detail.instructions.text && <p className="order-detail-rich-text">{detail.instructions.text}</p>}
++            {detail.instructions.links.length > 0 && <div className="order-detail-links">{detail.instructions.links.map((link, index) => <a href={link.url} target="_blank" rel="noreferrer" key={`${link.url}-${index}`}><Link2 size={14}/><span>{link.label}</span><ExternalLink size={12}/></a>)}</div>}
++          </section>}
++
++          <section className="order-detail-section order-delivery-section">
++            <div className="order-detail-section-head"><div><span>DELIVERY</span><h3>{orderDeliveryKindLabel(delivery.kind)}</h3></div><div className="order-detail-section-actions">
++              {delivery.api_status !== null && delivery.api_status !== undefined && <em>接口状态 {delivery.api_status}</em>}
++              {delivery.cards?.length > 0 && <button className="button secondary order-copy-all" type="button" onClick={() => onCopy(formatOrderCardsForCopy(delivery.cards), '全部卡密')}><Clipboard size={14}/>复制全部</button>}
++            </div></div>
++            {delivery.message && <div className="order-delivery-message"><ShieldCheck size={15}/><span>{delivery.message}</span></div>}
++            {delivery.cards?.length > 0 && <div className="order-card-list">{delivery.cards.map((card, index) => <div key={`${card}-${index}`}><span>卡密 {index + 1}</span><code>{card}</code><DetailCopyButton label={`卡密 ${index + 1}`} value={card} onCopy={onCopy}/></div>)}</div>}
++            {delivery.content && <p className="order-detail-rich-text delivery-content">{delivery.content}</p>}
++            {delivery.links?.length > 0 && <div className="order-detail-links">{delivery.links.map((link, index) => <a href={link.url} target="_blank" rel="noreferrer" key={`${link.url}-${index}`}><Link2 size={14}/><span>{link.label}</span><ExternalLink size={12}/></a>)}</div>}
++            {!hasDelivery && <div className="order-detail-empty"><ReceiptText size={20}/><strong>暂无可展示的交付内容</strong><span>订单详情已读取，但没有返回卡密、正文或资源链接</span></div>}
++            {delivery.truncated && <div className="order-detail-truncated"><TriangleAlert size={14}/><span>交付内容较长，当前仅显示部分结果</span></div>}
++          </section>
++        </div>
++        <div className="order-dialog-foot order-detail-foot">
++          <span><ShieldCheck size={14}/>安全密码已验证</span>
++          <button className="button primary" type="button" onClick={onClose}>关闭</button>
++        </div>
++      </>}
++    </div>
++  </div>;
++}
++
++function OrderRow({order, onCopy, onOpenProtectedDetail}) {
+   return <tr>
+     <td data-label="商品">
+       <div className="order-product-cell"><OrderImage order={order}/><span><strong>{order.goods_name}</strong><small>{formatOrderDateTime(order.created_at)}</small></span></div>
+@@ -84,6 +243,7 @@ function OrderRow({order, onCopy}) {
+     <td data-label="商品类型"><div className="order-type"><strong>{order.goods_type_label}</strong>{order.need_query_password && <small><ShieldCheck size={11}/>权益需安全密码</small>}</div></td>
+     <td data-label="操作"><div className="order-row-actions">
+       {order.detail_url && <a className="icon-button" href={order.detail_url} target="_blank" rel="noreferrer" aria-label="打开官方订单详情" title="打开官方订单详情"><ExternalLink size={14}/></a>}
++      {canOpenProtectedOrderDetail(order) && <button className="button secondary order-result-link order-password-button" type="button" onClick={event => onOpenProtectedDetail(order, event.currentTarget)}><KeyRound size={14}/>安全密码</button>}
+       {order.status === 1 && order.result_url && !order.need_query_password && <a className="button secondary order-result-link" href={order.result_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>{order.goods_action_label}</a>}
+     </div></td>
+   </tr>;
+@@ -104,18 +264,94 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+   const [error, setError] = useState('');
+   const [hasQueried, setHasQueried] = useState(false);
+   const [queriedAt, setQueriedAt] = useState(null);
++  const [detailOrder, setDetailOrder] = useState(null);
++  const [orderDetail, setOrderDetail] = useState(null);
++  const [detailPassword, setDetailPassword] = useState('');
++  const [detailPasswordVisible, setDetailPasswordVisible] = useState(false);
++  const [detailBusy, setDetailBusy] = useState(false);
++  const [detailError, setDetailError] = useState('');
++  const [detailSessionExpired, setDetailSessionExpired] = useState(false);
+   const requestVersion = useRef(0);
++  const detailRequestVersion = useRef(0);
++  const detailAbortController = useRef(null);
++  const detailDialogRef = useRef(null);
++  const detailPasswordInputRef = useRef(null);
++  const detailTriggerRef = useRef(null);
+   const resultContext = useRef({keywords: '', status: 999, pageSize: 10});
+   const initialKeywordsApplied = useRef(false);
  
- .account-management-panel { border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
--.account-management-head { min-height: 70px; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
--.account-management-head h3 { margin: 4px 0 0; color: var(--ui-text); font-size: 17px; }
--.account-management-head p { margin: 5px 0 0; color: var(--ui-text-muted); font-size: 11px; }
-+.account-management-head { min-height: 78px; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
-+.account-management-head h3 { margin: 4px 0 0; color: var(--ui-text); font-size: 20px; }
-+.account-management-head p { margin: 6px 0 0; color: var(--ui-text-muted); font-size: 13px; }
- .account-management-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
--.account-management-actions select { min-width: 112px; height: 36px; }
--.account-search { width: min(240px, 30vw); height: 36px; margin: 0 !important; padding: 0 10px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
--.account-search input { width: 100%; height: 32px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
-+.account-management-actions select { min-width: 122px; height: 40px; }
-+.account-search { width: min(260px, 32vw); height: 40px; margin: 0 !important; padding: 0 11px; display: flex; align-items: center; gap: 8px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
-+.account-search input { width: 100%; height: 36px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
- .account-search input:focus { outline: none; box-shadow: none; }
- .account-table-wrap { overflow-x: auto; border-block: 1px solid var(--ui-border); scrollbar-gutter: stable; }
--.account-table { width: 100%; min-width: 1420px; border-collapse: collapse; table-layout: fixed; }
--.account-table th, .account-table td { padding: 13px 12px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: top; text-align: left; }
-+.account-table { width: 100%; min-width: 1580px; border-collapse: collapse; table-layout: fixed; }
-+.account-table th, .account-table td { padding: 15px 13px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: top; text-align: left; }
- .account-table th:last-child, .account-table td:last-child { border-right: 0; }
--.account-table th { color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 10px; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
--.account-table td { color: var(--ui-text); font-size: 12px; }
-+.account-table th { color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 12px; font-weight: 700; letter-spacing: 0; white-space: nowrap; }
-+.account-table td { color: var(--ui-text); font-size: 14px; }
- .account-table tbody tr { transition: background-color .15s ease; }
- .account-table tbody tr:hover { background: color-mix(in srgb, var(--ui-surface-muted) 72%, transparent); }
- .account-table td > strong, .account-table td > span, .account-table td > small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
--.account-table td > strong { font-size: 12px; font-weight: 700; }
--.account-table td > small { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; line-height: 1.35; }
--.account-table th:nth-child(1) { width: 235px; }
-+.account-table td > strong { font-size: 14px; font-weight: 700; }
-+.account-table td > small { margin-top: 5px; color: var(--ui-text-muted); font-size: 12px; line-height: 1.4; }
-+.account-table th:nth-child(1) { width: 240px; }
- .account-table th:nth-child(2) { width: 155px; }
- .account-table th:nth-child(3) { width: 190px; }
--.account-table th:nth-child(4) { width: 275px; }
--.account-table th:nth-child(5) { width: 300px; }
-+.account-table th:nth-child(4) { width: 260px; }
-+.account-table th:nth-child(5) { width: 410px; }
- .account-table th:nth-child(6) { width: 160px; }
--.account-table th:nth-child(7) { width: 145px; }
-+.account-table th:nth-child(7) { width: 125px; }
- .account-name-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
--.account-name-line > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
--.account-name-line .icon-button { width: 27px; height: 27px; flex: 0 0 27px; }
--.account-billing-rate { width: fit-content; max-width: 100%; margin-top: 8px; padding: 3px 6px; display: inline-flex !important; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 10px; font-weight: 700; }
--.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; border-radius: 3px; font-size: 10px !important; font-weight: 700; }
-+.account-name-line > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
-+.account-name-line .icon-button { width: 30px; height: 30px; flex: 0 0 30px; }
-+.account-billing-rate { width: fit-content; max-width: 100%; margin-top: 9px; padding: 4px 7px; display: inline-flex !important; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 12px; font-weight: 700; }
-+.account-status { display: inline-flex !important; width: fit-content; padding: 4px 8px; border: 1px solid currentColor; border-radius: 3px; font-size: 12px !important; font-weight: 700; }
- .account-status.success { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 8%, transparent); }
- .account-status.warning { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, transparent); }
- .account-status.danger { color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); }
- .account-status.muted { color: var(--ui-text-muted); background: var(--ui-surface-muted); }
--.account-status-detail { max-width: 165px; margin-top: 7px !important; white-space: normal !important; line-height: 1.45 !important; }
--.account-progress-stack { display: grid; gap: 9px; }
-+.account-status-detail { max-width: 170px; margin-top: 8px !important; white-space: normal !important; line-height: 1.5 !important; }
-+.account-progress-stack { display: grid; gap: 11px; }
- .account-progress { min-width: 0; }
- .account-progress-head { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
--.account-progress-head span { color: var(--ui-text-muted); font-size: 9px; font-weight: 700; }
--.account-progress-head strong { color: var(--ui-text); font-size: 10px; font-weight: 700; }
--.account-progress-track { width: 100%; height: 5px; margin-top: 5px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 70%, var(--ui-surface)); border-radius: 2px; }
-+.account-progress-head span { color: var(--ui-text-muted); font-size: 12px; font-weight: 700; }
-+.account-progress-head strong { color: var(--ui-text); font-size: 13px; font-weight: 700; }
-+.account-progress-track { width: 100%; height: 7px; margin-top: 7px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 70%, var(--ui-surface)); border-radius: 3px; }
- .account-progress-track > span { display: block; height: 100%; background: var(--ui-success); border-radius: inherit; transition: width .25s ease; }
- .account-progress.warning .account-progress-track > span { background: var(--ui-warning); }
- .account-progress.danger .account-progress-track > span { background: var(--ui-danger); }
--.account-progress-meta { margin-top: 4px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ui-text-faint); }
--.account-progress-meta > span { color: var(--ui-text-muted); font-size: 9px; font-weight: 700; }
--.account-progress-meta > small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
--.account-usage-stats, .account-usage-costs { margin-top: 4px; display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ui-text-muted); font-size: 9px; line-height: 1.35; }
--.account-usage-costs { color: var(--ui-text); }
--.account-usage-error { padding: 5px 6px; display: flex; align-items: flex-start; gap: 5px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-left: 2px solid var(--ui-danger); font-size: 9px; line-height: 1.4; }
-+.account-progress-meta { margin-top: 5px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ui-text-faint); }
-+.account-progress-meta > span { color: var(--ui-text-muted); font-size: 11px; font-weight: 700; }
-+.account-progress-meta > small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-+.account-usage-stack { display: grid; gap: 10px; }
-+.account-usage-stack-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); }
-+.account-usage-stack-meta > span { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 700; }
-+.account-usage-stack-meta > small { min-width: 0; overflow: hidden; color: var(--ui-text-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-+.account-usage-window { min-width: 0; padding: 11px 12px; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-left: 3px solid var(--ui-success); border-radius: 4px; }
-+.account-usage-window.seven-day { border-left-color: #5b7194; }
-+.account-usage-window.warning { border-left-color: var(--ui-warning); }
-+.account-usage-window.danger { border-left-color: var(--ui-danger); }
-+.account-usage-window-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-+.account-usage-window-head > span { min-width: 0; display: inline-flex; align-items: center; gap: 6px; color: var(--ui-text-muted); }
-+.account-usage-window-head > span > strong { color: var(--ui-text); font-size: 13px; }
-+.account-usage-percent { flex: 0 0 auto; color: var(--ui-text); font-size: 16px; font-variant-numeric: tabular-nums; }
-+.account-usage-track { width: 100%; height: 8px; margin-top: 9px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 72%, var(--ui-surface)); border-radius: 3px; }
-+.account-usage-track > span { display: block; height: 100%; background: var(--ui-success); border-radius: inherit; transition: width .25s ease; }
-+.account-usage-window.seven-day .account-usage-track > span { background: #5b7194; }
-+.account-usage-window.warning .account-usage-track > span { background: var(--ui-warning); }
-+.account-usage-window.danger .account-usage-track > span { background: var(--ui-danger); }
-+.account-usage-reset { width: fit-content; margin-top: 8px; display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-muted); font-size: 12px; font-weight: 650; }
-+.account-usage-details { margin: 10px 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); }
-+.account-usage-details > div { min-width: 0; padding: 9px 7px 0; border-right: 1px solid var(--ui-border-soft); }
-+.account-usage-details > div:first-child { padding-left: 0; }
-+.account-usage-details > div:last-child { padding-right: 0; border-right: 0; }
-+.account-usage-details dt { color: var(--ui-text-faint); font-size: 11px; white-space: nowrap; }
-+.account-usage-details dd { margin: 5px 0 0; overflow-wrap: anywhere; color: var(--ui-text); font-size: 13px; font-weight: 750; font-variant-numeric: tabular-nums; }
-+.account-usage-standard { width: fit-content; margin-top: 9px; display: block; color: var(--ui-text-muted); font-size: 11px; border-bottom: 1px dotted currentColor; }
-+.account-usage-window-empty { min-height: 38px; display: flex; align-items: center; color: var(--ui-text-muted); font-size: 12px; }
-+.account-usage-error { padding: 8px 9px; display: flex; align-items: flex-start; gap: 6px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-left: 2px solid var(--ui-danger); font-size: 12px; line-height: 1.45; }
- .account-usage-error svg { flex: 0 0 auto; margin-top: 1px; }
- .account-row-actions { display: flex; align-items: center; gap: 5px; }
--.account-row-actions .icon-button { width: 32px; height: 32px; }
-+.account-row-actions .icon-button { width: 36px; height: 36px; }
- .account-test-result { max-width: 125px; white-space: normal !important; }
- .account-test-result.ok { color: var(--ui-success) !important; }
- .account-test-result.bad { color: var(--ui-danger) !important; }
- .account-table-empty { min-height: 110px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
--.account-pagination { min-height: 52px; padding: 9px 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ui-text-muted); font-size: 11px; }
-+.account-pagination { min-height: 58px; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ui-text-muted); font-size: 13px; }
- .account-pagination > div { display: flex; gap: 5px; }
- .account-pagination .icon-button { width: 32px; height: 32px; }
++  const closeOrderDetail = useCallback(() => {
++    detailRequestVersion.current += 1;
++    detailAbortController.current?.abort();
++    detailAbortController.current = null;
++    setDetailOrder(null);
++    setOrderDetail(null);
++    setDetailPassword('');
++    setDetailPasswordVisible(false);
++    setDetailBusy(false);
++    setDetailError('');
++    setDetailSessionExpired(false);
++    const trigger = detailTriggerRef.current;
++    detailTriggerRef.current = null;
++    window.requestAnimationFrame(() => {
++      if (trigger?.isConnected) trigger.focus();
++    });
++  }, []);
++
++  useEffect(() => () => {
++    detailRequestVersion.current += 1;
++    detailAbortController.current?.abort();
++    detailAbortController.current = null;
++  }, []);
++
+   useEffect(() => {
+     if (initialKeywordsApplied.current || !initialKeywords) return;
+     initialKeywordsApplied.current = true;
+     setKeywords(current => current || initialKeywords);
+   }, [initialKeywords]);
  
-@@ -2318,80 +2384,80 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
-   .account-management-actions { justify-content: stretch; flex-wrap: wrap; }
-   .account-search { width: min(100%, 320px); flex: 1 1 220px; }
-   .account-management-actions select { flex: 1 1 120px; }
--  .account-table { min-width: 1420px; }
-+  .account-table { min-width: 1580px; }
-   .account-pagination { align-items: flex-start; flex-direction: column; }
-   .account-pagination > div { align-self: flex-end; }
++  useEffect(() => {
++    if (!detailOrder) return undefined;
++    const previousOverflow = document.body.style.overflow;
++    document.body.style.overflow = 'hidden';
++    const focusFrame = window.requestAnimationFrame(() => {
++      if (orderDetail) detailDialogRef.current?.focus();
++      else detailPasswordInputRef.current?.focus();
++    });
++    const handleKeyDown = event => {
++      if (event.key === 'Escape') {
++        event.preventDefault();
++        closeOrderDetail();
++        return;
++      }
++      if (event.key !== 'Tab' || !detailDialogRef.current) return;
++      const focusable = Array.from(detailDialogRef.current.querySelectorAll(
++        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
++      ));
++      if (!focusable.length) {
++        event.preventDefault();
++        detailDialogRef.current.focus();
++        return;
++      }
++      const first = focusable[0];
++      const last = focusable[focusable.length - 1];
++      if (event.shiftKey && (document.activeElement === first || !detailDialogRef.current.contains(document.activeElement))) {
++        event.preventDefault();
++        last.focus();
++      } else if (!event.shiftKey && (document.activeElement === last || !detailDialogRef.current.contains(document.activeElement))) {
++        event.preventDefault();
++        first.focus();
++      }
++    };
++    window.addEventListener('keydown', handleKeyDown);
++    return () => {
++      window.cancelAnimationFrame(focusFrame);
++      document.body.style.overflow = previousOverflow;
++      window.removeEventListener('keydown', handleKeyDown);
++    };
++  }, [closeOrderDetail, detailOrder, orderDetail]);
++
+   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
+-  const verified = verification?.status === 'verified';
+   const manualRequired = verification?.status === 'manual_required';
+ 
+   const sendSearch = async (payload, allowExpiredRetry = true) => {
+@@ -242,6 +478,92 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+     runSearch({manualCode: captchaCode.trim(), pageValue: 1});
+   };
+ 
++  const openProtectedOrderDetail = (order, trigger) => {
++    const sessionAvailable = Boolean(sessionId && submittedKeywords);
++    detailRequestVersion.current += 1;
++    detailAbortController.current?.abort();
++    detailAbortController.current = null;
++    detailTriggerRef.current = trigger || document.activeElement;
++    setDetailOrder(order);
++    setOrderDetail(null);
++    setDetailPassword('');
++    setDetailPasswordVisible(false);
++    setDetailBusy(false);
++    setDetailError(sessionAvailable ? '' : '订单查询会话已失效，请重新查询订单后再验证');
++    setDetailSessionExpired(!sessionAvailable);
++  };
++
++  const submitOrderDetailPassword = async event => {
++    event.preventDefault();
++    if (!detailOrder || detailBusy || detailSessionExpired || !detailPassword.length) return;
++    if (!sessionId || !submittedKeywords) {
++      setSessionId('');
++      setVerification(null);
++      setExpiresIn(0);
++      setDetailPassword('');
++      setDetailPasswordVisible(false);
++      setDetailSessionExpired(true);
++      setDetailError('订单查询会话已失效，请重新查询订单后再验证');
++      return;
++    }
++
++    const version = detailRequestVersion.current + 1;
++    detailRequestVersion.current = version;
++    detailAbortController.current?.abort();
++    const controller = new AbortController();
++    detailAbortController.current = controller;
++    const password = detailPassword;
++    setDetailBusy(true);
++    setDetailError('');
++    try {
++      const response = await request('/order-query/detail', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify({
++          session_id: sessionId,
++          keywords: submittedKeywords,
++          trade_no: detailOrder.trade_no,
++          query_password: password,
++        }),
++        signal: controller.signal,
++      });
++      if (version !== detailRequestVersion.current) return;
++      if (!response.detail || typeof response.detail !== 'object') throw new Error('订单详情响应格式无效');
++      setSessionId(String(response.session_id || sessionId));
++      setExpiresIn(Number(response.expires_in || expiresIn));
++      setOrderDetail(normalizeOrderDetail(response, detailOrder));
++      setDetailPassword('');
++      setDetailPasswordVisible(false);
++      setDetailError('');
++      setDetailSessionExpired(false);
++    } catch (requestError) {
++      if (controller.signal.aborted || requestError?.name === 'AbortError') return;
++      if (version !== detailRequestVersion.current) return;
++      const errorState = orderDetailErrorState(requestError);
++      if (errorState.sessionExpired) {
++        setSessionId('');
++        setVerification(null);
++        setExpiresIn(0);
++      }
++      setOrderDetail(null);
++      setDetailPassword('');
++      setDetailPasswordVisible(false);
++      setDetailSessionExpired(errorState.sessionExpired);
++      setDetailError(errorState.message);
++      if (!errorState.sessionExpired) window.requestAnimationFrame(() => detailPasswordInputRef.current?.focus());
++    } finally {
++      if (detailAbortController.current === controller) detailAbortController.current = null;
++      if (version === detailRequestVersion.current) setDetailBusy(false);
++    }
++  };
++
++  const requeryAfterDetailExpiry = () => {
++    const keyword = submittedKeywords;
++    const page = result.pagination.page || 1;
++    closeOrderDetail();
++    if (keyword) runSearch({keywordValue: keyword, pageValue: page, reuseSession: false});
++  };
++
+   const changeStatus = status => {
+     setActiveStatus(status);
+     if (submittedKeywords && !manualRequired) runSearch({statusValue: status, pageValue: 1, quiet: true});
+@@ -258,15 +580,17 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+     if (submittedKeywords && !manualRequired) runSearch({pageSizeValue: nextSize, pageValue: 1, quiet: true});
+   };
+ 
+-  const copyOrderNumber = async tradeNo => {
++  const copyDetailValue = async (value, label = '内容') => {
+     try {
+-      await navigator.clipboard.writeText(tradeNo);
+-      notify(`已复制订单号：${tradeNo}`);
++      await navigator.clipboard.writeText(String(value));
++      notify({type: 'success', title: `${label}已复制`, message: '已写入剪贴板', duration: 2400});
+     } catch {
+       notify('无法访问剪贴板，请检查浏览器权限', 'error');
+     }
+   };
+ 
++  const copyOrderNumber = tradeNo => copyDetailValue(tradeNo, '订单号');
++
+   const emptyMessage = busy && !result.orders.length
+     ? {icon: <RefreshCw className="spin" size={22}/>, title: '正在自动验证并读取订单', detail: '结果返回后会显示在这里'}
+     : error && !result.orders.length
+@@ -321,7 +645,7 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+       <div className="order-table-wrap">
+         <table className="order-query-table">
+           <thead><tr><th>商品 / 下单时间</th><th>订单号</th><th>金额 / 数量</th><th>状态</th><th>商品类型</th><th>操作</th></tr></thead>
+-          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
++          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
+         </table>
+       </div>
+ 
+@@ -331,5 +655,25 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
+       </div>
+       {busy && result.orders.length > 0 && <div className="order-update-indicator"><RefreshCw className="spin" size={14}/>正在更新订单</div>}
+     </section>
++    {detailOrder && <OrderDetailDialog
++      order={detailOrder}
++      detail={orderDetail}
++      password={detailPassword}
++      passwordVisible={detailPasswordVisible}
++      busy={detailBusy}
++      error={detailError}
++      sessionExpired={detailSessionExpired}
++      dialogRef={detailDialogRef}
++      passwordInputRef={detailPasswordInputRef}
++      onPassword={value => {
++        setDetailPassword(value);
++        if (detailError) setDetailError('');
++      }}
++      onTogglePassword={() => setDetailPasswordVisible(current => !current)}
++      onSubmit={submitOrderDetailPassword}
++      onClose={closeOrderDetail}
++      onCopy={copyDetailValue}
++      onRequery={requeryAfterDetailExpiry}
++    />}
+   </section>;
+ }
+diff --git a/frontend/src/orderQuery.css b/frontend/src/orderQuery.css
+index 2386f3b..945c076 100644
+--- a/frontend/src/orderQuery.css
++++ b/frontend/src/orderQuery.css
+@@ -186,6 +186,105 @@
+ .order-pagination .icon-button { width: 30px; height: 30px; }
+ .order-update-indicator { position: absolute; right: 16px; bottom: 62px; min-height: 29px; padding: 0 9px; display: flex; align-items: center; gap: 6px; color: var(--ui-text-muted); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; box-shadow: 0 6px 18px #11131518; font-size: 9px; }
+ 
++.order-detail-backdrop { z-index: 50; }
++.order-password-modal,
++.order-detail-modal { color: var(--ui-text); background: var(--ui-surface); border-color: var(--ui-border); }
++.order-password-modal { width: min(440px, 100%); padding: 22px; overflow: visible; }
++.order-dialog-head { align-items: center; gap: 14px; }
++.order-dialog-head > div { min-width: 0; }
++.order-dialog-head > div > span { display: block; color: var(--ui-text-faint); font-size: 9px; font-weight: 750; }
++.order-dialog-head h2 { margin: 5px 0 0; color: var(--ui-text); font-size: 18px; }
++.order-dialog-head .icon-button { width: 32px; height: 32px; flex: 0 0 32px; }
++
++.order-password-form { margin-top: 18px; }
++.order-password-context { min-width: 0; padding: 13px 0; display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; gap: 10px; align-items: center; border-top: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
++.order-password-context-icon { width: 38px; height: 38px; display: grid; place-items: center; color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, var(--ui-surface)); border: 1px solid color-mix(in srgb, var(--ui-warning) 30%, var(--ui-border)); border-radius: 4px; }
++.order-password-context > div { min-width: 0; }
++.order-password-context strong,
++.order-password-context small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.order-password-context strong { color: var(--ui-text); font-size: 12px; }
++.order-password-context small { margin-top: 5px; color: var(--ui-text-faint); font-size: 9px; font-variant-numeric: tabular-nums; }
++.order-password-description { margin: 14px 0 13px; color: var(--ui-text-muted); font-size: 11px; line-height: 1.55; }
++.order-password-label { margin-bottom: 7px; color: var(--ui-text-muted); font-size: 10px; font-weight: 680; }
++.order-password-control { min-width: 0; height: 42px; display: grid; grid-template-columns: 34px minmax(0, 1fr) 36px; align-items: center; color: var(--ui-text-faint); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 4px; }
++.order-password-control:focus-within { border-color: var(--ui-text-muted); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-text) 10%, transparent); }
++.order-password-control.invalid { border-color: color-mix(in srgb, var(--ui-danger) 70%, var(--ui-border)); }
++.order-password-control > svg { justify-self: center; }
++.order-password-control input { width: 100%; height: 40px; border: 0; padding: 0; color: var(--ui-text); background: transparent; outline: 0; }
++.order-password-control .icon-button { width: 30px; height: 30px; padding: 0; border: 0; background: transparent; }
++.order-password-error { min-height: 38px; margin-top: 9px; padding: 8px 10px; display: flex; align-items: flex-start; gap: 8px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 7%, var(--ui-surface)); border-left: 3px solid var(--ui-danger); font-size: 10px; line-height: 1.45; }
++.order-password-error svg { flex: 0 0 auto; margin-top: 1px; }
++.order-password-error span { min-width: 0; overflow-wrap: anywhere; }
++.order-dialog-foot { margin-top: 18px; padding-top: 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--ui-border); }
++.order-dialog-foot > span { min-width: 0; display: inline-flex; align-items: center; gap: 6px; color: var(--ui-text-faint); font-size: 9px; }
++.order-dialog-foot > div { display: flex; gap: 8px; }
++.order-dialog-foot .button { min-height: 36px; }
++
++.order-detail-modal { width: min(840px, 100%); max-height: calc(100dvh - 48px); padding: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
++.order-detail-modal > .order-dialog-head { min-height: 70px; padding: 16px 20px; border-bottom: 1px solid var(--ui-border); }
++.order-detail-scroll { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
++.order-detail-identity { min-width: 0; min-height: 76px; padding: 14px 20px; display: grid; grid-template-columns: 46px minmax(0, 1fr) auto; gap: 12px; align-items: center; background: var(--ui-surface-muted); border-bottom: 1px solid var(--ui-border); }
++.order-detail-identity .order-product-image { width: 46px; height: 46px; }
++.order-detail-identity > div { min-width: 0; }
++.order-detail-identity > div > span,
++.order-detail-identity strong,
++.order-detail-identity small { display: block; }
++.order-detail-identity > div > span { color: var(--ui-text-faint); font-size: 9px; }
++.order-detail-identity strong { margin-top: 4px; overflow: hidden; color: var(--ui-text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
++.order-detail-identity small { margin-top: 5px; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.order-detail-section { min-width: 0; padding: 18px 20px; border-bottom: 1px solid var(--ui-border); }
++.order-detail-section:last-child { border-bottom: 0; }
++.order-detail-section-head { margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
++.order-detail-section-head > div { min-width: 0; }
++.order-detail-section-head span { display: block; color: var(--ui-text-faint); font-size: 8px; font-weight: 750; }
++.order-detail-section-head h3 { margin: 4px 0 0; color: var(--ui-text); font-size: 13px; }
++.order-detail-section-actions { display: flex; align-items: center; gap: 7px; }
++.order-detail-section-actions > em { min-height: 24px; padding: 0 7px; display: inline-flex; align-items: center; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); border-radius: 3px; font-size: 9px; font-style: normal; white-space: nowrap; }
++.order-copy-all { min-height: 29px; padding-inline: 8px; font-size: 9px; white-space: nowrap; }
++.order-detail-section-head .icon-button { width: 29px; height: 29px; }
++.order-detail-facts { margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); border-left: 1px solid var(--ui-border-soft); }
++.order-detail-facts > div { min-width: 0; min-height: 55px; padding: 10px 11px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
++.order-detail-facts dt { color: var(--ui-text-faint); font-size: 9px; }
++.order-detail-facts dd { min-width: 0; min-height: 26px; margin: 4px 0 0; display: flex; align-items: center; gap: 6px; color: var(--ui-text); font-size: 11px; font-weight: 680; }
++.order-detail-facts dd > span { min-width: 0; overflow: hidden; overflow-wrap: anywhere; text-overflow: ellipsis; }
++.order-detail-facts .icon-button,
++.order-seller-contacts .icon-button,
++.order-card-list .icon-button { width: 26px; height: 26px; flex: 0 0 26px; }
++
++.order-seller-row { min-width: 0; display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 10px; align-items: center; }
++.order-seller-avatar { width: 42px; height: 42px; display: block; object-fit: cover; background: var(--ui-surface-muted); border: 1px solid var(--ui-border); border-radius: 4px; }
++.order-seller-avatar.fallback { display: grid; place-items: center; color: var(--ui-text-faint); }
++.order-seller-row > div { min-width: 0; }
++.order-seller-row strong,
++.order-seller-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.order-seller-row strong { color: var(--ui-text); font-size: 12px; }
++.order-seller-row small { margin-top: 5px; color: var(--ui-text-muted); font-size: 9px; }
++.order-seller-contacts { margin: 13px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); border-left: 1px solid var(--ui-border-soft); }
++.order-seller-contacts > div { min-width: 0; padding: 9px 10px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
++.order-seller-contacts dt { color: var(--ui-text-faint); font-size: 8px; }
++.order-seller-contacts dd { min-width: 0; margin: 4px 0 0; display: flex; align-items: center; gap: 5px; }
++.order-seller-contacts dd > span { min-width: 0; flex: 1; overflow: hidden; color: var(--ui-text); font-size: 10px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
++.order-detail-rich-text { margin: 0; overflow-wrap: anywhere; color: var(--ui-text-muted); font-size: 11px; line-height: 1.65; white-space: pre-wrap; }
++.order-detail-rich-text.delivery-content { padding: 12px; color: var(--ui-text); background: var(--ui-surface-muted); border-left: 3px solid var(--ui-border); }
++.order-detail-links { margin-top: 11px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
++.order-detail-links:first-child { margin-top: 0; }
++.order-detail-links a { min-width: 0; min-height: 36px; padding: 0 10px; display: grid; grid-template-columns: 16px minmax(0, 1fr) 14px; gap: 7px; align-items: center; color: var(--ui-text-muted); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 4px; font-size: 10px; text-decoration: none; }
++.order-detail-links a:hover { color: var(--ui-text); border-color: var(--ui-text-faint); }
++.order-detail-links a span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.order-delivery-message { min-height: 38px; margin-bottom: 11px; padding: 8px 10px; display: flex; align-items: flex-start; gap: 8px; color: var(--ui-text-muted); background: color-mix(in srgb, var(--ui-success) 7%, var(--ui-surface)); border-left: 3px solid color-mix(in srgb, var(--ui-success) 65%, var(--ui-border)); font-size: 10px; line-height: 1.5; }
++.order-delivery-message svg { flex: 0 0 auto; margin-top: 1px; color: var(--ui-success); }
++.order-delivery-message span { min-width: 0; overflow-wrap: anywhere; }
++.order-card-list { border-top: 1px solid var(--ui-border-soft); }
++.order-card-list > div { min-width: 0; min-height: 45px; padding: 8px 8px 8px 10px; display: grid; grid-template-columns: 58px minmax(0, 1fr) 26px; gap: 8px; align-items: center; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); border-left: 1px solid var(--ui-border-soft); }
++.order-card-list span { color: var(--ui-text-faint); font-size: 9px; }
++.order-card-list code { min-width: 0; overflow-wrap: anywhere; color: var(--ui-text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; }
++.order-detail-empty { min-height: 118px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; color: var(--ui-text-faint); text-align: center; }
++.order-detail-empty strong { color: var(--ui-text-muted); font-size: 11px; }
++.order-detail-empty span { max-width: 360px; font-size: 9px; line-height: 1.5; }
++.order-detail-truncated { min-height: 34px; margin-top: 10px; padding: 7px 9px; display: flex; align-items: center; gap: 7px; color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 8%, var(--ui-surface)); border-left: 3px solid var(--ui-warning); font-size: 9px; }
++.order-detail-foot { min-height: 62px; margin: 0; padding: 12px 20px; background: var(--ui-surface); }
++.order-detail-foot > .button { min-width: 82px; }
++
+ @media (max-width: 1100px) {
+   .order-query-console { grid-template-columns: 1fr; }
+   .order-verification { border-top: 1px solid var(--ui-border); border-left: 0; }
+@@ -231,6 +330,25 @@
+   .order-number strong { flex: 0 1 auto; }
+   .order-row-actions { flex-wrap: wrap; }
+   .order-result-link { min-height: 32px; }
++  .order-detail-backdrop { padding: 10px; }
++  .order-password-modal { max-height: calc(100dvh - 20px); padding: 18px; overflow-y: auto; }
++  .order-detail-modal { max-height: calc(100dvh - 20px); }
++  .order-detail-modal > .order-dialog-head { min-height: 62px; padding: 13px 14px; }
++  .order-detail-identity { min-height: 70px; padding: 12px 14px; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 9px; }
++  .order-detail-identity .order-product-image { width: 42px; height: 42px; }
++  .order-detail-section { padding: 15px 14px; }
++  .order-detail-facts { grid-template-columns: 1fr; }
++  .order-seller-contacts { grid-template-columns: 1fr; }
++  .order-detail-links { grid-template-columns: 1fr; }
++  .order-detail-section-actions { align-items: flex-end; flex-direction: column; }
++  .order-dialog-foot { align-items: flex-start; flex-direction: column; }
++  .order-dialog-foot > div,
++  .order-dialog-foot > div .button { width: 100%; }
++  .order-detail-foot { min-height: 62px; padding: 10px 14px; align-items: center; flex-direction: row; }
++  .order-detail-foot .button { width: auto; margin-left: auto; }
++  .order-password-context { grid-template-columns: 38px minmax(0, 1fr); }
++  .order-password-context > .order-status { grid-column: 2; }
++  .order-card-list > div { grid-template-columns: 52px minmax(0, 1fr) 26px; gap: 6px; }
+   .order-empty-state { min-height: 190px; padding: 18px; }
+   .order-pagination { align-items: flex-start; }
+   .order-pagination > span { max-width: 210px; line-height: 1.5; }
+diff --git a/frontend/src/orderQueryModel.js b/frontend/src/orderQueryModel.js
+index 0ab72e1..f5de15b 100644
+--- a/frontend/src/orderQueryModel.js
++++ b/frontend/src/orderQueryModel.js
+@@ -46,6 +46,11 @@ export function orderGoodsActionLabel(value) {
+   return GOODS_ACTION_LABELS[String(value || '').toLowerCase()] || '查看订单';
  }
  
- .automation-console > .automation-head { min-height: 82px; padding: 14px 18px; }
--.sub2api-view .automation-head h2 { font-size: 19px; }
--.sub2api-view .automation-head p { margin-top: 6px; font-size: 12px; }
-+.sub2api-view .automation-head h2 { font-size: 21px; }
-+.sub2api-view .automation-head p { margin-top: 6px; font-size: 13px; }
- .automation-head-actions { gap: 9px; }
- .automation-head-actions .button { min-height: 38px; }
--.sub2api-view .automation-readiness { min-height: 36px; padding: 7px 10px; font-size: 12px; }
-+.sub2api-view .automation-readiness { min-height: 40px; padding: 8px 11px; font-size: 13px; }
- .automation-metrics > div { min-height: 88px; padding: 13px 15px; }
--.automation-metrics span { font-size: 11px; }
-+.automation-metrics span { font-size: 12px; }
- .automation-metrics strong { margin-top: 7px; font-size: 24px; }
--.automation-metrics small { margin-top: 6px; font-size: 11px; }
-+.automation-metrics small { margin-top: 6px; font-size: 12px; }
++export function canOpenProtectedOrderDetail(order = {}) {
++  const passwordRequired = order.need_query_password === true || Number(order.need_query_password) === 1;
++  return Number(order.status) === 1 && passwordRequired && Boolean(String(order.trade_no || '').trim());
++}
++
+ export function formatOrderMoney(value) {
+   if (value === null || value === undefined || value === '') return '--';
+   const number = Number(value);
+@@ -82,6 +87,131 @@ export function safeOfficialOrderUrl(value, fallbackPath = '/order') {
+   }
+ }
  
- .automation-setting-card { padding: 18px; }
- .automation-card-head { min-height: 42px; grid-template-columns: 25px minmax(0, 1fr) auto; gap: 9px; }
--.automation-card-head strong { font-size: 14px; }
--.automation-card-head small { margin-top: 4px; font-size: 11px; }
-+.automation-card-head strong { font-size: 15px; }
-+.automation-card-head small { margin-top: 4px; font-size: 12px; }
- .automation-card-head .icon-button { width: 34px; height: 34px; }
- .automation-toggle-row, .automation-check-row { min-height: 60px; margin-top: 11px; padding: 10px 0; }
--.automation-toggle-row strong, .automation-check-row strong { font-size: 13px; }
--.automation-toggle-row small, .automation-check-row small { margin-top: 4px; font-size: 11px; }
-+.automation-toggle-row strong, .automation-check-row strong { font-size: 14px; }
-+.automation-toggle-row small, .automation-check-row small { margin-top: 4px; font-size: 12px; }
- .automation-check-row { margin-top: 0; }
- .automation-check-row > input { width: 18px; height: 18px; }
- .automation-setting-card .automation-interval { margin-top: 10px; }
--.automation-setting-card .automation-interval > span { margin-bottom: 7px; font-size: 11px; }
-+.automation-setting-card .automation-interval > span { margin-bottom: 7px; font-size: 12px; }
- .interval-presets { margin-top: 9px; gap: 6px; }
--.interval-presets button { height: 34px; padding-inline: 5px; font-size: 11px; }
-+.interval-presets button { height: 36px; padding-inline: 5px; font-size: 12px; }
- .automation-readiness-grid { margin-top: 12px; }
--.automation-readiness-grid > span { min-height: 39px; padding: 8px 9px; gap: 6px; font-size: 11px; }
-+.automation-readiness-grid > span { min-height: 42px; padding: 9px 10px; gap: 6px; font-size: 12px; }
++export function safeOrderContentUrl(value) {
++  try {
++    const url = new URL(String(value || ''));
++    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
++    return url.href;
++  } catch {
++    return '';
++  }
++}
++
++function plainText(value, fallback = '') {
++  if (typeof value === 'string') return value.trim();
++  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
++  return fallback;
++}
++
++function optionalNumber(value) {
++  if (value === null || value === undefined || value === '') return null;
++  const number = Number(value);
++  return Number.isFinite(number) ? number : null;
++}
++
++function normalizeDetailLinks(value) {
++  if (!Array.isArray(value)) return [];
++  return value.flatMap((entry, index) => {
++    if (!entry || typeof entry !== 'object') return [];
++    const url = safeOrderContentUrl(entry.url);
++    if (!url) return [];
++    return [{label: plainText(entry.label, `链接 ${index + 1}`), url}];
++  });
++}
++
++export function orderDeliveryKindLabel(value) {
++  const labels = {
++    card: '卡密信息',
++    article: '文章内容',
++    resource: '资源信息',
++    equity: '权益信息',
++  };
++  return labels[String(value || '').toLowerCase()] || '交付内容';
++}
++
++export function formatOrderCardsForCopy(cards = []) {
++  if (!Array.isArray(cards)) return '';
++  return cards.filter(value => typeof value === 'string' && value.trim()).join('\n');
++}
++
++export function orderDetailErrorState(error = {}) {
++  const sessionExpired = Number(error?.status) === 410;
++  const message = plainText(error?.message);
++  return {
++    sessionExpired,
++    message: sessionExpired
++      ? '订单查询会话已失效，请重新查询订单后再验证'
++      : message || '订单详情读取失败，请重试',
++  };
++}
++
++export function normalizeOrderDetail(payload = {}, fallback = {}) {
++  const source = payload?.detail && typeof payload.detail === 'object' ? payload.detail : payload;
++  const safeSource = source && typeof source === 'object' ? source : {};
++  const safeFallback = fallback && typeof fallback === 'object' ? fallback : {};
++  const status = orderStatusMeta(
++    safeSource.status ?? safeFallback.status,
++    safeSource.status_label || safeFallback.status_label,
++  );
++  const goodsType = plainText(safeSource.goods_type || safeFallback.goods_type).toLowerCase();
++  const sellerSource = safeSource.seller && typeof safeSource.seller === 'object' ? safeSource.seller : {};
++  const instructionSource = safeSource.instructions && typeof safeSource.instructions === 'object'
++    ? safeSource.instructions
++    : {};
++  const legacyEquity = safeSource.equity && typeof safeSource.equity === 'object' ? safeSource.equity : {};
++  const deliverySource = safeSource.delivery && typeof safeSource.delivery === 'object'
++    ? safeSource.delivery
++    : {
++        kind: goodsType,
++        cards: safeSource.cards,
++        api_status: legacyEquity.status,
++        message: legacyEquity.message,
++        content: legacyEquity.content,
++      };
++  const cards = Array.isArray(deliverySource.cards)
++    ? deliverySource.cards.filter(value => typeof value === 'string' && value.trim())
++    : [];
++  const sendout = optionalNumber(safeSource.sendout);
++
++  return {
++    trade_no: plainText(safeSource.trade_no || safeFallback.trade_no),
++    goods_name: plainText(safeSource.goods_name || safeFallback.goods_name, '未命名商品'),
++    goods_type: goodsType,
++    goods_type_label: orderGoodsTypeLabel(goodsType),
++    status: status.key,
++    status_label: status.label,
++    status_tone: status.tone,
++    total_amount: safeSource.total_amount ?? safeFallback.total_amount ?? null,
++    quantity: Math.max(0, finiteNumber(safeSource.quantity ?? safeFallback.quantity, 0)),
++    created_at: safeSource.created_at ?? safeSource.create_time ?? safeFallback.created_at ?? null,
++    success_at: safeSource.success_at ?? safeSource.paid_at ?? safeSource.success_time ?? null,
++    sendout: sendout === null ? null : Math.max(0, Math.trunc(sendout)),
++    contact: plainText(safeSource.contact),
++    can_complaint: safeSource.can_complaint === true || Number(safeSource.can_complaint) === 1,
++    seller: {
++      nickname: plainText(sellerSource.nickname),
++      avatar: safeOrderContentUrl(sellerSource.avatar),
++      shop_url: safeOrderContentUrl(sellerSource.shop_url),
++      contact_qq: plainText(sellerSource.contact_qq ?? sellerSource.qq),
++      contact_mobile: plainText(sellerSource.contact_mobile ?? sellerSource.mobile),
++      contact_wechat: plainText(sellerSource.contact_wechat ?? sellerSource.wechat),
++    },
++    instructions: {
++      text: plainText(instructionSource.text, plainText(safeSource.instructions)),
++      links: normalizeDetailLinks(instructionSource.links),
++    },
++    delivery: {
++      kind: plainText(deliverySource.kind, goodsType).toLowerCase(),
++      cards,
++      api_status: optionalNumber(deliverySource.api_status),
++      message: plainText(deliverySource.message),
++      content: plainText(deliverySource.content),
++      links: normalizeDetailLinks(deliverySource.links),
++      truncated: deliverySource.truncated === true || Number(deliverySource.truncated) === 1,
++    },
++  };
++}
++
+ export function normalizeOrder(raw = {}) {
+   const status = orderStatusMeta(raw.status, raw.status_label);
+   const goodsType = String(raw.goods_type || raw.goods?.goods_type || '').toLowerCase();
+diff --git a/frontend/src/orderQueryModel.test.js b/frontend/src/orderQueryModel.test.js
+index d8c751c..d401faa 100644
+--- a/frontend/src/orderQueryModel.test.js
++++ b/frontend/src/orderQueryModel.test.js
+@@ -1,13 +1,19 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import {
++  canOpenProtectedOrderDetail,
+   formatOrderDateTime,
++  formatOrderCardsForCopy,
+   formatOrderMoney,
+   normalizeOrder,
++  normalizeOrderDetail,
+   normalizeOrderResponse,
++  orderDeliveryKindLabel,
++  orderDetailErrorState,
+   orderQueryContextChanged,
+   orderGoodsActionLabel,
+   orderStatusMeta,
++  safeOrderContentUrl,
+   safeOfficialOrderUrl,
+   summarizeOrders,
+   verificationLabel,
+@@ -33,6 +39,9 @@ test('normalizes upstream order fields and status labels', () => {
+   assert.equal(order.quantity, 2);
+   assert.equal(order.need_query_password, true);
+   assert.equal(order.detail_url, 'https://pay.ldxp.cn/order/info/LD-1001');
++  assert.equal(canOpenProtectedOrderDetail(order), true);
++  assert.equal(canOpenProtectedOrderDetail({...order, status: 0}), false);
++  assert.equal(canOpenProtectedOrderDetail({...order, need_query_password: false}), false);
+ });
  
- .assignment-card > label { margin-top: 11px; }
--.assignment-card > label > span, .fingerprint-field > span { margin-bottom: 7px; font-size: 11px; }
--.selected-proxy-meta { min-height: 34px; padding: 7px 9px; font-size: 10px; }
-+.assignment-card > label > span, .fingerprint-field > span { margin-bottom: 7px; font-size: 12px; }
-+.selected-proxy-meta { min-height: 36px; padding: 8px 10px; font-size: 12px; }
- .fingerprint-field { margin-top: 11px; }
- .fingerprint-segment { height: 40px; padding: 3px; }
--.sub2api-view .fingerprint-segment button { font-size: 11px; }
-+.sub2api-view .fingerprint-segment button { font-size: 12px; }
- .automation-group-picker { margin-top: 11px; }
- .automation-group-picker > .group-picker-head { min-height: 32px; }
--.group-picker-head > span { font-size: 11px; }
--.group-picker-head button { height: 30px; padding-inline: 8px; font-size: 10px; }
-+.group-picker-head > span { font-size: 12px; }
-+.group-picker-head button { height: 32px; padding-inline: 9px; font-size: 12px; }
- .automation-group-picker > div:last-child { max-height: 145px; }
--.automation-group-picker label { min-height: 48px; padding: 8px 4px; gap: 9px; }
-+.automation-group-picker label { min-height: 52px; padding: 9px 4px; gap: 9px; }
- .automation-group-picker input { width: 17px; height: 17px; }
--.automation-group-picker label strong { font-size: 12px; }
--.automation-group-picker label small { margin-top: 4px; font-size: 10px; }
-+.automation-group-picker label strong { font-size: 13px; }
-+.automation-group-picker label small { margin-top: 4px; font-size: 12px; }
- 
- .runtime-state { min-height: 46px; margin-top: 11px; padding: 10px 11px; gap: 8px; }
--.runtime-state strong { font-size: 12px; }
-+.runtime-state strong { font-size: 13px; }
- .runtime-dot { width: 8px; height: 8px; }
- .runtime-details { margin-top: 10px; }
- .runtime-details > div { min-height: 52px; padding: 9px 10px; }
--.runtime-details dt { font-size: 10px; }
--.runtime-details dd { margin-top: 5px; font-size: 12px; }
--.runtime-error { margin-top: 10px; padding: 9px 10px; font-size: 11px; }
-+.runtime-details dt { font-size: 12px; }
-+.runtime-details dd { margin-top: 5px; font-size: 14px; }
-+.runtime-error { margin-top: 10px; padding: 9px 10px; font-size: 12px; }
- .platform-health { margin-top: 11px; }
--.platform-health > span { margin-bottom: 7px; font-size: 11px; }
-+.platform-health > span { margin-bottom: 7px; font-size: 12px; }
- .platform-health > div { min-height: 27px; grid-template-columns: 68px minmax(45px, 1fr) 78px; gap: 8px; }
--.platform-health strong, .platform-health em { font-size: 10px; }
--.platform-health > small { font-size: 11px; }
-+.platform-health strong, .platform-health em { font-size: 12px; }
-+.platform-health > small { font-size: 12px; }
- 
- .automation-activity-panel { padding: 15px 18px 16px; }
- .activity-panel-head { min-height: 38px; }
--.activity-panel-head h3 { font-size: 14px; }
--.activity-panel-head > span { font-size: 11px; }
-+.activity-panel-head h3 { font-size: 15px; }
-+.activity-panel-head > span { font-size: 12px; }
- .automation-run-list, .account-alert-list { margin-top: 8px; }
- .automation-run-list > div { min-height: 44px; padding: 8px 5px; grid-template-columns: 128px 90px minmax(0, 1fr); gap: 10px; }
--.automation-run-list span, .automation-run-list strong, .automation-run-list small { font-size: 11px; }
-+.automation-run-list span, .automation-run-list strong, .automation-run-list small { font-size: 12px; }
- .account-alert-list > div { min-height: 48px; padding: 8px 5px; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 9px; }
--.account-alert-list strong { font-size: 12px; }
--.account-alert-list small, .account-alert-list em { font-size: 10px; }
--.automation-run-list .compact-empty, .account-alert-list .compact-empty { min-height: 64px; font-size: 11px; }
-+.account-alert-list strong { font-size: 13px; }
-+.account-alert-list small, .account-alert-list em { font-size: 12px; }
-+.automation-run-list .compact-empty, .account-alert-list .compact-empty { min-height: 64px; font-size: 12px; }
- 
- @media (max-width: 1200px) {
-   .sub2api-primary-grid { grid-template-columns: 1fr; }
+ test('normalizes pagination and computes current page summary', () => {
+@@ -68,3 +77,109 @@ test('detects result context changes that would make preserved rows stale', () =
+   assert.equal(orderQueryContextChanged(current, {...current, pageSize: 20}), true);
+   assert.equal(orderQueryContextChanged(current, {...current, keywords: 'other'}), true);
+ });
++
++test('normalizes password-protected order detail with delivery and seller fields', () => {
++  const detail = normalizeOrderDetail({
++    detail: {
++      trade_no: 'LD-DETAIL-1',
++      goods_name: '测试卡密',
++      goods_type: 'card',
++      status: 1,
++      status_label: '交易成功',
++      total_amount: 28.8,
++      quantity: 2,
++      created_at: 1_788_000_000,
++      success_at: 1_788_000_120,
++      sendout: 1,
++      contact: 'buyer@example.test',
++      can_complaint: 1,
++      seller: {
++        nickname: '测试店铺',
++        avatar: 'https://cdn.example.test/avatar.png',
++        shop_url: 'https://pay.ldxp.cn/shop/TEST',
++        contact_qq: '12345',
++      },
++      instructions: {
++        text: '请妥善保管卡密',
++        links: [{label: '使用说明', url: 'https://docs.example.test/use'}],
++      },
++      delivery: {
++        kind: 'card',
++        cards: ['CARD-A', 'CARD-B'],
++        api_status: 1,
++        message: '发货完成',
++        links: [{label: '导出卡密', url: 'https://pay.ldxp.cn/export/cards'}],
++        truncated: true,
++      },
++      query_password: 'must-not-leak',
++      internal_ticket: 'must-not-leak',
++    },
++  });
++
++  assert.equal(detail.status_label, '交易成功');
++  assert.equal(detail.status_tone, 'success');
++  assert.equal(detail.goods_type_label, '卡密商品');
++  assert.equal(detail.sendout, 1);
++  assert.deepEqual(detail.delivery.cards, ['CARD-A', 'CARD-B']);
++  assert.equal(detail.delivery.links[0].url, 'https://pay.ldxp.cn/export/cards');
++  assert.equal(detail.seller.contact_qq, '12345');
++  assert.equal(detail.instructions.links[0].label, '使用说明');
++  assert.equal(detail.delivery.truncated, true);
++  assert.equal('query_password' in detail, false);
++  assert.doesNotMatch(JSON.stringify(detail), /must-not-leak/);
++});
++
++test('filters unsafe detail links and uses stable fallbacks', () => {
++  const detail = normalizeOrderDetail({
++    goods_type: 'resource',
++    seller: {avatar: 'javascript:alert(1)', shop_url: 'https://example.test/shop'},
++    instructions: {links: [{label: 'bad', url: 'data:text/html,bad'}]},
++    delivery: {
++      cards: ['  ', null, 'RESOURCE-CODE'],
++      api_status: 'not-a-number',
++      links: [{label: 'download', url: 'ftp://example.test/file'}],
++    },
++  }, {trade_no: 'FALLBACK-1', goods_name: '备用商品', status: 0, quantity: 1});
++
++  assert.equal(detail.trade_no, 'FALLBACK-1');
++  assert.equal(detail.goods_name, '备用商品');
++  assert.equal(detail.status_label, '待付款');
++  assert.equal(detail.seller.avatar, '');
++  assert.equal(detail.seller.shop_url, 'https://example.test/shop');
++  assert.deepEqual(detail.instructions.links, []);
++  assert.deepEqual(detail.delivery.cards, ['RESOURCE-CODE']);
++  assert.equal(detail.delivery.api_status, null);
++  assert.deepEqual(detail.delivery.links, []);
++  assert.equal(orderDeliveryKindLabel(detail.delivery.kind), '资源信息');
++});
++
++test('allows only credential-free HTTP detail URLs', () => {
++  assert.equal(safeOrderContentUrl('https://example.test/path'), 'https://example.test/path');
++  assert.equal(safeOrderContentUrl('http://example.test/path'), 'http://example.test/path');
++  assert.equal(safeOrderContentUrl('https://user:pass@example.test/path'), '');
++  assert.equal(safeOrderContentUrl('javascript:alert(1)'), '');
++});
++
++test('formats one or many delivered cards for a single clipboard write', () => {
++  assert.equal(formatOrderCardsForCopy(['CARD-A']), 'CARD-A');
++  assert.equal(formatOrderCardsForCopy(['CARD-A', 'CARD-B']), 'CARD-A\nCARD-B');
++  assert.equal(formatOrderCardsForCopy(['', null, 'CARD-C']), 'CARD-C');
++  assert.equal(formatOrderCardsForCopy(['  CARD-A\n']), '  CARD-A\n');
++});
++
++test('preserves delivered card bytes and classifies an expired detail session', () => {
++  const detail = normalizeOrderDetail({delivery: {kind: 'card', cards: ['  CARD-A\n', '   ']}});
++  assert.deepEqual(detail.delivery.cards, ['  CARD-A\n']);
++  assert.deepEqual(orderDetailErrorState({status: 410, message: 'expired'}), {
++    sessionExpired: true,
++    message: '订单查询会话已失效，请重新查询订单后再验证',
++  });
++  assert.deepEqual(orderDetailErrorState({status: 403, message: '安全密码错误'}), {
++    sessionExpired: false,
++    message: '安全密码错误',
++  });
++  assert.deepEqual(orderDetailErrorState({status: 502, message: ''}), {
++    sessionExpired: false,
++    message: '订单详情读取失败，请重试',
++  });
++});
