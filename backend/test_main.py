@@ -1371,9 +1371,22 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertEqual(result["stats"]["error_count"], 1)
                 self.assertEqual(result["stats"]["in_stock_count"], 1)
                 self.assertEqual(result["stats"]["out_stock_count"], 1)
-                self.assertEqual(result["stats"]["unknown_stock_count"], 1)
+                self.assertEqual(result["stats"]["unknown_stock_count"], 0)
                 self.assertEqual(result["stats"]["min_price"], "4.50")
                 self.assertEqual(result["stats"]["max_price"], "5.00")
+                self.assertEqual(result["stats"]["first_price"], "5.00")
+                self.assertEqual(result["stats"]["latest_price"], "4.50")
+                self.assertEqual(result["stats"]["previous_price"], "5.00")
+                self.assertEqual(result["stats"]["price_change"], "-0.50")
+                self.assertEqual(result["stats"]["price_change_percent"], -10.0)
+                self.assertEqual(result["stats"]["latest_change_percent"], -10.0)
+                self.assertEqual(result["stats"]["volatility_percent"], 5.26)
+                self.assertEqual(result["stats"]["price_change_count"], 1)
+                self.assertEqual(result["stats"]["restock_count"], 0)
+                self.assertEqual(result["stats"]["sold_out_count"], 1)
+                self.assertEqual(result["stats"]["availability_rate"], 50.0)
+                self.assertEqual(result["stats"]["first_at"], "2026-08-01T10:00:00")
+                self.assertEqual(result["stats"]["latest_at"], "2026-08-02T10:00:00")
 
                 status, payload = self.request_api(
                     "GET",
@@ -1384,6 +1397,42 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertEqual(payload["total"], 1)
                 self.assertEqual(payload["items"][0]["stock"], 0)
                 self.assertEqual(payload["trend"][0]["price"], "4.50")
+
+    def test_price_history_tracks_price_and_inventory_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = connection.execute(
+                        "INSERT INTO watches(url, name, enabled) VALUES(?, ?, 1)",
+                        ("https://pay.ldxp.cn/item/history-events", "价格事件测试"),
+                    ).lastrowid
+                    rows = [
+                        ("2026-08-01T10:00:00", "10.00", "0"),
+                        ("2026-08-02T10:00:00", "12.00", "4"),
+                        ("2026-08-03T10:00:00", "12.00", None),
+                        ("2026-08-04T10:00:00", "9.00", "0"),
+                        ("2026-08-05T10:00:00", "9.00", "7"),
+                    ]
+                    connection.executemany(
+                        """
+                        INSERT INTO snapshots(watch_id, title, price, stock, sale_status, fetched_at, status)
+                        VALUES(?, '价格事件测试', ?, ?, 'on_sale', ?, 'success')
+                        """,
+                        [(watch_id, price, stock, fetched_at) for fetched_at, price, stock in rows],
+                    )
+
+                result = main.price_history(watch_id, limit=25)
+                self.assertEqual(result["stats"]["price_change_count"], 2)
+                self.assertEqual(result["stats"]["restock_count"], 2)
+                self.assertEqual(result["stats"]["sold_out_count"], 1)
+                self.assertEqual(result["stats"]["availability_rate"], 50.0)
+                self.assertEqual(result["stats"]["unknown_stock_count"], 1)
+                self.assertEqual(result["stats"]["price_change"], "-1.00")
+                self.assertEqual(result["stats"]["price_change_percent"], -10.0)
+                self.assertEqual(result["stats"]["latest_change"], "0.00")
+                self.assertEqual(len(result["trend"]), 5)
 
     def test_price_history_rejects_invalid_pagination(self):
         status, payload = self.request_api("GET", "/api/watches/1/history?limit=invalid", {})

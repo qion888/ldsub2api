@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import base64
 import json
+import math
 import os
 import re
 import sqlite3
@@ -2479,13 +2480,9 @@ def price_history(
             SELECT
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
                 SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
-                COUNT(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN 1 END) AS quoted_count,
-                MIN(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN CAST(price AS REAL) END) AS min_price,
-                MAX(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN CAST(price AS REAL) END) AS max_price,
-                AVG(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN CAST(price AS REAL) END) AS average_price,
-                SUM(CASE WHEN {numeric_stock} AND CAST(stock AS INTEGER) > 0 THEN 1 ELSE 0 END) AS in_stock_count,
-                SUM(CASE WHEN {numeric_stock} AND CAST(stock AS INTEGER) <= 0 THEN 1 ELSE 0 END) AS out_stock_count,
-                SUM(CASE WHEN NOT ({numeric_stock}) THEN 1 ELSE 0 END) AS unknown_stock_count
+                SUM(CASE WHEN status = 'success' AND {numeric_stock} AND CAST(stock AS INTEGER) > 0 THEN 1 ELSE 0 END) AS in_stock_count,
+                SUM(CASE WHEN status = 'success' AND {numeric_stock} AND CAST(stock AS INTEGER) <= 0 THEN 1 ELSE 0 END) AS out_stock_count,
+                SUM(CASE WHEN status = 'success' AND NOT ({numeric_stock}) THEN 1 ELSE 0 END) AS unknown_stock_count
             FROM snapshots WHERE {where_sql}
             """,
             params,
@@ -2503,8 +2500,16 @@ def price_history(
             SELECT id, price, stock, sale_status, fetched_at, status, error FROM (
                 SELECT id, price, stock, sale_status, fetched_at, status, error
                 FROM snapshots WHERE {where_sql} AND status = 'success'
-                ORDER BY id DESC LIMIT 240
-            ) ORDER BY id ASC
+                ORDER BY fetched_at DESC, id DESC LIMIT 720
+            ) ORDER BY fetched_at ASC, id ASC
+            """,
+            params,
+        ).fetchall()
+        analysis_rows = connection.execute(
+            f"""
+            SELECT id, price, stock, fetched_at
+            FROM snapshots WHERE {where_sql} AND status = 'success'
+            ORDER BY fetched_at ASC, id ASC
             """,
             params,
         ).fetchall()
@@ -2516,16 +2521,77 @@ def price_history(
         result["stock_label"] = str(raw_stock) if raw_stock not in (None, "") else "接口未公开数量"
         return result
 
+    price_points: list[tuple[float, str]] = []
+    stock_points: list[int] = []
+    price_change_count = 0
+    restock_count = 0
+    sold_out_count = 0
+    previous_price_value: float | None = None
+    previous_stock_value: int | None = None
+    for row in analysis_rows:
+        try:
+            price_value = float(row["price"])
+        except (TypeError, ValueError):
+            price_value = None
+        if price_value is not None and not math.isfinite(price_value):
+            price_value = None
+        if price_value is not None:
+            if previous_price_value is not None and price_value != previous_price_value:
+                price_change_count += 1
+            price_points.append((price_value, row["fetched_at"]))
+            previous_price_value = price_value
+
+        raw_stock = row["stock"]
+        stock_value = int(raw_stock) if str(raw_stock or "").isdigit() else None
+        if stock_value is not None:
+            if previous_stock_value is not None:
+                if previous_stock_value <= 0 < stock_value:
+                    restock_count += 1
+                elif previous_stock_value > 0 >= stock_value:
+                    sold_out_count += 1
+            stock_points.append(stock_value)
+            previous_stock_value = stock_value
+
+    prices = [point[0] for point in price_points]
+    first_price = prices[0] if prices else None
+    latest_price = prices[-1] if prices else None
+    previous_price = prices[-2] if len(prices) > 1 else None
+    price_change = latest_price - first_price if latest_price is not None and first_price is not None else None
+    latest_change = latest_price - previous_price if latest_price is not None and previous_price is not None else None
+    average_price = sum(prices) / len(prices) if prices else None
+    variance = sum((value - average_price) ** 2 for value in prices) / len(prices) if prices else None
+    volatility_percent = ((variance ** 0.5) / average_price * 100) if variance is not None and average_price else None
+    numeric_stock_count = len(stock_points)
+    in_stock_count = sum(1 for value in stock_points if value > 0)
+    min_point = min(price_points, key=lambda point: point[0]) if price_points else None
+    max_point = max(price_points, key=lambda point: point[0]) if price_points else None
+
     stats = {
         "success_count": int(stats_row["success_count"] or 0),
         "error_count": int(stats_row["error_count"] or 0),
-        "quoted_count": int(stats_row["quoted_count"] or 0),
-        "min_price": _money(stats_row["min_price"]) if stats_row["min_price"] is not None else None,
-        "max_price": _money(stats_row["max_price"]) if stats_row["max_price"] is not None else None,
-        "average_price": _money(stats_row["average_price"]) if stats_row["average_price"] is not None else None,
+        "quoted_count": len(prices),
+        "min_price": _money(min_point[0]) if min_point else None,
+        "max_price": _money(max_point[0]) if max_point else None,
+        "average_price": _money(average_price) if average_price is not None else None,
         "in_stock_count": int(stats_row["in_stock_count"] or 0),
         "out_stock_count": int(stats_row["out_stock_count"] or 0),
         "unknown_stock_count": int(stats_row["unknown_stock_count"] or 0),
+        "first_price": _money(first_price) if first_price is not None else None,
+        "latest_price": _money(latest_price) if latest_price is not None else None,
+        "previous_price": _money(previous_price) if previous_price is not None else None,
+        "price_change": _money(price_change) if price_change is not None else None,
+        "price_change_percent": round(price_change / first_price * 100, 2) if price_change is not None and first_price else None,
+        "latest_change": _money(latest_change) if latest_change is not None else None,
+        "latest_change_percent": round(latest_change / previous_price * 100, 2) if latest_change is not None and previous_price else None,
+        "volatility_percent": round(volatility_percent, 2) if volatility_percent is not None else None,
+        "price_change_count": price_change_count,
+        "restock_count": restock_count,
+        "sold_out_count": sold_out_count,
+        "availability_rate": round(in_stock_count / numeric_stock_count * 100, 2) if numeric_stock_count else None,
+        "first_at": price_points[0][1] if price_points else None,
+        "latest_at": price_points[-1][1] if price_points else None,
+        "min_price_at": min_point[1] if min_point else None,
+        "max_price_at": max_point[1] if max_point else None,
     }
     return {
         "items": [serialize_history_row(row) for row in rows],

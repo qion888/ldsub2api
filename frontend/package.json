@@ -8,6 +8,7 @@
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
+    "recharts": "^3.10.1",
     "typescript": "latest",
     "vite": "latest"
   },
