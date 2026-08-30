@@ -1,0 +1,301 @@
+diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
+index 3be38c7..f270a3c 100644
+--- a/frontend/src/Sub2ApiView.jsx
++++ b/frontend/src/Sub2ApiView.jsx
+@@ -207,18 +207,23 @@ function Sub2ApiUsageWindow({label, window, tone, testId}) {
+       : formatSub2ApiCompactNumber(requests)
+     : null;
+   const detailItems = [
+-    requestValue && {label: '请求', value: requestValue},
+-    hasNumber(stats.tokens) && {label: 'Token', value: formatSub2ApiCompactNumber(stats.tokens)},
+-    hasNumber(stats.cost) && {label: '账号费用', value: `$${Number(stats.cost).toFixed(2)}`},
+-    hasNumber(stats.user_cost) && {label: '用户费用', value: `$${Number(stats.user_cost).toFixed(2)}`},
++    requestValue && {key: 'requests', label: '请求', fullLabel: '请求数', value: requestValue},
++    hasNumber(stats.tokens) && {key: 'tokens', label: 'Token', fullLabel: 'Token 数', value: formatSub2ApiCompactNumber(stats.tokens)},
++    hasNumber(stats.cost) && {key: 'account-cost', label: '账号费', fullLabel: '账号费用', value: `$${Number(stats.cost).toFixed(2)}`},
++    hasNumber(stats.user_cost) && {key: 'user-cost', label: '用户费', fullLabel: '用户费用', value: `$${Number(stats.user_cost).toFixed(2)}`},
+   ].filter(Boolean);
+   const resetsAt = window?.resets_at ?? window?.reset_at;
+   const hasWindowData = hasPercent || detailItems.length > 0 || Boolean(resetsAt);
+   const resetLabel = formatSub2ApiResetCountdown(resetsAt, window?.remaining_seconds);
+   const exactResetLabel = resetsAt ? `准确重置时间：${formatSub2ApiDateTime(resetsAt)}` : resetLabel;
+-  return <section className={`account-usage-window ${tone} ${state}`} data-testid={testId}>
++  const stateLabel = !hasPercent ? '未知' : state === 'danger' ? '已满' : state === 'warning' ? '预警' : '正常';
++  const stateTone = hasPercent ? state : 'unknown';
++  return <section className={`account-usage-window ${tone} ${stateTone}`} data-testid={testId}>
+     <div className="account-usage-window-head">
+-      <span><Clock3 size={15}/><strong>{label}</strong></span>
++      <div className="account-usage-window-title">
++        <span className={`account-usage-window-tag ${tone}`}><Clock3 size={15}/><strong>{label}</strong></span>
++        <span className={`account-usage-state-tag ${stateTone}`}>{stateLabel}</span>
++      </div>
+       <strong className="account-usage-percent">{hasPercent ? `${displayPercent.toFixed(1)}%` : '--'}</strong>
+     </div>
+     {hasWindowData ? <>
+@@ -232,11 +237,15 @@ function Sub2ApiUsageWindow({label, window, tone, testId}) {
+         aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '暂无使用率'}
+       ><span style={{width: `${meterPercent}%`}}/></div>
+       <div className="account-usage-footnote">
+-        <Tooltip label={exactResetLabel}><span className="account-usage-reset"><TimerReset size={12}/>{resetLabel}</span></Tooltip>
+-        {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-standard">标准成本 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
++        <Tooltip label={exactResetLabel}><span className="account-usage-tag reset" tabIndex={0} aria-label={exactResetLabel}><TimerReset size={12}/>{resetLabel}</span></Tooltip>
++        {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-tag baseline" tabIndex={0} aria-label={`标准成本 $${Number(stats.standard_cost).toFixed(2)}，不含账号倍率，用于费用核对`}>标准 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
+       </div>
+       {detailItems.length > 0
+-        ? <dl className="account-usage-details">{detailItems.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>
++        ? <dl className="account-usage-details">{detailItems.map(item => {
++          const metricLabel = `${item.fullLabel}：${item.value}`;
++          const metricValue = <dd tabIndex={String(item.value).length > 8 ? 0 : undefined} aria-label={metricLabel}>{item.value}</dd>;
++          return <div className={`account-usage-metric ${item.key}`} key={item.key}><dt>{item.label}</dt>{String(item.value).length > 8 ? <Tooltip label={metricLabel}>{metricValue}</Tooltip> : metricValue}</div>;
++        })}</dl>
+         : <div className="account-usage-window-empty">暂无请求与费用明细</div>}
+     </> : <div className="account-usage-window-empty">暂未返回此窗口数据</div>}
+   </section>;
+@@ -247,12 +256,17 @@ function Sub2ApiUsageStack({account, usage, usageError}) {
+   const windowFor = key => ({...(account?.[key] || {}), ...(accountUsage?.[key] || {})});
+   const fiveHour = windowFor('five_hour');
+   const sevenDay = windowFor('seven_day');
+-  const sourceLabels = {active: '主动查询', live: '主动查询', passive: '被动采样'};
+-  const sourceLabel = sourceLabels[String(accountUsage.source || '').toLowerCase()] || (Object.keys(accountUsage).length ? '上游数据' : '账号快照');
++  const sourceMap = {
++    active: {label: '主动查询', tone: 'live'},
++    live: {label: '主动查询', tone: 'live'},
++    passive: {label: '被动采样', tone: 'passive'},
++  };
++  const source = sourceMap[String(accountUsage.source || '').toLowerCase()]
++    || (Object.keys(accountUsage).length ? {label: '上游数据', tone: 'upstream'} : {label: '账号快照', tone: 'snapshot'});
+   const updatedAt = accountUsage.updated_at || account.updated_at;
+   return <div className="account-usage-stack upstream">
+     <div className="account-usage-stack-meta">
+-      <span><Activity size={13}/>{sourceLabel}</span>
++      <span className={`account-usage-source-tag ${source.tone}`}><Activity size={13}/>{source.label}</span>
+       {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
+     </div>
+     <div className="account-usage-windows">
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index 0a6ef6d..48dcaf8 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2317,13 +2317,13 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-pagination { min-height: 50px; padding: 7px 16px; font-size: 11px; }
+ 
+ .account-management-panel { border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+-.account-management-head { min-height: 66px; padding: 11px 15px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+-.account-management-head h3 { margin: 3px 0 0; color: var(--ui-text); font-size: 17px; }
+-.account-management-head p { margin: 3px 0 0; color: var(--ui-text-muted); font-size: 11px; }
++.account-management-head { min-height: 72px; padding: 13px 16px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
++.account-management-head h3 { margin: 3px 0 0; color: var(--ui-text); font-size: 18px; }
++.account-management-head p { margin: 4px 0 0; color: var(--ui-text-muted); font-size: 12px; }
+ .account-management-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+-.account-management-actions select { min-width: 108px; height: 34px; }
+-.account-search { width: min(230px, 30vw); height: 34px; margin: 0 !important; padding: 0 9px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
+-.account-search input { width: 100%; height: 30px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
++.account-management-actions select { width: 112px; min-width: 112px; height: 36px; flex: 0 0 112px; font-size: 12px; }
++.account-search { width: 220px; min-width: 200px; height: 36px; margin: 0 !important; padding: 0 10px; display: flex; flex: 0 0 220px; align-items: center; gap: 8px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
++.account-search input { width: 100%; height: 32px !important; padding: 0 !important; border: 0 !important; background: transparent !important; font-size: 12px; }
+ .account-search input:focus { outline: none; box-shadow: none; }
+ 
+ .account-table-wrap { overflow-x: auto; border-block: 1px solid var(--ui-border); scrollbar-gutter: stable; }
+@@ -2335,11 +2335,10 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .account-col-usage { width: 440px; }
+ .account-col-routing { width: 120px; }
+ .account-col-actions { width: 85px; }
+-.account-table th, .account-table td { padding: 8px 10px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); text-align: left; }
++.account-table th, .account-table td { padding: 10px 11px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); text-align: left; }
+ .account-table th:last-child, .account-table td:last-child { border-right: 0; }
+-.account-table th { position: sticky; top: 0; z-index: 1; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 11px; font-weight: 750; letter-spacing: 0; white-space: nowrap; }
+-.account-table td { color: var(--ui-text); font-size: 12px; vertical-align: middle; }
+-.account-table .account-quota-cell, .account-table .account-usage-cell { vertical-align: top; }
++.account-table th { position: sticky; top: 0; z-index: 1; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 12px; font-weight: 750; letter-spacing: 0; white-space: nowrap; }
++.account-table td { color: var(--ui-text); font-size: 13px; vertical-align: top; }
+ .account-table tbody tr { background: var(--ui-surface); transition: background-color .15s ease; }
+ .account-table tbody tr:hover { background: color-mix(in srgb, var(--ui-surface-muted) 68%, transparent); }
+ .account-table tbody tr > td:first-child { border-left: 3px solid transparent; }
+@@ -2349,93 +2348,103 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ 
+ .account-identity, .account-platform-block, .account-state-block, .account-routing, .account-action-stack { min-width: 0; }
+ .account-name-line { min-width: 0; display: flex; align-items: center; gap: 6px; }
+-.account-name-line > strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+-.account-name-line .icon-button { width: 26px; height: 26px; flex: 0 0 26px; }
+-.account-identity-meta { margin-top: 5px; display: flex; align-items: center; gap: 5px; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; white-space: nowrap; }
++.account-name-line > strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 13px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
++.account-name-line .icon-button { width: 28px; height: 28px; flex: 0 0 28px; }
++.account-identity-meta { margin-top: 6px; display: flex; align-items: center; gap: 5px; overflow: hidden; color: var(--ui-text-muted); font-size: 11px; white-space: nowrap; }
+ .account-identity-meta span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+ .account-identity-meta span + span::before { margin-right: 5px; color: var(--ui-text-faint); content: "·"; }
+-.account-identity > small { display: block; margin-top: 3px; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
++.account-identity > small { display: block; margin-top: 4px; overflow: hidden; color: var(--ui-text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+ 
+ .account-platform-name { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+-.account-platform-name strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+-.account-platform-name span { flex: 0 0 auto; color: var(--ui-text-muted); font-size: 10px; }
+-.account-billing-rate { width: fit-content; max-width: 100%; margin-top: 6px; padding: 2px 5px; display: inline-flex !important; overflow: hidden; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+-.account-concurrency { margin-top: 5px; display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--ui-text-muted); font-size: 10px; }
+-.account-concurrency strong { color: var(--ui-text); font-size: 10px; font-variant-numeric: tabular-nums; }
++.account-platform-name strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
++.account-platform-name span { flex: 0 0 auto; color: var(--ui-text-muted); font-size: 11px; }
++.account-billing-rate { width: fit-content; max-width: 100%; margin-top: 7px; padding: 3px 6px; display: inline-flex !important; overflow: hidden; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
++.account-concurrency { margin-top: 6px; display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--ui-text-muted); font-size: 11px; }
++.account-concurrency strong { color: var(--ui-text); font-size: 11px; font-variant-numeric: tabular-nums; }
+ 
+-.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; border-radius: 3px; font-size: 10px !important; font-weight: 750; }
++.account-status { display: inline-flex !important; width: fit-content; padding: 4px 8px; border: 1px solid currentColor; border-radius: 3px; font-size: 11px !important; font-weight: 750; }
+ .account-status.success { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 8%, transparent); }
+ .account-status.warning { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, transparent); }
+ .account-status.danger { color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); }
+ .account-status.muted { color: var(--ui-text-muted); background: var(--ui-surface-muted); }
+-.account-status-detail { margin-top: 5px; display: -webkit-box; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
++.account-status-detail { margin-top: 6px; display: -webkit-box; overflow: hidden; color: var(--ui-text-muted); font-size: 11px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+ 
+-.account-progress-stack { display: grid; gap: 5px; }
++.account-progress-stack { display: grid; gap: 6px; }
+ .account-progress { min-width: 0; }
+ .account-progress-head { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 7px; line-height: 1.2; }
+-.account-progress-head span { color: var(--ui-text-muted); font-size: 10px; font-weight: 700; }
+-.account-progress-head strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 11px; font-weight: 750; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+-.account-progress-track { width: 100%; height: 4px; margin-top: 3px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 70%, var(--ui-surface)); border-radius: 2px; }
++.account-progress-head span { color: var(--ui-text-muted); font-size: 11px; font-weight: 700; }
++.account-progress-head strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 12px; font-weight: 750; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.account-progress-track { width: 100%; height: 5px; margin-top: 4px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 70%, var(--ui-surface)); border-radius: 2px; }
+ .account-progress-track > span { display: block; height: 100%; background: var(--ui-success); border-radius: inherit; transition: width .25s ease; }
+ .account-progress.warning .account-progress-track > span { background: var(--ui-warning); }
+ .account-progress.danger .account-progress-track > span { background: var(--ui-danger); }
+-.account-progress-meta { margin-top: 2px; display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--ui-text-faint); line-height: 1.25; }
+-.account-progress-meta > span { color: var(--ui-text-muted); font-size: 9px; font-weight: 700; }
+-.account-progress-meta > small { min-width: 0; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
++.account-progress-meta { margin-top: 3px; display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--ui-text-faint); line-height: 1.25; }
++.account-progress-meta > span { color: var(--ui-text-muted); font-size: 10px; font-weight: 700; }
++.account-progress-meta > small { min-width: 0; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+ 
+-.account-usage-stack { display: grid; gap: 5px; }
++.account-usage-stack { display: grid; gap: 7px; }
+ .account-usage-stack-meta { display: flex; align-items: center; justify-content: space-between; gap: 9px; color: var(--ui-text-muted); line-height: 1.2; }
+-.account-usage-stack-meta > span { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 700; }
+-.account-usage-stack-meta > small { min-width: 0; overflow: hidden; color: var(--ui-text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+-.account-usage-windows { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; align-items: stretch; }
+-.account-usage-window { min-width: 0; min-height: 96px; padding: 6px 7px; background: color-mix(in srgb, var(--ui-success) 3%, var(--ui-surface-muted)); border: 1px solid var(--ui-border-soft); border-top: 2px solid var(--ui-success); border-radius: 4px; }
++.account-usage-source-tag { min-height: 22px; padding: 2px 6px; display: inline-flex; align-items: center; gap: 4px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 4px; font-size: 11px; font-weight: 750; white-space: nowrap; }
++.account-usage-source-tag.live { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 7%, var(--ui-surface)); border-color: color-mix(in srgb, var(--ui-success) 30%, var(--ui-border)); }
++.account-usage-source-tag.passive { color: #486b91; background: color-mix(in srgb, #5b7194 8%, var(--ui-surface)); border-color: color-mix(in srgb, #5b7194 30%, var(--ui-border)); }
++.account-usage-source-tag.snapshot { color: var(--ui-text-muted); border-style: dashed; }
++.account-usage-stack-meta > small { min-width: 0; overflow: hidden; color: var(--ui-text-faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-windows { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; align-items: stretch; }
++.account-usage-window { min-width: 0; min-height: 116px; padding: 8px; background: color-mix(in srgb, var(--ui-success) 3%, var(--ui-surface-muted)); border: 1px solid var(--ui-border-soft); border-top: 3px solid var(--ui-success); border-radius: 4px; }
+ .account-usage-window.seven-day { background: color-mix(in srgb, #5b7194 4%, var(--ui-surface-muted)); border-top-color: #5b7194; }
+ .account-usage-window.warning { border-top-color: var(--ui-warning); }
+ .account-usage-window.danger { border-top-color: var(--ui-danger); }
+-.account-usage-window-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; line-height: 1.2; }
+-.account-usage-window-head > span { min-width: 0; display: inline-flex; align-items: center; gap: 4px; overflow: hidden; color: var(--ui-text-muted); white-space: nowrap; }
+-.account-usage-window-head > span > strong { overflow: hidden; color: var(--ui-text); font-size: 11px; text-overflow: ellipsis; }
+-.account-usage-window-head svg { width: 13px; height: 13px; flex: 0 0 13px; }
+-.account-usage-percent { flex: 0 0 auto; color: var(--ui-text); font-size: 13px; font-variant-numeric: tabular-nums; }
+-.account-usage-track { width: 100%; height: 4px; margin-top: 5px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 72%, var(--ui-surface)); border-radius: 2px; }
++.account-usage-window.unknown { background: var(--ui-surface-muted); border-top-color: var(--ui-text-muted); }
++.account-usage-window-head { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 7px; line-height: 1.2; }
++.account-usage-window-title { min-width: 0; display: flex; align-items: center; gap: 4px; }
++.account-usage-window-tag { min-width: 0; min-height: 22px; padding: 2px 5px; display: inline-flex; align-items: center; gap: 4px; overflow: hidden; color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 7%, var(--ui-surface)); border: 1px solid color-mix(in srgb, var(--ui-success) 28%, var(--ui-border)); border-radius: 4px; white-space: nowrap; }
++.account-usage-window-tag.seven-day { color: #486b91; background: color-mix(in srgb, #5b7194 8%, var(--ui-surface)); border-color: color-mix(in srgb, #5b7194 30%, var(--ui-border)); }
++.account-usage-window-tag > strong { overflow: hidden; color: currentColor; font-size: 12px; text-overflow: ellipsis; }
++.account-usage-window-tag svg { width: 13px; height: 13px; flex: 0 0 13px; }
++.account-usage-state-tag { min-height: 19px; padding: 1px 4px; display: inline-flex; align-items: center; color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 7%, transparent); border: 1px solid color-mix(in srgb, var(--ui-success) 28%, transparent); border-radius: 3px; font-size: 10px; font-weight: 750; white-space: nowrap; }
++.account-usage-state-tag.warning { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, transparent); border-color: color-mix(in srgb, var(--ui-warning) 32%, transparent); }
++.account-usage-state-tag.danger { color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-color: color-mix(in srgb, var(--ui-danger) 30%, transparent); }
++.account-usage-state-tag.unknown { color: var(--ui-text-muted); background: var(--ui-surface-muted); border-color: var(--ui-border); }
++.account-usage-percent { flex: 0 0 auto; color: var(--ui-text); font-size: 15px; font-variant-numeric: tabular-nums; }
++.account-usage-track { width: 100%; height: 5px; margin-top: 6px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 72%, var(--ui-surface)); border-radius: 2px; }
+ .account-usage-track > span { display: block; height: 100%; background: var(--ui-success); border-radius: inherit; transition: width .25s ease; }
+ .account-usage-window.seven-day .account-usage-track > span { background: #5b7194; }
+ .account-usage-window.warning .account-usage-track > span { background: var(--ui-warning); }
+ .account-usage-window.danger .account-usage-track > span { background: var(--ui-danger); }
+-.account-usage-footnote { min-width: 0; margin-top: 4px; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+-.account-usage-footnote > span { min-width: 0; max-width: 52%; }
+-.account-usage-reset { width: fit-content; display: inline-flex; align-items: center; gap: 3px; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+-.account-usage-reset svg { width: 11px; height: 11px; flex: 0 0 11px; }
+-.account-usage-details { margin: 4px 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); }
+-.account-usage-details > div { min-width: 0; padding: 4px 3px 0; border-right: 1px solid var(--ui-border-soft); }
+-.account-usage-details > div:first-child { padding-left: 0; }
+-.account-usage-details > div:last-child { padding-right: 0; border-right: 0; }
+-.account-usage-details dt { overflow: hidden; color: var(--ui-text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+-.account-usage-details dd { margin: 1px 0 0; overflow: hidden; color: var(--ui-text); font-size: 10px; font-weight: 750; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+-.account-usage-standard { width: fit-content; display: block; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; border-bottom: 1px dotted currentColor; }
+-.account-usage-window-empty { min-height: 48px; display: flex; align-items: center; color: var(--ui-text-muted); font-size: 10px; }
+-.account-usage-error { padding: 5px 7px; display: flex; align-items: flex-start; gap: 5px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-left: 2px solid var(--ui-danger); font-size: 10px; line-height: 1.35; }
++.account-usage-footnote { min-width: 0; margin-top: 6px; display: flex; align-items: center; justify-content: space-between; gap: 5px; }
++.account-usage-footnote > span { min-width: 0; max-width: 100%; }
++.account-usage-tag { width: fit-content; min-height: 20px; padding: 2px 5px; display: inline-flex; align-items: center; gap: 3px; overflow: hidden; color: var(--ui-text-muted); background: color-mix(in srgb, var(--ui-surface) 72%, transparent); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-tag:focus-visible, .account-usage-details dd[tabindex="0"]:focus-visible { outline: 2px solid color-mix(in srgb, var(--ui-text) 55%, transparent); outline-offset: 1px; }
++.account-usage-tag.reset { max-width: 68%; }
++.account-usage-tag.reset svg { width: 11px; height: 11px; flex: 0 0 11px; }
++.account-usage-tag.baseline { max-width: 40%; color: var(--ui-text); border-bottom-style: dotted; }
++.account-usage-details { margin: 6px 0 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; }
++.account-usage-metric { min-width: 0; min-height: 25px; padding: 4px 5px; display: flex; align-items: center; justify-content: space-between; gap: 4px; background: color-mix(in srgb, var(--ui-surface) 70%, transparent); border: 1px solid var(--ui-border-soft); border-radius: 3px; }
++.account-usage-details dt { overflow: hidden; color: var(--ui-text-faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-details dd { min-width: 0; margin: 0; overflow: hidden; color: var(--ui-text); font-size: 12px; font-weight: 750; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-window-empty { min-height: 56px; display: flex; align-items: center; color: var(--ui-text-muted); font-size: 11px; }
++.account-usage-error { padding: 6px 8px; display: flex; align-items: flex-start; gap: 6px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-left: 2px solid var(--ui-danger); font-size: 11px; line-height: 1.35; }
+ .account-usage-error svg { flex: 0 0 auto; margin-top: 1px; }
+ 
+ .account-routing strong, .account-routing small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+-.account-routing strong { color: var(--ui-text); font-size: 12px; }
+-.account-routing small { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; }
+-.account-action-stack { display: grid; gap: 5px; justify-items: start; }
++.account-routing strong { color: var(--ui-text); font-size: 13px; }
++.account-routing small { margin-top: 5px; color: var(--ui-text-muted); font-size: 11px; }
++.account-action-stack { display: grid; gap: 6px; justify-items: start; }
+ .account-row-actions { display: flex; align-items: center; gap: 4px; }
+-.account-row-actions .icon-button { width: 30px; height: 30px; }
+-.account-test-result { max-width: 74px; display: -webkit-box; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
++.account-row-actions .icon-button { width: 32px; height: 32px; }
++.account-test-result { max-width: 74px; display: -webkit-box; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+ .account-test-result.ok { color: var(--ui-success) !important; }
+ .account-test-result.bad { color: var(--ui-danger) !important; }
+ .account-table-empty { min-height: 90px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
+-.account-pagination { min-height: 48px; padding: 7px 15px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); font-size: 11px; }
++.account-pagination { min-height: 50px; padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); font-size: 12px; }
+ .account-pagination > div { display: flex; gap: 5px; }
+ .account-pagination .icon-button { width: 31px; height: 31px; }
+ 
+ @media (max-width: 900px) {
+   .account-management-head { align-items: stretch; flex-direction: column; }
+   .account-management-actions { justify-content: stretch; flex-wrap: wrap; }
+-  .account-search { width: min(100%, 320px); flex: 1 1 220px; }
+-  .account-management-actions select { flex: 1 1 120px; }
++  .account-search { width: min(100%, 320px); min-width: 0; flex: 1 1 220px; }
++  .account-management-actions select { width: auto; min-width: 0; flex: 1 1 120px; }
+   .account-pagination { align-items: flex-start; flex-direction: column; }
+   .account-pagination > div { align-self: flex-end; }
+ }
+@@ -2448,14 +2457,17 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+   .account-table tbody { display: grid; gap: 9px; }
+   .account-table tbody tr { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; }
+   .account-table tbody tr:hover { background: var(--ui-surface); }
+-  .account-table tbody tr > td { min-width: 0; padding: 9px; display: block; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
++  .account-table tbody tr > td { min-width: 0; padding: 10px; display: block; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
+   .account-table tbody tr > td:nth-child(even) { border-right: 0; }
+-  .account-table tbody tr > td::before { margin-bottom: 6px; display: block; color: var(--ui-text-faint); content: attr(data-label); font-size: 9px; font-weight: 750; text-transform: uppercase; }
++  .account-table tbody tr > td::before { margin-bottom: 7px; display: block; color: var(--ui-text-faint); content: attr(data-label); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+   .account-table tbody tr > td:first-child { border-left-width: 3px; }
+   .account-table .account-identity-cell, .account-table .account-quota-cell, .account-table .account-usage-cell { grid-column: 1 / -1; border-right: 0; }
+   .account-table .account-quota-cell { vertical-align: top; }
+   .account-progress-stack { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+   .account-usage-windows { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .account-usage-details { grid-template-columns: repeat(4, minmax(0, 1fr)); }
++  .account-usage-metric { min-height: 39px; padding: 4px; display: block; }
++  .account-usage-details dd { margin-top: 2px; }
+   .account-action-stack { justify-items: end; }
+   .account-row-actions { justify-content: flex-end; }
+   .account-test-result { max-width: 100%; text-align: right; }
+@@ -2469,9 +2481,12 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+   .account-management-actions .account-search { max-width: none; flex-basis: 100%; }
+   .account-table-wrap { padding: 7px; }
+   .account-usage-windows { grid-template-columns: 1fr; }
+-  .account-usage-window { min-height: 92px; }
++  .account-usage-window { min-height: 112px; }
+ }
+ 
++:root[data-theme="dark"] .account-usage-source-tag.passive,
++:root[data-theme="dark"] .account-usage-window-tag.seven-day { color: #9dc3e8; border-color: color-mix(in srgb, #9dc3e8 45%, var(--ui-border)); }
++
+ .automation-console > .automation-head { min-height: 72px; padding: 12px 16px; }
+ .sub2api-view .automation-head h2 { font-size: 18px; }
+ .sub2api-view .automation-head p { margin-top: 4px; font-size: 12px; }
