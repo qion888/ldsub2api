@@ -21,6 +21,18 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from monitor_settings import (
+    DEFAULT_INTERVAL,
+    DEFAULT_SHOP_INTERVAL,
+    MAX_INTERVAL,
+    MIN_INTERVAL,
+    MonitorNotFound,
+    normalize_interval,
+    sync_shop_product_intervals,
+    update_shop_monitoring,
+    update_watch_monitoring,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -31,9 +43,6 @@ PORT = int(os.environ.get("LDXP_PORT", "8000"))
 FRONTEND_URL = os.environ.get("LDXP_FRONTEND_URL", "http://127.0.0.1:5173/")
 DB_PATH = Path(os.environ.get("LDXP_DB_PATH", str(Path(__file__).with_name("monitor.db"))))
 ALLOWED_HOST = "pay.ldxp.cn"
-DEFAULT_INTERVAL = 60
-MIN_INTERVAL = 1
-MAX_INTERVAL = 86400
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 USER_AGENT = "LDXP-Local-Monitor/2.0"
 VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
@@ -59,10 +68,6 @@ class WafChallengeRequired(RuntimeError):
 
 class PreorderConflict(RuntimeError):
     pass
-
-
-def normalize_interval(value: Any, default: int = DEFAULT_INTERVAL) -> int:
-    return min(max(int(value or default), MIN_INTERVAL), MAX_INTERVAL)
 
 
 def utc_now() -> str:
@@ -931,7 +936,7 @@ def record_shop_fetch(shop_id: int, products_override: list[dict[str, Any]] | No
                     VALUES(?, ?, 0, ?, ?)
                     ON CONFLICT(url) DO NOTHING
                     """,
-                    (product["source_url"], product["title"], DEFAULT_INTERVAL, stamp),
+                    (product["source_url"], product["title"], shop["interval_seconds"], stamp),
                 )
                 watch = connection.execute(
                     "SELECT id FROM watches WHERE url = ?", (product["source_url"],)
@@ -997,6 +1002,7 @@ def record_shop_fetch(shop_id: int, products_override: list[dict[str, Any]] | No
                 """,
                 (stamp, shop_id),
             )
+            sync_shop_product_intervals(connection, shop_id, int(shop["interval_seconds"]))
         imported_products = [product for product in products if product["goods_key"] not in excluded]
         known_stock = [product["stock"] for product in imported_products if product["stock"] not in (None, "")]
         return {
@@ -3278,7 +3284,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/shops":
             try:
                 token, canonical_url = parse_shop_url(str(data.get("url") or ""))
-                interval = normalize_interval(data.get("interval_seconds"), 300)
+                interval = normalize_interval(data.get("interval_seconds"), DEFAULT_SHOP_INTERVAL)
                 requested_name = str(data.get("name") or "").strip()[:100]
                 name = requested_name or token
                 keywords = str(data.get("keywords") or "").strip()[:100]
@@ -3564,44 +3570,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         if match:
             watch_id = int(match.group(1))
             try:
-                enabled = 1 if bool(data.get("enabled", True)) else 0
-                interval = normalize_interval(data.get("interval_seconds"))
-                name = str(data.get("name") or "").strip()[:100]
+                with database() as connection:
+                    result = update_watch_monitoring(connection, watch_id, data)
             except (TypeError, ValueError):
                 return self._send_json({"detail": "监控设置无效"}, 400)
-            with database() as connection:
-                cursor = connection.execute(
-                    "UPDATE watches SET name = ?, enabled = ?, interval_seconds = ? WHERE id = ?",
-                    (name, enabled, interval, watch_id),
-                )
-            if cursor.rowcount == 0:
-                return self._send_json({"detail": "监控商品不存在"}, 404)
-            return self._send_json({"ok": True})
+            except MonitorNotFound as exc:
+                return self._send_json({"detail": str(exc)}, 404)
+            return self._send_json(result)
 
         shop_match = re.fullmatch(r"/api/shops/(\d+)", path)
         if shop_match:
             shop_id = int(shop_match.group(1))
             try:
-                enabled = 1 if bool(data.get("enabled", True)) else 0
-                interval = normalize_interval(data.get("interval_seconds"), 300)
-                name = str(data.get("name") or "").strip()[:100]
-                keywords = str(data.get("keywords") or "").strip()[:100]
-                raw_category = data.get("category_id")
-                category_id = int(raw_category) if raw_category not in (None, "") else None
-                goods_type = str(data.get("goods_type") or "card").strip()[:30]
+                with database() as connection:
+                    result = update_shop_monitoring(connection, shop_id, data)
             except (TypeError, ValueError):
                 return self._send_json({"detail": "店铺监控设置无效"}, 400)
-            with database() as connection:
-                cursor = connection.execute(
-                    """
-                    UPDATE shops SET name = ?, keywords = ?, category_id = ?, goods_type = ?,
-                        enabled = ?, interval_seconds = ? WHERE id = ?
-                    """,
-                    (name, keywords, category_id, goods_type, enabled, interval, shop_id),
-                )
-            if cursor.rowcount == 0:
-                return self._send_json({"detail": "监控店铺不存在"}, 404)
-            return self._send_json({"ok": True})
+            except MonitorNotFound as exc:
+                return self._send_json({"detail": str(exc)}, 404)
+            return self._send_json(result)
 
         if path == "/api/settings/contact":
             contact = str(data.get("contact") or "").strip()[:160]

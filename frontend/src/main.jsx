@@ -59,6 +59,7 @@ const DEFAULT_SUB2API_AUTOMATION = {
   interval_seconds: 300,
   auto_import: false,
 };
+const MONITOR_INTERVAL_OPTIONS = [1, 3, 5, 10, 30, 60, 300, 900, 1800];
 
 function getVisitorId() {
   const cached = window.localStorage.getItem('visitorId');
@@ -104,6 +105,20 @@ function intervalLabel(value) {
   if (seconds < 60) return `${seconds}秒`;
   if (seconds % 60 === 0) return `${seconds / 60}分钟`;
   return `${seconds}秒`;
+}
+
+function intervalOptionLabel(value) {
+  const seconds = Number(value || 0);
+  return seconds < 60 ? `每 ${seconds} 秒` : `每 ${seconds / 60} 分钟`;
+}
+
+function MonitorIntervalSelect({value, onChange, label, disabled = false, caption = ''}) {
+  return <label className={`monitor-interval-control ${disabled ? 'disabled' : ''}`} onClick={event => event.stopPropagation()}>
+    {caption && <span>{caption}</span>}
+    <div><TimerReset size={13}/><select value={Number(value)} onChange={event => onChange(Number(event.target.value))} aria-label={label} disabled={disabled}>
+      {MONITOR_INTERVAL_OPTIONS.map(seconds => <option value={seconds} key={seconds}>{intervalOptionLabel(seconds)}</option>)}
+    </select></div>
+  </label>;
 }
 
 function ProductImage({item, size = 'normal'}) {
@@ -827,6 +842,10 @@ function App() {
   const [categoryId, setCategoryId] = useState('');
   const [goodsType, setGoodsType] = useState('card');
   const [shopFilter, setShopFilter] = useState(null);
+  const [shopQuery, setShopQuery] = useState('');
+  const [shopStatusFilter, setShopStatusFilter] = useState('all');
+  const [productQuery, setProductQuery] = useState('');
+  const [productStatusFilter, setProductStatusFilter] = useState('all');
   const [checkedIds, setCheckedIds] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [theme, setTheme] = useState(() => window.localStorage.getItem('ldxp-theme') === 'dark' ? 'dark' : 'light');
@@ -1081,14 +1100,45 @@ function App() {
 
   const selected = items.find(item => item.id === selectedId) || null;
   const latest = selected?.latest;
-  const monitored = items.filter(item => item.enabled).length;
+  const enabledShopIds = new Set(shops.filter(shop => shop.enabled).map(shop => shop.id));
+  const itemMonitoringEnabled = item => item.shops?.length
+    ? item.shops.some(shop => enabledShopIds.has(shop.id))
+    : item.enabled;
+  const monitored = items.filter(itemMonitoringEnabled).length;
   const saleCount = items.filter(item => item.latest?.sale_status === 'on_sale').length;
   const changes = items.filter(item => item.price_changed).length;
   const failures = items.filter(item => item.last_attempt?.status === 'error' && !itemIsUnlisted(item)).length;
   const shopFailures = shops.filter(shop => shop.last_attempt?.status === 'error').length;
-  const visibleItems = shopFilter
+  const normalizedShopQuery = shopQuery.trim().toLocaleLowerCase('zh-CN');
+  const filteredShops = shops.filter(shop => {
+    const matchesQuery = !normalizedShopQuery || [shop.name, shop.token, shop.category_id, shop.goods_type]
+      .some(value => String(value || '').toLocaleLowerCase('zh-CN').includes(normalizedShopQuery));
+    const matchesStatus = shopStatusFilter === 'all'
+      || (shopStatusFilter === 'enabled' && shop.enabled)
+      || (shopStatusFilter === 'paused' && !shop.enabled)
+      || (shopStatusFilter === 'error' && shop.last_attempt?.status === 'error');
+    return matchesQuery && matchesStatus;
+  });
+  const normalizedProductQuery = productQuery.trim().toLocaleLowerCase('zh-CN');
+  const shopScopedItems = shopFilter
     ? items.filter(item => item.shops?.some(shop => shop.id === shopFilter))
     : items;
+  const visibleItems = shopScopedItems.filter(item => {
+    const matchesQuery = !normalizedProductQuery || [
+      item.latest?.title,
+      item.name,
+      item.url,
+      ...(item.shops || []).flatMap(shop => [shop.name, shop.token]),
+    ].some(value => String(value || '').toLocaleLowerCase('zh-CN').includes(normalizedProductQuery));
+    const stock = itemStock(item);
+    const matchesStatus = productStatusFilter === 'all'
+      || (productStatusFilter === 'enabled' && itemMonitoringEnabled(item))
+      || (productStatusFilter === 'paused' && !itemMonitoringEnabled(item))
+      || (productStatusFilter === 'error' && item.last_attempt?.status === 'error')
+      || (productStatusFilter === 'in_stock' && stock.key === 'in')
+      || (productStatusFilter === 'out_of_stock' && stock.key === 'out');
+    return matchesQuery && matchesStatus;
+  });
   const totalCart = cart.reduce((sum, entry) => sum + entry.quantity, 0);
   const estimatedTotal = cart.reduce((sum, entry) => {
     const item = items.find(candidate => candidate.id === entry.watch_id);
@@ -1181,16 +1231,29 @@ function App() {
 
   const updateShop = async (shop, patch) => {
     const next = {...shop, ...patch};
+    const intervalChanged = Number(next.interval_seconds) !== Number(shop.interval_seconds);
     setShops(current => current.map(value => value.id === shop.id ? next : value));
+    if (intervalChanged) {
+      setItems(current => current.map(item => item.shops?.some(link => link.id === shop.id)
+        ? {...item, interval_seconds: next.interval_seconds}
+        : item));
+    }
+    setBusy(value => ({...value, [`shop-save-${shop.id}`]: true}));
     try {
-      await request(`/shops/${shop.id}`, {
+      const result = await request(`/shops/${shop.id}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(next),
       });
+      if (intervalChanged) {
+        await loadItems({quiet: true});
+        notify(`店铺频率已更新为每 ${intervalLabel(result.interval_seconds)}，同步 ${result.synced_product_count} 个商品`);
+      }
     } catch (error) {
       await loadItems({quiet: true});
       notify(error.message, 'error');
+    } finally {
+      setBusy(value => ({...value, [`shop-save-${shop.id}`]: false}));
     }
   };
 
@@ -1242,16 +1305,21 @@ function App() {
 
   const updateWatch = async (item, patch) => {
     const next = {...item, ...patch};
+    const intervalChanged = Number(next.interval_seconds) !== Number(item.interval_seconds);
     setItems(current => current.map(candidate => candidate.id === item.id ? next : candidate));
+    setBusy(value => ({...value, [`watch-save-${item.id}`]: true}));
     try {
-      await request(`/watches/${item.id}`, {
+      const result = await request(`/watches/${item.id}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name: next.name, enabled: next.enabled, interval_seconds: next.interval_seconds}),
       });
+      if (intervalChanged) notify(`商品频率已更新为每 ${intervalLabel(result.interval_seconds)}`);
     } catch (error) {
       await loadItems({quiet: true});
       notify(error.message, 'error');
+    } finally {
+      setBusy(value => ({...value, [`watch-save-${item.id}`]: false}));
     }
   };
 
@@ -2006,14 +2074,20 @@ function App() {
                 <label><span>备注</span><input value={name} onChange={event => setName(event.target.value)} placeholder="可选"/></label>
                 {sourceMode === 'shop' && <label><span>分类 ID（可选）</span><input value={categoryId} onChange={event => setCategoryId(event.target.value.replace(/\D/g, ''))} placeholder="全部分类" inputMode="numeric"/></label>}
                 {sourceMode === 'shop' && <label><span>商品类型</span><input value={goodsType} onChange={event => setGoodsType(event.target.value.replace(/[^A-Za-z0-9_-]/g, ''))} placeholder="card"/></label>}
-                <label><span>监控频率</span><select value={intervalSeconds} onChange={event => setIntervalSeconds(Number(event.target.value))}><option value={1}>每 1 秒</option><option value={3}>每 3 秒</option><option value={5}>每 5 秒</option><option value={10}>每 10 秒</option><option value={30}>每 30 秒</option><option value={60}>每 1 分钟</option><option value={300}>每 5 分钟</option><option value={900}>每 15 分钟</option><option value={1800}>每 30 分钟</option></select></label>
+                <label><span>监控频率</span><select value={intervalSeconds} onChange={event => setIntervalSeconds(Number(event.target.value))}>{MONITOR_INTERVAL_OPTIONS.map(seconds => <option value={seconds} key={seconds}>{intervalOptionLabel(seconds)}</option>)}</select></label>
                 <button className="button primary" disabled={busy.add}><Plus size={16}/>{busy.add ? '正在同步' : sourceMode === 'shop' ? '同步店铺' : '开始监控'}</button>
               </div>
             </form>
 
             {!!shops.length && <section className="shop-overview">
               <div className="section-heading"><div><h2>店铺汇总</h2><p>店铺接口按设定频率分页同步</p></div>{shopFilter && <button className="clear-filter" onClick={() => { setShopFilter(null); setCheckedIds([]); }}><X size={13}/>显示全部商品</button>}</div>
-              <div className="shop-list">{shops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''}`} key={shop.id}>
+              <div className="monitor-filter-bar shop-filter-bar">
+                <label className="monitor-search"><Search size={15}/><input value={shopQuery} onChange={event => setShopQuery(event.target.value)} placeholder="搜索店铺名称、Token 或分类" aria-label="搜索店铺"/></label>
+                <label className="monitor-filter-select"><Filter size={14}/><select value={shopStatusFilter} onChange={event => setShopStatusFilter(event.target.value)} aria-label="筛选店铺状态"><option value="all">全部店铺</option><option value="enabled">运行中</option><option value="paused">已暂停</option><option value="error">同步异常</option></select></label>
+                <span className="monitor-result-count">{filteredShops.length} / {shops.length}</span>
+                {(shopQuery || shopStatusFilter !== 'all') && <IconButton label="清除店铺筛选" onClick={() => { setShopQuery(''); setShopStatusFilter('all'); }}><X size={14}/></IconButton>}
+              </div>
+              <div className="shop-list">{!filteredShops.length ? <div className="monitor-filter-empty"><Store size={20}/><span>没有符合条件的店铺</span></div> : filteredShops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''}`} key={shop.id}>
                 <button className="shop-main" onClick={() => { setShopFilter(current => current === shop.id ? null : shop.id); setCheckedIds([]); }}>
                   <span className="shop-icon"><Store size={18}/></span><span><strong>{shop.name || shop.token}</strong><small>{shop.token} · 分类 {shop.category_id || '全部'}</small></span>
                 </button>
@@ -2021,25 +2095,32 @@ function App() {
                 <div className="shop-stat"><span>在售</span><strong className="positive">{shop.on_sale_count}</strong></div>
                 <div className="shop-stat"><span>已知库存</span><strong>{shop.total_stock ?? '--'}</strong><small>{shop.known_stock_count}/{shop.product_count} 项公开</small></div>
                 <div className="shop-time" title={shop.last_attempt?.error || ''}><span className={`pill ${shop.last_attempt?.status === 'error' ? 'error' : 'live'}`}>{needsBrowserVerification(shop) ? '需要验证' : shop.last_attempt?.status === 'error' ? '同步异常' : '已同步'}</span><small>{compactTime(shop.last_attempt?.fetched_at)}</small></div>
-                <button className={`switch ${shop.enabled ? 'on' : ''}`} role="switch" aria-checked={shop.enabled} title={shop.enabled ? '暂停店铺监控' : '开启店铺监控'} onClick={() => updateShop(shop, {enabled: !shop.enabled})}><span/></button>
+                <MonitorIntervalSelect value={shop.interval_seconds} label={`修改${shop.name || shop.token}监控频率`} caption="监控频率" disabled={busy[`shop-save-${shop.id}`]} onChange={value => updateShop(shop, {interval_seconds: value})}/>
+                <button className={`switch ${shop.enabled ? 'on' : ''}`} role="switch" aria-checked={shop.enabled} title={shop.enabled ? '暂停店铺监控' : '开启店铺监控'} disabled={busy[`shop-save-${shop.id}`]} onClick={() => updateShop(shop, {enabled: !shop.enabled})}><span/></button>
                 <div className="row-actions">{needsBrowserVerification(shop) && (verificationShopId === shop.id ? <IconButton label="验证完成并同步" tone="verify" onClick={() => completeBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ShieldCheck size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton> : <IconButton label="打开浏览器验证" tone="verify" onClick={() => startBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ArrowUpRight size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton>)}<IconButton label="同步店铺" onClick={() => fetchShop(shop.id)} disabled={busy[`shop-${shop.id}`]}><RefreshCw size={15} className={busy[`shop-${shop.id}`] ? 'spin' : ''}/></IconButton><IconButton label="删除店铺监控" tone="danger" onClick={() => removeShop(shop)}><Trash2 size={15}/></IconButton></div>
               </div>)}</div>
             </section>}
 
             <div className="content-layout">
               <section className="monitor-panel">
-                <div className="section-heading"><div><h2>{shopFilter ? `${shops.find(shop => shop.id === shopFilter)?.name || '店铺'}商品` : '商品目录'}</h2><p>{visibleItems.length ? `最近状态已同步，共 ${visibleItems.length} 项` : '添加商品或同步店铺后会显示在这里'}</p></div><span className="count-badge">{visibleItems.length}</span></div>
+                <div className="section-heading"><div><h2>{shopFilter ? `${shops.find(shop => shop.id === shopFilter)?.name || '店铺'}商品` : '商品目录'}</h2><p>{visibleItems.length ? `最近状态已同步，共 ${visibleItems.length} 项` : shopScopedItems.length ? '没有符合当前搜索和筛选条件的商品' : '添加商品或同步店铺后会显示在这里'}</p></div><span className="count-badge">{visibleItems.length}</span></div>
+                <div className="monitor-filter-bar product-filter-bar">
+                  <label className="monitor-search"><Search size={15}/><input value={productQuery} onChange={event => setProductQuery(event.target.value)} placeholder="搜索商品、店铺或链接" aria-label="搜索监控商品"/></label>
+                  <label className="monitor-filter-select"><SlidersHorizontal size={14}/><select value={productStatusFilter} onChange={event => setProductStatusFilter(event.target.value)} aria-label="筛选商品状态"><option value="all">全部商品</option><option value="enabled">监控中</option><option value="paused">已暂停</option><option value="in_stock">有货</option><option value="out_of_stock">缺货</option><option value="error">抓取异常</option></select></label>
+                  <span className="monitor-result-count">{visibleItems.length} / {shopScopedItems.length}</span>
+                  {(productQuery || productStatusFilter !== 'all') && <IconButton label="清除商品筛选" onClick={() => { setProductQuery(''); setProductStatusFilter('all'); }}><X size={14}/></IconButton>}
+                </div>
                 {visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
                 {!!displayedPreorders.length && <div className="preorder-list" aria-label="自动预购任务">{displayedPreorders.map(preorder => <div className={`preorder-row ${preorder.status}`} key={preorder.id}><span className="preorder-icon"><Clock3 size={15}/></span><div className="preorder-copy"><strong>{preorder.title}</strong><small>目标 {preorder.quantity} 件 · 每 {preorder.interval_seconds} 秒检查 · 当前库存 {preorder.stock_label}</small>{preorder.last_error && <small className="negative">{preorder.last_error}</small>}</div><span className={`pill ${preorder.status === 'triggered' ? 'live' : preorder.status === 'error' ? 'error' : 'neutral'}`}>{preorder.status === 'watching' ? '预购监控中' : preorder.status === 'processing' ? '正在创建订单' : preorder.status === 'triggered' ? '支付链接已创建' : '预购失败'}</span>{preorder.payment_url ? <a className="button official preorder-pay-link" href={preorder.payment_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>打开支付链接</a> : preorder.status === 'watching' || preorder.status === 'error' ? <IconButton label="停止自动预购" tone="danger" onClick={() => cancelPreorder(preorder)}><X size={15}/></IconButton> : <span/>}</div>)}</div>}
-                <div className="table-head"><label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label><span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控</span><span>操作</span></div>
+                <div className="table-head"><label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label><span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控频率</span><span>操作</span></div>
                 <div className="product-list">
-                  {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>暂无商品数据</strong><span>在上方添加店铺或商品链接</span></div> : visibleItems.map(item => (
+                  {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>{shopScopedItems.length ? '没有匹配的商品' : '暂无商品数据'}</strong><span>{shopScopedItems.length ? '调整搜索词或状态筛选后重试' : '在上方添加店铺或商品链接'}</span></div> : visibleItems.map(item => (
                     <div className={`product-row ${selectedId === item.id ? 'selected' : ''} ${checkedIds.includes(item.id) ? 'checked' : ''}`} key={item.id} onClick={() => openProductDetail(item.id)}>
                       <label className="check-wrap checkbox-cell" title="选择商品" onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedIds.includes(item.id)} onChange={() => toggleChecked(item.id)}/></label>
                       <div className="product-cell"><ProductImage item={item}/><div className="product-copy"><strong>{item.latest?.title || item.name || '等待首次抓取'}</strong><span>{item.shops?.length ? `${item.shops[0].name || item.shops[0].token} · ${item.url}` : item.name && item.latest ? item.name : item.url}</span><small>{compactTime(item.last_attempt?.fetched_at)}</small></div></div>
                       <div className="price-cell"><strong>{money(item.latest?.price)}</strong>{item.price_changed && <span className="change-flag">有变化</span>}</div>
                       <div className="state-cell"><StatusPill item={item}/><small>{itemStockLabel(item)}</small>{preorderByWatch.get(item.id)?.status === 'watching' && <small className="preorder-state">自动预购 {preorderByWatch.get(item.id).quantity} 件</small>}</div>
-                      <div className="monitor-cell"><button className={`switch ${item.enabled ? 'on' : ''}`} role="switch" aria-checked={item.enabled} title={item.enabled ? '暂停自动监控' : '开启自动监控'} onClick={event => {event.stopPropagation(); updateWatch(item, {enabled: !item.enabled});}}><span/></button><small>{intervalLabel(item.interval_seconds)}</small></div>
+                      <div className="monitor-cell" onClick={event => event.stopPropagation()}><button className={`switch ${itemMonitoringEnabled(item) ? 'on' : ''}`} role="switch" aria-checked={itemMonitoringEnabled(item)} title={item.shops?.length ? '由所属店铺统一控制' : item.enabled ? '暂停自动监控' : '开启自动监控'} disabled={busy[`watch-save-${item.id}`] || !!item.shops?.length} onClick={() => updateWatch(item, {enabled: !item.enabled})}><span/></button><MonitorIntervalSelect value={item.interval_seconds} label={`修改${item.latest?.title || item.name || '商品'}监控频率`} disabled={busy[`watch-save-${item.id}`] || !!item.shops?.length} onChange={value => updateWatch(item, {interval_seconds: value})}/><small>{item.shops?.length ? '跟随店铺' : '独立设置'}</small></div>
                       <div className="row-actions" onClick={event => event.stopPropagation()}>
                         <IconButton label={item.shops?.length ? '同步所属店铺库存' : '立即抓取'} onClick={() => fetchOne(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>
                         <IconButton label="复制商品链接" onClick={() => copyLinks([item])}><Clipboard size={15}/></IconButton>

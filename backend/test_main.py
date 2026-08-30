@@ -187,6 +187,39 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(main.normalize_interval(-10), 1)
         self.assertEqual(main.normalize_interval(999999), main.MAX_INTERVAL)
 
+    def test_shop_monitor_route_syncs_linked_product_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = self.seed_preorder_product(connection)
+                    shop_id = connection.execute(
+                        "SELECT id FROM shops WHERE token = 'PREORDER'"
+                    ).fetchone()["id"]
+
+                status, result = self.request_api(
+                    "PUT",
+                    f"/api/shops/{shop_id}",
+                    {
+                        "name": "预购店铺",
+                        "keywords": "",
+                        "category_id": None,
+                        "goods_type": "card",
+                        "enabled": True,
+                        "interval_seconds": 900,
+                    },
+                )
+
+                with main.database() as connection:
+                    interval = connection.execute(
+                        "SELECT interval_seconds FROM watches WHERE id = ?", (watch_id,)
+                    ).fetchone()["interval_seconds"]
+                self.assertEqual(status, 200)
+                self.assertEqual(result["synced_product_count"], 1)
+                self.assertEqual(result["interval_seconds"], 900)
+                self.assertEqual(interval, 900)
+
     def test_accepts_only_canonical_ldxp_item_urls(self):
         key, url = main.parse_item_url("https://pay.ldxp.cn/item/tp7o88")
         self.assertEqual(key, "tp7o88")
@@ -744,6 +777,7 @@ class GoodsParserTests(unittest.TestCase):
                 watch = main.list_watches()[0]
                 self.assertEqual(watch["latest"]["stock"], 8)
                 self.assertEqual(watch["shops"][0]["token"], "SHOPTEST")
+                self.assertEqual(watch["interval_seconds"], 300)
                 self.assertEqual(main.delete_watches([watch["id"]]), 1)
                 with patch.object(main, "fetch_shop_catalog", return_value=[product]):
                     summary = main.record_shop_fetch(shop_id)
