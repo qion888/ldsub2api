@@ -1600,7 +1600,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   transition: opacity .16s ease, transform .16s ease, visibility .16s ease;
 }
 .tooltip-anchor::after {
-  content: attr(data-tooltip);
+  content: none;
   left: 50%;
   bottom: calc(100% + 9px);
   width: max-content;
@@ -1620,13 +1620,17 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   transform: translate(-50%, 4px);
 }
 .tooltip-anchor::before {
-  content: "";
+  content: none;
   left: 50%;
   bottom: calc(100% + 4px);
   border: 5px solid transparent;
   border-top-color: #17191c;
   transform: translate(-50%, 4px);
 }
+.tooltip-anchor:hover::after,
+.tooltip-anchor:focus-visible::after { content: attr(data-tooltip); }
+.tooltip-anchor:hover::before,
+.tooltip-anchor:focus-visible::before { content: ""; }
 .tooltip-anchor:hover::before,
 .tooltip-anchor:hover::after,
 .tooltip-anchor:focus-visible::before,

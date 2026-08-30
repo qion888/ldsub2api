@@ -116,6 +116,30 @@ function StatusPill({item}) {
   return <span className="pill neutral"><Clock3 size={12}/>状态未知</span>;
 }
 
+function PriceBars({history}) {
+  const points = history.filter(point => {
+    if (point.status !== 'success' || point.price === null || point.price === undefined || point.price === '') return false;
+    return Number.isFinite(Number(point.price));
+  });
+  if (!points.length) return <div className="chart-empty">完成两次抓取后显示价格走势</div>;
+  const values = points.map(point => Number(point.price));
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  return (
+    <div className="price-chart" aria-label="价格历史">
+      {points.slice(-24).map((point, index) => {
+        const value = Number(point.price);
+        const height = max === min ? 58 : 22 + ((value - min) / (max - min)) * 70;
+        return <Tooltip key={`${point.id}-${index}`} label={`${compactTime(point.fetched_at)} · ${money(value)}`} placement="top">
+          <div className="bar-wrap">
+            <span className="bar" style={{height: `${height}%`}}/>
+          </div>
+        </Tooltip>;
+      })}
+    </div>
+  );
+}
+
 function historyStockMeta(point) {
   const raw = point?.stock;
   if (raw === null || raw === undefined || raw === '' || !Number.isFinite(Number(raw))) {
