@@ -2105,6 +2105,112 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .account-alert-list em { color: var(--ui-danger); font-size: 8px; font-style: normal; }
 .automation-run-list .compact-empty, .account-alert-list .compact-empty { min-height: 55px; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); font-size: 9px; }
 
+/* Keep the Sub2API console dense while using desktop-readable type and controls. */
+.sub2api-view { gap: 14px; }
+.sub2api-view .detail-kicker { font-size: 11px; }
+.sub2api-view .button { min-height: 38px; padding-inline: 15px; font-size: 13px; }
+.sub2api-view input, .sub2api-view select { height: 40px; padding-inline: 12px; font-size: 13px; }
+.sub2api-service-strip { min-height: 68px; grid-template-columns: minmax(270px, 1.5fr) repeat(3, minmax(82px, .45fr)) minmax(165px, .8fr) 44px; }
+.sub2api-service-strip > div { padding: 12px 15px; }
+.sub2api-service-strip > div > span { font-size: 11px; }
+.sub2api-service-strip > div > strong { margin-top: 6px; font-size: 15px; }
+.sub2api-service-strip .sub2api-service-state { grid-template-columns: 34px minmax(0, 1fr); gap: 11px; padding-inline: 16px; }
+.sub2api-service-state strong { font-size: 14px; }
+.sub2api-service-state small { margin-top: 5px; font-size: 11px; }
+
+.sub2api-primary-grid { gap: 14px; }
+.sub2api-primary-grid .tool-panel { padding: 20px; }
+.sub2api-primary-grid .section-heading { min-height: 42px; }
+.sub2api-primary-grid .section-heading h2 { font-size: 18px; }
+.sub2api-primary-grid .section-heading p { font-size: 12px; }
+.sub2api-primary-grid label > span { margin-bottom: 7px; font-size: 12px; }
+.compact-actions { margin-top: 14px; }
+.compact-actions .button, .sub2api-import-panel .import-button { min-height: 38px; }
+.sub2api-capability-grid { margin-top: 15px; }
+.sub2api-capability-grid > div { min-height: 62px; padding: 10px; grid-template-columns: 9px minmax(0, 1fr); column-gap: 7px; }
+.sub2api-capability-grid div > span { width: 8px; height: 8px; margin-top: 4px; }
+.sub2api-capability-grid small { font-size: 10px; }
+.sub2api-capability-grid strong { margin-top: 4px; font-size: 12px; }
+.sub2api-file-drop { min-height: 116px; margin-top: 15px !important; padding: 16px 20px; grid-template-columns: 32px minmax(0, 1fr); column-gap: 12px; }
+.sub2api-file-drop strong { font-size: 14px; }
+.sub2api-file-drop small { font-size: 12px; }
+.import-strategy-summary { margin-top: 13px; }
+.import-strategy-summary > div { min-height: 60px; padding: 10px 11px; grid-template-columns: 21px minmax(0, 1fr); gap: 8px; }
+.import-strategy-summary span { font-size: 11px; }
+.import-strategy-summary strong { margin-top: 5px; font-size: 12px; }
+.sub2api-import-panel .import-button { margin-top: 13px; }
+.sub2api-view .connection-result { font-size: 12px; }
+
+.automation-console > .automation-head { min-height: 82px; padding: 14px 18px; }
+.sub2api-view .automation-head h2 { font-size: 19px; }
+.sub2api-view .automation-head p { margin-top: 6px; font-size: 12px; }
+.automation-head-actions { gap: 9px; }
+.automation-head-actions .button { min-height: 38px; }
+.sub2api-view .automation-readiness { min-height: 36px; padding: 7px 10px; font-size: 12px; }
+.automation-metrics > div { min-height: 88px; padding: 13px 15px; }
+.automation-metrics span { font-size: 11px; }
+.automation-metrics strong { margin-top: 7px; font-size: 24px; }
+.automation-metrics small { margin-top: 6px; font-size: 11px; }
+
+.automation-setting-card { padding: 18px; }
+.automation-card-head { min-height: 42px; grid-template-columns: 25px minmax(0, 1fr) auto; gap: 9px; }
+.automation-card-head strong { font-size: 14px; }
+.automation-card-head small { margin-top: 4px; font-size: 11px; }
+.automation-card-head .icon-button { width: 34px; height: 34px; }
+.automation-toggle-row, .automation-check-row { min-height: 60px; margin-top: 11px; padding: 10px 0; }
+.automation-toggle-row strong, .automation-check-row strong { font-size: 13px; }
+.automation-toggle-row small, .automation-check-row small { margin-top: 4px; font-size: 11px; }
+.automation-check-row { margin-top: 0; }
+.automation-check-row > input { width: 18px; height: 18px; }
+.automation-setting-card .automation-interval { margin-top: 10px; }
+.automation-setting-card .automation-interval > span { margin-bottom: 7px; font-size: 11px; }
+.interval-presets { margin-top: 9px; gap: 6px; }
+.interval-presets button { height: 34px; padding-inline: 5px; font-size: 11px; }
+.automation-readiness-grid { margin-top: 12px; }
+.automation-readiness-grid > span { min-height: 39px; padding: 8px 9px; gap: 6px; font-size: 11px; }
+
+.assignment-card > label { margin-top: 11px; }
+.assignment-card > label > span, .fingerprint-field > span { margin-bottom: 7px; font-size: 11px; }
+.selected-proxy-meta { min-height: 34px; padding: 7px 9px; font-size: 10px; }
+.fingerprint-field { margin-top: 11px; }
+.fingerprint-segment { height: 40px; padding: 3px; }
+.sub2api-view .fingerprint-segment button { font-size: 11px; }
+.automation-group-picker { margin-top: 11px; }
+.automation-group-picker > .group-picker-head { min-height: 32px; }
+.group-picker-head > span { font-size: 11px; }
+.group-picker-head button { height: 30px; padding-inline: 8px; font-size: 10px; }
+.automation-group-picker > div:last-child { max-height: 145px; }
+.automation-group-picker label { min-height: 48px; padding: 8px 4px; gap: 9px; }
+.automation-group-picker input { width: 17px; height: 17px; }
+.automation-group-picker label strong { font-size: 12px; }
+.automation-group-picker label small { margin-top: 4px; font-size: 10px; }
+
+.runtime-state { min-height: 46px; margin-top: 11px; padding: 10px 11px; gap: 8px; }
+.runtime-state strong { font-size: 12px; }
+.runtime-dot { width: 8px; height: 8px; }
+.runtime-details { margin-top: 10px; }
+.runtime-details > div { min-height: 52px; padding: 9px 10px; }
+.runtime-details dt { font-size: 10px; }
+.runtime-details dd { margin-top: 5px; font-size: 12px; }
+.runtime-error { margin-top: 10px; padding: 9px 10px; font-size: 11px; }
+.platform-health { margin-top: 11px; }
+.platform-health > span { margin-bottom: 7px; font-size: 11px; }
+.platform-health > div { min-height: 27px; grid-template-columns: 68px minmax(45px, 1fr) 78px; gap: 8px; }
+.platform-health strong, .platform-health em { font-size: 10px; }
+.platform-health > small { font-size: 11px; }
+
+.automation-activity-panel { padding: 15px 18px 16px; }
+.activity-panel-head { min-height: 38px; }
+.activity-panel-head h3 { font-size: 14px; }
+.activity-panel-head > span { font-size: 11px; }
+.automation-run-list, .account-alert-list { margin-top: 8px; }
+.automation-run-list > div { min-height: 44px; padding: 8px 5px; grid-template-columns: 128px 90px minmax(0, 1fr); gap: 10px; }
+.automation-run-list span, .automation-run-list strong, .automation-run-list small { font-size: 11px; }
+.account-alert-list > div { min-height: 48px; padding: 8px 5px; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 9px; }
+.account-alert-list strong { font-size: 12px; }
+.account-alert-list small, .account-alert-list em { font-size: 10px; }
+.automation-run-list .compact-empty, .account-alert-list .compact-empty { min-height: 64px; font-size: 11px; }
+
 @media (max-width: 1200px) {
   .sub2api-primary-grid { grid-template-columns: 1fr; }
   .automation-workspace { grid-template-columns: 1fr 1.25fr; }
