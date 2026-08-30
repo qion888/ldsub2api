@@ -1,0 +1,495 @@
+diff --git a/backend/main.py b/backend/main.py
+index 06cbccb..7512872 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -373,6 +373,14 @@ def retry_sub2api_card_import_record(record_id: int) -> dict[str, Any]:
+     )
+ 
+ 
++def delete_sub2api_card_import_record(record_id: int) -> dict[str, Any]:
++    return sub2api_card_history.delete_record(database, record_id)
++
++
++def delete_sub2api_card_import_records(record_ids: list[int]) -> dict[str, Any]:
++    return sub2api_card_history.delete_records(database, record_ids)
++
++
+ def _sub2api_imported_order_nos() -> list[str]:
+     try:
+         value = sub2api_automation_state().get("imported_order_nos", [])
+@@ -1082,6 +1090,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             test_account=test_sub2api_account,
+             card_import_history_creator=create_sub2api_card_import_record,
+             card_import_history_retry=retry_sub2api_card_import_record,
++            card_import_history_batch_deleter=delete_sub2api_card_import_records,
+         ):
+             return
+ 
+@@ -1522,6 +1531,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             path,
+             send_json=self._send_json,
+             delete_account=delete_sub2api_account,
++            card_import_history_deleter=delete_sub2api_card_import_record,
+         ):
+             return
+         preorder_match = re.fullmatch(r"/api/preorders/(\d+)", path)
+diff --git a/backend/sub2api/card_import_history.py b/backend/sub2api/card_import_history.py
+index 86b84fd..ec88bae 100644
+--- a/backend/sub2api/card_import_history.py
++++ b/backend/sub2api/card_import_history.py
+@@ -21,6 +21,7 @@ COUNT_FIELDS = (
+ )
+ RETRYABLE_STATUSES = {"pending", "failed"}
+ MAX_RETRY_CONTEXT_BYTES = 8 * 1024 * 1024
++MAX_DELETE_RECORDS = 500
+ 
+ 
+ class RecordNotFound(LookupError):
+@@ -89,6 +90,22 @@ def _bounded_count(value: Any, name: str, *, maximum: int = 100000) -> int:
+     return number
+ 
+ 
++def _record_ids(value: Any) -> list[int]:
++    if not isinstance(value, list) or not value or len(value) > MAX_DELETE_RECORDS:
++        raise ValueError(f"请选择 1 到 {MAX_DELETE_RECORDS} 条导入记录")
++    record_ids: list[int] = []
++    for raw_id in value:
++        try:
++            record_id = int(raw_id)
++        except (TypeError, ValueError) as exc:
++            raise ValueError("导入记录编号无效") from exc
++        if record_id < 1:
++            raise ValueError("导入记录编号无效")
++        if record_id not in record_ids:
++            record_ids.append(record_id)
++    return record_ids
++
++
+ def _details(value: Any) -> dict[str, Any]:
+     if not isinstance(value, dict):
+         return {}
+@@ -415,6 +432,40 @@ def list_records(
+     }
+ 
+ 
++def delete_records(
++    database_factory: DatabaseFactory,
++    record_ids: list[int],
++) -> dict[str, Any]:
++    normalized = _record_ids(record_ids)
++    placeholders = ",".join("?" for _ in normalized)
++    with database_factory() as connection:
++        rows = connection.execute(
++            f"SELECT id FROM sub2api_card_import_records WHERE id IN ({placeholders})",
++            tuple(normalized),
++        ).fetchall()
++        existing = {int(row["id"]) for row in rows}
++        deleted_ids = [record_id for record_id in normalized if record_id in existing]
++        if deleted_ids:
++            delete_placeholders = ",".join("?" for _ in deleted_ids)
++            connection.execute(
++                f"DELETE FROM sub2api_card_import_records WHERE id IN ({delete_placeholders})",
++                tuple(deleted_ids),
++            )
++    return {
++        "ok": True,
++        "requested_count": len(normalized),
++        "deleted_count": len(deleted_ids),
++        "deleted_ids": deleted_ids,
++    }
++
++
++def delete_record(database_factory: DatabaseFactory, record_id: int) -> dict[str, Any]:
++    result = delete_records(database_factory, [record_id])
++    if result["deleted_count"] != 1:
++        raise RecordNotFound("卡密导入记录不存在")
++    return result
++
++
+ def retry_record(
+     database_factory: DatabaseFactory,
+     record_id: int,
+diff --git a/backend/sub2api/routes.py b/backend/sub2api/routes.py
+index 89b4409..43e6973 100644
+--- a/backend/sub2api/routes.py
++++ b/backend/sub2api/routes.py
+@@ -78,7 +78,17 @@ def handle_post(
+     test_account: Callable[[int], dict[str, Any]] | None = None,
+     card_import_history_creator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+     card_import_history_retry: Callable[[int], dict[str, Any]] | None = None,
++    card_import_history_batch_deleter: Callable[[list[int]], dict[str, Any]] | None = None,
+ ) -> bool:
++    if path == "/api/sub2api/card-import-records/batch-delete":
++        if card_import_history_batch_deleter is None:
++            return False
++        try:
++            send_json(card_import_history_batch_deleter(data.get("ids")), 200)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        return True
++
+     if path == "/api/sub2api/card-import-records":
+         if card_import_history_creator is None:
+             return False
+@@ -206,7 +216,20 @@ def handle_delete(
+     *,
+     send_json: SendJson,
+     delete_account: Callable[[int], dict[str, Any]] | None = None,
++    card_import_history_deleter: Callable[[int], dict[str, Any]] | None = None,
+ ) -> bool:
++    card_import_match = re.fullmatch(r"/api/sub2api/card-import-records/(\d+)", path)
++    if card_import_match:
++        if card_import_history_deleter is None:
++            return False
++        try:
++            send_json(card_import_history_deleter(int(card_import_match.group(1))), 200)
++        except LookupError as exc:
++            send_json({"detail": str(exc)}, 404)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        return True
++
+     account_match = re.fullmatch(r"/api/sub2api/accounts/(\d+)", path)
+     if not account_match:
+         return False
+diff --git a/backend/test_main.py b/backend/test_main.py
+index 5be7619..4dde9b6 100644
+--- a/backend/test_main.py
++++ b/backend/test_main.py
+@@ -1327,10 +1327,33 @@ class GoodsParserTests(unittest.TestCase):
+                 status, retried = self.request_api(
+                     "POST", f"/api/sub2api/card-import-records/{created['id']}/retry", {}
+                 )
+-
+-        self.assertEqual(status, 200)
+-        self.assertTrue(retried["ok"])
+-        self.assertEqual(retried["record"]["success_count"], 2)
++                self.assertEqual(status, 200)
++                self.assertTrue(retried["ok"])
++                self.assertEqual(retried["record"]["success_count"], 2)
++                status, deleted = self.request_api(
++                    "DELETE", f"/api/sub2api/card-import-records/{created['id']}", {}
++                )
++                self.assertEqual(status, 200)
++                self.assertEqual(deleted["deleted_ids"], [created["id"]])
++                batch_ids = []
++                for code in ("CARD-C", "CARD-D"):
++                    create_status, record = self.request_api(
++                        "POST", "/api/sub2api/card-import-records", {
++                            "mode": "manual", "card_codes": [code],
++                        }
++                    )
++                    self.assertEqual(create_status, 201)
++                    batch_ids.append(record["id"])
++                status, batch_deleted = self.request_api(
++                    "POST", "/api/sub2api/card-import-records/batch-delete", {"ids": batch_ids}
++                )
++                self.assertEqual(status, 200)
++                self.assertEqual(batch_deleted["deleted_count"], 2)
++                status, empty_records = self.request_api(
++                    "GET", "/api/sub2api/card-import-records?page=1&page_size=10", {}
++                )
++                self.assertEqual(status, 200)
++                self.assertEqual(empty_records["total"], 0)
+         self.assertEqual(records["page"], 1)
+         self.assertEqual(records["pages"], 1)
+         importer.assert_called_once()
+diff --git a/backend/test_sub2api_modules.py b/backend/test_sub2api_modules.py
+index 5cc712e..eaa6522 100644
+--- a/backend/test_sub2api_modules.py
++++ b/backend/test_sub2api_modules.py
+@@ -122,6 +122,40 @@ class Sub2ApiModuleTests(unittest.TestCase):
+         self.assertEqual(calls[0][1]["proxy_id"], 7)
+         self.assertEqual(calls[0][1]["reclaim_order_nos"], ["ORDER-123"])
+ 
++    def test_card_import_history_deletes_single_and_multiple_records(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "history.db"
++
++            def database():
++                return monitor_database.create_database(path)
++
++            timestamps = iter(f"2026-08-30T09:{minute:02d}:00+00:00" for minute in range(4))
++            card_import_history.initialize(database)
++            records = [
++                card_import_history.create_record(
++                    database,
++                    {"mode": "manual", "card_codes": [f"DELETE-{index}"]},
++                    now=lambda: next(timestamps),
++                )
++                for index in range(3)
++            ]
++
++            single = card_import_history.delete_record(database, records[0]["id"])
++            batch = card_import_history.delete_records(
++                database, [records[1]["id"], records[2]["id"], records[2]["id"], 999]
++            )
++            remaining = card_import_history.list_records(database)
++            self.assertEqual(single["deleted_ids"], [records[0]["id"]])
++            self.assertEqual(batch["requested_count"], 3)
++            self.assertEqual(batch["deleted_count"], 2)
++            self.assertEqual(batch["deleted_ids"], [records[1]["id"], records[2]["id"]])
++            self.assertEqual(remaining["total"], 0)
++            with self.assertRaises(card_import_history.RecordNotFound):
++                card_import_history.delete_record(database, records[0]["id"])
++            for invalid in ([], [0], ["bad"], list(range(1, 502))):
++                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
++                    card_import_history.delete_records(database, invalid)
++
+     def test_card_import_history_retry_failure_restores_failed_state(self) -> None:
+         with tempfile.TemporaryDirectory() as directory:
+             path = Path(directory) / "history.db"
+@@ -556,6 +590,23 @@ class Sub2ApiModuleTests(unittest.TestCase):
+             card_import_history_updater=lambda record_id, payload: {"id": record_id, **payload},
+         ))
+         self.assertEqual(responses[-1], (200, {"id": 7, "status": "success"}))
++        self.assertTrue(routes.handle_post(
++            "/api/sub2api/card-import-records/batch-delete",
++            {"ids": [7, 8]},
++            **common_write,
++            card_import_history_batch_deleter=lambda record_ids: {
++                "ok": True, "deleted_count": len(record_ids), "deleted_ids": record_ids,
++            },
++        ))
++        self.assertEqual(responses[-1][1]["deleted_ids"], [7, 8])
++        self.assertTrue(routes.handle_delete(
++            "/api/sub2api/card-import-records/7",
++            send_json=common_get["send_json"],
++            card_import_history_deleter=lambda record_id: {
++                "ok": True, "deleted_count": 1, "deleted_ids": [record_id],
++            },
++        ))
++        self.assertEqual(responses[-1][1]["deleted_ids"], [7])
+         self.assertTrue(routes.handle_delete(
+             "/api/sub2api/accounts/12",
+             send_json=lambda payload, status=200: responses.append((status, payload)),
+diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
+index c0fc21e..3be38c7 100644
+--- a/frontend/src/Sub2ApiView.jsx
++++ b/frontend/src/Sub2ApiView.jsx
+@@ -1,4 +1,4 @@
+-import React, {useState} from 'react';
++import React, {useEffect, useState} from 'react';
+ import {
+   Activity,
+   AlertCircle,
+@@ -27,6 +27,7 @@ import {
+   TriangleAlert,
+   Upload,
+   Wifi,
++  X,
+ } from 'lucide-react';
+ 
+ function compactTime(value) {
+@@ -325,8 +326,9 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
+   );
+ }
+ 
+-function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage, onPageSize, busy, actions, onRefresh, onRetry, onCopyCode}) {
++function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage, onPageSize, busy, actions, onRefresh, onRetry, onDelete, onCopyCode}) {
+   const items = Array.isArray(data?.items) ? data.items : [];
++  const [selectedIds, setSelectedIds] = useState([]);
+   const summary = data?.summary || {total: 0, success: 0, failed: 0, pending: 0, successful_accounts: 0, failed_accounts: 0};
+   const filters = [
+     {value: 'all', label: '全部', count: summary.total},
+@@ -345,6 +347,18 @@ function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage,
+   const total = Number(data?.total || 0);
+   const pageStart = total ? ((currentPage - 1) * Number(data?.page_size || pageSize || 10)) + 1 : 0;
+   const pageEnd = Math.min(total, currentPage * Number(data?.page_size || pageSize || 10));
++  const pageIds = items.map(record => Number(record.id)).filter(Number.isInteger);
++  const allSelected = pageIds.length > 0 && pageIds.every(recordId => selectedIds.includes(recordId));
++  const batchDeleting = actions?.batchDelete === 'delete';
++  useEffect(() => {
++    setSelectedIds(current => current.filter(recordId => pageIds.includes(recordId)));
++  }, [data]);
++  const toggleRecord = recordId => setSelectedIds(current => current.includes(recordId) ? current.filter(value => value !== recordId) : [...current, recordId]);
++  const togglePage = () => setSelectedIds(allSelected ? [] : pageIds);
++  const deleteRecords = async records => {
++    const deleted = await onDelete(records);
++    if (deleted) setSelectedIds([]);
++  };
+   const recordDetail = record => {
+     const accountIds = Array.isArray(record.details?.new_account_ids) ? record.details.new_account_ids : [];
+     const missing = Array.isArray(record.details?.missing_accounts) ? record.details.missing_accounts : [];
+@@ -369,25 +383,27 @@ function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage,
+         <div className="card-history-filters" role="tablist" aria-label="导入记录状态筛选">
+           {filters.map(item => <button type="button" role="tab" aria-selected={filter === item.value} className={filter === item.value ? 'active' : ''} onClick={() => onFilter(item.value)} key={item.value}>{item.label}<span>{item.count ?? 0}</span></button>)}
+         </div>
+-        <span>{total ? `当前 ${pageStart}-${pageEnd} / ${total} 条` : '当前没有记录'}</span>
++        <div className="card-history-toolbar-actions"><span>{selectedIds.length ? `已选 ${selectedIds.length} 条` : total ? `当前 ${pageStart}-${pageEnd} / ${total} 条` : '当前没有记录'}</span>{selectedIds.length > 0 && <button className="icon-button" type="button" onClick={() => setSelectedIds([])} disabled={busy || batchDeleting} title="取消选择" aria-label="取消选择"><X size={15}/></button>}<button className="button danger-button" type="button" onClick={() => deleteRecords(items.filter(record => selectedIds.includes(Number(record.id))))} disabled={busy || batchDeleting || !selectedIds.length}>{batchDeleting ? <RefreshCw size={14} className="spin"/> : <Trash2 size={14}/>}<span>{batchDeleting ? '正在删除' : '批量删除'}</span></button></div>
+       </div>
+       <div className={`card-history-table-wrap ${busy ? 'is-loading' : ''}`} role="region" tabIndex={0} aria-label="可横向滚动的卡密导入记录" aria-busy={busy}>
+         <div className="card-history-table" role="table" aria-label="卡密导入记录">
+-          <div className="card-history-row head" role="row"><span role="columnheader">状态</span><span role="columnheader">时间 / 模式</span><span role="columnheader">卡密</span><span role="columnheader">下载 / 账号</span><span role="columnheader">推送结果</span><span role="columnheader">详情</span><span role="columnheader">操作</span></div>
++          <div className="card-history-row head" role="row"><span role="columnheader" className="card-history-select"><input type="checkbox" checked={allSelected} onChange={togglePage} disabled={busy || !pageIds.length} aria-label="选择当前页全部导入记录" title="选择当前页全部导入记录"/></span><span role="columnheader">状态</span><span role="columnheader">时间 / 模式</span><span role="columnheader">卡密</span><span role="columnheader">下载 / 账号</span><span role="columnheader">推送结果</span><span role="columnheader">详情</span><span role="columnheader">操作</span></div>
+           {items.length ? items.map(record => {
+             const meta = statusMeta[record.status] || statusMeta.running;
+             const StatusIcon = meta.icon;
+             const cardCodes = Array.isArray(record.card_codes) ? record.card_codes : [];
+             const retryVisible = ['failed', 'pending'].includes(record.status);
+             const retryBusy = actions?.[record.id] === 'retry';
+-            return <div className={`card-history-row ${record.status}`} role="row" key={record.id}>
++            const deleteBusy = actions?.[record.id] === 'delete';
++            return <div className={`card-history-row ${record.status} ${selectedIds.includes(Number(record.id)) ? 'selected' : ''}`} role="row" key={record.id}>
++              <span role="cell" className="card-history-select"><input type="checkbox" checked={selectedIds.includes(Number(record.id))} onChange={() => toggleRecord(Number(record.id))} disabled={busy || retryBusy || deleteBusy || batchDeleting} aria-label={`选择导入记录 #${record.id}`}/></span>
+               <span role="cell" className={`card-history-status ${record.status}`}><StatusIcon size={14} className={record.status === 'running' ? 'spin' : ''}/><strong>{meta.label}</strong></span>
+               <span role="cell"><strong>{compactTime(record.completed_at || record.updated_at || record.started_at)}</strong><small>{record.mode === 'auto' ? '自动推送' : '手动推送'} · #{record.id}</small></span>
+               <span role="cell" className="card-history-codes">{cardCodes.length ? <span className="card-code-list">{cardCodes.map(code => <button type="button" onClick={() => onCopyCode(code)} title={`复制卡密 ${code}`} aria-label={`复制卡密 ${code}`} key={code}><code>{code}</code><Clipboard size={12}/></button>)}</span> : <small>旧记录未保存卡密</small>}</span>
+               <span role="cell"><strong>{record.downloaded_files} 个文件 · {record.account_count} 个账号</strong><small>已核验 {record.verified_count} / {record.card_count} 张卡密</small></span>
+               <span role="cell"><strong><em className="positive">{record.success_count}</em> 成功 · <em className={record.failed_count ? 'negative' : ''}>{record.failed_count}</em> 失败</strong><small>待推送 {Math.max(0, Number(record.account_count || 0) - Number(record.success_count || 0))}</small></span>
+               <span role="cell" title={recordDetail(record)}><strong>{record.message || meta.label}</strong><small>{recordDetail(record)}</small></span>
+-              <span role="cell" className="card-history-actions">{retryVisible ? <button className="button secondary" type="button" onClick={() => onRetry(record)} disabled={busy || retryBusy || !record.retryable} title={record.retryable ? '使用原导入参数重新推送' : '该记录尚未保存可重推的账号数据'}>{retryBusy ? <RefreshCw size={13} className="spin"/> : <Send size={13}/>}<span>{retryBusy ? '推送中' : '重新推送'}</span></button> : <small>无需操作</small>}</span>
++              <span role="cell" className="card-history-actions">{retryVisible && <button className="button secondary" type="button" onClick={() => onRetry(record)} disabled={busy || retryBusy || deleteBusy || batchDeleting || !record.retryable} title={record.retryable ? '使用原导入参数重新推送' : '该记录尚未保存可重推的账号数据'}>{retryBusy ? <RefreshCw size={13} className="spin"/> : <Send size={13}/>}<span>{retryBusy ? '推送中' : '重新推送'}</span></button>}<button className="icon-button danger-icon" type="button" onClick={() => deleteRecords(record)} disabled={busy || retryBusy || deleteBusy || batchDeleting} title={`删除导入记录 #${record.id}`} aria-label={`删除导入记录 #${record.id}`}>{deleteBusy ? <RefreshCw size={14} className="spin"/> : <Trash2 size={14}/>}</button></span>
+             </div>;
+           }) : <div className="card-history-empty">{busy ? <RefreshCw size={20} className="spin"/> : <History size={20}/>}<span>{busy ? '正在读取导入记录' : '当前筛选下暂无导入记录'}</span></div>}
+         </div>
+@@ -397,7 +413,7 @@ function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage,
+   );
+ }
+ 
+-function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyPage, historyPageSize, onHistoryPage, onHistoryPageSize, historyBusy, historyActions, onRefreshHistory, onRetryHistory, onCopyCode}) {
++function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyPage, historyPageSize, onHistoryPage, onHistoryPageSize, historyBusy, historyActions, onRefreshHistory, onRetryHistory, onDeleteHistory, onCopyCode}) {
+   const stageLabel = {
+     idle: '等待输入',
+     verify: '正在核验',
+@@ -454,12 +470,12 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
+           </div>
+         </div>
+       </div>
+-      <CardImportHistoryPanel data={historyData} filter={historyFilter} onFilter={onHistoryFilter} page={historyPage} pageSize={historyPageSize} onPage={onHistoryPage} onPageSize={onHistoryPageSize} busy={historyBusy} actions={historyActions} onRefresh={onRefreshHistory} onRetry={onRetryHistory} onCopyCode={onCopyCode}/>
++      <CardImportHistoryPanel data={historyData} filter={historyFilter} onFilter={onHistoryFilter} page={historyPage} pageSize={historyPageSize} onPage={onHistoryPage} onPageSize={onHistoryPageSize} busy={historyBusy} actions={historyActions} onRefresh={onRefreshHistory} onRetry={onRetryHistory} onDelete={onDeleteHistory} onCopyCode={onCopyCode}/>
+     </section>
+   );
+ }
+ 
+-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
++export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+   const [dragging, setDragging] = useState(false);
+   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
+   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
+@@ -537,7 +553,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
+         onRun={onRunCardImport} onPush={onPushCards}
+         historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
+         historyPage={cardHistoryPage} historyPageSize={cardHistoryPageSize} onHistoryPage={onCardHistoryPage} onHistoryPageSize={onCardHistoryPageSize}
+-        historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onCopyCode={onCopyCardCode}
++        historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onDeleteHistory={onDeleteCardHistory} onCopyCode={onCopyCardCode}
+       />
+ 
+       <div className="automation-console">
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 1c7e83a..8f05766 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -2407,6 +2407,40 @@ function App() {
+     }
+   };
+ 
++  const deleteSub2ApiCardHistory = async records => {
++    const batch = Array.isArray(records);
++    const values = batch ? records : [records];
++    const recordIds = [...new Set(values
++      .map(record => Number(record?.id))
++      .filter(recordId => Number.isInteger(recordId) && recordId > 0))];
++    if (!recordIds.length) return false;
++    const prompt = batch
++      ? `确定删除选中的 ${recordIds.length} 条导入记录？删除后不可恢复。`
++      : `确定删除导入记录 #${recordIds[0]}？删除后不可恢复。`;
++    if (!window.confirm(prompt)) return false;
++
++    const actionKey = batch ? 'batchDelete' : recordIds[0];
++    setSub2apiCardHistoryActions(current => ({...current, [actionKey]: 'delete'}));
++    try {
++      const result = batch
++        ? await request('/sub2api/card-import-records/batch-delete', {
++          method: 'POST',
++          headers: {'Content-Type': 'application/json'},
++          body: JSON.stringify({ids: recordIds}),
++        })
++        : await request(`/sub2api/card-import-records/${recordIds[0]}`, {method: 'DELETE'});
++      await loadSub2ApiCardHistory({quiet: true});
++      notify(batch ? `已删除 ${result.deleted_count} 条导入记录` : `导入记录 #${recordIds[0]} 已删除`);
++      return true;
++    } catch (error) {
++      notify(error.message, 'error');
++      await loadSub2ApiCardHistory({quiet: true});
++      return false;
++    } finally {
++      setSub2apiCardHistoryActions(current => ({...current, [actionKey]: null}));
++    }
++  };
++
+   const retrySub2ApiCardHistory = async record => {
+     const recordId = Number(record?.id);
+     if (!Number.isInteger(recordId) || recordId < 1 || !record?.retryable) return;
+@@ -2787,7 +2821,7 @@ function App() {
+             cardHistoryPage={sub2apiCardHistoryPage} cardHistoryPageSize={sub2apiCardHistoryPageSize}
+             onCardHistoryPage={setSub2apiCardHistoryPage} onCardHistoryPageSize={value => { setSub2apiCardHistoryPage(1); setSub2apiCardHistoryPageSize(value); }}
+             cardHistoryBusy={sub2apiCardHistoryBusy} cardHistoryActions={sub2apiCardHistoryActions} onRefreshCardHistory={() => loadSub2ApiCardHistory()}
+-            onRetryCardHistory={retrySub2ApiCardHistory} onCopyCardCode={copySub2ApiCardCode}
++            onRetryCardHistory={retrySub2ApiCardHistory} onDeleteCardHistory={deleteSub2ApiCardHistory} onCopyCardCode={copySub2ApiCardCode}
+             fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
+             optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
+             codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index 53034ae..0a6ef6d 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2081,6 +2081,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-summary small { margin-top: 3px; color: var(--ui-text-muted); font-size: 9px; }
+ .card-history-toolbar { min-height: 50px; padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--ui-border-soft); }
+ .card-history-toolbar > span { color: var(--ui-text-muted); font-size: 10px; white-space: nowrap; }
++.card-history-toolbar-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 7px; color: var(--ui-text-muted); font-size: 10px; white-space: nowrap; }
++.card-history-toolbar-actions .button { min-height: 32px; padding-inline: 10px; }
+ .card-history-filters { min-width: 0; display: inline-flex; align-items: center; background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
+ .card-history-filters button { min-width: 78px; height: 32px; border: 0; border-right: 1px solid var(--ui-border-soft); padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-muted); background: transparent; font-size: 10px; }
+ .card-history-filters button:last-child { border-right: 0; }
+@@ -2088,10 +2090,11 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-filters button.active { color: #fff; background: var(--ui-black); }
+ .card-history-filters button span { min-width: 19px; height: 18px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; color: inherit; background: color-mix(in srgb, currentColor 10%, transparent); border-radius: 3px; font-size: 9px; font-variant-numeric: tabular-nums; }
+ .card-history-table-wrap { max-height: 360px; overflow: auto; }
+-.card-history-table { min-width: 1060px; }
+-.card-history-row { min-height: 58px; display: grid; grid-template-columns: 100px 135px 170px 155px 145px minmax(205px, 1fr) 120px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
++.card-history-table { min-width: 1120px; }
++.card-history-row { min-height: 58px; display: grid; grid-template-columns: 42px 100px 135px 170px 155px 145px minmax(205px, 1fr) 150px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
+ .card-history-row:last-child { border-bottom: 0; }
+ .card-history-row.head { position: sticky; z-index: 2; top: 0; min-height: 35px; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 9px; font-weight: 700; }
++.card-history-row.selected { background: color-mix(in srgb, var(--ui-text) 8%, var(--ui-surface)); }
+ .card-history-row > span { min-width: 0; padding: 8px 12px; }
+ .card-history-row > span + span { border-left: 1px solid var(--ui-border-soft); }
+ .card-history-row strong, .card-history-row small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@@ -2104,9 +2107,14 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-code-list button:hover { color: var(--ui-text); border-color: var(--ui-border); background: var(--ui-control); }
+ .card-code-list code { min-width: 0; overflow: hidden; color: inherit; font: inherit; text-overflow: ellipsis; white-space: nowrap; }
+ .card-code-list svg { flex: 0 0 auto; }
+-.card-history-actions { display: flex; justify-content: center; }
++.card-history-select { display: flex; align-items: center; justify-content: center; }
++.card-history-select input { width: 16px; height: 16px; margin: 0; accent-color: var(--ui-text); cursor: pointer; }
++.card-history-select input:disabled { cursor: not-allowed; opacity: .52; }
++.card-history-actions { display: flex; align-items: center; justify-content: center; gap: 6px; }
+ .card-history-actions .button { min-width: 106px; min-height: 32px; padding: 0 9px; font-size: 10px; }
+ .card-history-actions .button:disabled { cursor: not-allowed; opacity: .52; }
++.card-history-actions .danger-icon { flex: 0 0 auto; color: var(--ui-danger); border-color: color-mix(in srgb, var(--ui-danger) 35%, var(--ui-border)); }
++.card-history-actions .danger-icon:hover:not(:disabled) { color: #fff; border-color: var(--ui-danger); background: var(--ui-danger); }
+ .card-history-status { display: flex; align-items: center; gap: 7px; }
+ .card-history-status svg { flex: 0 0 auto; }
+ .card-history-status.success { color: var(--ui-success); }
+@@ -2298,8 +2306,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-toolbar > span { font-size: 11px; }
+ .card-history-filters button { min-width: 78px; height: 34px; padding-inline: 10px; font-size: 11px; }
+ .card-history-filters button span { min-width: 19px; height: 18px; font-size: 10px; }
+-.card-history-table { min-width: 1060px; }
+-.card-history-row { min-height: 58px; grid-template-columns: 100px 135px 170px 155px 145px minmax(205px, 1fr) 120px; }
++.card-history-table { min-width: 1120px; }
++.card-history-row { min-height: 58px; grid-template-columns: 42px 100px 135px 170px 155px 145px minmax(205px, 1fr) 150px; }
+ .card-history-row.head { min-height: 36px; font-size: 11px; }
+ .card-history-row > span { padding: 8px 11px; }
+ .card-history-row:not(.head) strong { font-size: 12px; }
+@@ -2573,7 +2581,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+   .card-history-toolbar { align-items: stretch; flex-direction: column; }
+   .card-history-filters { width: 100%; overflow-x: auto; }
+   .card-history-filters button { min-width: 72px; flex: 1; }
+-  .card-history-toolbar > span { align-self: flex-end; }
++  .card-history-toolbar-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+   .card-history-pagination { align-items: flex-start; flex-wrap: wrap; justify-content: space-between; }
+   .card-history-pagination > div { margin-left: auto; }
+   .card-mode-head { align-items: stretch; flex-direction: column; gap: 7px; }

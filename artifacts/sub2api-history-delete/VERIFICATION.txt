@@ -1,0 +1,71 @@
+Sub2API 导入记录删除功能验收
+
+分支/字段
+- 分支：codex/sub2api-history-delete
+- 数据表：sub2api_card_import_records.id
+- 单条接口：DELETE /api/sub2api/card-import-records/{id}
+- 批量接口：POST /api/sub2api/card-import-records/batch-delete，输入字段 ids，最多 500 条
+
+制品路径
+- MODIFIED_FILE: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/MODIFIED_FILE
+- DIFF_FILE: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/DIFF_FILE
+- VERIFICATION.txt: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/VERIFICATION.txt
+- ROLLBACK.sh: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/ROLLBACK.sh
+- ROLLBACK_BASELINE: E:/soft/java/ldxp-sub2api-history-delete/artifacts/sub2api-history-delete/ROLLBACK_BASELINE
+
+哈希
+- BASELINE frontend/src/main.jsx SHA256: 1EB6EA7C5CFE3C216D016814BAD13477E50DF1D9EB1814B3987B7CD4D170CAD5
+- MODIFIED frontend/src/main.jsx SHA256: 8F4A096EB57CEC5C0ABF3692E67C727E2FB430BB734F12CC83029058D4F8B44A
+- DIFF_FILE SHA256: 649FF30B626BDE1B20A96585E7B031B52F0866231449CAC43ECAAAAED10E5DF4
+
+BASELINE
+- command: python -m unittest discover -s backend -q
+- input: git d5a0c8b
+- literal result: Ran 96 tests; OK
+- exit status: 0
+- command: npm test
+- input: git d5a0c8b/frontend
+- literal result: tests 10; pass 10; fail 0
+- exit status: 0
+
+MODIFIED
+- command: python -m unittest discover -s backend -q
+- input: git 0f4f92a
+- literal output: Ran 97 tests in 2.172s; OK
+- exit status: 0
+- command: npm test
+- input: codex/sub2api-history-delete/frontend
+- literal output: tests 10; pass 10; fail 0; duration_ms 120.5291
+- exit status: 0
+- command: npm run build
+- input: codex/sub2api-history-delete/frontend
+- literal output: 2385 modules transformed; built in 393ms
+- exit status: 0
+- command: git diff --check
+- input: HEAD..working tree
+- literal result: no whitespace errors
+- exit status: 0
+
+HTTP/UI 验收
+- command: DELETE /api/sub2api/card-import-records/11
+- input: browser confirmation accepted
+- literal result: total=11; deleted11Button=false; pageLabel=第 1 / 2 页
+- status: PASS
+- command: POST /api/sub2api/card-import-records/batch-delete
+- input: ids=[1,2]，浏览器当前页全选并确认
+- literal result: total=10; pageLabel=第 1 / 1 页; selectedRows=0; deletedIdsPresent=false
+- status: PASS
+- command: responsive layout check
+- input: viewport=390x844, theme=light/dark
+- literal result: body clientWidth=380; body scrollWidth=380; toolbar clientWidth=354; toolbar scrollWidth=354; tableWrap clientWidth=344; tableWrap scrollWidth=1120; overflowX=auto
+- status: PASS
+
+ROLLBACK
+- command: E:/soft/Git/bin/bash.exe artifacts/sub2api-history-delete/ROLLBACK.sh E:/soft/java/ldxp-sub2api-history-delete-rollback-check
+- input: detached d5a0c8b worktree with DIFF_FILE applied
+- literal result: RollbackExit=0; InitialWorktreeSHA256=1EB6EA7C5CFE3C216D016814BAD13477E50DF1D9EB1814B3987B7CD4D170CAD5; RestoredWorktreeSHA256=1EB6EA7C5CFE3C216D016814BAD13477E50DF1D9EB1814B3987B7CD4D170CAD5; HashesMatch=true; GitStatus=''
+- exit status: 0
+- command: python -m unittest discover -s E:/soft/java/ldxp-sub2api-history-delete-rollback-check/backend -q
+- literal output: Ran 96 tests in 1.941s; OK
+- exit status: 0
+- restored behavior/status: 删除接口与删除 UI 已恢复为 d5a0c8b 基线，测试副本无差异，基线 96 项后端测试通过；原工作树的 MODIFIED_FILE 保持修改状态。
