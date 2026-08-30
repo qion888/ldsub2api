@@ -230,11 +230,13 @@ function Sub2ApiUsageWindow({label, window, tone, testId}) {
         aria-valuenow={hasPercent ? Math.round(meterPercent) : undefined}
         aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '暂无使用率'}
       ><span style={{width: `${meterPercent}%`}}/></div>
-      <Tooltip label={exactResetLabel}><span className="account-usage-reset"><TimerReset size={13}/>{resetLabel}</span></Tooltip>
+      <div className="account-usage-footnote">
+        <Tooltip label={exactResetLabel}><span className="account-usage-reset"><TimerReset size={12}/>{resetLabel}</span></Tooltip>
+        {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-standard">标准成本 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
+      </div>
       {detailItems.length > 0
         ? <dl className="account-usage-details">{detailItems.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>
         : <div className="account-usage-window-empty">暂无请求与费用明细</div>}
-      {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-standard">标准成本 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
     </> : <div className="account-usage-window-empty">暂未返回此窗口数据</div>}
   </section>;
 }
