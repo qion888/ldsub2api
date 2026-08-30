@@ -27,6 +27,7 @@ import {
   Package,
   PanelRight,
   Plus,
+  ReceiptText,
   RefreshCw,
   Save,
   Search,
@@ -35,6 +36,7 @@ import {
   Sun,
   Tag,
   TimerReset,
+  TriangleAlert,
   Upload,
   ShieldCheck,
   ShoppingBag,
@@ -55,11 +57,13 @@ import {
 const API = '/api';
 const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
 const ProductDetailPriceChart = React.lazy(() => import('./PriceHistoryChart.jsx').then(module => ({default: module.ProductDetailPriceChart})));
+const loadOrderQueryView = () => import('./OrderQueryView.jsx');
 const loadReclaimView = () => import('./ReclaimView.jsx');
 const loadSub2ApiView = () => import('./Sub2ApiView.jsx');
+const OrderQueryView = React.lazy(() => loadOrderQueryView());
 const ReclaimView = React.lazy(() => loadReclaimView());
 const Sub2ApiView = React.lazy(() => loadSub2ApiView());
-const FEATURE_MODULE_LOADERS = {reclaim: loadReclaimView, sub2api: loadSub2ApiView};
+const FEATURE_MODULE_LOADERS = {orders: loadOrderQueryView, reclaim: loadReclaimView, sub2api: loadSub2ApiView};
 const DEFAULT_SUB2API_AUTOMATION = {
   enabled: false,
   interval_seconds: 300,
@@ -2615,6 +2619,7 @@ function App() {
     products: {title: '商品总览', description: '聚合监控店铺报价，快速比较最低价、库存与销售状态'},
     monitor: {title: '店铺与商品监控', description: '汇总店铺商品，追踪库存、价格与在售状态'},
     history: {title: '价格记录', description: '查看选中商品的抓取结果与价格变化'},
+    orders: {title: '订单查询', description: '自动完成链动小铺验证并查看购买订单'},
     reclaim: {title: '卡密 401 找回', description: '检测并找回 30d.team 卡密关联的 401 账号'},
     sub2api: {title: 'Sub2API 账号导入', description: '使用管理员密钥将账号 JSON 导入 Sub2API'},
   }[activeView];
@@ -2632,6 +2637,7 @@ function App() {
           <button className={activeView === 'products' ? 'active' : ''} onClick={() => switchView('products')}><CircleDollarSign size={18}/>商品总览</button>
           <button className={activeView === 'monitor' ? 'active' : ''} onClick={() => switchView('monitor')}><ListChecks size={18}/>监控面板</button>
           <button className={activeView === 'history' ? 'active' : ''} onClick={() => switchView('history')}><History size={18}/>价格记录</button>
+          <button className={activeView === 'orders' ? 'active' : ''} onClick={() => switchView('orders')}><ReceiptText size={18}/>订单查询</button>
           <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>
           <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>
         </nav>
@@ -2758,6 +2764,10 @@ function App() {
             onPageSizeChange={changeHistoryPageSize}
             busy={historyBusy}
           />
+        ) : activeView === 'orders' ? (
+          <React.Suspense fallback={<FeatureLoadingState feature="订单查询界面" state={{status: 'loading'}}/>}>
+            <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact}/>
+          </React.Suspense>
         ) : activeView === 'reclaim' ? featureLoadState.reclaim.status !== 'ready' ? (
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
         ) : (

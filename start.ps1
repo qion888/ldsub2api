@@ -8,6 +8,64 @@ $requirements = Join-Path $backendDirectory 'requirements.txt'
 $runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
 $backendPidFile = Join-Path $runtimeDirectory 'backend.pid'
 
+function Resolve-LdxpPython {
+    $candidates = @()
+    $fallback = $null
+    if (-not [string]::IsNullOrWhiteSpace($env:LDXP_PYTHON)) {
+        $candidates += $env:LDXP_PYTHON
+    }
+    $candidates += @(
+        (Join-Path $runtimeDirectory 'python\Scripts\python.exe'),
+        (Join-Path $runtimeDirectory 'python\python.exe'),
+        (Join-Path $runtimeDirectory 'python.exe')
+    )
+    $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
+    if ($launcher) {
+        & $launcher.Source -0p 2>$null | ForEach-Object {
+            if ([string]$_ -match '([A-Za-z]:\\.*\\python(?:[0-9.]*)?\.exe)\s*$') {
+                $candidates += $Matches[1]
+            }
+        }
+    }
+    $candidates += 'python'
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
+        $candidateKey = ([string]$candidate).ToLowerInvariant()
+        if ($seen.ContainsKey($candidateKey)) { continue }
+        $seen[$candidateKey] = $true
+        $resolved = $null
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $resolved = (Resolve-Path -LiteralPath $candidate).Path
+        }
+        else {
+            $command = Get-Command $candidate -ErrorAction SilentlyContinue
+            if ($command) {
+                $resolved = $command.Source
+            }
+        }
+        if ($resolved) {
+            if (-not $fallback) {
+                $fallback = $resolved
+            }
+            & $resolved -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)" *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $resolved
+            }
+        }
+    }
+    if ($fallback) {
+        Write-Warning 'Python 3.10-3.13 was not found. The app will start with the available interpreter and use manual captcha entry if OCR cannot load.'
+        return $fallback
+    }
+    throw 'Python interpreter not found. Set LDXP_PYTHON or install Python.'
+}
+
+function Test-LdxpBackendDependencies([string]$PythonExecutable) {
+    & $PythonExecutable -c "import selenium, ddddocr, numpy, onnxruntime" *> $null
+    return $LASTEXITCODE -eq 0
+}
+
 function Stop-RecordedLdxpBackend {
     if (-not (Test-Path -LiteralPath $backendPidFile)) { return }
     $recordedPid = 0
@@ -77,15 +135,36 @@ if (-not (Test-Path -LiteralPath $viteCommand)) {
 }
 
 New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
+$pythonExecutable = Resolve-LdxpPython
 Stop-RecordedLdxpBackend
 Stop-StaleLdxpProcesses
 
 if (Test-Path $requirements) {
-    python -c "import selenium" 2>$null
-    $seleniumMissing = $LASTEXITCODE -ne 0
-    if ($seleniumMissing) {
-        Write-Host 'Installing backend browser verification dependency...'
-        python -m pip install -r $requirements
+    $backendDependenciesReady = Test-LdxpBackendDependencies $pythonExecutable
+    if (-not $backendDependenciesReady) {
+        Write-Host 'Installing backend browser verification and OCR dependencies...'
+        & $pythonExecutable -m pip install -r $requirements
+        $backendDependenciesReady = $LASTEXITCODE -eq 0 -and (Test-LdxpBackendDependencies $pythonExecutable)
+        if (-not $backendDependenciesReady) {
+            $runtimeEnvironment = Join-Path $runtimeDirectory 'python'
+            $runtimePython = Join-Path $runtimeEnvironment 'Scripts\python.exe'
+            $selectedPython = [IO.Path]::GetFullPath($pythonExecutable)
+            $runtimePythonPath = [IO.Path]::GetFullPath($runtimePython)
+            if (-not $selectedPython.Equals($runtimePythonPath, [StringComparison]::OrdinalIgnoreCase)) {
+                Write-Host 'Creating an isolated backend Python runtime...'
+                & $pythonExecutable -m venv $runtimeEnvironment
+                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
+                    & $runtimePython -m pip install -r $requirements
+                    $backendDependenciesReady = $LASTEXITCODE -eq 0 -and (Test-LdxpBackendDependencies $runtimePython)
+                    if ($backendDependenciesReady) {
+                        $pythonExecutable = $runtimePython
+                    }
+                }
+            }
+        }
+        if (-not $backendDependenciesReady) {
+            Write-Warning 'Some optional backend dependencies could not be installed. Order lookup will offer manual captcha entry when OCR is unavailable.'
+        }
     }
 }
 
@@ -96,7 +175,7 @@ $env:LDXP_FRONTEND_URL = "http://127.0.0.1:$frontendPort/"
 
 Write-Host "Starting backend at http://127.0.0.1:$backendPort"
 $backendScript = Join-Path $backendDirectory 'main.py'
-$backendProcess = Start-Process python `
+$backendProcess = Start-Process $pythonExecutable `
     -ArgumentList ('"{0}"' -f $backendScript) `
     -WorkingDirectory $backendDirectory `
     -WindowStyle Hidden `

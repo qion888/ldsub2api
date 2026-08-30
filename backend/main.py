@@ -35,6 +35,8 @@ from monitor_core import settings as monitor_setting_store
 from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
 from monitor_core.workers import MonitorWorker as CoreMonitorWorker
+from order_query import routes as order_query_routes
+from order_query.service import OrderQueryService
 from sub2api import automation as sub2api_automation
 from sub2api import card_import_history as sub2api_card_history
 from sub2api import client as sub2api_client
@@ -847,6 +849,7 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
 
 
 BROWSER_VERIFICATION = BrowserVerificationManager()
+ORDER_QUERY_SERVICE = OrderQueryService()
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -906,6 +909,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "sub2api_automation_worker": AUTOMATION_WORKER.is_alive(),
                 "sub2api_accounts": True,
                 "sub2api_card_import_history": True,
+                "order_query": True,
             })
         if path == "/api/watches":
             return self._send_json(list_watches())
@@ -988,10 +992,26 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path.rstrip("/")
+        rejection = order_query_routes.request_rejection(
+            path,
+            self.headers,
+            frontend_url=FRONTEND_URL,
+        )
+        if rejection is not None:
+            status, payload = rejection
+            return self._send_json(payload, status)
         try:
             data = self._read_json()
         except ValueError as exc:
             return self._send_json({"detail": str(exc)}, 400)
+
+        if order_query_routes.handle_post(
+            path,
+            data,
+            send_json=self._send_json,
+            search=ORDER_QUERY_SERVICE.search,
+        ):
+            return
 
         if path == "/api/preorders":
             try:
@@ -1547,6 +1567,7 @@ def run() -> None:
         WORKER.stop_event.set()
         AUTOMATION_WORKER.stop_event.set()
         BROWSER_VERIFICATION._close()
+        ORDER_QUERY_SERVICE.sessions.clear()
         server.server_close()
 
 
