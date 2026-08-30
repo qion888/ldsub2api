@@ -5,11 +5,15 @@ import {
   AlertCircle,
   ArrowUpRight,
   BellRing,
+  BarChart3,
+  CalendarDays,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleDollarSign,
   Clipboard,
   Clock3,
+  Database,
   Eye,
   EyeOff,
   FileUp,
@@ -25,6 +29,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  SlidersHorizontal,
   KeyRound,
   Sun,
   Tag,
@@ -111,28 +116,68 @@ function StatusPill({item}) {
   return <span className="pill neutral"><Clock3 size={12}/>状态未知</span>;
 }
 
-function PriceBars({history}) {
-  const points = history.filter(point => {
-    if (point.status !== 'success' || point.price === null || point.price === undefined || point.price === '') return false;
-    return Number.isFinite(Number(point.price));
-  });
-  if (!points.length) return <div className="chart-empty">完成两次抓取后显示价格走势</div>;
-  const values = points.map(point => Number(point.price));
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  return (
-    <div className="price-chart" aria-label="价格历史">
-      {points.slice(-24).map((point, index) => {
-        const value = Number(point.price);
-        const height = max === min ? 58 : 22 + ((value - min) / (max - min)) * 70;
-        return <Tooltip key={`${point.id}-${index}`} label={`${compactTime(point.fetched_at)} · ${money(value)}`} placement="top">
-          <div className="bar-wrap">
-            <span className="bar" style={{height: `${height}%`}}/>
-          </div>
-        </Tooltip>;
-      })}
+function historyStockMeta(point) {
+  const raw = point?.stock;
+  if (raw === null || raw === undefined || raw === '' || !Number.isFinite(Number(raw))) {
+    return {key: 'unknown', label: point?.stock_label || '库存未知', value: null};
+  }
+  const value = Number(raw);
+  return value > 0
+    ? {key: 'in', label: '有货', value}
+    : {key: 'out', label: '缺货', value: 0};
+}
+
+function historyStatusLabel(point) {
+  return point?.status === 'success' ? '抓取成功' : point?.error || '抓取失败';
+}
+
+function PriceHistoryChart({points}) {
+  const [hovered, setHovered] = useState(null);
+  const chartPoints = useMemo(() => (points || [])
+    .filter(point => point.status === 'success' && point.price !== null && point.price !== '' && Number.isFinite(Number(point.price)))
+    .slice(-160), [points]);
+  if (!chartPoints.length) return <div className="chart-empty"><BarChart3 size={24}/><strong>暂无可绘制的有效报价</strong><span>完成成功抓取后，价格趋势会显示在这里</span></div>;
+
+  const width = 900;
+  const height = 270;
+  const padding = {top: 22, right: 24, bottom: 30, left: 56};
+  const values = chartPoints.map(point => Number(point.price));
+  const rawMin = Math.min(...values);
+  const rawMax = Math.max(...values);
+  const equalValuePadding = rawMax === rawMin ? Math.max(Math.abs(rawMax) * .05, .01) : 0;
+  const min = rawMin - equalValuePadding;
+  const max = rawMax + equalValuePadding;
+  const range = max - min;
+  const x = index => padding.left + (index / Math.max(chartPoints.length - 1, 1)) * (width - padding.left - padding.right);
+  const y = value => padding.top + (1 - (value - min) / range) * (height - padding.top - padding.bottom);
+  const linePoints = chartPoints.map((point, index) => `${x(index)},${y(Number(point.price))}`).join(' ');
+  const hoveredIndex = hovered === null ? -1 : chartPoints.findIndex(point => String(point.id) === String(hovered));
+  const hoveredPoint = hoveredIndex >= 0 ? chartPoints[hoveredIndex] : null;
+  const hoveredLeft = hoveredIndex >= 0 ? Math.min(86, Math.max(14, x(hoveredIndex) / width * 100)) : 50;
+  const hoveredTop = hoveredIndex >= 0 ? Math.min(66, Math.max(10, y(Number(hoveredPoint.price)) / height * 100)) : 18;
+
+  return <div className="history-chart-wrap" onMouseLeave={() => setHovered(null)}>
+    <div className="history-chart-canvas">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="价格历史趋势图" preserveAspectRatio="none">
+        {[0, 1, 2, 3, 4].map(step => {
+          const value = max - (range * step / 4);
+          const yPosition = y(value);
+          return <g key={step} className="chart-grid-line"><line x1={padding.left} x2={width - padding.right} y1={yPosition} y2={yPosition}/><text x={padding.left - 10} y={yPosition + 4} textAnchor="end">{money(value)}</text></g>;
+        })}
+        <polyline className="history-chart-line" points={linePoints}/>
+        {chartPoints.map((point, index) => <g className="history-chart-point" key={`${point.id}-${index}`}>
+          <circle className="history-chart-hit" cx={x(index)} cy={y(Number(point.price))} r="13" tabIndex="0" role="button" aria-label={`${compactTime(point.fetched_at)} ${money(point.price)}`} onMouseEnter={() => setHovered(point.id)} onFocus={() => setHovered(point.id)} onClick={() => setHovered(point.id)} onBlur={() => setHovered(null)}/>
+          <circle className={`history-chart-dot ${historyStockMeta(point).key}`} cx={x(index)} cy={y(Number(point.price))} r={hovered === point.id ? 5 : 3.5} pointerEvents="none"/>
+        </g>)}
+      </svg>
+      {hoveredPoint && <div className="history-chart-tooltip" style={{left: `${hoveredLeft}%`, top: `${hoveredTop}%`}}>
+        <strong>{money(hoveredPoint.price)}</strong>
+        <span>{compactTime(hoveredPoint.fetched_at)}</span>
+        <span>{historyStockMeta(hoveredPoint).label}{historyStockMeta(hoveredPoint).value !== null ? ` · ${historyStockMeta(hoveredPoint).value}` : ''}</span>
+      </div>}
     </div>
-  );
+    <div className="history-chart-axis"><span>{compactTime(chartPoints[0].fetched_at)}</span><span>{chartPoints.length > 2 ? `${chartPoints.length} 个有效报价` : '最近记录'}</span><span>{compactTime(chartPoints[chartPoints.length - 1].fetched_at)}</span></div>
+  </div>;
 }
 
 function Tooltip({label, children, placement = 'top'}) {
@@ -617,6 +662,127 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
   </>;
 }
 
+function HistoryView({
+  items,
+  selectedId,
+  onSelect,
+  history,
+  trend,
+  meta,
+  filters,
+  onFiltersChange,
+  onResetFilters,
+  page,
+  pageSize,
+  onPageChange,
+  onPageSizeChange,
+  busy,
+}) {
+  const [itemQuery, setItemQuery] = useState('');
+  const selected = items.find(item => item.id === selectedId) || null;
+  const stats = meta?.stats || {};
+  const total = Number(meta?.total || 0);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const pageStart = total ? (page - 1) * pageSize + 1 : 0;
+  const pageEnd = Math.min(page * pageSize, total);
+  const visibleItems = useMemo(() => {
+    const needle = itemQuery.trim().toLowerCase();
+    if (!needle) return items;
+    return items.filter(item => [item.latest?.title, item.name, item.url, item.latest?.goods_key].filter(Boolean).join(' ').toLowerCase().includes(needle));
+  }, [itemQuery, items]);
+  const updateFilter = (key, value) => {
+    onFiltersChange({...filters, [key]: value});
+    onPageChange(1);
+  };
+  const clearFilters = () => {
+    onResetFilters();
+    onPageChange(1);
+  };
+  const successRate = total ? `${Math.round((Number(stats.success_count || 0) / total) * 100)}%` : '--';
+  const rows = history || [];
+  const rowDelta = index => {
+    const currentRaw = rows[index]?.price;
+    const previousRaw = rows[index + 1]?.price;
+    if (currentRaw === null || currentRaw === undefined || currentRaw === '' || previousRaw === null || previousRaw === undefined || previousRaw === '') return null;
+    const current = Number(currentRaw);
+    const previous = Number(previousRaw);
+    if (!Number.isFinite(current) || !Number.isFinite(previous)) return null;
+    return current - previous;
+  };
+
+  return <section className="history-view history-view-enhanced">
+    <aside className="history-sidebar">
+      <div className="history-sidebar-head">
+        <div><span className="history-kicker">MONITORED PRODUCTS</span><h2>商品记录</h2></div>
+        <strong>{items.length}</strong>
+      </div>
+      <label className="history-product-search"><Search size={15}/><input value={itemQuery} onChange={event => setItemQuery(event.target.value)} placeholder="搜索商品" aria-label="搜索商品"/></label>
+      <div className="history-product-list">
+        {!visibleItems.length ? <div className="history-sidebar-empty"><Database size={19}/><span>没有匹配商品</span></div> : visibleItems.map(item => <button className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => { onSelect(item.id); onPageChange(1); }}>
+          <ProductImage item={item}/>
+          <span><strong>{item.latest?.title || item.name || '等待商品数据'}</strong><small>{money(item.latest?.price)} · {item.latest?.stock_label || '库存未知'}</small></span>
+          <ChevronRight size={15}/>
+        </button>)}
+      </div>
+    </aside>
+
+    <div className="history-main history-main-enhanced">
+      <div className="history-top history-top-enhanced">
+        <div><span className="history-kicker">PRICE HISTORY / DATA EXPLORER</span><h2>{selected?.latest?.title || '请选择商品'}</h2><p>{selected ? `${total.toLocaleString('zh-CN')} 条历史记录 · 服务端分页加载` : '从左侧选择商品查看价格、库存和抓取结果'}</p></div>
+        <div className="history-current-price"><span>当前价格</span><strong>{money(selected?.latest?.price)}</strong><small>{selected?.last_attempt?.fetched_at ? `同步于 ${compactTime(selected.last_attempt.fetched_at)}` : '尚未同步'}</small></div>
+      </div>
+
+      <div className="history-filter-panel">
+        <div className="history-filter-title"><SlidersHorizontal size={16}/><span>精细筛选</span><small>按日期、结果和库存缩小数据范围</small></div>
+        <div className="history-filter-fields">
+          <label className="history-filter-search"><span>记录关键词</span><div><Search size={15}/><input value={filters.query} onChange={event => updateFilter('query', event.target.value)} placeholder="价格、库存、错误信息"/></div></label>
+          <label><span>开始日期</span><div className="history-date-input"><CalendarDays size={15}/><input type="date" value={filters.startDate} onChange={event => updateFilter('startDate', event.target.value)}/></div></label>
+          <label><span>结束日期</span><div className="history-date-input"><CalendarDays size={15}/><input type="date" value={filters.endDate} onChange={event => updateFilter('endDate', event.target.value)}/></div></label>
+          <label><span>抓取结果</span><select value={filters.status} onChange={event => updateFilter('status', event.target.value)}><option value="all">全部结果</option><option value="success">仅成功</option><option value="error">仅失败</option></select></label>
+          <label><span>库存状态</span><select value={filters.stock} onChange={event => updateFilter('stock', event.target.value)}><option value="all">全部库存</option><option value="in">有货</option><option value="out">缺货</option><option value="unknown">库存未知</option></select></label>
+          <button className="history-filter-reset" onClick={clearFilters} disabled={!filters.query && !filters.startDate && !filters.endDate && filters.status === 'all' && filters.stock === 'all'}><X size={15}/>清除筛选</button>
+        </div>
+      </div>
+
+      <div className="history-summary-grid">
+        <div><span>筛选后记录</span><strong>{total.toLocaleString('zh-CN')}</strong><small>当前页 {rows.length} 条</small></div>
+        <div><span>有效报价</span><strong>{Number(stats.quoted_count || 0).toLocaleString('zh-CN')}</strong><small>成功率 {successRate}</small></div>
+        <div><span>价格区间</span><strong>{money(stats.min_price)} <em>至</em> {money(stats.max_price)}</strong><small>平均 {money(stats.average_price)}</small></div>
+        <div><span>库存快照</span><strong className="positive">{Number(stats.in_stock_count || 0).toLocaleString('zh-CN')}</strong><small>{Number(stats.out_stock_count || 0).toLocaleString('zh-CN')} 缺货 · {Number(stats.unknown_stock_count || 0).toLocaleString('zh-CN')} 未知</small></div>
+        <div><span>异常记录</span><strong className={Number(stats.error_count || 0) ? 'negative' : ''}>{Number(stats.error_count || 0).toLocaleString('zh-CN')}</strong><small>抓取失败或返回异常</small></div>
+      </div>
+
+      <section className="history-chart-card">
+        <div className="history-card-head"><div><span className="history-kicker">TREND SAMPLE</span><h3>价格与库存走势</h3></div><div className="history-chart-legend"><span><i className="legend-dot price"/>价格</span><span><i className="legend-dot stock"/>有货节点</span><small>{trend?.length || 0} 个趋势节点</small></div></div>
+        <PriceHistoryChart points={trend}/>
+      </section>
+
+      <section className="history-record-card">
+        <div className="history-card-head"><div><span className="history-kicker">AUDIT LOG</span><h3>抓取明细</h3></div><span className="history-record-total">{total ? `${pageStart.toLocaleString('zh-CN')}-${pageEnd.toLocaleString('zh-CN')} / ${total.toLocaleString('zh-CN')}` : '暂无记录'}</span></div>
+        <div className="history-table-scroll">
+          <div className="history-row history-row-enhanced head"><span>抓取时间</span><span>价格</span><span>变化</span><span>库存</span><span>销售状态</span><span>抓取结果</span></div>
+          {busy ? <div className="history-loading"><RefreshCw size={18} className="spin"/><span>正在加载历史记录…</span></div> : !rows.length ? <div className="history-loading"><Database size={22}/><span>当前筛选条件下没有记录</span><button className="button secondary" onClick={clearFilters}>清除筛选</button></div> : rows.map((point, index) => {
+            const stockMeta = historyStockMeta(point);
+            const delta = rowDelta(index);
+            return <div className="history-row history-row-enhanced" key={`${point.id}-${index}`}>
+              <span className="history-time-cell"><time dateTime={point.fetched_at}>{compactTime(point.fetched_at)}</time><small>{point.id ? `记录 #${point.id}` : '本地快照'}</small></span>
+              <strong className="history-price-cell">{money(point.price)}</strong>
+              <span className={delta > 0 ? 'negative history-delta' : delta < 0 ? 'positive history-delta' : 'history-delta'}>{delta === null ? '--' : delta === 0 ? '持平' : `${delta > 0 ? '+' : '-'}${money(Math.abs(delta))}`}</span>
+              <span className={`history-stock-pill ${stockMeta.key}`}><i/>{stockMeta.label}{stockMeta.value !== null ? ` · ${stockMeta.value}` : ''}</span>
+              <span className={point.sale_status === 'on_sale' ? 'positive' : point.sale_status === 'off_sale' ? 'negative' : ''}>{point.sale_status === 'on_sale' ? '在售' : point.sale_status === 'off_sale' ? '已下架' : '未知'}</span>
+              <span className={`history-result ${point.status === 'success' ? 'positive' : 'negative'}`} title={historyStatusLabel(point)}>{historyStatusLabel(point)}</span>
+            </div>;
+          })}
+        </div>
+        <div className="history-pagination">
+          <span>每页 <select value={pageSize} onChange={event => onPageSizeChange(Number(event.target.value))}><option value={15}>15 条</option><option value={25}>25 条</option><option value={50}>50 条</option><option value={100}>100 条</option></select></span>
+          <div><button aria-label="上一页" title="上一页" onClick={() => onPageChange(Math.max(1, page - 1))} disabled={page <= 1 || busy}><ChevronLeft size={15}/></button><strong>第 {page} / {totalPages} 页</strong><button aria-label="下一页" title="下一页" onClick={() => onPageChange(Math.min(totalPages, page + 1))} disabled={page >= totalPages || busy}><ChevronRight size={15}/></button></div>
+        </div>
+      </section>
+    </div>
+  </section>;
+}
+
 function App() {
   const [items, setItems] = useState([]);
   const [shops, setShops] = useState([]);
@@ -635,6 +801,14 @@ function App() {
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [history, setHistory] = useState([]);
+  const [historyTrend, setHistoryTrend] = useState([]);
+  const [historyMeta, setHistoryMeta] = useState({total: 0, page: 1, page_size: 25, stats: {}});
+  const [historyFilters, setHistoryFilters] = useState({query: '', startDate: '', endDate: '', status: 'all', stock: 'all'});
+  const [historyRequestFilters, setHistoryRequestFilters] = useState(historyFilters);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyPageSize, setHistoryPageSize] = useState(25);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const historyRequestVersion = useRef(0);
   const [cart, setCart] = useState([]);
   const [contact, setContact] = useState({contact: '', note: ''});
   const [queryPassword, setQueryPassword] = useState('');
@@ -776,11 +950,40 @@ function App() {
   };
 
   const loadHistory = async id => {
-    if (!id) return setHistory([]);
-    try {
-      setHistory(await request(`/watches/${id}/history?limit=60`));
-    } catch {
+    const requestVersion = ++historyRequestVersion.current;
+    if (!id) {
       setHistory([]);
+      setHistoryTrend([]);
+      setHistoryMeta({total: 0, page: 1, page_size: historyPageSize, stats: {}});
+      setHistoryBusy(false);
+      return;
+    }
+    setHistoryBusy(true);
+    try {
+      const params = new URLSearchParams({
+        limit: String(historyPageSize),
+        offset: String((historyPage - 1) * historyPageSize),
+        status: historyRequestFilters.status,
+        stock: historyRequestFilters.stock,
+      });
+      if (historyRequestFilters.query.trim()) params.set('query', historyRequestFilters.query.trim());
+      if (historyRequestFilters.startDate) params.set('start_date', historyRequestFilters.startDate);
+      if (historyRequestFilters.endDate) params.set('end_date', historyRequestFilters.endDate);
+      const payload = await request(`/watches/${id}/history?${params.toString()}`);
+      if (requestVersion !== historyRequestVersion.current) return;
+      const result = Array.isArray(payload)
+        ? {items: payload, trend: payload, total: payload.length, page: 1, page_size: payload.length || historyPageSize, stats: {}}
+        : payload;
+      setHistory(result.items || []);
+      setHistoryTrend(result.trend || result.items || []);
+      setHistoryMeta({total: Number(result.total || 0), page: Number(result.page || historyPage), page_size: Number(result.page_size || historyPageSize), stats: result.stats || {}});
+    } catch {
+      if (requestVersion !== historyRequestVersion.current) return;
+      setHistory([]);
+      setHistoryTrend([]);
+      setHistoryMeta({total: 0, page: historyPage, page_size: historyPageSize, stats: {}});
+    } finally {
+      if (requestVersion === historyRequestVersion.current) setHistoryBusy(false);
     }
   };
 
@@ -819,8 +1022,13 @@ function App() {
   }, [dashboardRefreshMs]);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setHistoryRequestFilters(historyFilters), 250);
+    return () => window.clearTimeout(timer);
+  }, [historyFilters]);
+
+  useEffect(() => {
     loadHistory(selectedId);
-  }, [selectedId, items.find(item => item.id === selectedId)?.last_run]);
+  }, [selectedId, items.find(item => item.id === selectedId)?.last_run, historyRequestFilters, historyPage, historyPageSize]);
 
   const selected = items.find(item => item.id === selectedId) || null;
   const latest = selected?.latest;
@@ -1669,13 +1877,10 @@ function App() {
   };
 
   const selectedPriceDelta = useMemo(() => {
-    const prices = history
-      .filter(point => point.status === 'success' && point.price !== null && point.price !== undefined && point.price !== '')
-      .map(point => Number(point.price))
-      .filter(value => Number.isFinite(value));
+    const prices = historyTrend.filter(point => point.status === 'success' && point.price !== '' && Number.isFinite(Number(point.price))).map(point => Number(point.price));
     if (prices.length < 2) return null;
     return prices[prices.length - 1] - prices[prices.length - 2];
-  }, [history]);
+  }, [historyTrend]);
   const localLowestPrice = useMemo(() => {
     const selectedCategory = selected ? itemCategory(selected) : null;
     const prices = items.filter(item => (!selectedCategory || itemCategory(item) === selectedCategory) && itemStock(item).key !== 'off').map(itemPrice).filter(value => value !== null);
@@ -1699,6 +1904,11 @@ function App() {
     reclaim: {title: '卡密 401 找回', description: '检测并找回 30d.team 卡密关联的 401 账号'},
     sub2api: {title: 'Sub2API 账号导入', description: '使用管理员密钥将账号 JSON 导入 Sub2API'},
   }[activeView];
+  const resetHistoryFilters = () => setHistoryFilters({query: '', startDate: '', endDate: '', status: 'all', stock: 'all'});
+  const changeHistoryPageSize = value => {
+    setHistoryPageSize(value);
+    setHistoryPage(1);
+  };
 
   return (
     <div className="app-shell">
@@ -1798,10 +2008,22 @@ function App() {
             </div>
           </>
         ) : activeView === 'history' ? (
-          <section className="history-view">
-            <div className="history-sidebar"><div className="section-heading"><div><h2>商品</h2><p>选择查看记录</p></div></div>{items.map(item => <button className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => setSelectedId(item.id)}><ProductImage item={item}/><span><strong>{item.latest?.title || item.name}</strong><small>{money(item.latest?.price)}</small></span><ChevronRight size={16}/></button>)}</div>
-            <div className="history-main"><div className="history-top"><div><span>最近 60 次记录</span><h2>{latest?.title || '请选择商品'}</h2></div><strong>{money(latest?.price)}</strong></div><PriceBars history={history}/><div className="history-table"><div className="history-row head"><span>抓取时间</span><span>价格</span><span>在售状态</span><span>结果</span></div>{[...history].reverse().map((point, index) => <div className="history-row" key={`${point.id}-${index}`}><span>{compactTime(point.fetched_at)}</span><strong>{money(point.price)}</strong><span>{point.sale_status === 'on_sale' ? '在售' : point.sale_status === 'off_sale' ? '未上架' : '--'}</span><span className={point.status === 'success' ? 'positive' : 'negative'}>{point.status === 'success' ? '成功' : point.error || '失败'}</span></div>)}</div></div>
-          </section>
+          <HistoryView
+            items={items}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            history={history}
+            trend={historyTrend}
+            meta={historyMeta}
+            filters={historyFilters}
+            onFiltersChange={setHistoryFilters}
+            onResetFilters={resetHistoryFilters}
+            page={historyPage}
+            pageSize={historyPageSize}
+            onPageChange={setHistoryPage}
+            onPageSizeChange={changeHistoryPageSize}
+            busy={historyBusy}
+          />
         ) : activeView === 'reclaim' ? (
           <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
         ) : (
@@ -1974,4 +2196,7 @@ function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuan
   );
 }
 
-createRoot(document.getElementById('root')).render(<App/>);
+const rootElement = document.getElementById('root');
+const root = import.meta.hot?.data.root || createRoot(rootElement);
+if (import.meta.hot) import.meta.hot.data.root = root;
+root.render(<App/>);
