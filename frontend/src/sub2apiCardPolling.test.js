@@ -72,15 +72,50 @@ test('does not treat a partial set of account JSON files as complete', async () 
   assert.match(reclaimPollingFailureMessage(result), /已下载 1\/2 个账号 JSON/);
 });
 
-test('reports terminal upstream outcomes separately from a timeout', async () => {
+test('keeps polling terminal-looking snapshots for the full minute', async () => {
+  let clock = 0;
+  let attempts = 0;
   const initialResponse = {result: {queued: 0, already_running: 0, done: 0, failed: 1, unreclaimable: 2}};
   const summary = summarizeReclaimProgress(initialResponse);
   const result = await pollForReclaimDownloads({
     initialResponse,
-    requestProgress: async () => assert.fail('terminal state must not be polled again'),
+    requestProgress: async () => {
+      attempts += 1;
+      return initialResponse;
+    },
+    intervalMs: 5000,
+    timeoutMs: 60000,
+    now: () => clock,
+    sleep: async milliseconds => { clock += milliseconds; },
   });
 
   assert.equal(summary.terminal, true);
-  assert.equal(result.timedOut, false);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.elapsedMs, 60000);
+  assert.equal(attempts, 12);
+  assert.match(reclaimPollingFailureMessage(result), /持续轮询 1 分钟/);
   assert.match(reclaimPollingFailureMessage(result), /失败 1、不可找回 2/);
+});
+
+test('recovers JSON after an early terminal-looking snapshot', async () => {
+  let clock = 0;
+  const responses = [
+    {result: {queued: 0, already_running: 0, done: 0, failed: 1}},
+    {result: {queued: 0, already_running: 0, done: 1}, downloaded_payloads: [payload]},
+  ];
+
+  const result = await pollForReclaimDownloads({
+    initialResponse: {result: {queued: 0, already_running: 0, done: 0, failed: 1}},
+    requestProgress: async () => responses.shift(),
+    intervalMs: 5000,
+    timeoutMs: 60000,
+    now: () => clock,
+    sleep: async milliseconds => { clock += milliseconds; },
+  });
+
+  assert.equal(result.completed, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.attempts, 2);
+  assert.equal(result.elapsedMs, 10000);
+  assert.deepEqual(result.downloads, [payload]);
 });

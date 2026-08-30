@@ -63,7 +63,7 @@ export async function pollForReclaimDownloads({
       lastError,
     };
     onSnapshot(snapshot);
-    if (snapshot.completed || snapshot.terminal) {
+    if (snapshot.completed) {
       return {...snapshot, timedOut: false};
     }
     if (elapsedMs >= timeoutMs) {
@@ -92,7 +92,7 @@ export function reclaimPollingFailureMessage(result) {
       ['未归属', progress.not_owned],
       ['已跳过', progress.skipped],
     ].filter(([, value]) => count(value) > 0).map(([label, value]) => `${label} ${count(value)}`);
-    return `找回任务已结束，但没有生成可导入 JSON${details.length ? `（${details.join('、')}）` : ''}`;
+    return `已持续轮询 1 分钟，找回任务已结束但仍没有生成可导入 JSON${details.length ? `（${details.join('、')}）` : ''}`;
   }
   if (result?.activeTasks > 0) {
     return `找回处理超过 1 分钟，仍有 ${result.activeTasks} 个任务处理中，可稍后重试`;

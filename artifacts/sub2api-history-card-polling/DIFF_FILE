@@ -1,0 +1,140 @@
+diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
+index f270a3c..478e90d 100644
+--- a/frontend/src/Sub2ApiView.jsx
++++ b/frontend/src/Sub2ApiView.jsx
+@@ -471,11 +471,11 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
+           <div className="card-flow-summary">
+             <div><span>当前状态</span><strong className={flow.stage === 'error' ? 'negative' : ''}>{stageLabel}</strong></div>
+             <div><span>核验总数</span><strong>{health.total ?? '--'}</strong></div>
+-            <div><span>轮询等待</span><strong>{flow.pollElapsedSeconds == null ? '--' : `${flow.pollElapsedSeconds}s / ${flow.pollTimeoutSeconds || 60}s`}</strong></div>
++            <div><span>轮询进度</span><strong>{flow.pollElapsedSeconds == null ? '--' : `${flow.pollAttempts || 0} 次 · ${flow.pollElapsedSeconds}s / ${flow.pollTimeoutSeconds || 60}s`}</strong></div>
+             <div><span>账号数量</span><strong>{flow.accounts ?? '--'}</strong></div>
+           </div>
+           {mode === 'auto' && !canAutoPush && <div className="card-flow-notice"><AlertCircle size={14}/><span>自动推送需要先保存 Sub2API 管理员密钥</span></div>}
+-          {flow.stage === 'poll' && <div className="card-flow-notice"><RefreshCw size={14} className="spin"/><span>每 5 秒查询一次；即使队列已清空，也会继续等待账号 JSON，最长 1 分钟</span></div>}
++          {flow.stage === 'poll' && <div className="card-flow-notice"><RefreshCw size={14} className="spin"/><span>每 5 秒查询一次；中途出现失败计数也会继续刷新，拿到账号 JSON 或满 1 分钟后结束</span></div>}
+           {flow.notice && <div className="card-flow-notice"><Clock3 size={14}/><span>{flow.notice}</span></div>}
+           {flow.error && <div className="card-flow-notice error"><TriangleAlert size={14}/><span>{flow.error}</span></div>}
+           <div className="card-import-actions">
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index 48dcaf8..6939440 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2090,8 +2090,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-filters button.active { color: #fff; background: var(--ui-black); }
+ .card-history-filters button span { min-width: 19px; height: 18px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; color: inherit; background: color-mix(in srgb, currentColor 10%, transparent); border-radius: 3px; font-size: 9px; font-variant-numeric: tabular-nums; }
+ .card-history-table-wrap { max-height: 360px; overflow: auto; }
+-.card-history-table { min-width: 1120px; }
+-.card-history-row { min-height: 58px; display: grid; grid-template-columns: 42px 100px 135px 170px 155px 145px minmax(205px, 1fr) 150px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
++.card-history-table { min-width: 1280px; }
++.card-history-row { min-height: 58px; display: grid; grid-template-columns: 42px 100px 135px 320px 155px 145px minmax(205px, 1fr) 150px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
+ .card-history-row:last-child { border-bottom: 0; }
+ .card-history-row.head { position: sticky; z-index: 2; top: 0; min-height: 35px; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 9px; font-weight: 700; }
+ .card-history-row.selected { background: color-mix(in srgb, var(--ui-text) 8%, var(--ui-surface)); }
+@@ -2102,11 +2102,11 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-row:not(.head) small { margin-top: 4px; color: var(--ui-text-muted); font-size: 9px; }
+ .card-history-row em { font-style: normal; }
+ .card-history-codes { align-self: stretch; display: flex; align-items: center; }
+-.card-code-list { width: 100%; max-height: 74px; overflow: auto; display: grid; gap: 4px; }
+-.card-code-list button { width: 100%; min-height: 25px; border: 1px solid var(--ui-border-soft); padding: 3px 6px; display: flex; align-items: center; justify-content: space-between; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); text-align: left; }
++.card-code-list { width: 100%; max-height: 104px; overflow: auto; display: grid; gap: 4px; }
++.card-code-list button { width: 100%; min-height: 25px; border: 1px solid var(--ui-border-soft); padding: 4px 7px; display: flex; align-items: flex-start; justify-content: space-between; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); text-align: left; }
+ .card-code-list button:hover { color: var(--ui-text); border-color: var(--ui-border); background: var(--ui-control); }
+-.card-code-list code { min-width: 0; overflow: hidden; color: inherit; font: inherit; text-overflow: ellipsis; white-space: nowrap; }
+-.card-code-list svg { flex: 0 0 auto; }
++.card-code-list code { min-width: 0; overflow: visible; color: inherit; font: inherit; line-height: 1.35; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; word-break: break-all; }
++.card-code-list svg { margin-top: 2px; flex: 0 0 auto; }
+ .card-history-select { display: flex; align-items: center; justify-content: center; }
+ .card-history-select input { width: 16px; height: 16px; margin: 0; accent-color: var(--ui-text); cursor: pointer; }
+ .card-history-select input:disabled { cursor: not-allowed; opacity: .52; }
+@@ -2306,8 +2306,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-toolbar > span { font-size: 11px; }
+ .card-history-filters button { min-width: 78px; height: 34px; padding-inline: 10px; font-size: 11px; }
+ .card-history-filters button span { min-width: 19px; height: 18px; font-size: 10px; }
+-.card-history-table { min-width: 1120px; }
+-.card-history-row { min-height: 58px; grid-template-columns: 42px 100px 135px 170px 155px 145px minmax(205px, 1fr) 150px; }
++.card-history-table { min-width: 1280px; }
++.card-history-row { min-height: 58px; grid-template-columns: 42px 100px 135px 320px 155px 145px minmax(205px, 1fr) 150px; }
+ .card-history-row.head { min-height: 36px; font-size: 11px; }
+ .card-history-row > span { padding: 8px 11px; }
+ .card-history-row:not(.head) strong { font-size: 12px; }
+diff --git a/frontend/src/sub2apiCardPolling.js b/frontend/src/sub2apiCardPolling.js
+index 85973d5..cef4c41 100644
+--- a/frontend/src/sub2apiCardPolling.js
++++ b/frontend/src/sub2apiCardPolling.js
+@@ -63,7 +63,7 @@ export async function pollForReclaimDownloads({
+       lastError,
+     };
+     onSnapshot(snapshot);
+-    if (snapshot.completed || snapshot.terminal) {
++    if (snapshot.completed) {
+       return {...snapshot, timedOut: false};
+     }
+     if (elapsedMs >= timeoutMs) {
+@@ -92,7 +92,7 @@ export function reclaimPollingFailureMessage(result) {
+       ['未归属', progress.not_owned],
+       ['已跳过', progress.skipped],
+     ].filter(([, value]) => count(value) > 0).map(([label, value]) => `${label} ${count(value)}`);
+-    return `找回任务已结束，但没有生成可导入 JSON${details.length ? `（${details.join('、')}）` : ''}`;
++    return `已持续轮询 1 分钟，找回任务已结束但仍没有生成可导入 JSON${details.length ? `（${details.join('、')}）` : ''}`;
+   }
+   if (result?.activeTasks > 0) {
+     return `找回处理超过 1 分钟，仍有 ${result.activeTasks} 个任务处理中，可稍后重试`;
+diff --git a/frontend/src/sub2apiCardPolling.test.js b/frontend/src/sub2apiCardPolling.test.js
+index c90e7c7..ae80d0e 100644
+--- a/frontend/src/sub2apiCardPolling.test.js
++++ b/frontend/src/sub2apiCardPolling.test.js
+@@ -72,15 +72,50 @@ test('does not treat a partial set of account JSON files as complete', async ()
+   assert.match(reclaimPollingFailureMessage(result), /已下载 1\/2 个账号 JSON/);
+ });
+ 
+-test('reports terminal upstream outcomes separately from a timeout', async () => {
++test('keeps polling terminal-looking snapshots for the full minute', async () => {
++  let clock = 0;
++  let attempts = 0;
+   const initialResponse = {result: {queued: 0, already_running: 0, done: 0, failed: 1, unreclaimable: 2}};
+   const summary = summarizeReclaimProgress(initialResponse);
+   const result = await pollForReclaimDownloads({
+     initialResponse,
+-    requestProgress: async () => assert.fail('terminal state must not be polled again'),
++    requestProgress: async () => {
++      attempts += 1;
++      return initialResponse;
++    },
++    intervalMs: 5000,
++    timeoutMs: 60000,
++    now: () => clock,
++    sleep: async milliseconds => { clock += milliseconds; },
+   });
+ 
+   assert.equal(summary.terminal, true);
+-  assert.equal(result.timedOut, false);
++  assert.equal(result.timedOut, true);
++  assert.equal(result.elapsedMs, 60000);
++  assert.equal(attempts, 12);
++  assert.match(reclaimPollingFailureMessage(result), /持续轮询 1 分钟/);
+   assert.match(reclaimPollingFailureMessage(result), /失败 1、不可找回 2/);
+ });
++
++test('recovers JSON after an early terminal-looking snapshot', async () => {
++  let clock = 0;
++  const responses = [
++    {result: {queued: 0, already_running: 0, done: 0, failed: 1}},
++    {result: {queued: 0, already_running: 0, done: 1}, downloaded_payloads: [payload]},
++  ];
++
++  const result = await pollForReclaimDownloads({
++    initialResponse: {result: {queued: 0, already_running: 0, done: 0, failed: 1}},
++    requestProgress: async () => responses.shift(),
++    intervalMs: 5000,
++    timeoutMs: 60000,
++    now: () => clock,
++    sleep: async milliseconds => { clock += milliseconds; },
++  });
++
++  assert.equal(result.completed, true);
++  assert.equal(result.timedOut, false);
++  assert.equal(result.attempts, 2);
++  assert.equal(result.elapsedMs, 10000);
++  assert.deepEqual(result.downloads, [payload]);
++});

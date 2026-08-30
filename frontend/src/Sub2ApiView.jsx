@@ -471,11 +471,11 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
           <div className="card-flow-summary">
             <div><span>当前状态</span><strong className={flow.stage === 'error' ? 'negative' : ''}>{stageLabel}</strong></div>
             <div><span>核验总数</span><strong>{health.total ?? '--'}</strong></div>
-            <div><span>轮询等待</span><strong>{flow.pollElapsedSeconds == null ? '--' : `${flow.pollElapsedSeconds}s / ${flow.pollTimeoutSeconds || 60}s`}</strong></div>
+            <div><span>轮询进度</span><strong>{flow.pollElapsedSeconds == null ? '--' : `${flow.pollAttempts || 0} 次 · ${flow.pollElapsedSeconds}s / ${flow.pollTimeoutSeconds || 60}s`}</strong></div>
             <div><span>账号数量</span><strong>{flow.accounts ?? '--'}</strong></div>
           </div>
           {mode === 'auto' && !canAutoPush && <div className="card-flow-notice"><AlertCircle size={14}/><span>自动推送需要先保存 Sub2API 管理员密钥</span></div>}
-          {flow.stage === 'poll' && <div className="card-flow-notice"><RefreshCw size={14} className="spin"/><span>每 5 秒查询一次；即使队列已清空，也会继续等待账号 JSON，最长 1 分钟</span></div>}
+          {flow.stage === 'poll' && <div className="card-flow-notice"><RefreshCw size={14} className="spin"/><span>每 5 秒查询一次；中途出现失败计数也会继续刷新，拿到账号 JSON 或满 1 分钟后结束</span></div>}
           {flow.notice && <div className="card-flow-notice"><Clock3 size={14}/><span>{flow.notice}</span></div>}
           {flow.error && <div className="card-flow-notice error"><TriangleAlert size={14}/><span>{flow.error}</span></div>}
           <div className="card-import-actions">
