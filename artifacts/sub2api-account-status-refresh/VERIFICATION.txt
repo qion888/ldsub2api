@@ -15,6 +15,8 @@ BASELINE command: git hash-object artifacts/sub2api-account-status-refresh/BASEL
 BASELINE result: dd91b50af19ea7deacca1d1a8b658313ff762603 (exit 0)
 MODIFIED command: git hash-object frontend/src/main.jsx
 MODIFIED result: e3c9cb2f7cb3ad41e8e79610922dde5de7b8c603 (exit 0)
+MODIFIED_FILE command: git hash-object artifacts/sub2api-account-status-refresh/MODIFIED_FILE
+MODIFIED_FILE result: 40b6e79f59ea127edccc540ba3e2eaef80a6d814 (exit 0)
 ROLLBACK command: Copy-Item artifacts/sub2api-account-status-refresh/BASELINE_FILE artifacts/sub2api-account-status-refresh/rollback-test-main.jsx; git hash-object artifacts/sub2api-account-status-refresh/rollback-test-main.jsx
 ROLLBACK result: dd91b50af19ea7deacca1d1a8b658313ff762603 (exit 0)
 
