@@ -1710,6 +1710,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 @media (prefers-reduced-motion: reduce) {
   .tooltip-anchor::before,
   .tooltip-anchor::after { transition: none; }
+}
+
 /* Dense history workspace for large monitoring datasets. */
 .history-view-enhanced {
   min-height: 0;
