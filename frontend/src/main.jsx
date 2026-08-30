@@ -125,16 +125,32 @@ function PriceBars({history}) {
       {points.slice(-24).map((point, index) => {
         const value = Number(point.price);
         const height = max === min ? 58 : 22 + ((value - min) / (max - min)) * 70;
-        return <div className="bar-wrap" key={`${point.id}-${index}`} title={`${compactTime(point.fetched_at)} · ${money(value)}`}>
-          <span className="bar" style={{height: `${height}%`}}/>
-        </div>;
+        return <Tooltip key={`${point.id}-${index}`} label={`${compactTime(point.fetched_at)} · ${money(value)}`} placement="top">
+          <div className="bar-wrap">
+            <span className="bar" style={{height: `${height}%`}}/>
+          </div>
+        </Tooltip>;
       })}
     </div>
   );
 }
 
+function Tooltip({label, children, placement = 'top'}) {
+  if (!label) return children;
+  const child = React.Children.only(children);
+  const className = [child.props.className, 'tooltip-anchor'].filter(Boolean).join(' ');
+  return React.cloneElement(child, {
+    className,
+    title: undefined,
+    'data-tooltip': label,
+    'data-tooltip-placement': placement,
+  });
+}
+
 function IconButton({label, children, tone = '', ...props}) {
-  return <button className={`icon-button ${tone}`} title={label} aria-label={label} {...props}>{children}</button>;
+  return <Tooltip label={label}>
+    <button className={`icon-button ${tone}`} aria-label={label} {...props}>{children}</button>
+  </Tooltip>;
 }
 
 function itemSpecValue(item, matcher) {
@@ -569,6 +585,37 @@ function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('ldxp-theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    const syncTooltips = () => {
+      const titleNodes = document.querySelectorAll('[title]');
+      titleNodes.forEach(node => {
+        const label = node.getAttribute('title');
+        if (!label) {
+          node.removeAttribute('title');
+          return;
+        }
+        node.dataset.tooltip = label;
+        node.dataset.tooltipPlacement = node.dataset.tooltipPlacement || 'top';
+        node.classList.add('tooltip-anchor');
+        node.removeAttribute('title');
+      });
+
+      document.querySelectorAll('.nav-list button, .topbar-actions button').forEach(node => {
+        if (node.dataset.tooltip) return;
+        const label = node.getAttribute('aria-label') || node.textContent.trim();
+        if (!label) return;
+        node.dataset.tooltip = label;
+        node.dataset.tooltipPlacement = 'top';
+        node.classList.add('tooltip-anchor');
+      });
+    };
+
+    syncTooltips();
+    const observer = new MutationObserver(syncTooltips);
+    observer.observe(document.body, {attributes: true, attributeFilter: ['title'], childList: true, subtree: true});
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const drawerOpen = overviewOpen || detailOpen;

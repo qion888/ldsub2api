@@ -1482,3 +1482,125 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .overview-result-count { font-size: 10px; }
   .detail-drawer-body { padding: 16px; }
 }
+
+/* Consistent, keyboard-friendly hints for compact controls and truncated labels. */
+.tooltip-anchor {
+  position: relative;
+}
+.tooltip-anchor::before,
+.tooltip-anchor::after {
+  position: absolute;
+  z-index: 120;
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity .16s ease, transform .16s ease, visibility .16s ease;
+}
+.tooltip-anchor::after {
+  content: attr(data-tooltip);
+  left: 50%;
+  bottom: calc(100% + 9px);
+  width: max-content;
+  max-width: min(260px, calc(100vw - 24px));
+  padding: 7px 9px;
+  color: #fff;
+  background: #17191c;
+  border: 1px solid #343a40;
+  border-radius: 4px;
+  box-shadow: 0 8px 22px #1113152e;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.4;
+  letter-spacing: 0;
+  text-align: center;
+  white-space: normal;
+  transform: translate(-50%, 4px);
+}
+.tooltip-anchor::before {
+  content: "";
+  left: 50%;
+  bottom: calc(100% + 4px);
+  border: 5px solid transparent;
+  border-top-color: #17191c;
+  transform: translate(-50%, 4px);
+}
+.tooltip-anchor:hover::before,
+.tooltip-anchor:hover::after,
+.tooltip-anchor:focus-visible::before,
+.tooltip-anchor:focus-visible::after {
+  visibility: visible;
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.tooltip-anchor[data-tooltip-placement="bottom"]::after {
+  top: calc(100% + 9px);
+  bottom: auto;
+  transform: translate(-50%, -4px);
+}
+.tooltip-anchor[data-tooltip-placement="bottom"]::before {
+  top: calc(100% + 4px);
+  bottom: auto;
+  border-top-color: transparent;
+  border-bottom-color: #17191c;
+  transform: translate(-50%, -4px);
+}
+.tooltip-anchor[data-tooltip-placement="bottom"]:hover::before,
+.tooltip-anchor[data-tooltip-placement="bottom"]:hover::after,
+.tooltip-anchor[data-tooltip-placement="bottom"]:focus-visible::before,
+.tooltip-anchor[data-tooltip-placement="bottom"]:focus-visible::after {
+  transform: translate(-50%, 0);
+}
+.tooltip-anchor[data-tooltip-placement="right"]::after {
+  top: 50%;
+  left: calc(100% + 9px);
+  bottom: auto;
+  transform: translate(-4px, -50%);
+}
+.tooltip-anchor[data-tooltip-placement="right"]::before {
+  top: 50%;
+  left: calc(100% + 4px);
+  bottom: auto;
+  border-top-color: transparent;
+  border-right-color: #17191c;
+  transform: translate(-4px, -50%);
+}
+.tooltip-anchor[data-tooltip-placement="right"]:hover::before,
+.tooltip-anchor[data-tooltip-placement="right"]:hover::after,
+.tooltip-anchor[data-tooltip-placement="right"]:focus-visible::before,
+.tooltip-anchor[data-tooltip-placement="right"]:focus-visible::after {
+  transform: translate(0, -50%);
+}
+.tooltip-anchor[data-tooltip-placement="left"]::after {
+  top: 50%;
+  right: calc(100% + 9px);
+  left: auto;
+  bottom: auto;
+  transform: translate(4px, -50%);
+}
+.tooltip-anchor[data-tooltip-placement="left"]::before {
+  top: 50%;
+  right: calc(100% + 4px);
+  left: auto;
+  bottom: auto;
+  border-top-color: transparent;
+  border-left-color: #17191c;
+  transform: translate(4px, -50%);
+}
+.tooltip-anchor[data-tooltip-placement="left"]:hover::before,
+.tooltip-anchor[data-tooltip-placement="left"]:hover::after,
+.tooltip-anchor[data-tooltip-placement="left"]:focus-visible::before,
+.tooltip-anchor[data-tooltip-placement="left"]:focus-visible::after {
+  transform: translate(0, -50%);
+}
+.tooltip-anchor[data-tooltip=""]::before,
+.tooltip-anchor[data-tooltip=""]::after { display: none; }
+
+/* The compact stepper needs visible overflow so its hints are not clipped. */
+.stepper { overflow: visible; }
+.stepper > button:first-child { border-radius: 3px 0 0 3px; }
+.stepper > button:last-child { border-radius: 0 3px 3px 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .tooltip-anchor::before,
+  .tooltip-anchor::after { transition: none; }
+}
