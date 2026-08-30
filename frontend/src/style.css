@@ -930,7 +930,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .button { min-height: 36px; padding: 0 13px; font-size: 12px; }
 .url-field svg { top: 10px; }
 .composer-fields { grid-template-columns: minmax(240px, 2fr) minmax(110px, .75fr) 105px auto; gap: 9px; }
-.composer-fields.shop-mode { grid-template-columns: minmax(210px, 2fr) 95px 90px 95px 105px auto; gap: 8px; }
+.composer-fields.shop-mode { grid-template-columns: minmax(210px, 2fr) minmax(95px, .7fr) minmax(190px, 1.25fr) 108px 105px auto; gap: 8px; }
+.shop-category-field { min-width: 0; }
+.shop-category-field select { overflow: hidden; text-overflow: ellipsis; }
 
 .shop-overview { margin-top: 14px; padding: 15px 16px 7px; }
 .section-heading { min-height: 38px; }
@@ -2534,6 +2536,12 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   border: 1px solid var(--ui-border-soft);
 }
 .shop-filter-bar { margin: 10px 0 4px; }
+.shop-batch-toolbar { min-height: 42px; padding: 6px 8px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); background: var(--ui-surface); border: 1px solid var(--ui-border-soft); border-top: 0; font-size: 9px; }
+.shop-select-all { min-width: max-content; margin: 0; display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
+.shop-select-all > span { margin: 0; color: var(--ui-text-muted); font-size: 9px; }
+.shop-batch-toolbar > div { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+.shop-batch-toolbar .icon-button { width: 29px; height: 29px; }
+.shop-batch-toolbar .button { min-height: 30px; padding-inline: 9px; font-size: 9px; }
 .product-filter-bar { margin-top: 10px; }
 .monitor-search,
 .monitor-filter-select { min-width: 0; margin: 0; position: relative; }
@@ -2577,9 +2585,12 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 }
 
 .shop-row {
-  grid-template-columns: minmax(200px, 1.5fr) 54px 54px 96px 105px 118px 34px 72px;
+  grid-template-columns: 24px minmax(200px, 1.5fr) 54px 54px 96px 105px 118px 34px 72px;
   gap: 9px;
 }
+.shop-row.checked { background: color-mix(in srgb, var(--ui-warning) 7%, var(--ui-surface)); }
+.shop-row.checked.selected { background: color-mix(in srgb, var(--ui-success) 8%, var(--ui-surface)); }
+.shop-select-cell { justify-self: center; }
 .monitor-interval-control { min-width: 0; margin: 0; }
 .monitor-interval-control > span {
   margin: 0 0 4px;
@@ -2635,13 +2646,13 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 }
 
 @media (max-width: 1360px) and (min-width: 901px) {
-  .shop-row { grid-template-columns: minmax(180px, 1.4fr) 50px 50px 88px 96px 108px 32px 68px; gap: 7px; }
+  .shop-row { grid-template-columns: 22px minmax(180px, 1.4fr) 50px 50px 88px 96px 108px 32px 68px; gap: 7px; }
   .table-head,
   .product-row { grid-template-columns: 22px minmax(135px, 2fr) 64px minmax(78px, .75fr) 104px 98px; gap: 6px; }
 }
 
 @media (max-width: 1100px) and (min-width: 681px) {
-  .shop-row { grid-template-columns: minmax(180px, 1fr) 58px 58px 104px 34px 70px; gap: 8px; }
+  .shop-row { grid-template-columns: 22px minmax(180px, 1fr) 58px 58px 104px 34px 70px; gap: 8px; }
   .shop-time,
   .shop-row .shop-stat:nth-of-type(3) { display: none; }
   .monitor-filter-bar { grid-template-columns: minmax(180px, 1fr) 145px auto 30px; }
@@ -2661,18 +2672,22 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   }
   .monitor-search { grid-column: 1 / -1; }
   .shop-row {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
     gap: 8px;
   }
   .shop-row .shop-stat,
   .shop-row .shop-time { display: none !important; }
   .shop-row > .monitor-interval-control {
     width: min(160px, 100%);
-    grid-column: 1;
+    grid-column: 2;
     grid-row: 2;
   }
+  .shop-row > .shop-select-cell { grid-column: 1; grid-row: 1; }
+  .shop-row > .shop-main { grid-column: 2 / -1; grid-row: 1; }
   .shop-row > .switch { top: 15px; }
-  .shop-row > .row-actions { grid-column: 2; grid-row: 2; align-self: end; }
+  .shop-row > .row-actions { grid-column: 3; grid-row: 2; align-self: end; }
+  .shop-batch-toolbar { align-items: flex-start; flex-direction: column; }
+  .shop-batch-toolbar > div { width: 100%; justify-content: space-between; }
   .product-row { grid-template-columns: 22px minmax(0, 1fr) auto; }
   .monitor-cell {
     position: static;

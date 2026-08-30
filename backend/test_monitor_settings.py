@@ -20,6 +20,7 @@ class MonitorSettingsTests(unittest.TestCase):
                 name TEXT,
                 keywords TEXT,
                 category_id INTEGER,
+                category_name TEXT,
                 goods_type TEXT,
                 enabled INTEGER,
                 interval_seconds INTEGER
@@ -46,7 +47,7 @@ class MonitorSettingsTests(unittest.TestCase):
             """
         )
         self.connection.execute(
-            "INSERT INTO shops VALUES(1, '测试店铺', '', NULL, 'card', 1, 300)"
+            "INSERT INTO shops VALUES(1, '测试店铺', '', NULL, '', 'card', 1, 300)"
         )
         self.connection.executemany(
             "INSERT INTO watches VALUES(?, ?, 1, 60)",
@@ -68,6 +69,7 @@ class MonitorSettingsTests(unittest.TestCase):
                 "name": "测试店铺",
                 "keywords": "",
                 "category_id": "",
+                "category_name": "",
                 "goods_type": "card",
                 "enabled": True,
                 "interval_seconds": 900,

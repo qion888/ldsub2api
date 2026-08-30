@@ -180,6 +180,72 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual([channel["id"] for channel in channels], [1, 4])
         self.assertEqual(post.call_args.args[0], "/shopApi/Shop/getUserChannel")
 
+    def test_shop_categories_normalize_names_ids_and_counts(self):
+        response = {
+            "code": 1,
+            "data": [
+                {"id": 157738, "name": "team", "goods_count": 2},
+                {"id": "108401", "name": "codex官方直充", "goods_count": "4"},
+                {"id": "bad", "name": "无效"},
+                {"id": 157738, "name": "重复"},
+            ],
+        }
+        with patch.object(main, "_post_shop_api", return_value=response) as post:
+            result = main.fetch_shop_categories(
+                "https://pay.ldxp.cn/shop/JVVH1Q5N", goods_type="card"
+            )
+        self.assertEqual(result["token"], "JVVH1Q5N")
+        self.assertEqual(result["categories"], [
+            {"id": 157738, "name": "team", "goods_count": 2},
+            {"id": 108401, "name": "codex官方直充", "goods_count": 4},
+        ])
+        endpoint, payload, referer = post.call_args.args
+        self.assertEqual(endpoint, "/shopApi/Shop/categoryList")
+        self.assertEqual(payload, {"token": "JVVH1Q5N", "goods_type": "card", "category_key": ""})
+        self.assertEqual(referer, "https://pay.ldxp.cn/shop/JVVH1Q5N")
+
+    def test_shop_category_and_batch_delete_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = connection.execute(
+                        "INSERT INTO watches(url, name, enabled) VALUES(?, '保留商品', 1)",
+                        ("https://pay.ldxp.cn/item/batch-shop-keep",),
+                    ).lastrowid
+                    shop_ids = []
+                    for token in ("BATCHA", "BATCHB", "BATCHC"):
+                        shop_ids.append(connection.execute(
+                            "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
+                            (f"https://pay.ldxp.cn/shop/{token}", token, token, main.utc_now()),
+                        ).lastrowid)
+                    connection.execute(
+                        "INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen) VALUES(?, 'batch-shop-keep', ?, 1, ?)",
+                        (shop_ids[0], watch_id, main.utc_now()),
+                    )
+
+                categories = {"token": "JVVH1Q5N", "url": "https://pay.ldxp.cn/shop/JVVH1Q5N", "goods_type": "card", "categories": [{"id": 108401, "name": "codex官方直充", "goods_count": 4}]}
+                with patch.object(main, "fetch_shop_categories", return_value=categories):
+                    category_status, category_result = self.request_api("POST", "/api/shops/categories", {
+                        "url": "https://pay.ldxp.cn/shop/JVVH1Q5N", "goods_type": "card",
+                    })
+                self.assertEqual(category_status, 200)
+                self.assertEqual(category_result["categories"][0]["name"], "codex官方直充")
+
+                delete_status, delete_result = self.request_api(
+                    "POST", "/api/shops/batch-delete", {"ids": shop_ids[:2]}
+                )
+                self.assertEqual(delete_status, 200)
+                self.assertEqual(delete_result["deleted_count"], 2)
+                with main.database() as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
+
+                invalid_status, _ = self.request_api("POST", "/api/shops/batch-delete", {"ids": []})
+                self.assertEqual(invalid_status, 400)
+
     def test_monitor_interval_supports_one_second_and_clamps_bounds(self):
         self.assertEqual(main.normalize_interval(1), 1)
         self.assertEqual(main.normalize_interval("3"), 3)

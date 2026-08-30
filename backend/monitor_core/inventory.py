@@ -455,3 +455,14 @@ class InventoryService:
                 watch_ids,
             )
         return cursor.rowcount
+
+    def delete_shops(self, shop_ids: list[int]) -> int:
+        if not shop_ids:
+            return 0
+        placeholders = ",".join("?" for _ in shop_ids)
+        with self.database() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM shops WHERE id IN ({placeholders})",
+                shop_ids,
+            )
+        return cursor.rowcount

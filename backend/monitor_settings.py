@@ -68,16 +68,17 @@ def update_shop_monitoring(
     keywords = str(payload.get("keywords") or "").strip()[:100]
     raw_category = payload.get("category_id")
     category_id = int(raw_category) if raw_category not in (None, "") else None
+    category_name = str(payload.get("category_name") or "").strip()[:100] if category_id else ""
     goods_type = str(payload.get("goods_type") or "card").strip()[:30]
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,30}", goods_type):
         raise ValueError("商品类型格式无效")
 
     cursor = connection.execute(
         """
-        UPDATE shops SET name = ?, keywords = ?, category_id = ?, goods_type = ?,
+        UPDATE shops SET name = ?, keywords = ?, category_id = ?, category_name = ?, goods_type = ?,
             enabled = ?, interval_seconds = ? WHERE id = ?
         """,
-        (name, keywords, category_id, goods_type, enabled, interval, shop_id),
+        (name, keywords, category_id, category_name, goods_type, enabled, interval, shop_id),
     )
     if cursor.rowcount == 0:
         raise MonitorNotFound("监控店铺不存在")

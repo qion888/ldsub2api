@@ -399,6 +399,55 @@ def fetch_payment_channels(
     return channels
 
 
+def fetch_shop_categories(
+    shop_url: str,
+    *,
+    goods_type: str = "card",
+    post_api: Callable[..., dict[str, Any]] = _post_shop_api,
+) -> dict[str, Any]:
+    token, canonical_url = parse_shop_url(shop_url)
+    normalized_type = str(goods_type or "card").strip()[:30]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,30}", normalized_type):
+        raise ValueError("商品类型格式无效")
+    result = post_api(
+        "/shopApi/Shop/categoryList",
+        {"token": token, "goods_type": normalized_type, "category_key": ""},
+        canonical_url,
+    )
+    if result.get("code") != 1 or not isinstance(result.get("data"), list):
+        raise RuntimeError(str(result.get("msg") or "无法获取店铺分类")[:200])
+
+    categories: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for entry in result["data"]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            category_id = int(entry.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if category_id < 1 or category_id in seen:
+            continue
+        seen.add(category_id)
+        try:
+            goods_count = max(0, int(entry.get("goods_count") or 0))
+        except (TypeError, ValueError):
+            goods_count = 0
+        categories.append(
+            {
+                "id": category_id,
+                "name": str(entry.get("name") or f"分类 {category_id}").strip()[:100],
+                "goods_count": goods_count,
+            }
+        )
+    return {
+        "token": token,
+        "url": canonical_url,
+        "goods_type": normalized_type,
+        "categories": categories,
+    }
+
+
 def create_official_payment_order(
     *,
     goods_key: str,

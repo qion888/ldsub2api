@@ -79,6 +79,7 @@ def initialize_database(
                 name TEXT,
                 keywords TEXT NOT NULL DEFAULT '',
                 category_id INTEGER,
+                category_name TEXT,
                 goods_type TEXT NOT NULL DEFAULT 'card',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 interval_seconds INTEGER NOT NULL DEFAULT 300,
@@ -145,6 +146,7 @@ def initialize_database(
         _add_column(connection, "snapshots", "sale_status TEXT")
         _add_column(connection, "snapshots", "goods_key TEXT")
         _add_column(connection, "snapshots", "raw_data TEXT")
+        _add_column(connection, "shops", "category_name TEXT")
         connection.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('contact', ?)",
             (json.dumps({"contact": "", "note": ""}, ensure_ascii=False),),

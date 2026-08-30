@@ -60,6 +60,12 @@ const DEFAULT_SUB2API_AUTOMATION = {
   auto_import: false,
 };
 const MONITOR_INTERVAL_OPTIONS = [1, 3, 5, 10, 30, 60, 300, 900, 1800];
+const SHOP_GOODS_TYPES = [
+  {value: 'card', label: '卡密商品'},
+  {value: 'article', label: '文章商品'},
+  {value: 'resource', label: '资源商品'},
+  {value: 'equity', label: '权益商品'},
+];
 
 function getVisitorId() {
   const cached = window.localStorage.getItem('visitorId');
@@ -202,6 +208,15 @@ function itemCategory(item) {
 
 function itemShopName(item) {
   return item?.shops?.[0]?.name || item?.shops?.[0]?.token || itemSpecValue(item, /店铺|seller|shop/i) || '独立商品';
+}
+
+function shopGoodsTypeLabel(value) {
+  return SHOP_GOODS_TYPES.find(option => option.value === value)?.label || value || '卡密商品';
+}
+
+function shopCategoryLabel(shop) {
+  if (!shop?.category_id) return '全部分类';
+  return shop.category_name ? `${shop.category_name} · ID ${shop.category_id}` : `ID ${shop.category_id}`;
 }
 
 function itemPrice(item) {
@@ -841,12 +856,14 @@ function App() {
   const [intervalSeconds, setIntervalSeconds] = useState(300);
   const [categoryId, setCategoryId] = useState('');
   const [goodsType, setGoodsType] = useState('card');
+  const [shopCategoryState, setShopCategoryState] = useState({token: '', goodsType: 'card', categories: [], loading: false, error: ''});
   const [shopFilter, setShopFilter] = useState(null);
   const [shopQuery, setShopQuery] = useState('');
   const [shopStatusFilter, setShopStatusFilter] = useState('all');
   const [productQuery, setProductQuery] = useState('');
   const [productStatusFilter, setProductStatusFilter] = useState('all');
   const [checkedIds, setCheckedIds] = useState([]);
+  const [checkedShopIds, setCheckedShopIds] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [theme, setTheme] = useState(() => window.localStorage.getItem('ldxp-theme') === 'dark' ? 'dark' : 'light');
   const [overviewOpen, setOverviewOpen] = useState(false);
@@ -905,6 +922,42 @@ function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('ldxp-theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      setShopCategoryState({token: '', goodsType, categories: [], loading: false, error: ''});
+      return undefined;
+    }
+    const match = parsed.pathname.match(/^\/shop\/([A-Za-z0-9_-]{3,80})\/?$/);
+    if (sourceMode !== 'shop' || parsed.protocol !== 'https:' || parsed.hostname !== 'pay.ldxp.cn' || !match) {
+      setShopCategoryState({token: '', goodsType, categories: [], loading: false, error: ''});
+      return undefined;
+    }
+
+    const token = match[1];
+    let cancelled = false;
+    setCategoryId('');
+    setShopCategoryState({token, goodsType, categories: [], loading: true, error: ''});
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await request('/shops/categories', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({url, goods_type: goodsType}),
+        });
+        if (!cancelled) setShopCategoryState({token: result.token || token, goodsType, categories: result.categories || [], loading: false, error: ''});
+      } catch (error) {
+        if (!cancelled) setShopCategoryState({token, goodsType, categories: [], loading: false, error: error.message});
+      }
+    }, 320);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [goodsType, sourceMode, url]);
 
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
@@ -995,6 +1048,7 @@ function App() {
       ]);
       setItems(data);
       setShops(shopData);
+      setCheckedShopIds(current => current.filter(id => shopData.some(shop => shop.id === id)));
       const triggeredIds = new Set(preorderData.filter(entry => entry.status === 'triggered').map(entry => entry.id));
       if (preorderLoaded.current) {
         const triggered = preorderData.find(entry => entry.status === 'triggered' && !knownTriggeredPreorders.current.has(entry.id));
@@ -1111,7 +1165,7 @@ function App() {
   const shopFailures = shops.filter(shop => shop.last_attempt?.status === 'error').length;
   const normalizedShopQuery = shopQuery.trim().toLocaleLowerCase('zh-CN');
   const filteredShops = shops.filter(shop => {
-    const matchesQuery = !normalizedShopQuery || [shop.name, shop.token, shop.category_id, shop.goods_type]
+    const matchesQuery = !normalizedShopQuery || [shop.name, shop.token, shop.category_id, shop.category_name, shop.goods_type, shopGoodsTypeLabel(shop.goods_type)]
       .some(value => String(value || '').toLocaleLowerCase('zh-CN').includes(normalizedShopQuery));
     const matchesStatus = shopStatusFilter === 'all'
       || (shopStatusFilter === 'enabled' && shop.enabled)
@@ -1147,6 +1201,9 @@ function App() {
   }, 0);
   const visibleCheckedIds = visibleItems.filter(item => checkedIds.includes(item.id)).map(item => item.id);
   const allVisibleChecked = visibleItems.length > 0 && visibleCheckedIds.length === visibleItems.length;
+  const validCheckedShopIds = shops.filter(shop => checkedShopIds.includes(shop.id)).map(shop => shop.id);
+  const visibleCheckedShopIds = filteredShops.filter(shop => checkedShopIds.includes(shop.id)).map(shop => shop.id);
+  const allVisibleShopsChecked = filteredShops.length > 0 && visibleCheckedShopIds.length === filteredShops.length;
   const preorderByWatch = new Map(preorders.map(entry => [entry.watch_id, entry]));
   const displayedPreorders = preorders.filter(entry => entry.status !== 'cancelled');
 
@@ -1170,6 +1227,7 @@ function App() {
           name,
           interval_seconds: intervalSeconds,
           category_id: isShop ? categoryId : undefined,
+          category_name: isShop ? shopCategoryState.categories.find(category => String(category.id) === String(categoryId))?.name || '' : undefined,
           goods_type: isShop ? goodsType : undefined,
         }),
       });
@@ -1262,10 +1320,43 @@ function App() {
     try {
       await request(`/shops/${shop.id}`, {method: 'DELETE'});
       if (shopFilter === shop.id) setShopFilter(null);
+      setCheckedShopIds(current => current.filter(id => id !== shop.id));
       await loadItems({quiet: true});
       notify('店铺监控已删除');
     } catch (error) {
       notify(error.message, 'error');
+    }
+  };
+
+  const toggleShopChecked = id => {
+    setCheckedShopIds(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]);
+  };
+
+  const toggleAllVisibleShops = () => {
+    const visibleIds = filteredShops.map(shop => shop.id);
+    setCheckedShopIds(current => allVisibleShopsChecked
+      ? current.filter(id => !visibleIds.includes(id))
+      : [...new Set([...current, ...visibleIds])]);
+  };
+
+  const removeCheckedShops = async () => {
+    if (!validCheckedShopIds.length) return;
+    if (!window.confirm(`删除 ${validCheckedShopIds.length} 个店铺监控？已导入的商品和价格记录会保留。`)) return;
+    setBusy(value => ({...value, shopBatchDelete: true}));
+    try {
+      const result = await request('/shops/batch-delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ids: validCheckedShopIds}),
+      });
+      if (validCheckedShopIds.includes(shopFilter)) setShopFilter(null);
+      setCheckedShopIds([]);
+      await loadItems({quiet: true});
+      notify(`已删除 ${result.deleted_count} 个店铺监控，商品记录已保留`);
+    } catch (error) {
+      notify(error.message, 'error');
+    } finally {
+      setBusy(value => ({...value, shopBatchDelete: false}));
     }
   };
 
@@ -2072,8 +2163,8 @@ function App() {
               <div className={`composer-fields ${sourceMode === 'shop' ? 'shop-mode' : ''}`}>
                 <label className="url-field"><span>{sourceMode === 'shop' ? '店铺链接' : '商品链接'}</span><div><Link2 size={16}/><input value={url} onChange={event => changeSourceUrl(event.target.value)} placeholder={sourceMode === 'shop' ? '粘贴店铺链接' : '粘贴商品链接'} required spellCheck="false"/></div></label>
                 <label><span>备注</span><input value={name} onChange={event => setName(event.target.value)} placeholder="可选"/></label>
-                {sourceMode === 'shop' && <label><span>分类 ID（可选）</span><input value={categoryId} onChange={event => setCategoryId(event.target.value.replace(/\D/g, ''))} placeholder="全部分类" inputMode="numeric"/></label>}
-                {sourceMode === 'shop' && <label><span>商品类型</span><input value={goodsType} onChange={event => setGoodsType(event.target.value.replace(/[^A-Za-z0-9_-]/g, ''))} placeholder="card"/></label>}
+                {sourceMode === 'shop' && <label className="shop-category-field"><span>{shopCategoryState.token ? `商品分类 · ${shopCategoryState.token}` : '商品分类'}</span><select value={categoryId} onChange={event => setCategoryId(event.target.value)} aria-label="选择店铺商品分类" title={shopCategoryState.error || '按店铺公开分类选择同步范围'}><option value="">{shopCategoryState.loading ? '正在读取分类…' : shopCategoryState.error ? '全部分类（读取失败）' : shopCategoryState.token && !shopCategoryState.categories.length ? '全部分类（暂无子分类）' : '全部分类'}</option>{shopCategoryState.categories.map(category => <option value={category.id} key={category.id}>{category.name} · ID {category.id}{category.goods_count ? ` · ${category.goods_count} 件` : ''}</option>)}</select></label>}
+                {sourceMode === 'shop' && <label><span>商品类型</span><select value={goodsType} onChange={event => setGoodsType(event.target.value)}>{SHOP_GOODS_TYPES.map(option => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>}
                 <label><span>监控频率</span><select value={intervalSeconds} onChange={event => setIntervalSeconds(Number(event.target.value))}>{MONITOR_INTERVAL_OPTIONS.map(seconds => <option value={seconds} key={seconds}>{intervalOptionLabel(seconds)}</option>)}</select></label>
                 <button className="button primary" disabled={busy.add}><Plus size={16}/>{busy.add ? '正在同步' : sourceMode === 'shop' ? '同步店铺' : '开始监控'}</button>
               </div>
@@ -2087,9 +2178,14 @@ function App() {
                 <span className="monitor-result-count">{filteredShops.length} / {shops.length}</span>
                 {(shopQuery || shopStatusFilter !== 'all') && <IconButton label="清除店铺筛选" onClick={() => { setShopQuery(''); setShopStatusFilter('all'); }}><X size={14}/></IconButton>}
               </div>
-              <div className="shop-list">{!filteredShops.length ? <div className="monitor-filter-empty"><Store size={20}/><span>没有符合条件的店铺</span></div> : filteredShops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''}`} key={shop.id}>
+              <div className="shop-batch-toolbar">
+                <label className="shop-select-all"><input className="select-checkbox" type="checkbox" checked={allVisibleShopsChecked} onChange={toggleAllVisibleShops} disabled={!filteredShops.length} aria-label="全选当前店铺"/><span>全选当前结果</span></label>
+                <div><span>{validCheckedShopIds.length ? `已选 ${validCheckedShopIds.length} 个店铺` : '尚未选择店铺'}</span>{validCheckedShopIds.length > 0 && <IconButton label="取消选择店铺" onClick={() => setCheckedShopIds([])}><X size={14}/></IconButton>}<button className="button danger-button" onClick={removeCheckedShops} disabled={!validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button></div>
+              </div>
+              <div className="shop-list">{!filteredShops.length ? <div className="monitor-filter-empty"><Store size={20}/><span>没有符合条件的店铺</span></div> : filteredShops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''} ${checkedShopIds.includes(shop.id) ? 'checked' : ''}`} key={shop.id}>
+                <label className="check-wrap shop-select-cell" title={`选择店铺：${shop.name || shop.token}`} onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedShopIds.includes(shop.id)} onChange={() => toggleShopChecked(shop.id)} aria-label={`选择店铺：${shop.name || shop.token}`}/></label>
                 <button className="shop-main" onClick={() => { setShopFilter(current => current === shop.id ? null : shop.id); setCheckedIds([]); }}>
-                  <span className="shop-icon"><Store size={18}/></span><span><strong>{shop.name || shop.token}</strong><small>{shop.token} · 分类 {shop.category_id || '全部'}</small></span>
+                  <span className="shop-icon"><Store size={18}/></span><span><strong>{shop.name || shop.token}</strong><small>{shop.token} · {shopGoodsTypeLabel(shop.goods_type)} · {shopCategoryLabel(shop)}</small></span>
                 </button>
                 <div className="shop-stat"><span>商品</span><strong>{shop.product_count}</strong></div>
                 <div className="shop-stat"><span>在售</span><strong className="positive">{shop.on_sale_count}</strong></div>

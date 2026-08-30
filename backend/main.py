@@ -170,6 +170,14 @@ def fetch_payment_channels(shop_token: str) -> list[dict[str, Any]]:
     )
 
 
+def fetch_shop_categories(shop_url: str, *, goods_type: str = "card") -> dict[str, Any]:
+    return storefront.fetch_shop_categories(
+        shop_url,
+        goods_type=goods_type,
+        post_api=_post_shop_api,
+    )
+
+
 def create_official_payment_order(
     *,
     goods_key: str,
@@ -694,6 +702,10 @@ def delete_watches(watch_ids: list[int]) -> int:
     return INVENTORY.delete_watches(watch_ids)
 
 
+def delete_shops(shop_ids: list[int]) -> int:
+    return INVENTORY.delete_shops(shop_ids)
+
+
 class MonitorWorker(CoreMonitorWorker):
     def __init__(self) -> None:
         # Lambdas resolve main-module names when work runs, preserving runtime
@@ -964,6 +976,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             deleted_count = delete_watches(watch_ids)
             return self._send_json({"ok": True, "deleted_count": deleted_count})
 
+        if path == "/api/shops/categories":
+            try:
+                result = fetch_shop_categories(
+                    str(data.get("url") or ""),
+                    goods_type=str(data.get("goods_type") or "card"),
+                )
+            except ValueError as exc:
+                return self._send_json({"detail": str(exc)}, 400)
+            except WafChallengeRequired as exc:
+                return self._send_json({"detail": str(exc)}, 409)
+            except RuntimeError as exc:
+                return self._send_json({"detail": str(exc)}, 502)
+            return self._send_json(result)
+
+        if path == "/api/shops/batch-delete":
+            raw_ids = data.get("ids")
+            if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 500:
+                return self._send_json({"detail": "请选择 1 到 500 个店铺"}, 400)
+            try:
+                shop_ids = sorted({int(value) for value in raw_ids})
+            except (TypeError, ValueError):
+                return self._send_json({"detail": "店铺编号无效"}, 400)
+            if any(value < 1 for value in shop_ids):
+                return self._send_json({"detail": "店铺编号无效"}, 400)
+            deleted_count = delete_shops(shop_ids)
+            return self._send_json({"ok": True, "deleted_count": deleted_count})
+
         if path == "/api/watches":
             try:
                 _, canonical_url = parse_item_url(str(data.get("url") or ""))
@@ -994,6 +1033,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 keywords = str(data.get("keywords") or "").strip()[:100]
                 raw_category = data.get("category_id")
                 category_id = int(raw_category) if raw_category not in (None, "") else None
+                category_name = str(data.get("category_name") or "").strip()[:100] if category_id else ""
                 goods_type = str(data.get("goods_type") or "card").strip()[:30]
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,30}", goods_type):
                     raise ValueError("商品类型格式无效")
@@ -1001,11 +1041,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     cursor = connection.execute(
                         """
                         INSERT INTO shops(
-                            url, token, name, keywords, category_id, goods_type,
+                            url, token, name, keywords, category_id, category_name, goods_type,
                             enabled, interval_seconds, created_at
-                        ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?)
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                         """,
-                        (canonical_url, token, name, keywords, category_id, goods_type, interval, utc_now()),
+                        (canonical_url, token, name, keywords, category_id, category_name, goods_type, interval, utc_now()),
                     )
                     shop_id = cursor.lastrowid
             except (TypeError, ValueError) as exc:
@@ -1013,21 +1053,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             except sqlite3.IntegrityError:
                 with database() as connection:
                     existing = connection.execute(
-                        "SELECT id, name FROM shops WHERE token = ? OR url = ?",
+                        "SELECT id, name, category_id, category_name FROM shops WHERE token = ? OR url = ?",
                         (token, canonical_url),
                     ).fetchone()
                     if existing is None:
                         return self._send_json({"detail": "店铺配置冲突"}, 409)
                     shop_id = existing["id"]
+                    if not category_name and existing["category_id"] == category_id:
+                        category_name = str(existing["category_name"] or "")
                     connection.execute(
                         """
-                        UPDATE shops SET name = ?, keywords = ?, category_id = ?, goods_type = ?,
+                        UPDATE shops SET name = ?, keywords = ?, category_id = ?, category_name = ?, goods_type = ?,
                             enabled = 1, interval_seconds = ? WHERE id = ?
                         """,
                         (
                             requested_name or existing["name"] or token,
                             keywords,
                             category_id,
+                            category_name,
                             goods_type,
                             interval,
                             shop_id,
@@ -1367,9 +1410,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True})
         shop_match = re.fullmatch(r"/api/shops/(\d+)", path)
         if shop_match:
-            with database() as connection:
-                cursor = connection.execute("DELETE FROM shops WHERE id = ?", (int(shop_match.group(1)),))
-            if cursor.rowcount == 0:
+            if delete_shops([int(shop_match.group(1))]) == 0:
                 return self._send_json({"detail": "监控店铺不存在"}, 404)
             return self._send_json({"ok": True})
         match = re.fullmatch(r"/api/watches/(\d+)", path)
