@@ -1,0 +1,28 @@
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index 529bc41..c866b6a 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2385,7 +2385,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .account-table th, .account-table td { box-sizing: border-box; padding: 10px 12px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); text-align: center; }
+ .account-table th:last-child, .account-table td:last-child { border-right: 0; }
+ .account-table th { position: sticky; top: 0; z-index: 1; height: 38px; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 12px; font-weight: 750; letter-spacing: 0; vertical-align: middle; white-space: nowrap; }
+-.account-table td { color: var(--ui-text); font-size: 13px; vertical-align: top; }
++.account-table td { color: var(--ui-text); font-size: 13px; vertical-align: middle; }
+ .account-table tbody tr { --account-row-accent: transparent; background: var(--ui-surface); transition: background-color .15s ease; }
+ .account-table tbody tr:hover { background: color-mix(in srgb, var(--ui-surface-muted) 68%, transparent); }
+ .account-table tbody tr > td:first-child { box-shadow: inset 3px 0 var(--account-row-accent); }
+@@ -2436,12 +2436,12 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .account-progress-meta > small { min-width: 0; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+ 
+ .account-usage-stack { display: grid; gap: 7px; }
+-.account-usage-stack-meta { min-height: var(--account-primary-rail); display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--ui-text-muted); line-height: 1.2; }
++.account-usage-stack-meta { min-height: var(--account-primary-rail); display: flex; align-items: center; justify-content: space-between; gap: 9px; color: var(--ui-text-muted); line-height: 1.2; }
+ .account-usage-source-tag { min-height: 22px; padding: 2px 6px; display: inline-flex; align-items: center; gap: 4px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 4px; font-size: 11px; font-weight: 750; white-space: nowrap; }
+ .account-usage-source-tag.live { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 7%, var(--ui-surface)); border-color: color-mix(in srgb, var(--ui-success) 30%, var(--ui-border)); }
+ .account-usage-source-tag.passive { color: #486b91; background: color-mix(in srgb, #5b7194 8%, var(--ui-surface)); border-color: color-mix(in srgb, #5b7194 30%, var(--ui-border)); }
+ .account-usage-source-tag.snapshot { color: var(--ui-text-muted); border-style: dashed; }
+-.account-usage-meta-tail { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 6px; }
++.account-usage-meta-tail { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+ .account-usage-meta-tail small { min-width: 0; overflow: hidden; color: var(--ui-text-faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+ .account-usage-alert { min-height: 21px; padding: 2px 5px; display: inline-flex; align-items: center; gap: 3px; overflow: hidden; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 7%, transparent); border: 1px solid color-mix(in srgb, var(--ui-danger) 28%, var(--ui-border)); border-radius: 3px; font-size: 10px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+ .account-usage-alert:focus-visible { outline: 2px solid color-mix(in srgb, var(--ui-danger) 55%, transparent); outline-offset: 1px; }
