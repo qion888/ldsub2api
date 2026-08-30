@@ -1279,35 +1279,62 @@ class GoodsParserTests(unittest.TestCase):
 
     def test_sub2api_card_import_history_http_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(main, "DB_PATH", Path(directory) / "history.db"):
+            import_result = {
+                "import_verification": {
+                    "confirmed": True,
+                    "expected": 2,
+                    "matched": 2,
+                    "failed": 0,
+                    "new_account_ids": [11, 12],
+                }
+            }
+            with patch.object(main, "DB_PATH", Path(directory) / "history.db"), patch.object(
+                main, "_sub2api_import_payload", return_value=import_result
+            ) as importer:
                 main.init_database()
                 status, created = self.request_api("POST", "/api/sub2api/card-import-records", {
                     "mode": "auto",
-                    "card_count": 2,
+                    "card_codes": ["CARD-A", "CARD-B"],
                 })
                 self.assertEqual(status, 201)
                 status, updated = self.request_api(
                     "PUT",
                     f"/api/sub2api/card-import-records/{created['id']}",
                     {
-                        "status": "success",
-                        "stage": "done",
+                        "status": "pending",
+                        "stage": "ready",
                         "verified_count": 2,
                         "account_count": 2,
-                        "success_count": 2,
-                        "message": "推送并核验成功",
+                        "message": "等待推送",
+                        "retry_context": {
+                            "data": {"accounts": [{"name": "a"}, {"name": "b"}]},
+                            "proxy_id": 3,
+                            "group_ids": [5],
+                            "codex_fingerprint_mode": "device",
+                            "assign_existing": True,
+                            "reclaim_order_nos": ["ORDER-123"],
+                        },
                     },
                 )
                 self.assertEqual(status, 200)
-                self.assertEqual(updated["success_count"], 2)
+                self.assertTrue(updated["retryable"])
                 status, records = self.request_api(
-                    "GET", "/api/sub2api/card-import-records?status=success&limit=10", {}
+                    "GET", "/api/sub2api/card-import-records?status=pending&page=1&page_size=10", {}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(records["items"][0]["card_codes"], ["CARD-A", "CARD-B"])
+                self.assertNotIn("retry_context", records["items"][0])
+                status, retried = self.request_api(
+                    "POST", f"/api/sub2api/card-import-records/{created['id']}/retry", {}
                 )
 
         self.assertEqual(status, 200)
-        self.assertEqual(records["total"], 1)
-        self.assertEqual(records["items"][0]["status"], "success")
-        self.assertEqual(records["summary"]["successful_accounts"], 2)
+        self.assertTrue(retried["ok"])
+        self.assertEqual(retried["record"]["success_count"], 2)
+        self.assertEqual(records["page"], 1)
+        self.assertEqual(records["pages"], 1)
+        importer.assert_called_once()
+        self.assertEqual(importer.call_args.kwargs["proxy_id"], 3)
 
     def test_sub2api_401_text_recognizes_token_revoked_parenthesized_status(self):
         self.assertTrue(main._sub2api_account_is_401({

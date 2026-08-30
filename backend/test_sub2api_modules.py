@@ -10,6 +10,163 @@ from sub2api.worker import Sub2ApiAutomationWorker
 
 
 class Sub2ApiModuleTests(unittest.TestCase):
+    def test_card_import_history_migrates_existing_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.db"
+
+            def database():
+                return monitor_database.create_database(path)
+
+            with database() as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE sub2api_card_import_records (
+                        id INTEGER PRIMARY KEY,
+                        started_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        mode TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        stage TEXT NOT NULL,
+                        card_count INTEGER NOT NULL DEFAULT 0,
+                        verified_count INTEGER NOT NULL DEFAULT 0,
+                        downloaded_files INTEGER NOT NULL DEFAULT 0,
+                        account_count INTEGER NOT NULL DEFAULT 0,
+                        success_count INTEGER NOT NULL DEFAULT 0,
+                        failed_count INTEGER NOT NULL DEFAULT 0,
+                        filename TEXT NOT NULL DEFAULT '',
+                        message TEXT NOT NULL DEFAULT '',
+                        details_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+
+            card_import_history.initialize(database)
+            with database() as connection:
+                columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(sub2api_card_import_records)"
+                    )
+                }
+
+        self.assertIn("card_codes_json", columns)
+        self.assertIn("retry_context_json", columns)
+
+    def test_card_import_history_paginates_codes_and_retries_private_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.db"
+
+            def database():
+                return monitor_database.create_database(path)
+
+            timestamps = iter(f"2026-08-30T08:{minute:02d}:00+00:00" for minute in range(12))
+            now = lambda: next(timestamps)
+            card_import_history.initialize(database)
+            records = [
+                card_import_history.create_record(
+                    database,
+                    {"mode": "manual", "card_codes": [f"CARD-{index}"]},
+                    now=now,
+                )
+                for index in range(3)
+            ]
+            retry_context = {
+                "data": {"accounts": [{"name": "account-a"}]},
+                "assign_existing": True,
+                "proxy_id": 7,
+                "group_ids": [3, 4],
+                "codex_fingerprint_mode": "session",
+                "endpoint": "/api/v1/admin/accounts/data",
+                "reclaim_order_nos": ["ORDER-123"],
+            }
+            pending = card_import_history.update_record(
+                database,
+                records[-1]["id"],
+                {"status": "pending", "stage": "ready", "retry_context": retry_context},
+                now=now,
+            )
+            first_page = card_import_history.list_records(
+                database, {"page": ["1"], "page_size": ["2"]}
+            )
+            second_page = card_import_history.list_records(
+                database, {"page": ["2"], "page_size": ["2"]}
+            )
+            calls = []
+            retried = card_import_history.retry_record(
+                database,
+                pending["id"],
+                import_payload=lambda data, **kwargs: calls.append((data, kwargs)) or {
+                    "import_verification": {
+                        "confirmed": True,
+                        "expected": 1,
+                        "matched": 1,
+                        "failed": 0,
+                        "new_account_ids": [42],
+                    }
+                },
+                now=now,
+            )
+
+        self.assertEqual(first_page["items"][0]["card_codes"], ["CARD-2"])
+        self.assertEqual(first_page["total"], 3)
+        self.assertEqual(first_page["pages"], 2)
+        self.assertEqual(second_page["page"], 2)
+        self.assertEqual([item["card_codes"][0] for item in second_page["items"]], ["CARD-0"])
+        self.assertNotIn("retry_context", pending)
+        self.assertTrue(pending["retryable"])
+        self.assertTrue(retried["ok"])
+        self.assertEqual(retried["record"]["status"], "success")
+        self.assertFalse(retried["record"]["retryable"])
+        self.assertEqual(calls[0][0], retry_context["data"])
+        self.assertEqual(calls[0][1]["proxy_id"], 7)
+        self.assertEqual(calls[0][1]["reclaim_order_nos"], ["ORDER-123"])
+
+    def test_card_import_history_retry_failure_restores_failed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.db"
+
+            def database():
+                return monitor_database.create_database(path)
+
+            timestamps = iter((
+                "2026-08-30T09:00:00+00:00",
+                "2026-08-30T09:01:00+00:00",
+                "2026-08-30T09:02:00+00:00",
+                "2026-08-30T09:03:00+00:00",
+            ))
+            now = lambda: next(timestamps)
+            card_import_history.initialize(database)
+            record = card_import_history.create_record(
+                database, {"mode": "auto", "card_codes": ["FAILED-CARD"]}, now=now
+            )
+            card_import_history.update_record(
+                database,
+                record["id"],
+                {
+                    "status": "failed",
+                    "stage": "error",
+                    "retry_context": {"data": {"accounts": [{"name": "account-b"}]}},
+                },
+                now=now,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "upstream unavailable"):
+                card_import_history.retry_record(
+                    database,
+                    record["id"],
+                    import_payload=lambda *args, **kwargs: (_ for _ in ()).throw(
+                        RuntimeError("upstream unavailable")
+                    ),
+                    now=now,
+                )
+            failed = card_import_history.list_records(database)["items"][0]
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["stage"], "error")
+        self.assertIn("upstream unavailable", failed["message"])
+        self.assertTrue(failed["retryable"])
+
     def test_card_import_history_tracks_pending_success_and_failure_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.db"
@@ -368,6 +525,24 @@ class Sub2ApiModuleTests(unittest.TestCase):
         ))
         self.assertEqual(responses[-1][0], 201)
         self.assertEqual(responses[-1][1]["id"], 7)
+
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/card-import-records/7/retry",
+            {},
+            **common_write,
+            card_import_history_retry=lambda record_id: {"ok": True, "record_id": record_id},
+        ))
+        self.assertEqual(responses[-1], (200, {"ok": True, "record_id": 7}))
+
+        self.assertTrue(routes.handle_post(
+            "/api/sub2api/card-import-records/7/retry",
+            {},
+            **common_write,
+            card_import_history_retry=lambda record_id: (_ for _ in ()).throw(
+                card_import_history.RetryFailed("upstream unavailable")
+            ),
+        ))
+        self.assertEqual(responses[-1], (502, {"detail": "upstream unavailable"}))
 
         self.assertTrue(routes.handle_put(
             "/api/sub2api/card-import-records/7",

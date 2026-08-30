@@ -68,6 +68,9 @@ const DEFAULT_SUB2API_AUTOMATION = {
 const EMPTY_CARD_IMPORT_HISTORY = {
   items: [],
   total: 0,
+  page: 1,
+  page_size: 10,
+  pages: 1,
   status: 'all',
   summary: {total: 0, success: 0, failed: 0, pending: 0, successful_accounts: 0, failed_accounts: 0},
 };
@@ -958,8 +961,13 @@ function App() {
   const [sub2apiCardFlow, setSub2apiCardFlow] = useState({stage: 'idle'});
   const [sub2apiCardHistory, setSub2apiCardHistory] = useState(EMPTY_CARD_IMPORT_HISTORY);
   const [sub2apiCardHistoryFilter, setSub2apiCardHistoryFilter] = useState('all');
+  const [sub2apiCardHistoryPage, setSub2apiCardHistoryPage] = useState(1);
+  const [sub2apiCardHistoryPageSize, setSub2apiCardHistoryPageSize] = useState(10);
   const [sub2apiCardHistoryBusy, setSub2apiCardHistoryBusy] = useState(false);
+  const [sub2apiCardHistoryActions, setSub2apiCardHistoryActions] = useState({});
   const sub2apiCardHistoryFilterRef = useRef('all');
+  const sub2apiCardHistoryPageRef = useRef(1);
+  const sub2apiCardHistoryPageSizeRef = useRef(10);
   const [sub2apiAccounts, setSub2apiAccounts] = useState({items: [], total: 0, page: 1, page_size: 12, pages: 1, usage: {}, usage_errors: {}});
   const [sub2apiAccountFilters, setSub2apiAccountFilters] = useState({search: '', status: '', platform: ''});
   const [sub2apiAccountBusy, setSub2apiAccountBusy] = useState(false);
@@ -1250,10 +1258,16 @@ function App() {
 
   useEffect(() => {
     sub2apiCardHistoryFilterRef.current = sub2apiCardHistoryFilter;
+    sub2apiCardHistoryPageRef.current = sub2apiCardHistoryPage;
+    sub2apiCardHistoryPageSizeRef.current = sub2apiCardHistoryPageSize;
     if (activeView === 'sub2api' && featureLoadState.sub2api.status === 'ready') {
-      loadSub2ApiCardHistory({status: sub2apiCardHistoryFilter});
+      loadSub2ApiCardHistory({
+        status: sub2apiCardHistoryFilter,
+        page: sub2apiCardHistoryPage,
+        pageSize: sub2apiCardHistoryPageSize,
+      });
     }
-  }, [activeView, featureLoadState.sub2api.status, sub2apiCardHistoryFilter]);
+  }, [activeView, featureLoadState.sub2api.status, sub2apiCardHistoryFilter, sub2apiCardHistoryPage, sub2apiCardHistoryPageSize]);
 
   useEffect(() => {
     if (activeView !== 'sub2api' || featureLoadState.sub2api.status !== 'ready') return undefined;
@@ -2271,26 +2285,33 @@ function App() {
     }
   };
 
-  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos, throwOnError = false} = {}) => {
+  const buildSub2ApiImportBody = (payloadOverride, reclaimOrderNos = sub2apiReclaimOrderNos) => {
     const payload = payloadOverride || sub2apiPayload || reclaimPayload;
-    if (!payload) {
+    if (!payload) return null;
+    const assignExisting = sub2apiProxyChoice !== 'json' || sub2apiGroupIds.length > 0;
+    const proxyId = sub2apiProxyChoice.startsWith('proxy:') ? Number(sub2apiProxyChoice.slice(6)) : null;
+    return {
+      data: payload,
+      assign_existing: assignExisting,
+      reclaim_order_nos: reclaimOrderNos,
+      proxy_id: proxyId,
+      group_ids: sub2apiGroupIds,
+      codex_fingerprint_mode: sub2apiCodexFingerprintMode,
+      endpoint: '/api/v1/admin/accounts/data',
+    };
+  };
+
+  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos, throwOnError = false, bodyOverride = null} = {}) => {
+    const importBody = bodyOverride || buildSub2ApiImportBody(payloadOverride, reclaimOrderNos);
+    if (!importBody) {
       notify('请先选择账号 JSON 文件或下载找回结果', 'error');
       return null;
     }
     setSub2apiBusy(true);
     try {
-      const assignExisting = sub2apiProxyChoice !== 'json' || sub2apiGroupIds.length > 0;
-      const proxyId = sub2apiProxyChoice.startsWith('proxy:') ? Number(sub2apiProxyChoice.slice(6)) : null;
       const result = await request('/sub2api/import', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          data: payload,
-          assign_existing: assignExisting,
-          reclaim_order_nos: reclaimOrderNos,
-          proxy_id: proxyId,
-          group_ids: sub2apiGroupIds,
-          codex_fingerprint_mode: sub2apiCodexFingerprintMode,
-        }),
+        body: JSON.stringify(importBody),
       });
       setSub2apiResult(result);
       const verification = result.import_verification;
@@ -2317,12 +2338,20 @@ function App() {
     }
   };
 
-  const loadSub2ApiCardHistory = async ({status = sub2apiCardHistoryFilterRef.current, quiet = false} = {}) => {
+  const loadSub2ApiCardHistory = async ({
+    status = sub2apiCardHistoryFilterRef.current,
+    page = sub2apiCardHistoryPageRef.current,
+    pageSize = sub2apiCardHistoryPageSizeRef.current,
+    quiet = false,
+  } = {}) => {
     if (!quiet) setSub2apiCardHistoryBusy(true);
     try {
-      const params = new URLSearchParams({status, limit: '50'});
+      const params = new URLSearchParams({status, page: String(page), page_size: String(pageSize)});
       const result = await request(`/sub2api/card-import-records?${params}`);
       setSub2apiCardHistory(result);
+      if (Number(result.page) !== sub2apiCardHistoryPageRef.current) {
+        setSub2apiCardHistoryPage(Number(result.page) || 1);
+      }
       return result;
     } catch (error) {
       if (!quiet) notify(error.message, 'error');
@@ -2339,7 +2368,9 @@ function App() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(payload),
       });
-      await loadSub2ApiCardHistory({quiet: true});
+      sub2apiCardHistoryPageRef.current = 1;
+      setSub2apiCardHistoryPage(1);
+      await loadSub2ApiCardHistory({page: 1, quiet: true});
       return record;
     } catch {
       return null;
@@ -2363,6 +2394,40 @@ function App() {
 
   const normalizedSub2ApiCardCodes = () => [...new Set(sub2apiCardCodes.split(/[\s,，]+/).map(value => value.trim()).filter(Boolean))];
 
+  const copySub2ApiCardCode = async code => {
+    try {
+      await navigator.clipboard.writeText(String(code));
+      notify(`已复制卡密：${code}`);
+    } catch {
+      notify('无法访问剪贴板，请检查浏览器权限', 'error');
+    }
+  };
+
+  const retrySub2ApiCardHistory = async record => {
+    const recordId = Number(record?.id);
+    if (!Number.isInteger(recordId) || recordId < 1 || !record?.retryable) return;
+    setSub2apiCardHistoryActions(current => ({...current, [recordId]: 'retry'}));
+    try {
+      const result = await request(`/sub2api/card-import-records/${recordId}/retry`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: '{}',
+      });
+      setSub2apiResult(result.result || null);
+      notify(result.ok ? `记录 #${recordId} 重新推送成功` : `记录 #${recordId} 重新推送后核验失败`, result.ok ? 'info' : 'error');
+      await Promise.all([
+        loadSub2ApiCardHistory({quiet: true}),
+        result.ok ? loadSub2ApiAccounts({page: 1, quiet: true}) : Promise.resolve(),
+        result.ok ? loadSub2ApiOptions({quiet: true}) : Promise.resolve(),
+      ]);
+    } catch (error) {
+      notify(error.message, 'error');
+      await loadSub2ApiCardHistory({quiet: true});
+    } finally {
+      setSub2apiCardHistoryActions(current => ({...current, [recordId]: null}));
+    }
+  };
+
   const runSub2ApiCardImport = async () => {
     const codes = normalizedSub2ApiCardCodes();
     if (!codes.length) return notify('请先输入卡密，每行一个', 'error');
@@ -2370,7 +2435,7 @@ function App() {
     if (sub2apiCardMode === 'auto' && !sub2apiConfig.admin_key_set) return notify('自动推送前请先保存 Sub2API 管理员密钥', 'error');
 
     setSub2apiCardBusy(true);
-    const historyRecord = await createSub2ApiCardHistory({mode: sub2apiCardMode, card_count: codes.length});
+    const historyRecord = await createSub2ApiCardHistory({mode: sub2apiCardMode, card_codes: codes});
     const recordId = historyRecord?.id || null;
     let staged = null;
     setSub2apiCardFlow({stage: 'verify', cardCount: codes.length, startedAt: new Date().toISOString(), recordId});
@@ -2433,6 +2498,7 @@ function App() {
       }
 
       if (sub2apiCardMode === 'manual') {
+        const retryContext = buildSub2ApiImportBody(staged.payload, staged.orderNos);
         setSub2apiCardFlow(current => ({...current, stage: 'ready', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename, recordId}));
         await updateSub2ApiCardHistory(recordId, {
           status: 'pending',
@@ -2441,11 +2507,13 @@ function App() {
           account_count: staged.accounts,
           filename: staged.filename,
           message: '核验下载成功，等待手动推送',
+          retry_context: retryContext,
         });
         notify(`已核验并下载 ${staged.accounts} 个账号，请确认后手动推送`);
         return;
       }
 
+      const retryContext = buildSub2ApiImportBody(staged.payload, staged.orderNos);
       setSub2apiCardFlow(current => ({...current, stage: 'push', downloaded: staged.files, accounts: staged.accounts, filename: staged.filename, recordId}));
       await updateSub2ApiCardHistory(recordId, {
         status: 'running',
@@ -2454,8 +2522,9 @@ function App() {
         account_count: staged.accounts,
         filename: staged.filename,
         message: '账号文件已下载，正在自动推送',
+        retry_context: retryContext,
       });
-      const pushed = await importSub2Api(staged.payload, {reclaimOrderNos: staged.orderNos, throwOnError: true});
+      const pushed = await importSub2Api(staged.payload, {reclaimOrderNos: staged.orderNos, throwOnError: true, bodyOverride: retryContext});
       if (!pushed) throw new Error('账号 JSON 已下载，但自动推送未完成');
       const confirmed = Boolean(pushed.import_verification?.confirmed);
       setSub2apiCardFlow(current => ({...current, stage: confirmed ? 'done' : 'ready', pushed: confirmed, pushResult: pushed}));
@@ -2483,15 +2552,17 @@ function App() {
 
   const pushStagedSub2ApiCards = async () => {
     if (!sub2apiPayload) return notify('当前没有待推送的卡密账号 JSON', 'error');
+    const retryContext = buildSub2ApiImportBody(sub2apiPayload, sub2apiReclaimOrderNos);
     setSub2apiCardFlow(current => ({...current, stage: 'push', error: ''}));
     await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, {
       status: 'running',
       stage: 'push',
       message: '正在手动推送账号文件',
+      retry_context: retryContext,
     });
     let pushed;
     try {
-      pushed = await importSub2Api(undefined, {throwOnError: true});
+      pushed = await importSub2Api(undefined, {throwOnError: true, bodyOverride: retryContext});
     } catch (error) {
       setSub2apiCardFlow(current => ({...current, stage: 'error', error: error.message}));
       await updateSub2ApiCardHistory(sub2apiCardFlow.recordId, {
@@ -2702,8 +2773,11 @@ function App() {
             redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={saveRedeemConfig}
             cardCodes={sub2apiCardCodes} onCardCodes={setSub2apiCardCodes} cardMode={sub2apiCardMode} onCardMode={setSub2apiCardMode}
             cardBusy={sub2apiCardBusy} cardFlow={sub2apiCardFlow} onRunCardImport={runSub2ApiCardImport} onPushCards={pushStagedSub2ApiCards}
-            cardHistory={sub2apiCardHistory} cardHistoryFilter={sub2apiCardHistoryFilter} onCardHistoryFilter={setSub2apiCardHistoryFilter}
-            cardHistoryBusy={sub2apiCardHistoryBusy} onRefreshCardHistory={() => loadSub2ApiCardHistory()}
+            cardHistory={sub2apiCardHistory} cardHistoryFilter={sub2apiCardHistoryFilter} onCardHistoryFilter={value => { setSub2apiCardHistoryPage(1); setSub2apiCardHistoryFilter(value); }}
+            cardHistoryPage={sub2apiCardHistoryPage} cardHistoryPageSize={sub2apiCardHistoryPageSize}
+            onCardHistoryPage={setSub2apiCardHistoryPage} onCardHistoryPageSize={value => { setSub2apiCardHistoryPage(1); setSub2apiCardHistoryPageSize(value); }}
+            cardHistoryBusy={sub2apiCardHistoryBusy} cardHistoryActions={sub2apiCardHistoryActions} onRefreshCardHistory={() => loadSub2ApiCardHistory()}
+            onRetryCardHistory={retrySub2ApiCardHistory} onCopyCardCode={copySub2ApiCardCode}
             fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
             optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
             codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}

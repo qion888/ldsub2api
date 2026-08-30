@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
+from .card_import_history import RetryFailed, RetryNotAllowed
 from .constants import DEFAULT_URL
 
 SendJson = Callable[[Any, int], Any]
@@ -76,6 +77,7 @@ def handle_post(
     import_payload: Callable[..., dict[str, Any]],
     test_account: Callable[[int], dict[str, Any]] | None = None,
     card_import_history_creator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    card_import_history_retry: Callable[[int], dict[str, Any]] | None = None,
 ) -> bool:
     if path == "/api/sub2api/card-import-records":
         if card_import_history_creator is None:
@@ -84,6 +86,25 @@ def handle_post(
             send_json(card_import_history_creator(data), 201)
         except (TypeError, ValueError) as exc:
             send_json({"detail": str(exc)}, 400)
+        return True
+
+    retry_match = re.fullmatch(r"/api/sub2api/card-import-records/(\d+)/retry", path)
+    if retry_match:
+        if card_import_history_retry is None:
+            return False
+        try:
+            result = card_import_history_retry(int(retry_match.group(1)))
+            send_json(result, 200 if result.get("ok", False) else 502)
+        except LookupError as exc:
+            send_json({"detail": str(exc)}, 404)
+        except RetryNotAllowed as exc:
+            send_json({"detail": str(exc)}, 409)
+        except RetryFailed as exc:
+            send_json({"detail": str(exc)}, 502)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        except Exception as exc:
+            send_json({"detail": str(exc)[:240]}, 502)
         return True
 
     if path == "/api/sub2api/test":

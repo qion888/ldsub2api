@@ -362,6 +362,15 @@ def update_sub2api_card_import_record(record_id: int, payload: dict[str, Any]) -
     return sub2api_card_history.update_record(database, record_id, payload, now=utc_now)
 
 
+def retry_sub2api_card_import_record(record_id: int) -> dict[str, Any]:
+    return sub2api_card_history.retry_record(
+        database,
+        record_id,
+        import_payload=_sub2api_import_payload,
+        now=utc_now,
+    )
+
+
 def _sub2api_imported_order_nos() -> list[str]:
     try:
         value = sub2api_automation_state().get("imported_order_nos", [])
@@ -1052,6 +1061,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             import_payload=_sub2api_import_payload,
             test_account=test_sub2api_account,
             card_import_history_creator=create_sub2api_card_import_record,
+            card_import_history_retry=retry_sub2api_card_import_record,
         ):
             return
 
