@@ -207,18 +207,23 @@ function Sub2ApiUsageWindow({label, window, tone, testId}) {
       : formatSub2ApiCompactNumber(requests)
     : null;
   const detailItems = [
-    requestValue && {label: '请求', value: requestValue},
-    hasNumber(stats.tokens) && {label: 'Token', value: formatSub2ApiCompactNumber(stats.tokens)},
-    hasNumber(stats.cost) && {label: '账号费用', value: `$${Number(stats.cost).toFixed(2)}`},
-    hasNumber(stats.user_cost) && {label: '用户费用', value: `$${Number(stats.user_cost).toFixed(2)}`},
+    requestValue && {key: 'requests', label: '请求', fullLabel: '请求数', value: requestValue},
+    hasNumber(stats.tokens) && {key: 'tokens', label: 'Token', fullLabel: 'Token 数', value: formatSub2ApiCompactNumber(stats.tokens)},
+    hasNumber(stats.cost) && {key: 'account-cost', label: '账号费', fullLabel: '账号费用', value: `$${Number(stats.cost).toFixed(2)}`},
+    hasNumber(stats.user_cost) && {key: 'user-cost', label: '用户费', fullLabel: '用户费用', value: `$${Number(stats.user_cost).toFixed(2)}`},
   ].filter(Boolean);
   const resetsAt = window?.resets_at ?? window?.reset_at;
   const hasWindowData = hasPercent || detailItems.length > 0 || Boolean(resetsAt);
   const resetLabel = formatSub2ApiResetCountdown(resetsAt, window?.remaining_seconds);
   const exactResetLabel = resetsAt ? `准确重置时间：${formatSub2ApiDateTime(resetsAt)}` : resetLabel;
-  return <section className={`account-usage-window ${tone} ${state}`} data-testid={testId}>
+  const stateLabel = !hasPercent ? '未知' : state === 'danger' ? '已满' : state === 'warning' ? '预警' : '正常';
+  const stateTone = hasPercent ? state : 'unknown';
+  return <section className={`account-usage-window ${tone} ${stateTone}`} data-testid={testId}>
     <div className="account-usage-window-head">
-      <span><Clock3 size={15}/><strong>{label}</strong></span>
+      <div className="account-usage-window-title">
+        <span className={`account-usage-window-tag ${tone}`}><Clock3 size={15}/><strong>{label}</strong></span>
+        <span className={`account-usage-state-tag ${stateTone}`}>{stateLabel}</span>
+      </div>
       <strong className="account-usage-percent">{hasPercent ? `${displayPercent.toFixed(1)}%` : '--'}</strong>
     </div>
     {hasWindowData ? <>
@@ -232,11 +237,15 @@ function Sub2ApiUsageWindow({label, window, tone, testId}) {
         aria-valuetext={hasPercent ? `${displayPercent.toFixed(1)}%` : '暂无使用率'}
       ><span style={{width: `${meterPercent}%`}}/></div>
       <div className="account-usage-footnote">
-        <Tooltip label={exactResetLabel}><span className="account-usage-reset"><TimerReset size={12}/>{resetLabel}</span></Tooltip>
-        {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-standard">标准成本 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
+        <Tooltip label={exactResetLabel}><span className="account-usage-tag reset" tabIndex={0} aria-label={exactResetLabel}><TimerReset size={12}/>{resetLabel}</span></Tooltip>
+        {hasNumber(stats.standard_cost) && <Tooltip label="标准费用不含账号倍率，用于和账号费用、用户结算费用核对"><span className="account-usage-tag baseline" tabIndex={0} aria-label={`标准成本 $${Number(stats.standard_cost).toFixed(2)}，不含账号倍率，用于费用核对`}>标准 ${Number(stats.standard_cost).toFixed(2)}</span></Tooltip>}
       </div>
       {detailItems.length > 0
-        ? <dl className="account-usage-details">{detailItems.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>
+        ? <dl className="account-usage-details">{detailItems.map(item => {
+          const metricLabel = `${item.fullLabel}：${item.value}`;
+          const metricValue = <dd tabIndex={String(item.value).length > 8 ? 0 : undefined} aria-label={metricLabel}>{item.value}</dd>;
+          return <div className={`account-usage-metric ${item.key}`} key={item.key}><dt>{item.label}</dt>{String(item.value).length > 8 ? <Tooltip label={metricLabel}>{metricValue}</Tooltip> : metricValue}</div>;
+        })}</dl>
         : <div className="account-usage-window-empty">暂无请求与费用明细</div>}
     </> : <div className="account-usage-window-empty">暂未返回此窗口数据</div>}
   </section>;
@@ -247,12 +256,17 @@ function Sub2ApiUsageStack({account, usage, usageError}) {
   const windowFor = key => ({...(account?.[key] || {}), ...(accountUsage?.[key] || {})});
   const fiveHour = windowFor('five_hour');
   const sevenDay = windowFor('seven_day');
-  const sourceLabels = {active: '主动查询', live: '主动查询', passive: '被动采样'};
-  const sourceLabel = sourceLabels[String(accountUsage.source || '').toLowerCase()] || (Object.keys(accountUsage).length ? '上游数据' : '账号快照');
+  const sourceMap = {
+    active: {label: '主动查询', tone: 'live'},
+    live: {label: '主动查询', tone: 'live'},
+    passive: {label: '被动采样', tone: 'passive'},
+  };
+  const source = sourceMap[String(accountUsage.source || '').toLowerCase()]
+    || (Object.keys(accountUsage).length ? {label: '上游数据', tone: 'upstream'} : {label: '账号快照', tone: 'snapshot'});
   const updatedAt = accountUsage.updated_at || account.updated_at;
   return <div className="account-usage-stack upstream">
     <div className="account-usage-stack-meta">
-      <span><Activity size={13}/>{sourceLabel}</span>
+      <span className={`account-usage-source-tag ${source.tone}`}><Activity size={13}/>{source.label}</span>
       {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
     </div>
     <div className="account-usage-windows">
