@@ -1,0 +1,6 @@
+MODIFIED_FILE binary
+ROLLBACK_BASELINE binary
+DIFF_FILE whitespace=-trailing-space
+ROLLBACK.sh text eol=lf
+VERIFICATION.txt text eol=lf
+*.png binary

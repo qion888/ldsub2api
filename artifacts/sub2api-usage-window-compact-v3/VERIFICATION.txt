@@ -1,0 +1,145 @@
+Branch: codex/sub2api-usage-window-compact-v3; source commit 5746a34; rebased onto main 7c3e366
+Changed field: frontend/src/Sub2ApiView.jsx aligns upstream reset and standard-cost metadata in one compact footnote row; frontend/src/style.css reduces Sub2API-only controls, import/history sections, automation panels, account-table spacing, quota meters, and 5-hour/7-day usage-window dimensions while retaining distinct states, four usage metrics, tooltips, ARIA progress values, and table-local horizontal scrolling.
+
+Artifacts after merge:
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\MODIFIED_FILE
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\DIFF_FILE
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\VERIFICATION.txt
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\ROLLBACK.sh
+Supporting baseline archive:
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\ROLLBACK_BASELINE
+
+SOURCE HASHES
+Original input: main 7c3e366
+Original frontend/src/Sub2ApiView.jsx git blob: df2e284baec504aaacb88260880a7734169ea683
+Original frontend/src/Sub2ApiView.jsx SHA256: 774A17C3F7614E05E4988CADEC6DBE2EBAA6C02746968B55AF971F20FC5C0814
+Original frontend/src/style.css git blob: be882cd03bb164a7657c2131017e75dba3c6a8d1
+Original frontend/src/style.css SHA256: 243AFF30B4946DAECA93641CDF80A34C5ADE131ECED30F13EA66A3EC7CAB668D
+Modified frontend/src/Sub2ApiView.jsx git blob: c6407d3bc9fb07f160c85b4fbce32bd130471db8
+Modified frontend/src/Sub2ApiView.jsx SHA256: 46FDC649C3C32C7D062BF1CCF7CE0445A2FF1458CECA00578AB92368091C79F1
+Modified frontend/src/style.css git blob: bee3055a4838e4ed09571b176ef4e6490d09256f
+Modified frontend/src/style.css SHA256: 7E5D90D0BFD887DD9A7443C6C3E1AD11632FC087851F69AA7B6079024EA76681
+ROLLBACK_BASELINE SHA256: 351719AC136C228E024CD8C8DF524885FBF7435D0888C080B4C0321458D1AC7C
+MODIFIED_FILE SHA256: 7B20CD2007B02A3865CE15BB7AD271923978D6416D59258422DB984898104D6D
+DIFF_FILE SHA256: EA414BCA89BF26020CEA2425A8CF7AAA5899287A92614807CAC22F768EB1B371
+ROLLBACK.sh SHA256: 764E29459A84D3D29F6FF30BCC3E5C9D6BB8B65C70FA0F7F63B86F9830C1FF06
+
+BASELINE BACKEND
+Command: python -m unittest discover -s backend -q
+Input: E:\soft\java\ldxp at main 7c3e366
+Literal output:
+----------------------------------------------------------------------
+Ran 75 tests in 1.792s
+
+OK
+Result: exit 0
+
+BASELINE FRONTEND
+Command: npm test; npm run build
+Input: E:\soft\java\ldxp\frontend at main 7c3e366
+Literal output/result:
+tests 6; pass 6; fail 0; duration_ms 94.6981
+vite v8.2.2; 2382 modules transformed; built in 504ms
+Sub2ApiView-Dgq9E1OX.js 44.83 kB; index-C6wOgfyr.css 171.16 kB
+Result: exit 0
+
+BASELINE BROWSER
+Command: mcp__node_repl__js(title="Measure baseline compact-v3 account layout", code=<inline Playwright route-mock acceptance>)
+Input: http://127.0.0.1:5196/ at 1600x1000; future-429 account with 5-hour and 7-day upstream windows
+Literal output/result:
+rowHeight=403px; windowHeights=[168px,168px]; tableMinWidth=1580px; tableBodyFont=14px; percentFont=16px; pageOverflow=false; consoleErrors=[]
+Result: exit 0
+
+MODIFIED DIFF CHECK
+Command: git diff --check main...HEAD
+Input: E:\soft\java\ldxp-sub2api-usage-window-compact-v3 at source commit 5746a34
+Literal output: empty
+Result: exit 0
+
+MODIFIED BACKEND
+Command: python -m unittest discover -s backend -q
+Input: E:\soft\java\ldxp-sub2api-usage-window-compact-v3 at source commit 5746a34
+Literal output:
+----------------------------------------------------------------------
+Ran 75 tests in 1.585s
+
+OK
+Result: exit 0
+
+MODIFIED FRONTEND
+Command: npm test; npm run build
+Input: E:\soft\java\ldxp-sub2api-usage-window-compact-v3\frontend at source commit 5746a34
+Literal output/result:
+tests 6; pass 6; fail 0; duration_ms 82.1623
+vite v8.2.2; 2382 modules transformed; built in 327ms
+Sub2ApiView-DOe6tE4j.js 44.90 kB; index-ubY5dXV9.css 171.33 kB
+Result: exit 0
+
+MODIFIED BROWSER
+Command: mcp__node_repl__js(title="Verify rebased compact Sub2API layout", code=<inline Playwright route-mock acceptance>)
+Input: http://127.0.0.1:5196/ at 1600x1000 and 390x844; future-429 account; 100.0% five-hour and 31.0% seven-day windows
+Literal output/result:
+{
+  "desktop": {
+    "rowHeight": 268,
+    "windowHeights": [110, 110],
+    "tableMinWidth": "1470px",
+    "bodyFont": "13px",
+    "percentFont": "14px",
+    "progressHeight": "5px",
+    "detailCounts": [4, 4],
+    "resetTexts": ["剩余 48 分钟", "剩余 6 天 14 小时"],
+    "standardTexts": ["标准成本 $0.00", "标准成本 $0.00"],
+    "noBodyOverflow": true,
+    "tableScrolls": true
+  },
+  "tooltips": {
+    "resetLabel": "准确重置时间：2026/08/30 20:47",
+    "resetOpacity": "1",
+    "costLabel": "标准费用不含账号倍率，用于和账号费用、用户结算费用核对",
+    "costOpacity": "1"
+  },
+  "mobile": {
+    "pageWidth": 390,
+    "clientWidth": 390,
+    "noBodyOverflow": true,
+    "tableClientWidth": 354,
+    "tableScrollWidth": 1470,
+    "tableScrolls": true
+  },
+  "consoleErrors": []
+}
+Result: exit 0
+Screenshots reopened and visually inspected:
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\baseline-account.png
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\desktop-account.png
+- E:\soft\java\ldxp\artifacts\sub2api-usage-window-compact-v3\mobile-usage.png
+
+ROLLBACK
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script E:\soft\java\ldxp-sub2api-usage-window-compact-v3\.runtime\rollback-compact-v3-5746a34
+Input: complete source commit 5746a34 copy; command run from E:\soft\java\ldxp-sub2api-usage-window-compact-v3\artifacts\sub2api-usage-window-compact-v3
+Literal output:
+Restored E:\soft\java\ldxp-sub2api-usage-window-compact-v3\.runtime\rollback-compact-v3-5746a34 from ROLLBACK_BASELINE; frontend/src/Sub2ApiView.jsx=774A17C3F7614E05E4988CADEC6DBE2EBAA6C02746968B55AF971F20FC5C0814; frontend/src/style.css=243AFF30B4946DAECA93641CDF80A34C5ADE131ECED30F13EA66A3EC7CAB668D
+Result: exit 0
+
+ROLLBACK BACKEND
+Command: python -m unittest discover -s backend -q
+Input: E:\soft\java\ldxp-sub2api-usage-window-compact-v3\.runtime\rollback-compact-v3-5746a34 after ROLLBACK.sh
+Literal output:
+----------------------------------------------------------------------
+Ran 75 tests in 1.800s
+
+OK
+Result: exit 0
+
+ROLLBACK FRONTEND
+Command: npm ci; npm test; npm run build
+Input: E:\soft\java\ldxp-sub2api-usage-window-compact-v3\.runtime\rollback-compact-v3-5746a34\frontend after ROLLBACK.sh
+Literal output/result:
+added 61 packages in 8s
+tests 6; pass 6; fail 0; duration_ms 204.8088
+vite v8.2.2; 2382 modules transformed; built in 6.63s
+Sub2ApiView-Dgq9E1OX.js 44.83 kB; index-C6wOgfyr.css 171.16 kB
+Result: exit 0
+
+Restored behavior/status: the rollback copy matches main 7c3e366 byte-for-byte for both changed source files, keeps the parallel delayed-card polling feature and its six frontend tests, and restores the pre-change larger Sub2API control/table/window layout. The working source and MODIFIED_FILE remain on the compact branch with a 268px account row, 110px usage windows, aligned reset/cost metadata, four visible usage metrics, functional tooltips, and page-local responsive scrolling. MODIFIED_FILE remained SHA256 7B20CD2007B02A3865CE15BB7AD271923978D6416D59258422DB984898104D6D after rollback verification.
