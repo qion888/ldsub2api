@@ -1,7 +1,8 @@
 {
   "scripts": {
     "dev": "vite --configLoader native",
-    "build": "vite build --configLoader native"
+    "build": "vite build --configLoader native",
+    "test": "node --test src/*.test.js"
   },
   "type": "module",
   "dependencies": {
