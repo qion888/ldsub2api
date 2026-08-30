@@ -211,8 +211,20 @@ class GoodsParserTests(unittest.TestCase):
                 "market_price": 3,
                 "description": "<p>说明 <strong>文本</strong></p>",
                 "contact_format": "any",
+                "coupon_status": 1,
                 "category": {"name": "测试分类"},
                 "user": {"nickname": "测试店铺"},
+                "multipleoffers": {
+                    "available": 1,
+                    "discount_type": 1,
+                    "rules": [{"condition": 10, "value": 8.8}],
+                },
+                "discount": {"available": 1, "rebate": 9.5},
+                "fullgift": {
+                    "available": 1,
+                    "gift_type": 1,
+                    "rules": [{"condition": 20, "value": 2}],
+                },
                 "extend": {"limit_count": 2, "query_password_status": 1},
             },
         }
@@ -223,6 +235,14 @@ class GoodsParserTests(unittest.TestCase):
         self.assertTrue(item["query_password_required"])
         self.assertEqual(item["description"], "说明 文本")
         self.assertEqual(item["stock_label"], "接口未公开数量")
+        tags = {tag["key"]: tag for tag in item["commerce_tags"]}
+        self.assertEqual(tags["multiple_offers"]["detail"], "购10件享8.8折")
+        self.assertEqual(tags["discount"]["detail"], "当前享9.5折")
+        self.assertEqual(tags["full_gift"]["detail"], "购20件赠2件")
+        self.assertEqual(tags["delivery"]["label"], "自动发货")
+        self.assertEqual(tags["minimum"]["label"], "2件起购")
+        self.assertIn("coupon", tags)
+        self.assertIn("query_password", tags)
 
     def test_accepts_shop_urls_and_rejects_foreign_hosts(self):
         token, url = main.parse_shop_url("https://pay.ldxp.cn/shop/SHOPTEST")
@@ -257,6 +277,9 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(item["specs"]["累计销量"], 12)
         self.assertEqual(item["limit_count"], 1)
         self.assertTrue(item["query_password_required"])
+        tags = {tag["key"]: tag for tag in item["commerce_tags"]}
+        self.assertEqual(tags["delivery"]["label"], "自动发货")
+        self.assertEqual(tags["minimum"]["label"], "1件起购")
 
     def test_checkout_treats_limit_count_as_minimum_purchase(self):
         with tempfile.TemporaryDirectory() as directory:

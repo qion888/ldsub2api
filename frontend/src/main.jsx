@@ -4,6 +4,7 @@ import {
   Activity,
   AlertCircle,
   ArrowUpRight,
+  BadgePercent,
   BellRing,
   Check,
   ChevronRight,
@@ -483,6 +484,7 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
   const latest = item?.latest;
   const stock = itemStock(item);
   const specs = latest?.specs && typeof latest.specs === 'object' ? Object.entries(latest.specs) : [];
+  const commerceTags = Array.isArray(latest?.commerce_tags) ? latest.commerce_tags : [];
   const sourceUrl = latest?.source_url || item?.url;
   const currentPrice = itemPrice(item);
   const marketPriceValue = Number(latest?.market_price);
@@ -525,10 +527,23 @@ function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy
               <div className="detail-hero-copy">
                 <span className="detail-kicker">{itemCategory(item)}</span>
                 <h3>{latest?.title || item.name || '等待商品数据'}</h3>
+                {!!commerceTags.length && <div className="detail-commerce-tags" aria-label="商品交易标签">
+                  {commerceTags.map(tag => <span className={`detail-commerce-tag ${tag.tone || 'neutral'}`} title={tag.detail || tag.label} key={tag.key}>{tag.label}</span>)}
+                </div>}
                 <div className="detail-hero-meta"><RadarStockPill item={item}/><span><Store size={13}/>{itemShopName(item)}</span><span><Package size={13}/>{latest?.goods_key || `商品 #${item.id}`}</span></div>
               </div>
               <div className="detail-hero-price"><span>当前报价</span><strong>{money(currentPrice)}</strong><small className={priceDelta > 0 ? 'negative' : priceDelta < 0 ? 'positive' : ''}>{priceChangeLabel}</small></div>
             </div>
+
+            {!!commerceTags.length && <section className="detail-commerce-summary" aria-label="交易权益">
+              <div className="detail-commerce-heading"><span><BadgePercent size={16}/></span><div><strong>交易权益</strong><small>链动小铺接口实时同步</small></div></div>
+              <div className="detail-commerce-list">
+                {commerceTags.map(tag => <div className="detail-commerce-item" key={tag.key}>
+                  <span className={`detail-commerce-tag ${tag.tone || 'neutral'}`}>{tag.label}</span>
+                  <small>{tag.detail || '以结算页面为准'}</small>
+                </div>)}
+              </div>
+            </section>}
 
             <div className="detail-price-board" aria-label="价格指标">
               <div><span><CircleDollarSign size={14}/>当前报价</span><strong>{money(currentPrice)}</strong><small>{lowestGap === null || !Number.isFinite(lowestGap) ? '暂无同类比较' : lowestGap <= 0 ? '当前同类最低' : `高于最低 ${money(lowestGap)}`}</small></div>
