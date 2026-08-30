@@ -528,7 +528,11 @@ class OrderQueryService:
                 raise OrderQueryPasswordRequired()
 
             now = self.sessions.now()
-            if need_password and not session.password_attempt_allowed(identity["trade_no"], now):
+            # Apply the existing cooldown before the upstream call regardless
+            # of the latest ``need_pwd`` flag.  This keeps an inconsistent
+            # metadata response from bypassing a lock already earned by a
+            # password rejection.
+            if not session.password_attempt_allowed(identity["trade_no"], now):
                 raise OrderQueryPasswordRateLimited()
             try:
                 history_result = session.client.get_complaint_history(
@@ -536,7 +540,11 @@ class OrderQueryService:
                     query_password=password,
                 )
             except OrderQueryPasswordInvalid as exc:
-                if need_password and session.record_password_failure(identity["trade_no"], now):
+                # Count an explicit upstream password rejection even when the
+                # preceding metadata said no password was needed.  A stale or
+                # inconsistent ``need_pwd`` response must not provide a way
+                # around the same order-level backoff used by detail lookup.
+                if session.record_password_failure(identity["trade_no"], now):
                     raise OrderQueryPasswordRateLimited() from exc
                 raise
             except OrderQuerySessionExpired:
@@ -553,8 +561,7 @@ class OrderQueryService:
                     "投诉历史响应格式无效",
                     code="invalid_complaint_history_response",
                 ) from exc
-            if need_password:
-                session.clear_password_failure(identity["trade_no"])
+            session.clear_password_failure(identity["trade_no"])
             return {
                 "session_id": session.session_id,
                 "expires_in": self.sessions.remaining(session),

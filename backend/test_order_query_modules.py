@@ -1678,6 +1678,33 @@ class ComplaintWorkflowTests(unittest.TestCase):
             identity_service.complaint_history({**identity, "query_password": ""})
         self.assertEqual(context.exception.code, "invalid_complaint_history_password_response")
 
+    def test_complaint_history_rate_limits_explicit_password_errors_when_metadata_says_public(self) -> None:
+        class InconsistentHistoryClient(self.Client):
+            def __init__(self) -> None:
+                super().__init__()
+                self.history_calls = 0
+
+            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
+                return {"need_pwd": 0}
+
+            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
+                self.history_calls += 1
+                raise OrderQueryPasswordInvalid()
+
+        client = InconsistentHistoryClient()
+        service = self._service(client)
+        identity = self._identity(service)
+
+        for attempt in range(4):
+            with self.subTest(attempt=attempt + 1):
+                with self.assertRaises(OrderQueryPasswordInvalid):
+                    service.complaint_history({**identity, "query_password": ""})
+        with self.assertRaises(OrderQueryPasswordRateLimited):
+            service.complaint_history({**identity, "query_password": ""})
+        with self.assertRaises(OrderQueryPasswordRateLimited):
+            service.complaint_history({**identity, "query_password": ""})
+        self.assertEqual(client.history_calls, 5)
+
 
 if __name__ == "__main__":
     unittest.main()
