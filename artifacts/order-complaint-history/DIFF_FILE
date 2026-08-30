@@ -1,0 +1,1879 @@
+diff --git a/backend/main.py b/backend/main.py
+index 7319a88..5035db8 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1161,6 +1161,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             detail=ORDER_QUERY_SERVICE.detail,
+             complaint_preview=build_complaint_preview,
+             complaint_context=getattr(ORDER_QUERY_SERVICE, "complaint_context", None),
++            complaint_history=getattr(ORDER_QUERY_SERVICE, "complaint_history", None),
+             complaint_upload=getattr(ORDER_QUERY_SERVICE, "complaint_upload", None),
+             complaint_submit=getattr(ORDER_QUERY_SERVICE, "complaint_submit", None),
+             complaint_remove_upload=getattr(ORDER_QUERY_SERVICE, "complaint_remove_upload", None),
+diff --git a/backend/order_query/client.py b/backend/order_query/client.py
+index 292e535..70ec74b 100644
+--- a/backend/order_query/client.py
++++ b/backend/order_query/client.py
+@@ -14,24 +14,39 @@ from decimal import Decimal, InvalidOperation
+ from http.cookiejar import CookieJar
+ from typing import Any
+ from urllib.error import HTTPError, URLError
+-from urllib.parse import quote, urlparse
++from urllib.parse import quote, urlencode, urlparse
+ from urllib.request import HTTPCookieProcessor, Request, build_opener
+ 
+ from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired
+ 
+ from .captcha import captcha_sign
++from .complaint import normalize_complaint_history
+ from .detail import normalize_order_detail
+-from .errors import CaptchaVerificationExpired, UpstreamOrderError
++from .errors import (
++    CaptchaVerificationExpired,
++    OrderQueryDetailNotFound,
++    OrderQueryPasswordInvalid,
++    OrderQuerySessionExpired,
++    UpstreamOrderError,
++)
+ 
+ BASE_URL = f"https://{ALLOWED_HOST}"
+ CAPTCHA_START_PATH = "/shopApi/Common/captchaStart"
+ ORDER_LIST_PATH = "/shopApi/Order/list"
+ ORDER_DETAIL_PATH = "/shopApi/Order/info"
+ COMPLAINT_INFO_PATH = "/shopApi/Order/info"
++COMPLAINT_PASSWORD_CHECK_PATH = "/shopApi/Order/checkNeedComplaintPwd"
++COMPLAINT_HISTORY_PATH = "/shopApi/Order/complaintInfo"
+ COMPLAINT_UPLOAD_PATH = "/shopApi/upload/file"
+ COMPLAINT_SUBMIT_PATH = "/shopApi/Order/complaintOrder"
+ # Public aliases used by route-level tests and integrations.
+ COMPLAINT_INFO_ENDPOINT = COMPLAINT_INFO_PATH
++COMPLAINT_PASSWORD_CHECK_ENDPOINT = COMPLAINT_PASSWORD_CHECK_PATH
++COMPLAINT_HISTORY_ENDPOINT = COMPLAINT_HISTORY_PATH
++COMPLAINT_CHECK_NEED_PASSWORD_PATH = COMPLAINT_PASSWORD_CHECK_PATH
++COMPLAINT_CHECK_NEED_PASSWORD_ENDPOINT = COMPLAINT_PASSWORD_CHECK_PATH
++COMPLAINT_INFO_HISTORY_PATH = COMPLAINT_HISTORY_PATH
++COMPLAINT_INFO_HISTORY_ENDPOINT = COMPLAINT_HISTORY_PATH
+ COMPLAINT_UPLOAD_ENDPOINT = COMPLAINT_UPLOAD_PATH
+ COMPLAINT_SUBMIT_ENDPOINT = COMPLAINT_SUBMIT_PATH
+ MAX_JSON_BYTES = 2 * 1024 * 1024
+@@ -270,6 +285,13 @@ class OrderQueryClient:
+             raise UpstreamOrderError("订单接口响应格式无效", code="invalid_order_response")
+         return result
+ 
++    def _form_request(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
++        """Send an official form-encoded request using the current cookie/session context."""
++        headers = self._headers()
++        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
++        encoded = urlencode(payload, doseq=True, encoding="utf-8").encode("utf-8")
++        return self._request_json_with_headers(url, encoded, headers=headers)
++
+     @staticmethod
+     def _response_json(raw: bytes, content_type: str) -> dict[str, Any]:
+         if len(raw) > MAX_JSON_BYTES:
+@@ -539,3 +561,88 @@ class OrderQueryClient:
+             },
+         )
+         return normalize_order_detail(result, expected_trade_no=trade_no)
++
++    def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
++        """Read whether the official complaint history requires a password."""
++        result = self._form_request(
++            f"{BASE_URL}{COMPLAINT_PASSWORD_CHECK_PATH}",
++            {"trade_no": trade_no},
++        )
++        if not self._strict_numeric_code(result.get("code"), 1) or not isinstance(result.get("data"), dict):
++            self._complaint_history_error(
++                result,
++                fallback="投诉查询密码状态获取失败",
++                code="complaint_history_password_check_failed",
++            )
++        data = result["data"]
++        returned_trade_no = _safe_text(data.get("trade_no"), 160)
++        if returned_trade_no and returned_trade_no != _safe_text(trade_no, 160):
++            raise UpstreamOrderError(
++                "投诉历史订单号与请求不一致",
++                code="complaint_history_context_mismatch",
++            )
++        # The official Vue code uses ``need_pwd === 1``. Reject missing,
++        # boolean, string, and out-of-range values rather than failing open.
++        need_pwd = data.get("need_pwd")
++        if not self._is_numeric_code(need_pwd) or need_pwd not in (0, 1):
++            raise UpstreamOrderError(
++                "投诉查询密码状态响应格式无效",
++                code="invalid_complaint_history_password_response",
++            )
++        return {"need_pwd": int(need_pwd)}
++
++    @staticmethod
++    def _complaint_history_error(
++        result: dict[str, Any],
++        *,
++        fallback: str = "投诉历史获取失败",
++        code: str = "complaint_history_failed",
++    ) -> None:
++        message = _safe_text(result.get("msg") or result.get("message"), 240)
++        if any(token in message for token in ("安全密码", "查询密码", "密码错误", "密码不正确")):
++            raise OrderQueryPasswordInvalid()
++        message_lower = message.lower()
++        if (
++            any(token in message for token in ("重新查询", "会话已过期", "验证码已过期", "验证已过期", "人机验证", "人机校验"))
++            or "human verification" in message_lower
++            or ("captcha" in message_lower and any(token in message_lower for token in ("fail", "invalid", "expired")))
++        ):
++            raise OrderQuerySessionExpired()
++        if any(token in message for token in ("订单不存在", "未找到订单", "订单号不存在")):
++            raise OrderQueryDetailNotFound()
++        raise UpstreamOrderError(
++            message or fallback,
++            code=code,
++            retryable=True,
++        )
++
++    def get_complaint_history(
++        self,
++        *,
++        trade_no: str,
++        query_password: str = "",
++    ) -> dict[str, Any]:
++        """Fetch and normalize the official complaint history (read-only)."""
++        result = self._form_request(
++            f"{BASE_URL}{COMPLAINT_HISTORY_PATH}",
++            {"trade_no": trade_no, "query_pwd": query_password},
++        )
++        if not self._strict_numeric_code(result.get("code"), 1):
++            self._complaint_history_error(result)
++        try:
++            return normalize_complaint_history(
++                result.get("data"),
++                expected_trade_no=trade_no,
++            )
++        except ValueError as exc:
++            raise UpstreamOrderError(
++                "投诉历史响应格式无效",
++                code="invalid_complaint_history_response",
++            ) from exc
++
++    # Compatibility names mirror the endpoint names used in the official JS.
++    checkNeedComplaintPwd = check_need_complaint_password
++    check_complaint_password = check_need_complaint_password
++    complaintInfo = get_complaint_history
++    complaint_info = get_complaint_history
++    get_complaint_info_history = get_complaint_history
+diff --git a/backend/order_query/complaint.py b/backend/order_query/complaint.py
+index 5e15428..4d0a9c2 100644
+--- a/backend/order_query/complaint.py
++++ b/backend/order_query/complaint.py
+@@ -4,7 +4,10 @@ from __future__ import annotations
+ 
+ import base64
+ import binascii
++import ipaddress
++import math
+ import re
++from datetime import datetime, timezone
+ from typing import Any
+ from urllib.parse import urlparse
+ 
+@@ -39,6 +42,28 @@ COMPLAINT_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"}
+ MAX_UPLOAD_BYTES = MAX_COMPLAINT_IMAGE_BYTES
+ ALLOWED_UPLOAD_MIME_TYPES = COMPLAINT_IMAGE_MIME_TYPES
+ 
++# The history page renders these values directly. Keep the allowlists small
++# so an upstream response cannot smuggle arbitrary fields or destinations into
++# the local UI.
++COMPLAINT_HISTORY_STATUS_LABELS = {
++    -1: "已撤销",
++    0: "待处理",
++    1: "平台标记已完成",
++}
++COMPLAINT_MESSAGE_IDENTITY_LABELS = {
++    "platform": "平台",
++    "user": "商家",
++    "parent": "货源商",
++    "buyer": "买家",
++}
++MAX_HISTORY_TEXT_LENGTH = 20_000
++MAX_HISTORY_REASON_LENGTH = 240
++MAX_HISTORY_CONTACT_LENGTH = 254
++MAX_HISTORY_IMAGES = 12
++MAX_HISTORY_MESSAGES = 100
++MAX_HISTORY_URL_LENGTH = 1_000
++_NON_PUBLIC_HOST_SUFFIXES = (".internal", ".invalid", ".lan", ".local", ".localhost", ".test")
++
+ 
+ def _text_field(
+     data: dict[str, Any],
+@@ -205,3 +230,196 @@ def decode_complaint_upload(data: Any) -> tuple[str, str, bytes]:
+     if not signatures[mime_type]:
+         raise OrderComplaintInputError("图片内容与声明格式不一致")
+     return name, mime_type, content
++
++
++def _history_text(value: Any, limit: int) -> str:
++    """Convert scalar upstream values to bounded display text."""
++    if isinstance(value, (dict, list, tuple, set)):
++        return ""
++    if value is None:
++        return ""
++    return str(value).strip()[:limit]
++
++
++def _history_integer(value: Any, fallback: int = 0) -> int:
++    # ``bool`` is intentionally excluded: the upstream contract uses numeric
++    # status/content codes, not truthy values.
++    if isinstance(value, bool) or type(value) not in (int, float, str):
++        return fallback
++    try:
++        return int(value)
++    except (TypeError, ValueError, OverflowError):
++        return fallback
++
++
++def _history_timestamp(value: Any) -> str:
++    text = _history_text(value, 80)
++    if not text:
++        return ""
++    try:
++        stamp = int(text)
++        if stamp <= 0:
++            return ""
++        if stamp > 10_000_000_000:
++            stamp //= 1000
++        return datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="seconds")
++    except (TypeError, ValueError, OverflowError, OSError):
++        pass
++    try:
++        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
++    except ValueError:
++        return ""
++    if parsed.tzinfo is None:
++        return parsed.isoformat(timespec="seconds")
++    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
++
++
++def _history_https_url(value: Any) -> str:
++    """Allow only public HTTPS URLs suitable for an image/message preview."""
++    candidate = _history_text(value, MAX_HISTORY_URL_LENGTH)
++    if not candidate or any(char.isspace() for char in candidate):
++        return ""
++    try:
++        parsed = urlparse(candidate)
++        port = parsed.port
++    except (UnicodeError, ValueError):
++        return ""
++    hostname = (parsed.hostname or "").rstrip(".").lower()
++    if (
++        parsed.scheme.lower() != "https"
++        or not hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or port not in (None, 443)
++        or parsed.fragment
++        or hostname == "localhost"
++        or hostname.endswith(_NON_PUBLIC_HOST_SUFFIXES)
++    ):
++        return ""
++    try:
++        address = ipaddress.ip_address(hostname)
++    except ValueError:
++        address = None
++    if address is not None and not address.is_global:
++        return ""
++    if address is None and "." not in hostname:
++        return ""
++    return parsed.geturl()
++
++
++def _history_images(value: Any) -> list[str]:
++    if value is None:
++        return []
++    if not isinstance(value, list):
++        raise ValueError("complaint history images must be a list")
++    images: list[str] = []
++    seen: set[str] = set()
++    for raw in value[:MAX_HISTORY_IMAGES]:
++        url = _history_https_url(raw)
++        if url and url not in seen:
++            seen.add(url)
++            images.append(url)
++    return images
++
++
++def _history_message(value: Any) -> dict[str, Any] | None:
++    if not isinstance(value, dict):
++        return None
++    identity = _history_text(value.get("identity"), 24).lower()
++    identity_label = COMPLAINT_MESSAGE_IDENTITY_LABELS.get(identity)
++    if identity_label is None:
++        return None
++    content_type = _history_integer(value.get("content_type"), -1)
++    if content_type == 0:
++        content = _history_text(value.get("content"), MAX_HISTORY_TEXT_LENGTH)
++    elif content_type == 1:
++        content = _history_https_url(value.get("content"))
++        if not content:
++            return None
++    else:
++        return None
++    created_at = value.get("create_time")
++    if created_at is None:
++        # The client contract uses ``created_at`` after its first normalization;
++        # accepting it here keeps service-level validation idempotent.
++        created_at = value.get("created_at")
++    return {
++        "identity": identity,
++        "identity_label": identity_label,
++        "content_type": content_type,
++        "content": content,
++        "created_at": _history_timestamp(created_at),
++    }
++
++
++def _history_data(payload: Any) -> dict[str, Any]:
++    """Extract the official ``data`` object while enforcing its shape."""
++    if not isinstance(payload, dict):
++        raise ValueError("complaint history response must be an object")
++    if "data" in payload and ("code" in payload or "msg" in payload):
++        code = payload.get("code")
++        try:
++            valid_code = (
++                type(code) in (int, float)
++                and not isinstance(code, bool)
++                and math.isfinite(float(code))
++                and code == 1
++            )
++        except (OverflowError, TypeError, ValueError):
++            valid_code = False
++        if not valid_code:
++            raise ValueError("complaint history response code is not successful")
++        payload = payload.get("data")
++    if not isinstance(payload, dict):
++        raise ValueError("complaint history data must be an object")
++    return payload
++
++
++def normalize_complaint_history(
++    payload: Any,
++    *,
++    expected_trade_no: str,
++) -> dict[str, Any]:
++    """Return the small, display-safe complaint history contract."""
++    data = _history_data(payload)
++    requested_trade_no = _history_text(expected_trade_no, 160)
++    returned_trade_no = _history_text(data.get("trade_no"), 160)
++    if returned_trade_no and returned_trade_no != requested_trade_no:
++        raise ValueError("complaint history trade number mismatch")
++
++    status = _history_integer(data.get("status"), -1)
++    messages: list[dict[str, Any]] = []
++    raw_messages = data.get("messages")
++    if raw_messages is not None and not isinstance(raw_messages, list):
++        raise ValueError("complaint history messages must be a list")
++    for raw_message in (raw_messages or [])[:MAX_HISTORY_MESSAGES]:
++        normalized = _history_message(raw_message)
++        if normalized is not None:
++            messages.append(normalized)
++
++    created_at = data.get("create_time")
++    if created_at is None:
++        # ``OrderQueryClient`` returns the normalized contract, while injected
++        # clients and fixtures may still provide the upstream field name.
++        created_at = data.get("created_at")
++
++    return {
++        "status": status,
++        "status_label": COMPLAINT_HISTORY_STATUS_LABELS.get(status, "未知状态"),
++        "reason": _history_text(data.get("reason"), MAX_HISTORY_REASON_LENGTH),
++        "content": _history_text(data.get("content"), MAX_HISTORY_TEXT_LENGTH),
++        "images": _history_images(data.get("images")),
++        "contact": _history_text(data.get("contact"), MAX_HISTORY_CONTACT_LENGTH),
++        "created_at": _history_timestamp(created_at),
++        "collect_image": _history_https_url(data.get("collect_image")),
++        "messages": messages,
++        "can_complaint": (
++            data.get("can_complaint")
++            if isinstance(data.get("can_complaint"), bool)
++            else _history_integer(data.get("can_complaint"), 0) == 1
++        ),
++    }
++
++
++# Compatibility alias matching the upstream page terminology.
++normalize_complaint_info = normalize_complaint_history
+diff --git a/backend/order_query/routes.py b/backend/order_query/routes.py
+index 8be45e6..ec4b4f9 100644
+--- a/backend/order_query/routes.py
++++ b/backend/order_query/routes.py
+@@ -15,6 +15,7 @@ ORDER_QUERY_PATH = "/api/order-query/search"
+ ORDER_DETAIL_PATH = "/api/order-query/detail"
+ ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
+ ORDER_COMPLAINT_CONTEXT_PATH = "/api/order-query/complaints/context"
++ORDER_COMPLAINT_HISTORY_PATH = "/api/order-query/complaints/history"
+ ORDER_COMPLAINT_UPLOAD_PATH = "/api/order-query/complaints/upload"
+ ORDER_COMPLAINT_SUBMIT_PATH = "/api/order-query/complaints/submit"
+ ORDER_COMPLAINT_REMOVE_UPLOAD_PATH = "/api/order-query/complaints/upload/remove"
+@@ -23,6 +24,7 @@ ORDER_QUERY_POST_PATHS = frozenset({
+     ORDER_DETAIL_PATH,
+     ORDER_COMPLAINT_PREVIEW_PATH,
+     ORDER_COMPLAINT_CONTEXT_PATH,
++    ORDER_COMPLAINT_HISTORY_PATH,
+     ORDER_COMPLAINT_UPLOAD_PATH,
+     ORDER_COMPLAINT_SUBMIT_PATH,
+     ORDER_COMPLAINT_REMOVE_UPLOAD_PATH,
+@@ -101,6 +103,7 @@ def handle_post(
+     detail: Callable[[dict[str, Any]], dict[str, Any]],
+     complaint_preview: Callable[[dict[str, Any]], dict[str, Any]] = build_complaint_preview,
+     complaint_context: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
++    complaint_history: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+     complaint_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+     complaint_submit: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+     complaint_remove_upload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+@@ -113,6 +116,8 @@ def handle_post(
+         operation = complaint_preview
+     elif path == ORDER_COMPLAINT_CONTEXT_PATH:
+         operation = complaint_context
++    elif path == ORDER_COMPLAINT_HISTORY_PATH:
++        operation = complaint_history
+     elif path == ORDER_COMPLAINT_UPLOAD_PATH:
+         operation = complaint_upload
+     elif path == ORDER_COMPLAINT_SUBMIT_PATH:
+@@ -146,11 +151,21 @@ def handle_post(
+     except RuntimeError as exc:
+         is_complaint = path.startswith("/api/order-query/complaints/")
+         is_complaint_preview = path == ORDER_COMPLAINT_PREVIEW_PATH
+-        fallback_detail = "售后申请参数预览失败" if is_complaint_preview else ("售后申请失败" if is_complaint else "订单查询失败")
++        is_complaint_history = path == ORDER_COMPLAINT_HISTORY_PATH
++        fallback_detail = (
++            "售后历史获取失败"
++            if is_complaint_history
++            else ("售后申请参数预览失败" if is_complaint_preview else ("售后申请失败" if is_complaint else "订单查询失败"))
++        )
++        fallback_code = (
++            "order_complaint_history_failed"
++            if is_complaint_history
++            else ("order_complaint_preview_failed" if is_complaint_preview else ("order_complaint_failed" if is_complaint else "order_query_failed"))
++        )
+         send_json(
+             {
+                 "detail": str(exc)[:240] or fallback_detail,
+-                "code": "order_complaint_preview_failed" if is_complaint_preview else ("order_complaint_failed" if is_complaint else "order_query_failed"),
++                "code": fallback_code,
+                 "retryable": True,
+             },
+             502,
+diff --git a/backend/order_query/service.py b/backend/order_query/service.py
+index 7612ec5..ce5e357 100644
+--- a/backend/order_query/service.py
++++ b/backend/order_query/service.py
+@@ -13,6 +13,7 @@ from .captcha import CaptchaRecognizer, normalize_captcha_code
+ from .client import BASE_URL, CaptchaChallenge, OrderQueryClient
+ from .complaint import (
+     decode_complaint_upload,
++    normalize_complaint_history,
+     validate_complaint_payload,
+ )
+ from .errors import (
+@@ -368,6 +369,23 @@ class OrderQueryService:
+             raise OrderQueryDetailNotFound()
+         return identity, session
+ 
++    @staticmethod
++    def _validated_complaint_history_request(data: Any) -> dict[str, str]:
++        """Validate the history endpoint's identity and optional password."""
++        if not isinstance(data, dict):
++            raise OrderComplaintInputError("售后历史参数必须是 JSON 对象")
++        allowed = {"keywords", "session_id", "trade_no", "query_password"}
++        unknown = sorted(str(field) for field in data if field not in allowed)
++        if unknown:
++            raise OrderComplaintInputError("售后历史包含未知字段")
++        identity = OrderQueryService._validated_complaint_identity(data)
++        password = data.get("query_password", "")
++        if not isinstance(password, str):
++            raise OrderComplaintInputError("订单安全密码必须是字符串")
++        if len(password) > 160 or any(char in password for char in "\x00\r\n"):
++            raise OrderComplaintInputError("订单安全密码格式无效")
++        return {**identity, "query_password": password}
++
+     @staticmethod
+     def _context_flag(value: Any) -> bool:
+         if isinstance(value, bool):
+@@ -438,6 +456,128 @@ class OrderQueryService:
+         finally:
+             self._slots.release()
+ 
++    @staticmethod
++    def _history_need_password(value: Any) -> bool:
++        """Match the official JavaScript ``need_pwd === 1`` check."""
++        return (
++            type(value) in (int, float)
++            and not isinstance(value, bool)
++            and math.isfinite(float(value))
++            and value == 1
++        )
++
++    @staticmethod
++    def _history_check_value(value: Any) -> Any:
++        if not isinstance(value, dict):
++            raise UpstreamOrderError(
++                "投诉查询密码状态响应格式无效",
++                code="invalid_complaint_history_password_response",
++            )
++        # Accommodate a raw official response in test/integration clients while
++        # keeping the value exposed to the frontend strictly normalized.
++        if "data" in value:
++            code = value.get("code")
++            if code is not None and (
++                type(code) not in (int, float)
++                or isinstance(code, bool)
++                or not math.isfinite(float(code))
++                or code != 1
++            ):
++                raise UpstreamOrderError(
++                    "投诉查询密码状态响应格式无效",
++                    code="invalid_complaint_history_password_response",
++                )
++            if not isinstance(value.get("data"), dict):
++                raise UpstreamOrderError(
++                    "投诉查询密码状态响应格式无效",
++                    code="invalid_complaint_history_password_response",
++                )
++            value = value["data"]
++        if "need_pwd" not in value:
++            raise UpstreamOrderError(
++                "投诉查询密码状态响应格式无效",
++                code="invalid_complaint_history_password_response",
++            )
++        need_pwd = value["need_pwd"]
++        if (
++            type(need_pwd) not in (int, float)
++            or isinstance(need_pwd, bool)
++            or not math.isfinite(float(need_pwd))
++            or need_pwd not in (0, 1)
++        ):
++            raise UpstreamOrderError(
++                "投诉查询密码状态响应格式无效",
++                code="invalid_complaint_history_password_response",
++            )
++        return int(need_pwd)
++
++    def _complaint_history(self, data: Any) -> dict[str, Any]:
++        request = self._validated_complaint_history_request(data)
++        identity, session = self._complaint_session(request)
++        with session.lock:
++            try:
++                check_result = session.client.check_need_complaint_password(
++                    trade_no=identity["trade_no"],
++                )
++            except OrderQuerySessionExpired:
++                session.clear_verification()
++                raise
++            need_password = self._history_need_password(self._history_check_value(check_result))
++            password = request["query_password"]
++            if need_password and not password.strip():
++                raise OrderQueryPasswordRequired()
++
++            now = self.sessions.now()
++            # Apply the existing cooldown before the upstream call regardless
++            # of the latest ``need_pwd`` flag.  This keeps an inconsistent
++            # metadata response from bypassing a lock already earned by a
++            # password rejection.
++            if not session.complaint_password_attempt_allowed(identity["trade_no"], now):
++                raise OrderQueryPasswordRateLimited()
++            try:
++                history_result = session.client.get_complaint_history(
++                    trade_no=identity["trade_no"],
++                    query_password=password,
++                )
++            except OrderQueryPasswordInvalid as exc:
++                # Count an explicit upstream password rejection even when the
++                # preceding metadata said no password was needed.  A stale or
++                # inconsistent ``need_pwd`` response must not provide a way
++                # around the same order-level backoff used by detail lookup.
++                if session.record_complaint_password_failure(identity["trade_no"], now):
++                    raise OrderQueryPasswordRateLimited() from exc
++                raise
++            except OrderQuerySessionExpired:
++                session.clear_verification()
++                raise
++
++            try:
++                complaint = normalize_complaint_history(
++                    history_result,
++                    expected_trade_no=identity["trade_no"],
++                )
++            except ValueError as exc:
++                raise UpstreamOrderError(
++                    "投诉历史响应格式无效",
++                    code="invalid_complaint_history_response",
++                ) from exc
++            session.clear_complaint_password_failure(identity["trade_no"])
++            return {
++                "session_id": session.session_id,
++                "expires_in": self.sessions.remaining(session),
++                "trade_no": identity["trade_no"],
++                "need_query_password": need_password,
++                "complaint": complaint,
++            }
++
++    def complaint_history(self, data: Any) -> dict[str, Any]:
++        if not self._slots.acquire(blocking=False):
++            raise OrderQueryBusy()
++        try:
++            return self._complaint_history(data)
++        finally:
++            self._slots.release()
++
+     @staticmethod
+     def _context_or_fetch(
+         session: OrderQuerySession,
+diff --git a/backend/order_query/sessions.py b/backend/order_query/sessions.py
+index 904df35..a7dcc78 100644
+--- a/backend/order_query/sessions.py
++++ b/backend/order_query/sessions.py
+@@ -33,6 +33,7 @@ class OrderQuerySession:
+     cache: dict[tuple[int, int, int], tuple[float, dict[str, Any]]] = field(default_factory=dict)
+     authorized_orders: dict[str, dict[str, Any]] = field(default_factory=dict)
+     password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
++    complaint_password_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
+     complaint_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
+     complaint_uploads: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+     complaint_submitting: set[str] = field(default_factory=set)
+@@ -47,6 +48,7 @@ class OrderQuerySession:
+         self.cache.clear()
+         self.authorized_orders.clear()
+         self.password_failures.clear()
++        self.complaint_password_failures.clear()
+ 
+     def remember_orders(self, orders: list[Any]) -> None:
+         for order in orders:
+@@ -69,6 +71,7 @@ class OrderQuerySession:
+                 oldest = next(iter(self.authorized_orders))
+                 self.authorized_orders.pop(oldest)
+                 self.password_failures.pop(oldest, None)
++                self.complaint_password_failures.pop(oldest, None)
+ 
+     def authorized_order(self, trade_no: str) -> dict[str, Any] | None:
+         value = self.authorized_orders.get(trade_no)
+@@ -100,6 +103,33 @@ class OrderQuerySession:
+     def clear_password_failure(self, trade_no: str) -> None:
+         self.password_failures.pop(trade_no, None)
+ 
++    def complaint_password_attempt_allowed(self, trade_no: str, now: float) -> bool:
++        """Check the independent cooldown for complaint-history passwords."""
++        failure = self.complaint_password_failures.get(trade_no)
++        if failure is None:
++            return True
++        _, blocked_until = failure
++        if blocked_until > now:
++            return False
++        if blocked_until:
++            self.complaint_password_failures.pop(trade_no, None)
++        return True
++
++    def record_complaint_password_failure(self, trade_no: str, now: float) -> bool:
++        count, blocked_until = self.complaint_password_failures.get(trade_no, (0, 0.0))
++        if blocked_until and blocked_until <= now:
++            count = 0
++        count += 1
++        blocked = count >= MAX_PASSWORD_FAILURES
++        self.complaint_password_failures[trade_no] = (
++            count,
++            now + PASSWORD_BACKOFF_SECONDS if blocked else 0.0,
++        )
++        return blocked
++
++    def clear_complaint_password_failure(self, trade_no: str) -> None:
++        self.complaint_password_failures.pop(trade_no, None)
++
+     def remember_complaint_context(self, trade_no: str, context: dict[str, Any]) -> None:
+         self.complaint_contexts[trade_no] = copy.deepcopy(context)
+ 
+diff --git a/backend/test_order_query_modules.py b/backend/test_order_query_modules.py
+index 6c4e8e3..7f414d4 100644
+--- a/backend/test_order_query_modules.py
++++ b/backend/test_order_query_modules.py
+@@ -8,6 +8,7 @@ from io import BytesIO
+ from types import SimpleNamespace
+ from typing import Any
+ from unittest.mock import patch
++from urllib.parse import parse_qs
+ from urllib.request import Request
+ 
+ import main
+@@ -280,6 +281,65 @@ class ClientTests(unittest.TestCase):
+         with self.assertRaisesRegex(RuntimeError, "图片响应无效"):
+             client.download_captcha(challenge)
+ 
++    def test_complaint_history_uses_form_encoding_and_retains_visitor_id(self) -> None:
++        opener = FakeOpener([
++            self._json_response({"code": 1, "data": {"need_pwd": 1}}),
++            self._json_response({
++                "code": 1,
++                "data": {
++                    "status": 0,
++                    "reason": "描述不符",
++                    "content": "商品内容不一致",
++                    "images": [],
++                    "messages": [],
++                    "collect_image": None,
++                },
++            }),
++        ])
++        client = OrderQueryClient(opener=opener)
++
++        self.assertEqual(client.check_need_complaint_password(trade_no="ORDER-1"), {"need_pwd": 1})
++        history = client.get_complaint_history(trade_no="ORDER-1", query_password="123456")
++        self.assertEqual(history["status"], 0)
++        self.assertEqual(len(opener.requests), 2)
++        for request in opener.requests:
++            headers = {key.lower(): value for key, value in request.header_items()}
++            self.assertTrue(headers["content-type"].lower().startswith("application/x-www-form-urlencoded"))
++            self.assertEqual(headers["visitorid"], client.visitor_id)
++        self.assertEqual(parse_qs(opener.requests[0].data.decode("utf-8")), {"trade_no": ["ORDER-1"]})
++        self.assertEqual(parse_qs(opener.requests[1].data.decode("utf-8")), {
++            "trade_no": ["ORDER-1"],
++            "query_pwd": ["123456"],
++        })
++
++    def test_complaint_password_check_rejects_missing_or_non_numeric_need_pwd(self) -> None:
++        for value in (None, "1", True, 2, float("nan")):
++            with self.subTest(value=value):
++                data = {} if value is None else {"need_pwd": value}
++                opener = FakeOpener([self._json_response({"code": 1, "data": data})])
++                with self.assertRaisesRegex(UpstreamOrderError, "响应格式无效") as context:
++                    OrderQueryClient(opener=opener).check_need_complaint_password(trade_no="ORDER-1")
++                self.assertEqual(context.exception.code, "invalid_complaint_history_password_response")
++
++    def test_complaint_history_maps_human_verification_failure_to_expired_session(self) -> None:
++        for message in ("\u4eba\u673a\u9a8c\u8bc1\u5931\u8d25", "human verification failed"):
++            with self.subTest(message=message):
++                opener = FakeOpener([self._json_response({"code": 0, "msg": message, "data": None})])
++                with self.assertRaises(OrderQuerySessionExpired):
++                    OrderQueryClient(opener=opener).get_complaint_history(
++                        trade_no="ORDER-1",
++                        query_password="",
++                    )
++
++    def test_complaint_password_check_maps_human_verification_failure_to_expired_session(self) -> None:
++        opener = FakeOpener([self._json_response({
++            "code": 0,
++            "msg": "human verification failed",
++            "data": None,
++        })])
++        with self.assertRaises(OrderQuerySessionExpired):
++            OrderQueryClient(opener=opener).check_need_complaint_password(trade_no="ORDER-1")
++
+     def test_order_detail_uses_fixed_endpoint_and_returns_a_strict_allowlist(self) -> None:
+         upstream = {
+             "code": 1,
+@@ -1171,6 +1231,7 @@ class RouteTests(unittest.TestCase):
+     def test_main_http_handler_mounts_all_complaint_workflow_routes(self) -> None:
+         endpoints = {
+             "/api/order-query/complaints/context": "complaint_context",
++            "/api/order-query/complaints/history": "complaint_history",
+             "/api/order-query/complaints/upload": "complaint_upload",
+             "/api/order-query/complaints/upload/remove": "complaint_remove_upload",
+             "/api/order-query/complaints/submit": "complaint_submit",
+@@ -1572,6 +1633,124 @@ class ComplaintWorkflowTests(unittest.TestCase):
+             service.complaint_submit(payload)
+         self.assertEqual(len(client.submit_calls), 1)
+ 
++    def test_complaint_history_accepts_official_password_text_and_returns_normalized_record(self) -> None:
++        class HistoryClient(self.Client):
++            def __init__(self) -> None:
++                super().__init__()
++                self.history_passwords: list[str] = []
++
++            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
++                self.context_calls.append(trade_no)
++                return {"need_pwd": 1}
++
++            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
++                self.history_passwords.append(query_password)
++                return {
++                    "status": 1,
++                    "reason": "描述不符",
++                    "content": "已协商完成",
++                    "images": [],
++                    "contact": "buyer@example.test",
++                    "create_time": 1788134400,
++                    "messages": [{
++                        "identity": "platform",
++                        "content_type": 0,
++                        "content": "平台已处理",
++                        "create_time": 1_788_134_400,
++                    }],
++                    "collect_image": None,
++                }
++
++        client = HistoryClient()
++        service = self._service(client)
++        identity = self._identity(service)
++
++        with self.assertRaises(OrderQueryPasswordRequired):
++            service.complaint_history({**identity, "query_password": ""})
++        for password in ("bad\npassword", "x" * 161):
++            with self.subTest(password=password):
++                with self.assertRaises(OrderComplaintInputError):
++                    service.complaint_history({**identity, "query_password": password})
++        result = service.complaint_history({**identity, "query_password": "123456"})
++        self.assertEqual(result["need_query_password"], True)
++        self.assertEqual(result["complaint"]["status"], 1)
++        self.assertEqual(result["complaint"]["messages"][0]["identity"], "platform")
++        self.assertEqual(result["complaint"]["created_at"], "2026-08-31T00:00:00+00:00")
++        self.assertEqual(result["complaint"]["messages"][0]["created_at"], "2026-08-31T00:00:00+00:00")
++        self.assertEqual(client.history_passwords, ["123456"])
++
++    def test_complaint_history_check_fails_closed_when_need_pwd_is_malformed(self) -> None:
++        class MalformedHistoryClient(self.Client):
++            def __init__(self, value: Any) -> None:
++                super().__init__()
++                self.value = value
++
++            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
++                return {"need_pwd": self.value}
++
++            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
++                raise AssertionError("history must not be requested after malformed password metadata")
++
++        identity_service = self._service(MalformedHistoryClient(None))
++        identity = self._identity(identity_service)
++        with self.assertRaises(UpstreamOrderError) as context:
++            identity_service.complaint_history({**identity, "query_password": ""})
++        self.assertEqual(context.exception.code, "invalid_complaint_history_password_response")
++
++    def test_complaint_history_rate_limits_explicit_password_errors_when_metadata_says_public(self) -> None:
++        class InconsistentHistoryClient(self.Client):
++            def __init__(self) -> None:
++                super().__init__()
++                self.history_calls = 0
++
++            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
++                return {"need_pwd": 0}
++
++            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
++                self.history_calls += 1
++                raise OrderQueryPasswordInvalid()
++
++        client = InconsistentHistoryClient()
++        service = self._service(client)
++        identity = self._identity(service)
++
++        for attempt in range(4):
++            with self.subTest(attempt=attempt + 1):
++                with self.assertRaises(OrderQueryPasswordInvalid):
++                    service.complaint_history({**identity, "query_password": ""})
++        with self.assertRaises(OrderQueryPasswordRateLimited):
++            service.complaint_history({**identity, "query_password": ""})
++        with self.assertRaises(OrderQueryPasswordRateLimited):
++            service.complaint_history({**identity, "query_password": ""})
++        self.assertEqual(client.history_calls, 5)
++
++    def test_public_complaint_history_does_not_clear_detail_password_failures(self) -> None:
++        class PublicHistoryClient(self.Client):
++            def check_need_complaint_password(self, *, trade_no: str) -> dict[str, Any]:
++                return {"need_pwd": 0}
++
++            def get_complaint_history(self, *, trade_no: str, query_password: str = "") -> dict[str, Any]:
++                return {
++                    "status": 0,
++                    "reason": "鎻忚堪涓嶇",
++                    "content": "x",
++                    "images": [],
++                    "messages": [],
++                    "collect_image": None,
++                }
++
++        client = PublicHistoryClient()
++        service = self._service(client)
++        identity = self._identity(service)
++        session = service.sessions.get(identity["session_id"], identity["keywords"])
++        session.record_password_failure(identity["trade_no"], service.sessions.now())
++
++        result = service.complaint_history({**identity, "query_password": ""})
++
++        self.assertEqual(result["complaint"]["status"], 0)
++        self.assertIn(identity["trade_no"], session.password_failures)
++        self.assertNotIn(identity["trade_no"], session.complaint_password_failures)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/frontend/src/OrderQueryView.jsx b/frontend/src/OrderQueryView.jsx
+index 74474ce..c60a5c2 100644
+--- a/frontend/src/OrderQueryView.jsx
++++ b/frontend/src/OrderQueryView.jsx
+@@ -15,7 +15,9 @@ import {
+   ImagePlus,
+   KeyRound,
+   Link2,
++  Maximize2,
+   MessageSquareWarning,
++  MessagesSquare,
+   Package,
+   ReceiptText,
+   RefreshCw,
+@@ -34,11 +36,13 @@ import {
+   ORDER_STATUS_OPTIONS,
+   canOpenProtectedOrderDetail,
+   complaintActionForOrder,
++  complaintHistoryErrorState,
+   createComplaintDraft,
+   formatOrderDateTime,
+   formatOrderCardsForCopy,
+   formatOrderMoney,
+   normalizeOrderDetail,
++  normalizeComplaintHistoryResponse,
+   normalizeOrderResponse,
+   orderDeliveryKindLabel,
+   orderDetailErrorState,
+@@ -77,6 +81,22 @@ function QueryIconButton({label, children, ...props}) {
+   return <button className="icon-button" type="button" aria-label={label} title={label} {...props}>{children}</button>;
+ }
+ 
++// Complaint evidence is rendered as a button so mouse, keyboard, and assistive
++// technology users receive the same preview affordance.
++function ComplaintImageButton({src, alt = '售后图片', label = '查看图片', onOpen, className = ''}) {
++  if (!src) return null;
++  return <button
++    type="button"
++    className={`complaint-image-button ${className}`.trim()}
++    aria-label={label}
++    title={label}
++    onClick={event => onOpen?.(src, alt, event.currentTarget)}
++  >
++    <img src={src} alt={alt}/>
++    <span className="complaint-image-expand" aria-hidden="true"><Maximize2 size={13}/></span>
++  </button>;
++}
++
+ function OrderImage({order}) {
+   const [failed, setFailed] = useState(false);
+   useEffect(() => setFailed(false), [order.goods_image]);
+@@ -298,9 +318,11 @@ function ComplaintDropZone({label, hint, multiple = false, disabled = false, inv
+   </label>;
+ }
+ 
+-function ComplaintUploadItem({item, label, onRetry, onRemove}) {
++function ComplaintUploadItem({item, label, onRetry, onRemove, onPreview}) {
+   return <div className={`order-complaint-upload ${item.status}`} role="listitem" aria-busy={item.status === 'uploading'}>
+-    <img src={item.previewUrl || undefined} alt={`${label}预览`}/>
++    {item.previewUrl
++      ? <ComplaintImageButton src={item.previewUrl} alt={`${label}预览`} label={`查看${label}`} onOpen={onPreview}/>
++      : <span className="complaint-image-placeholder" aria-hidden="true"><Image size={18}/></span>}
+     <div><strong title={item.name}>{label}</strong><span>{item.status === 'uploading' ? '上传中' : item.status === 'done' ? '已上传' : '上传失败'}</span></div>
+     {item.status === 'uploading' && <RefreshCw className="spin" size={15} role="progressbar" aria-label={`${label}正在上传`}/>}
+     {item.status === 'error' && <QueryIconButton label={`重试上传${label}`} onClick={() => onRetry(item)}><RotateCcw size={14}/></QueryIconButton>}
+@@ -321,7 +343,7 @@ function readComplaintFile(file) {
+ function ComplaintDialog({
+   order, draft, errors, error, phase, uploads, snapshot, dialogRef, onChange, onFiles,
+   onRetryUpload, onRemoveUpload, onEditSubmit, onConfirmSubmit, onRetryContext,
+-  onBack, onClose, onCopyOrder, resultMessage, submissionUnknown,
++  onBack, onClose, onCopyOrder, resultMessage, submissionUnknown, onPreview,
+ }) {
+   const submitting = phase === 'submitting';
+   const phaseKnown = COMPLAINT_PHASES.has(phase);
+@@ -378,14 +400,14 @@ function ComplaintDialog({
+           <fieldset className="order-complaint-images">
+             <legend>图片凭证 <em>选填，最多 3 张</em></legend>
+             <ComplaintDropZone label="选择或拖入凭证图" hint="PNG / JPEG / WebP，单张不超过 5 MB" multiple disabled={uploads.evidence.length >= 3} invalid={Boolean(errors.images)} errorId="complaint-images-error" onFiles={files => onFiles('evidence', files)}/>
+-            {uploads.evidence.length > 0 && <div className="order-complaint-upload-list evidence" role="list" aria-live="polite">{uploads.evidence.map((item, index) => <ComplaintUploadItem item={item} label={`凭证图 ${index + 1}`} onRetry={value => onRetryUpload('evidence', value)} onRemove={value => onRemoveUpload('evidence', value)} key={item.id}/>)}</div>}
++            {uploads.evidence.length > 0 && <div className="order-complaint-upload-list evidence" role="list" aria-live="polite">{uploads.evidence.map((item, index) => <ComplaintUploadItem item={item} label={`凭证图 ${index + 1}`} onRetry={value => onRetryUpload('evidence', value)} onRemove={value => onRemoveUpload('evidence', value)} onPreview={onPreview} key={item.id}/>)}</div>}
+             <ComplaintFieldError id="complaint-images-error" message={errors.images}/>
+           </fieldset>
+ 
+           <fieldset className="order-complaint-collect-image">
+             <legend>退款二维码 <em>选填，最多 1 张</em></legend>
+             <ComplaintDropZone label={uploads.collect.length ? '替换退款二维码' : '选择或拖入退款二维码'} hint="PNG / JPEG / WebP，单张不超过 5 MB" invalid={Boolean(errors.collect_image)} errorId="complaint-collect-error" onFiles={files => onFiles('collect', files)}/>
+-            {uploads.collect.length > 0 && <div className="order-complaint-upload-list collect" role="list" aria-live="polite"><ComplaintUploadItem item={uploads.collect[0]} label="退款二维码" onRetry={value => onRetryUpload('collect', value)} onRemove={value => onRemoveUpload('collect', value)}/></div>}
++            {uploads.collect.length > 0 && <div className="order-complaint-upload-list collect" role="list" aria-live="polite"><ComplaintUploadItem item={uploads.collect[0]} label="退款二维码" onRetry={value => onRetryUpload('collect', value)} onRemove={value => onRemoveUpload('collect', value)} onPreview={onPreview}/></div>}
+             <ComplaintFieldError id="complaint-collect-error" message={errors.collect_image}/>
+           </fieldset>
+         </div>
+@@ -400,7 +422,7 @@ function ComplaintDialog({
+         <div className="order-complaint-confirm-warning" data-complaint-phase-focus tabIndex={-1}><TriangleAlert size={18}/><div><strong>提交后本订单不能再次申请</strong><span>请确认投诉类型、说明、邮箱和图片无误。</span></div></div>
+         {error && <div className="order-complaint-error" role="alert"><TriangleAlert size={15}/><span>{error}</span>{submissionUnknown && <button className="button secondary" type="button" onClick={onRetryContext}><RotateCcw size={14}/>刷新状态</button>}</div>}
+         <dl className="order-complaint-confirm-facts"><div><dt>投诉类型</dt><dd>{snapshot.reason}</dd></div><div><dt>通知邮箱</dt><dd>{snapshot.contact}</dd></div><div className="wide"><dt>补充说明</dt><dd>{snapshot.content}</dd></div><div><dt>图片凭证</dt><dd>{snapshot.images.length} 张</dd></div><div><dt>退款二维码</dt><dd>{snapshot.collect_image ? '已上传' : '未上传'}</dd></div></dl>
+-        {(uploads.evidence.length > 0 || uploads.collect.length > 0) && <div className="order-complaint-confirm-images">{[...uploads.evidence, ...uploads.collect].filter(item => item.status === 'done').map(item => <img src={item.previewUrl} alt="待提交图片" key={item.id}/>)}</div>}
++        {(uploads.evidence.length > 0 || uploads.collect.length > 0) && <div className="order-complaint-confirm-images">{[...uploads.evidence, ...uploads.collect].filter(item => item.status === 'done').map(item => <ComplaintImageButton src={item.previewUrl} alt="待提交图片" label="查看待提交图片" onOpen={onPreview} key={item.id}/>)}</div>}
+         <div className="modal-foot order-complaint-foot">
+           <span><ShieldCheck size={14}/>将提交到 pay.ldxp.cn</span>
+           <div className="modal-foot-actions"><button className="button secondary" type="button" onClick={onBack} disabled={submitting || submissionUnknown}><ChevronLeft size={15}/>返回修改</button><button className="button primary danger" type="button" onClick={onConfirmSubmit} disabled={submitting || submissionUnknown}>{submitting ? <RefreshCw className="spin" size={15}/> : <Send size={15}/>} {submitting ? '正在提交' : '确认提交售后'}</button></div>
+@@ -412,7 +434,99 @@ function ComplaintDialog({
+   </div>;
+ }
+ 
+-function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint}) {
++function ComplaintHistoryDialog({
++  order,
++  history,
++  phase,
++  password,
++  passwordVisible,
++  busy,
++  error,
++  sessionExpired,
++  dialogRef,
++  passwordInputRef,
++  onPassword,
++  onTogglePassword,
++  onSubmit,
++  onClose,
++  onRetry,
++  onRequery,
++  onPreview,
++}) {
++  const complaint = history?.complaint;
++  const messages = Array.isArray(complaint?.messages) ? complaint.messages : [];
++  const evidence = Array.isArray(complaint?.images) ? complaint.images : [];
++  const hasSummary = Boolean(complaint?.reason || complaint?.content || complaint?.contact || evidence.length || complaint?.collect_image);
++  const waiting = phase === 'loading' || busy;
++  const showPassword = phase === 'password';
++  const showError = phase === 'error';
++  return <div className="modal-backdrop order-history-backdrop" onMouseDown={event => event.target === event.currentTarget && !waiting && onClose()}>
++    <div ref={dialogRef} className="checkout-modal order-history-modal" role="dialog" aria-modal="true" aria-labelledby="order-history-title" tabIndex={-1}>
++      <div className="modal-head order-history-head">
++        <div><span>AFTER-SALES HISTORY</span><h2 id="order-history-title">售后记录</h2></div>
++        <QueryIconButton label="关闭售后记录" onClick={onClose} disabled={waiting}><X size={17}/></QueryIconButton>
++      </div>
++
++      <div className="order-history-order">
++        <div><span>当前订单</span><strong>{order?.goods_name || '订单'}</strong><small>{order?.trade_no || history?.trade_no || '--'}</small></div>
++        {complaint?.status_label && <span className={`order-status ${complaint.status_tone}`}>{complaint.status_label}</span>}
++      </div>
++
++      {waiting && <div className="order-history-state" data-history-phase-focus tabIndex={-1} role="status" aria-live="polite" aria-busy="true"><RefreshCw className="spin" size={21}/><strong>正在读取售后记录</strong><span>正在从官方售后通道获取对话和凭证</span></div>}
++
++      {showPassword && <form className="order-history-password" onSubmit={onSubmit}>
++        <div className="order-history-state compact" data-history-phase-focus tabIndex={-1}><KeyRound size={21}/><strong>需要订单安全密码</strong><span>该订单的售后记录受安全密码保护</span></div>
++        {error && <div className="order-password-error" role="alert"><TriangleAlert size={15}/><span>{error}</span></div>}
++        <label className="order-password-label" htmlFor="order-history-password">安全密码</label>
++        <div className={`order-password-control ${error ? 'invalid' : ''}`}>
++          <KeyRound size={16}/>
++          <input id="order-history-password" ref={passwordInputRef} type={passwordVisible ? 'text' : 'password'} value={password} onChange={event => onPassword(event.target.value)} autoComplete="off" maxLength={160} aria-invalid={Boolean(error)} disabled={busy}/>
++          <QueryIconButton label={passwordVisible ? '隐藏安全密码' : '显示安全密码'} onClick={onTogglePassword} disabled={busy}>{passwordVisible ? <EyeOff size={15}/> : <Eye size={15}/>}</QueryIconButton>
++        </div>
++        <div className="order-history-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={busy || !password.trim()}><ShieldCheck size={15}/>{busy ? '正在验证' : '验证并查看'}</button></div>
++      </form>}
++
++      {showError && <div className="order-history-state error" data-history-phase-focus tabIndex={-1} role="alert">
++        <TriangleAlert size={21}/><strong>{sessionExpired ? '查询会话已失效' : '售后记录暂时不可用'}</strong><span>{error || '售后记录读取失败，请重试'}</span>
++        <div className="order-history-actions">{sessionExpired ? <button className="button primary" type="button" onClick={onRequery}><RefreshCw size={15}/>关闭并重新查询</button> : <button className="button secondary" type="button" onClick={onRetry}><RotateCcw size={15}/>重试</button>}<button className="button secondary" type="button" onClick={onClose}>关闭</button></div>
++      </div>}
++
++      {phase === 'ready' && <div className="order-history-scroll">
++        {!complaint && <div className="order-history-empty" data-history-phase-focus tabIndex={-1}><MessagesSquare size={24}/><strong>暂无售后记录</strong><span>该订单当前没有可展示的售后对话或凭证</span></div>}
++        {complaint && <>
++          {hasSummary && <section className="order-history-summary">
++            <div className="order-history-section-head"><div><span>REQUEST</span><h3>申请信息</h3></div>{complaint.created_at && <time>{formatOrderDateTime(complaint.created_at)}</time>}</div>
++            <dl className="order-history-facts">
++              {complaint.reason && <div><dt>投诉类型</dt><dd>{complaint.reason}</dd></div>}
++              {complaint.contact && <div><dt>通知邮箱</dt><dd>{complaint.contact}</dd></div>}
++              {complaint.content && <div className="wide"><dt>补充说明</dt><dd>{complaint.content}</dd></div>}
++            </dl>
++            {evidence.length > 0 && <div className="order-history-gallery">
++              {evidence.map((src, index) => <ComplaintImageButton src={src} alt={`售后凭证 ${index + 1}`} label={`查看售后凭证 ${index + 1}`} onOpen={onPreview} key={`${src}-${index}`}/>) }
++            </div>}
++            <div className="order-history-refund-qr">
++              <div className="order-history-refund-head"><div><span>REFUND QR</span><strong>买家退款二维码</strong></div><em>{complaint.collect_image ? '点击图片查看' : '未上传'}</em></div>
++              {complaint.collect_image
++                ? <ComplaintImageButton src={complaint.collect_image} alt="退款二维码" label="查看退款二维码" onOpen={onPreview} className="collect"/>
++                : <div className="order-history-no-image"><Image size={18}/><span>暂无退款二维码</span></div>}
++            </div>
++          </section>}
++          <section className="order-history-conversation" aria-live="polite">
++            <div className="order-history-section-head"><div><span>CONVERSATION</span><h3>协商记录</h3></div><span className="order-history-count">{messages.length} 条</span></div>
++            {messages.length > 0 ? <div className="order-history-messages">{messages.map((message, index) => <article className={`order-history-message ${message.identity || 'unknown'}`} key={`${message.created_at || 'message'}-${index}`}>
++              <div className="order-history-message-meta"><strong>{message.identity_label || '协商方'}</strong>{message.created_at && <time>{formatOrderDateTime(message.created_at)}</time>}</div>
++              {message.content_type === 'image' ? <ComplaintImageButton src={message.content} alt={`${message.identity_label || '协商方'}发送的图片`} label={`查看${message.identity_label || '协商方'}发送的图片`} onOpen={onPreview} className="message-image"/> : <p>{message.content}</p>}
++            </article>)}</div> : <div className="order-history-empty compact"><MessagesSquare size={20}/><span>暂无文字或图片消息</span></div>}
++          </section>
++        </>}
++      </div>}
++
++      {phase === 'ready' && <div className="order-dialog-foot order-history-foot"><span><ShieldCheck size={14}/>记录来自 pay.ldxp.cn</span><button className="button primary" type="button" onClick={onClose}>关闭</button></div>}
++    </div>
++  </div>;
++}
++
++function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint, onComplaintHistory}) {
+   const complaintAction = complaintActionForOrder(order);
+   return <tr>
+     <td data-label="商品">
+@@ -427,6 +541,8 @@ function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint}) {
+       {canOpenProtectedOrderDetail(order) && <button className="button secondary order-result-link order-password-button" type="button" onClick={event => onOpenProtectedDetail(order, event.currentTarget)}><KeyRound size={14}/>安全密码</button>}
+       {order.status === 1 && order.result_url && !order.need_query_password && <a className="button secondary order-result-link" href={order.result_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>{order.goods_action_label}</a>}
+       {complaintAction.kind === 'apply' && <button className="button secondary order-complaint-button" type="button" onClick={event => onComplaint(order, event.currentTarget)}><MessageSquareWarning size={14}/>{complaintAction.label}</button>}
++      {complaintAction.kind === 'history' && <button className={`button secondary order-complaint-button history ${complaintAction.status.tone}`} type="button" onClick={event => onComplaintHistory(order, event.currentTarget)}><MessagesSquare size={14}/>{complaintAction.label}</button>}
++      {complaintAction.kind === 'history' && complaintAction.canReapply && <button className="button secondary order-complaint-button" type="button" onClick={event => onComplaint(order, event.currentTarget)}><MessageSquareWarning size={14}/>{complaintAction.reapplyLabel}</button>}
+       {complaintAction.kind === 'status' && <span className={`order-complaint-state ${complaintAction.status.tone}`}>{complaintAction.label}</span>}
+     </div></td>
+   </tr>;
+@@ -468,6 +584,15 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+   const [complaintSnapshot, setComplaintSnapshot] = useState(null);
+   const [complaintResultMessage, setComplaintResultMessage] = useState('订单已进入售后待处理状态。');
+   const [complaintSubmissionUnknown, setComplaintSubmissionUnknown] = useState(false);
++  const [historyOrder, setHistoryOrder] = useState(null);
++  const [historyData, setHistoryData] = useState(null);
++  const [historyPassword, setHistoryPassword] = useState('');
++  const [historyPasswordVisible, setHistoryPasswordVisible] = useState(false);
++  const [historyPhase, setHistoryPhase] = useState('closed');
++  const [historyBusy, setHistoryBusy] = useState(false);
++  const [historyError, setHistoryError] = useState('');
++  const [historySessionExpired, setHistorySessionExpired] = useState(false);
++  const [imagePreview, setImagePreview] = useState(null);
+   const requestVersion = useRef(0);
+   const detailRequestVersion = useRef(0);
+   const detailAbortController = useRef(null);
+@@ -484,8 +609,17 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+   const complaintGeneration = useRef(0);
+   const complaintSubmitLock = useRef(false);
+   const complaintUploadsRef = useRef(complaintUploads);
++  const historyTrigger = useRef(null);
++  const historyDialog = useRef(null);
++  const historyPasswordInput = useRef(null);
++  const historyRequest = useRef(null);
++  const historyGeneration = useRef(0);
++  const runSearchRef = useRef(null);
++  const imagePreviewDialog = useRef(null);
++  const imagePreviewTrigger = useRef(null);
+   complaintUploadsRef.current = complaintUploads;
+   const complaintOpen = Boolean(complaintOrder && complaintDraft);
++  const historyOpen = Boolean(historyOrder);
+ 
+   const revokeComplaintUploadUrls = useCallback((uploads) => {
+     [...(uploads?.evidence || []), ...(uploads?.collect || [])].forEach(item => {
+@@ -517,6 +651,158 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+     complaintSubmitLock.current = false;
+   }, [complaintPhase, revokeComplaintUploadUrls]);
+ 
++  const openImagePreview = useCallback((src, alt = '售后图片', trigger = null) => {
++    if (typeof src !== 'string' || !src.trim()) return;
++    imagePreviewTrigger.current = trigger || document.activeElement;
++    setImagePreview({src: src.trim(), alt: String(alt || '售后图片')});
++  }, []);
++
++  const closeImagePreview = useCallback(() => {
++    setImagePreview(null);
++    const trigger = imagePreviewTrigger.current;
++    imagePreviewTrigger.current = null;
++    window.requestAnimationFrame(() => {
++      if (trigger?.isConnected) trigger.focus();
++    });
++  }, []);
++
++  const loadComplaintHistory = useCallback(async (order, password = '') => {
++    if (!order?.trade_no) return false;
++    const generation = historyGeneration.current + 1;
++    historyGeneration.current = generation;
++    historyRequest.current?.abort();
++    const controller = new AbortController();
++    historyRequest.current = controller;
++    const queryPassword = String(password || '');
++    setHistoryBusy(true);
++    setHistoryPhase('loading');
++    setHistoryError('');
++    setHistorySessionExpired(false);
++    if (!sessionId || !submittedKeywords) {
++      if (generation === historyGeneration.current) {
++        setHistoryBusy(false);
++        setHistoryPhase('error');
++        setHistorySessionExpired(true);
++        setHistoryError('Order query session expired. Run a new order search before viewing history.');
++      }
++      if (historyRequest.current === controller) historyRequest.current = null;
++      return false;
++    }
++    try {
++      const response = await request('/order-query/complaints/history', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify({
++          keywords: submittedKeywords,
++          session_id: sessionId,
++          trade_no: order.trade_no,
++          query_password: queryPassword,
++        }),
++        signal: controller.signal,
++      });
++      if (generation !== historyGeneration.current || controller.signal.aborted) return false;
++      const normalized = normalizeComplaintHistoryResponse(response, {trade_no: order.trade_no});
++      setHistoryData(normalized);
++      if (response && response.session_id) setSessionId(String(response.session_id));
++      if (response && response.expires_in !== undefined) setExpiresIn(Math.max(0, Number(response.expires_in) || 0));
++      if (normalized.need_query_password && !normalized.complaint && !queryPassword.trim()) {
++        setHistoryPhase('password');
++        setHistoryPassword('');
++        setHistoryPasswordVisible(false);
++        setHistoryError('');
++        window.requestAnimationFrame(() => historyPasswordInput.current?.focus());
++        return false;
++      }
++      setHistoryPassword('');
++      setHistoryPasswordVisible(false);
++      setHistoryError('');
++      setHistorySessionExpired(false);
++      setHistoryPhase('ready');
++      return true;
++    } catch (requestError) {
++      if (controller.signal.aborted || requestError?.name === 'AbortError' || generation !== historyGeneration.current) return false;
++      const state = complaintHistoryErrorState(requestError);
++      if (state.sessionExpired) {
++        setSessionId('');
++        setVerification(null);
++        setExpiresIn(0);
++      }
++      if (state.passwordRequired || state.passwordInvalid) {
++        setHistoryPhase('password');
++        setHistorySessionExpired(false);
++        setHistoryError(state.passwordInvalid ? state.message : '');
++        if (state.passwordInvalid) setHistoryPassword('');
++        window.requestAnimationFrame(() => historyPasswordInput.current?.focus());
++      } else {
++        setHistoryData(null);
++        setHistoryPhase('error');
++        setHistorySessionExpired(state.sessionExpired);
++        setHistoryError(state.message);
++      }
++      return false;
++    } finally {
++      if (historyRequest.current === controller) historyRequest.current = null;
++      if (generation === historyGeneration.current) setHistoryBusy(false);
++    }
++  }, [request, sessionId, submittedKeywords]);
++
++  const closeComplaintHistory = useCallback(() => {
++    historyGeneration.current += 1;
++    historyRequest.current?.abort();
++    historyRequest.current = null;
++    setHistoryOrder(null);
++    setHistoryData(null);
++    setHistoryPassword('');
++    setHistoryPasswordVisible(false);
++    setHistoryPhase('closed');
++    setHistoryBusy(false);
++    setHistoryError('');
++    setHistorySessionExpired(false);
++    setImagePreview(null);
++    imagePreviewTrigger.current = null;
++  }, []);
++
++  const openComplaintHistory = useCallback((order, trigger) => {
++    if (!order || detailOrder || complaintOpen) return;
++    historyGeneration.current += 1;
++    historyRequest.current?.abort();
++    historyRequest.current = null;
++    historyTrigger.current = trigger || document.activeElement;
++    setHistoryOrder(order);
++    setHistoryData(null);
++    setHistoryPassword('');
++    setHistoryPasswordVisible(false);
++    setHistoryError('');
++    setHistorySessionExpired(false);
++    setHistoryPhase('loading');
++    setHistoryBusy(false);
++    if (!sessionId || !submittedKeywords) {
++      setHistoryPhase('error');
++      setHistorySessionExpired(true);
++      setHistoryError('Order query session expired. Run a new order search before viewing history.');
++      return;
++    }
++    loadComplaintHistory(order, '');
++  }, [complaintOpen, detailOrder, loadComplaintHistory, sessionId, submittedKeywords]);
++
++  const submitComplaintHistoryPassword = useCallback(event => {
++    event.preventDefault();
++    if (!historyOrder || historyBusy || historyPhase !== 'password' || !historyPassword.trim()) return;
++    loadComplaintHistory(historyOrder, historyPassword);
++  }, [historyBusy, historyOrder, historyPassword, historyPhase, loadComplaintHistory]);
++
++  const retryComplaintHistory = useCallback(() => {
++    if (!historyOrder || historyBusy) return;
++    loadComplaintHistory(historyOrder, historyPhase === 'password' ? historyPassword : '');
++  }, [historyBusy, historyOrder, historyPassword, historyPhase, loadComplaintHistory]);
++
++  const requeryAfterHistoryExpiry = useCallback(() => {
++    const keyword = submittedKeywords;
++    const page = result.pagination.page || 1;
++    closeComplaintHistory();
++    if (keyword) runSearchRef.current?.({keywordValue: keyword, pageValue: page, reuseSession: false});
++  }, [closeComplaintHistory, result.pagination.page, submittedKeywords]);
++
+   const closeOrderDetail = useCallback(() => {
+     detailRequestVersion.current += 1;
+     detailAbortController.current?.abort();
+@@ -545,7 +831,11 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+     complaintUploadControllers.current.clear();
+     complaintSubmitController.current?.abort();
+     complaintSubmitController.current = null;
++    historyGeneration.current += 1;
++    historyRequest.current?.abort();
++    historyRequest.current = null;
+     revokeComplaintUploadUrls(complaintUploadsRef.current);
++    imagePreviewTrigger.current = null;
+   }, [revokeComplaintUploadUrls]);
+ 
+   useEffect(() => {
+@@ -649,6 +939,91 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+     });
+   }, [complaintOpen]);
+ 
++  useEffect(() => {
++    if (!historyOpen) return undefined;
++    document.body.classList.add('order-history-open');
++    const dialog = historyDialog.current;
++    const focusFrame = window.requestAnimationFrame(() => {
++      if (historyPhase === 'password') historyPasswordInput.current?.focus();
++      else dialog?.querySelector('[data-history-phase-focus]')?.focus();
++    });
++    const handleDialogKey = event => {
++      if (imagePreview) return;
++      if (event.key === 'Escape') {
++        event.preventDefault();
++        if (!historyBusy) closeComplaintHistory();
++        return;
++      }
++      if (event.key !== 'Tab' || !dialog) return;
++      const focusable = Array.from(dialog.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
++      if (!focusable.length) {
++        event.preventDefault();
++        dialog.focus();
++        return;
++      }
++      const first = focusable[0];
++      const last = focusable[focusable.length - 1];
++      const outside = !dialog.contains(document.activeElement);
++      const notTabbable = !focusable.includes(document.activeElement);
++      if ((event.shiftKey && (document.activeElement === first || outside || notTabbable)) || (!event.shiftKey && (document.activeElement === last || outside || notTabbable))) {
++        event.preventDefault();
++        (event.shiftKey ? last : first).focus();
++      }
++    };
++    window.addEventListener('keydown', handleDialogKey);
++    return () => {
++      window.cancelAnimationFrame(focusFrame);
++      document.body.classList.remove('order-history-open');
++      window.removeEventListener('keydown', handleDialogKey);
++    };
++  }, [closeComplaintHistory, historyBusy, historyOpen, historyPhase, imagePreview]);
++
++  useEffect(() => {
++    if (historyOpen || !historyTrigger.current) return;
++    const trigger = historyTrigger.current;
++    historyTrigger.current = null;
++    window.requestAnimationFrame(() => {
++      if (trigger?.isConnected) trigger.focus();
++    });
++  }, [historyOpen]);
++
++  useEffect(() => {
++    if (!imagePreview) return undefined;
++    const dialog = imagePreviewDialog.current;
++    const previousOverflow = document.body.style.overflow;
++    document.body.style.overflow = 'hidden';
++    const focusFrame = window.requestAnimationFrame(() => dialog?.focus());
++    const handleLightboxKey = event => {
++      if (event.key === 'Escape') {
++        event.preventDefault();
++        closeImagePreview();
++        return;
++      }
++      if (event.key !== 'Tab' || !dialog) return;
++      const focusable = Array.from(dialog.querySelectorAll('button:not([disabled]), [tabindex]:not([tabindex="-1"])'));
++      if (!focusable.length) {
++        event.preventDefault();
++        dialog.focus();
++        return;
++      }
++      const first = focusable[0];
++      const last = focusable[focusable.length - 1];
++      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
++        event.preventDefault();
++        last.focus();
++      } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
++        event.preventDefault();
++        first.focus();
++      }
++    };
++    window.addEventListener('keydown', handleLightboxKey);
++    return () => {
++      window.cancelAnimationFrame(focusFrame);
++      document.body.style.overflow = previousOverflow;
++      window.removeEventListener('keydown', handleLightboxKey);
++    };
++  }, [closeImagePreview, imagePreview]);
++
+   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
+   const manualRequired = verification?.status === 'manual_required';
+ 
+@@ -766,6 +1141,8 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+     }
+   };
+ 
++  runSearchRef.current = runSearch;
++
+   const submitSearch = event => {
+     event.preventDefault();
+     runSearch({keywordValue: keywords, pageValue: 1, reuseSession: !manualRequired});
+@@ -1272,7 +1649,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+       <div className="order-table-wrap">
+         <table className="order-query-table">
+           <thead><tr><th>商品 / 下单时间</th><th>订单号</th><th>金额 / 数量</th><th>状态</th><th>商品类型</th><th>操作</th></tr></thead>
+-          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} onComplaint={openComplaint} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
++          <tbody>{result.orders.length ? result.orders.map((order, index) => <OrderRow order={order} onCopy={copyOrderNumber} onOpenProtectedDetail={openProtectedOrderDetail} onComplaint={openComplaint} onComplaintHistory={openComplaintHistory} key={order.trade_no || `${order.goods_key}-${index}`}/>) : <tr className="order-empty-row"><td colSpan="6"><div className="order-empty-state">{emptyMessage.icon}<strong>{emptyMessage.title}</strong><span>{emptyMessage.detail}</span></div></td></tr>}</tbody>
+         </table>
+       </div>
+ 
+@@ -1321,8 +1698,37 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+       onConfirmSubmit={confirmComplaintSubmit}
+       onRetryContext={retryComplaintContext}
+       onBack={() => { setComplaintPhase('edit'); setComplaintError(''); }}
+-      onClose={closeComplaint}
+-      onCopyOrder={copyOrderNumber}
++       onClose={closeComplaint}
++       onCopyOrder={copyOrderNumber}
++       onPreview={openImagePreview}
++     />}
++    {historyOpen && <ComplaintHistoryDialog
++      order={historyOrder}
++      history={historyData}
++      phase={historyPhase}
++      password={historyPassword}
++      passwordVisible={historyPasswordVisible}
++      busy={historyBusy}
++      error={historyError}
++      sessionExpired={historySessionExpired}
++      dialogRef={historyDialog}
++      passwordInputRef={historyPasswordInput}
++      onPassword={value => {
++        setHistoryPassword(value);
++        if (historyError) setHistoryError('');
++      }}
++      onTogglePassword={() => setHistoryPasswordVisible(current => !current)}
++      onSubmit={submitComplaintHistoryPassword}
++      onClose={closeComplaintHistory}
++      onRetry={retryComplaintHistory}
++      onRequery={requeryAfterHistoryExpiry}
++      onPreview={openImagePreview}
+     />}
+-  </section>;
++    {imagePreview && <div className="modal-backdrop order-image-preview-backdrop" onMouseDown={event => event.target === event.currentTarget && closeImagePreview()}>
++      <div ref={imagePreviewDialog} className="order-image-preview-dialog" role="dialog" aria-modal="true" aria-label="图片预览" tabIndex={-1}>
++        <QueryIconButton label="关闭图片预览" onClick={closeImagePreview}><X size={17}/></QueryIconButton>
++        <img src={imagePreview.src} alt={imagePreview.alt}/>
++      </div>
++    </div>}
++   </section>;
+ }
+diff --git a/frontend/src/orderQuery.css b/frontend/src/orderQuery.css
+index 130b702..82ae2b8 100644
+--- a/frontend/src/orderQuery.css
++++ b/frontend/src/orderQuery.css
+@@ -185,6 +185,8 @@
+ .order-row-actions .icon-button { width: 29px; height: 29px; flex: 0 0 29px; text-decoration: none; }
+ .order-result-link { min-height: 29px; padding-inline: 8px; font-size: 9px; text-decoration: none; white-space: nowrap; }
+ .order-complaint-button { min-height: 29px; padding-inline: 8px; color: var(--ui-warning); border-color: color-mix(in srgb, var(--ui-warning) 40%, var(--ui-border)); font-size: 9px; white-space: nowrap; }
++.order-complaint-button.history.success { color: var(--ui-success); border-color: color-mix(in srgb, var(--ui-success) 40%, var(--ui-border)); }
++.order-complaint-button.history.pending { color: var(--ui-warning); }
+ .order-complaint-button:hover:not(:disabled) { color: var(--ui-text); border-color: var(--ui-text-muted); background: var(--ui-surface-muted); }
+ .order-complaint-state { min-height: 25px; padding: 0 7px; display: inline-flex; align-items: center; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); border-radius: 3px; font-size: 9px; font-weight: 700; white-space: nowrap; }
+ .order-complaint-state.pending { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 8%, var(--ui-surface)); border-color: color-mix(in srgb, var(--ui-warning) 35%, var(--ui-border)); }
+@@ -313,6 +315,100 @@ body.order-complaint-open .toast { display: none; }
+ .order-complaint-modal .button.danger { color: #fff; background: var(--ui-danger); border-color: var(--ui-danger); }
+ .order-complaint-modal .button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-danger) 82%, #000); border-color: color-mix(in srgb, var(--ui-danger) 82%, #000); }
+ 
++body.order-history-open { overflow: hidden; }
++.order-history-backdrop { z-index: 50; }
++.order-history-modal { width: min(860px, 100%); max-height: calc(100dvh - 48px); padding: 0; display: flex; flex-direction: column; overflow: hidden; color: var(--ui-text); background: var(--ui-surface); border-color: var(--ui-border); }
++.order-history-head { min-height: 70px; padding: 16px 20px; align-items: center; border-bottom: 1px solid var(--ui-border); }
++.order-history-head > div { min-width: 0; }
++.order-history-head > div > span { display: block; color: var(--ui-text-faint); font-size: 9px; font-weight: 750; }
++.order-history-head h2 { margin: 5px 0 0; color: var(--ui-text); font-size: 18px; }
++.order-history-head .icon-button { width: 32px; height: 32px; flex: 0 0 32px; }
++.order-history-order { min-width: 0; min-height: 66px; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--ui-surface-muted); border-bottom: 1px solid var(--ui-border); }
++.order-history-order > div { min-width: 0; flex: 1; }
++.order-history-order span,
++.order-history-order strong,
++.order-history-order small { display: block; }
++.order-history-order > div > span { color: var(--ui-text-faint); font-size: 8px; }
++.order-history-order strong { margin-top: 4px; overflow: hidden; color: var(--ui-text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
++.order-history-order small { margin-top: 4px; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.order-history-order > .order-status { flex: 0 0 auto; }
++.order-history-state { min-height: 220px; padding: 28px 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--ui-text-muted); text-align: center; }
++.order-history-state strong { color: var(--ui-text); font-size: 13px; }
++.order-history-state span { max-width: 420px; color: var(--ui-text-faint); font-size: 10px; line-height: 1.55; }
++.order-history-state.compact { min-height: 0; padding: 8px 0 16px; }
++.order-history-state.error { color: var(--ui-danger); }
++.order-history-state.error strong { color: var(--ui-text); }
++.order-history-state.error span { color: var(--ui-text-muted); }
++.order-history-state.error > svg { color: var(--ui-danger); }
++.order-history-password { min-width: 0; padding: 18px 20px 20px; }
++.order-history-password .order-password-label { display: block; }
++.order-history-actions { margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px; }
++.order-history-actions .button { min-height: 36px; white-space: nowrap; }
++.order-history-scroll { min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; }
++.order-history-summary,
++.order-history-conversation { min-width: 0; padding: 18px 20px; border-bottom: 1px solid var(--ui-border); }
++.order-history-conversation { border-bottom: 0; }
++.order-history-section-head { min-width: 0; margin-bottom: 12px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
++.order-history-section-head > div { min-width: 0; }
++.order-history-section-head span { display: block; color: var(--ui-text-faint); font-size: 8px; font-weight: 750; }
++.order-history-section-head h3 { margin: 4px 0 0; color: var(--ui-text); font-size: 13px; }
++.order-history-section-head time { flex: 0 0 auto; color: var(--ui-text-faint); font-size: 9px; }
++.order-history-count { flex: 0 0 auto; color: var(--ui-text-muted) !important; font-size: 9px !important; font-weight: 600 !important; }
++.order-history-facts { margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); border-left: 1px solid var(--ui-border-soft); }
++.order-history-facts > div { min-width: 0; min-height: 54px; padding: 9px 10px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
++.order-history-facts > div.wide { grid-column: 1 / -1; }
++.order-history-facts dt { color: var(--ui-text-faint); font-size: 8px; }
++.order-history-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; color: var(--ui-text); font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
++.order-history-gallery { margin-top: 10px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; }
++.order-history-gallery .complaint-image-button { aspect-ratio: 1; }
++.order-history-gallery .complaint-image-button.collect { grid-column: span 2; aspect-ratio: 2 / 1; }
++.order-history-refund-qr { margin-top: 12px; padding: 11px; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); }
++.order-history-refund-head { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
++.order-history-refund-head > div { min-width: 0; }
++.order-history-refund-head span,
++.order-history-refund-head strong { display: block; }
++.order-history-refund-head span { color: var(--ui-text-faint); font-size: 8px; font-weight: 750; }
++.order-history-refund-head strong { margin-top: 4px; color: var(--ui-text); font-size: 10px; }
++.order-history-refund-head em { flex: 0 0 auto; color: var(--ui-text-faint); font-size: 8px; font-style: normal; }
++.order-history-refund-qr > .complaint-image-button { width: min(300px, 100%); margin-top: 9px; aspect-ratio: 1; }
++.order-history-no-image { min-height: 76px; margin-top: 9px; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); background: var(--ui-control); border: 1px dashed var(--ui-border); font-size: 9px; }
++.order-history-messages { display: grid; gap: 8px; }
++.order-history-message { min-width: 0; padding: 10px 11px; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-left: 3px solid var(--ui-border); }
++.order-history-message.buyer { border-left-color: var(--ui-text-muted); }
++.order-history-message.platform { border-left-color: var(--ui-success); }
++.order-history-message.user,
++.order-history-message.parent { border-left-color: var(--ui-warning); }
++.order-history-message-meta { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
++.order-history-message-meta strong { color: var(--ui-text); font-size: 10px; }
++.order-history-message-meta time { flex: 0 0 auto; color: var(--ui-text-faint); font-size: 8px; }
++.order-history-message p { margin: 7px 0 0; overflow-wrap: anywhere; color: var(--ui-text-muted); font-size: 10px; line-height: 1.55; white-space: pre-wrap; }
++.order-history-empty { min-height: 220px; padding: 24px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-faint); text-align: center; }
++.order-history-empty strong { color: var(--ui-text-muted); font-size: 12px; }
++.order-history-empty span { max-width: 390px; font-size: 9px; line-height: 1.55; }
++.order-history-empty.compact { min-height: 100px; padding: 18px; }
++.order-history-empty.compact span { color: var(--ui-text-faint); }
++.order-history-foot { min-height: 62px; margin: 0; padding: 12px 20px; background: var(--ui-surface); }
++.order-history-foot .button { min-width: 82px; }
++
++.complaint-image-button { position: relative; min-width: 0; min-height: 0; padding: 0; display: block; overflow: hidden; color: var(--ui-text); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 3px; cursor: zoom-in; line-height: 0; }
++.complaint-image-button:hover { border-color: var(--ui-text-muted); }
++.complaint-image-button:focus-visible { outline: 2px solid var(--ui-text); outline-offset: 2px; }
++.complaint-image-button img { width: 100%; height: 100%; display: block; object-fit: cover; }
++.complaint-image-expand { position: absolute; right: 5px; bottom: 5px; width: 22px; height: 22px; display: grid; place-items: center; color: #fff; background: #111315b8; border-radius: 3px; opacity: 0; transition: opacity .16s ease; }
++.complaint-image-button:hover .complaint-image-expand,
++.complaint-image-button:focus-visible .complaint-image-expand { opacity: 1; }
++.order-complaint-upload > .complaint-image-button { width: 54px; height: 54px; flex: 0 0 54px; }
++.order-complaint-confirm-images .complaint-image-button { width: 100%; aspect-ratio: 1; }
++.order-complaint-upload .complaint-image-button img { object-fit: cover; }
++.complaint-image-placeholder { width: 54px; height: 54px; display: grid; flex: 0 0 54px; place-items: center; color: var(--ui-text-faint); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 3px; }
++.order-history-message .complaint-image-button.message-image { width: min(280px, 100%); margin-top: 8px; aspect-ratio: 16 / 10; }
++.order-history-message .complaint-image-button.message-image img { object-fit: contain; background: var(--ui-control); }
++.order-image-preview-backdrop { z-index: 80; padding: 20px; background: #0b0d0fdd; }
++.order-image-preview-dialog { position: relative; width: min(1000px, 100%); max-height: calc(100dvh - 40px); padding: 12px; display: flex; align-items: center; justify-content: center; background: #111315; border: 1px solid #3b4248; border-radius: 4px; box-shadow: 0 20px 70px #00000066; }
++.order-image-preview-dialog > img { max-width: 100%; max-height: calc(100dvh - 66px); display: block; object-fit: contain; }
++.order-image-preview-dialog > .icon-button { position: absolute; z-index: 1; top: 7px; right: 7px; color: #fff; background: #111315b8; border-color: #66717a; }
++.order-image-preview-dialog > .icon-button:hover { background: #2c3034; }
++
+ .order-empty-state { min-height: 210px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); text-align: center; }
+ .order-empty-state strong { margin-top: 3px; color: var(--ui-text-muted); font-size: 12px; }
+ .order-empty-state span { max-width: 360px; font-size: 10px; line-height: 1.5; }
+@@ -511,6 +607,24 @@ body.order-complaint-open .toast { display: none; }
+   .order-complaint-confirm-facts { grid-template-columns: 1fr; }
+   .order-complaint-confirm-facts > div.wide { grid-column: 1; }
+   .order-complaint-confirm-images { grid-template-columns: repeat(3, minmax(0, 1fr)); }
++  .order-history-backdrop { padding: 8px; }
++  .order-history-modal { width: 100%; max-height: calc(100dvh - 16px); }
++  .order-history-head { min-height: 62px; padding: 13px 14px; }
++  .order-history-order { min-height: 62px; padding: 11px 14px; }
++  .order-history-summary,
++  .order-history-conversation { padding: 15px 14px; }
++  .order-history-password { padding: 16px 14px 17px; }
++  .order-history-facts { grid-template-columns: 1fr; }
++  .order-history-facts > div.wide { grid-column: 1; }
++  .order-history-gallery { grid-template-columns: repeat(3, minmax(0, 1fr)); }
++  .order-history-gallery .complaint-image-button.collect { grid-column: span 2; }
++  .order-history-foot { min-height: 62px; padding: 10px 14px; align-items: center; flex-direction: row; }
++  .order-history-foot .button { width: auto; margin-left: auto; }
++  .order-history-actions { flex-wrap: wrap; }
++  .order-history-actions .button { flex: 1 1 auto; }
++  .order-image-preview-backdrop { padding: 8px; }
++  .order-image-preview-dialog { max-height: calc(100dvh - 16px); padding: 8px; }
++  .order-image-preview-dialog > img { max-height: calc(100dvh - 34px); }
+ }
+ 
+ @media (max-width: 390px) {
+@@ -522,4 +636,11 @@ body.order-complaint-open .toast { display: none; }
+   .order-complaint-error .button { width: 100%; }
+   .order-complaint-upload > img { width: 54px; height: 54px; grid-column: 1; }
+   .order-complaint-confirm-images { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .order-history-backdrop { padding: 0; place-items: stretch; }
++  .order-history-modal { min-height: 100dvh; max-height: 100dvh; border-width: 0; }
++  .order-history-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .order-history-gallery .complaint-image-button.collect { grid-column: 1 / -1; aspect-ratio: 2 / 1; }
++  .order-image-preview-backdrop { padding: 0; place-items: stretch; }
++  .order-image-preview-dialog { width: 100%; min-height: 100dvh; max-height: 100dvh; border-width: 0; border-radius: 0; }
++  .order-image-preview-dialog > img { max-height: calc(100dvh - 24px); }
+ }
+diff --git a/frontend/src/orderQueryModel.js b/frontend/src/orderQueryModel.js
+index e376b7a..50c9db4 100644
+--- a/frontend/src/orderQueryModel.js
++++ b/frontend/src/orderQueryModel.js
+@@ -84,7 +84,17 @@ export function complaintActionForOrder(order = {}) {
+   const status = complaintStatusMeta(order.complaint_status);
+   const canApply = Boolean(order.trade_no && order.can_complaint);
+   if (status.key === null && canApply) return {kind: 'apply', label: '申请售后', status};
+-  if (status.key === -1 && canApply) return {kind: 'apply', label: '重新申请', status};
++  if (status.key === -1 && order.trade_no) {
++    return {
++      kind: 'history',
++      label: '查看记录',
++      status,
++      canReapply: canApply,
++      reapplyLabel: '重新申请',
++    };
++  }
++  if (status.key === 0) return {kind: 'history', label: '查看记录', status};
++  if (status.key === 1) return {kind: 'history', label: '售后完成', status};
+   if (status.key === null) return {kind: 'none', label: '', status};
+   return {kind: 'status', label: status.label, status};
+ }
+@@ -228,6 +238,100 @@ export function safeOrderContentUrl(value) {
+   }
+ }
+ 
++const COMPLAINT_IDENTITY_LABELS = Object.freeze({
++  platform: '平台',
++  user: '商家',
++  parent: '货源商',
++  buyer: '买家',
++});
++
++function complaintHistoryText(value, limit) {
++  if (typeof value !== 'string' && typeof value !== 'number') return '';
++  return String(value).trim().slice(0, limit);
++}
++
++function complaintHistoryImageList(value, limit = 24) {
++  if (!Array.isArray(value)) return [];
++  return value.slice(0, limit).map(safeOrderContentUrl).filter(Boolean);
++}
++
++function complaintMessageKind(value) {
++  const normalized = String(value ?? '').trim().toLowerCase();
++  return value === 1 || normalized === '1' || normalized === 'image' ? 'image' : 'text';
++}
++
++export function normalizeComplaintHistoryResponse(payload = {}, fallback = {}) {
++  const source = payload && typeof payload === 'object' ? payload : {};
++  const rawComplaint = source.complaint && typeof source.complaint === 'object'
++    ? source.complaint
++    : null;
++  const tradeNo = complaintHistoryText(source.trade_no, 160)
++    || normalizedText(fallback.trade_no);
++  const complaint = rawComplaint ? (() => {
++    const status = complaintStatusMeta(rawComplaint.status);
++    const messages = Array.isArray(rawComplaint.messages)
++      ? rawComplaint.messages.slice(0, 200).map(rawMessage => {
++        const message = rawMessage && typeof rawMessage === 'object' ? rawMessage : {};
++        const contentType = complaintMessageKind(message.content_type);
++        const content = contentType === 'image'
++          ? safeOrderContentUrl(message.content)
++          : complaintHistoryText(message.content, 4000);
++        const identity = complaintHistoryText(message.identity, 32).toLowerCase();
++        return {
++          identity: Object.hasOwn(COMPLAINT_IDENTITY_LABELS, identity) ? identity : 'unknown',
++          identity_label: complaintHistoryText(message.identity_label, 40)
++            || COMPLAINT_IDENTITY_LABELS[identity]
++            || '协商方',
++          content_type: contentType,
++          content,
++          created_at: complaintHistoryText(message.created_at, 80),
++        };
++      }).filter(message => Boolean(message.content))
++      : [];
++    return {
++      status: status.key,
++      status_label: complaintHistoryText(rawComplaint.status_label, 80) || status.label,
++      status_tone: status.tone,
++      reason: complaintHistoryText(rawComplaint.reason, 80),
++      content: complaintHistoryText(rawComplaint.content, 4000),
++      images: complaintHistoryImageList(rawComplaint.images),
++      contact: complaintHistoryText(rawComplaint.contact, 254),
++      created_at: complaintHistoryText(rawComplaint.created_at, 80),
++      collect_image: safeOrderContentUrl(rawComplaint.collect_image),
++      messages,
++      can_complaint: rawComplaint.can_complaint === true || Number(rawComplaint.can_complaint) === 1,
++    };
++  })() : null;
++
++  return {
++    session_id: complaintHistoryText(source.session_id, 128),
++    expires_in: Math.max(0, Math.floor(finiteNumber(source.expires_in, 0))),
++    trade_no: tradeNo,
++    need_query_password: source.need_query_password === true || Number(source.need_query_password) === 1,
++    complaint,
++  };
++}
++
++export function complaintHistoryErrorState(error = {}) {
++  const code = normalizedText(error.code || error.payload?.code);
++  const sessionExpired = Number(error.status) === 410 || code === 'order_query_session_expired';
++  const passwordRequired = code === 'order_query_password_required';
++  const passwordInvalid = code === 'order_query_password_invalid';
++  const fallback = sessionExpired
++    ? '订单查询会话已失效，请重新查询订单后再查看记录'
++    : passwordRequired
++      ? '请输入订单安全密码'
++      : passwordInvalid
++        ? '订单安全密码错误，请重新输入'
++        : '售后记录读取失败，请重试';
++  return {
++    sessionExpired,
++    passwordRequired,
++    passwordInvalid,
++    message: normalizedText(error.message) || fallback,
++  };
++}
++
+ function plainText(value, fallback = '') {
+   if (typeof value === 'string') return value.trim();
+   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+diff --git a/frontend/src/orderQueryModel.test.js b/frontend/src/orderQueryModel.test.js
+index e9431f9..86bc9bc 100644
+--- a/frontend/src/orderQueryModel.test.js
++++ b/frontend/src/orderQueryModel.test.js
+@@ -5,6 +5,7 @@ import {
+   COMPLAINT_MAX_IMAGE_BYTES,
+   COMPLAINT_REASON_OPTIONS,
+   complaintActionForOrder,
++  complaintHistoryErrorState,
+   complaintImageFileError,
+   complaintStatusMeta,
+   createComplaintDraft,
+@@ -12,6 +13,7 @@ import {
+   formatOrderCardsForCopy,
+   formatOrderMoney,
+   normalizeOrder,
++  normalizeComplaintHistoryResponse,
+   normalizeOrderDetail,
+   normalizeOrderResponse,
+   orderDeliveryKindLabel,
+@@ -64,16 +66,112 @@ test('distinguishes complaint actions and statuses conservatively', () => {
+     label: '申请售后',
+     status: {key: null, label: '未申请售后', tone: 'neutral'},
+   });
+-  assert.equal(complaintActionForOrder({...eligible, complaint_status: -1}).label, '重新申请');
+-  assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: -1}).kind, 'status');
+-  assert.equal(complaintActionForOrder({...eligible, complaint_status: 0}).label, '售后待处理');
+-  assert.equal(complaintActionForOrder({...eligible, complaint_status: 1}).label, '售后已完成');
++  assert.deepEqual(complaintActionForOrder({...eligible, complaint_status: -1}), {
++    kind: 'history',
++    label: '查看记录',
++    status: {key: -1, label: '售后已撤销', tone: 'muted'},
++    canReapply: true,
++    reapplyLabel: '重新申请',
++  });
++  assert.deepEqual(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: -1}), {
++    kind: 'history',
++    label: '查看记录',
++    status: {key: -1, label: '售后已撤销', tone: 'muted'},
++    canReapply: false,
++    reapplyLabel: '重新申请',
++  });
++  assert.deepEqual(complaintActionForOrder({...eligible, complaint_status: 0}), {
++    kind: 'history',
++    label: '查看记录',
++    status: {key: 0, label: '售后待处理', tone: 'pending'},
++  });
++  assert.deepEqual(complaintActionForOrder({...eligible, complaint_status: 1}), {
++    kind: 'history',
++    label: '售后完成',
++    status: {key: 1, label: '售后已完成', tone: 'success'},
++  });
+   assert.equal(complaintActionForOrder({...eligible, complaint_status: 7}).kind, 'status');
+   assert.equal(complaintActionForOrder({...eligible, complaint_status: 'unexpected'}).kind, 'status');
+   assert.equal(complaintStatusMeta(7).label, '售后状态未知');
+   assert.equal(complaintActionForOrder({trade_no: 'LD-1001', can_complaint: false, complaint_status: null}).kind, 'none');
+ });
+ 
++test('normalizes complaint history messages and image fields conservatively', () => {
++  const result = normalizeComplaintHistoryResponse({
++    session_id: ' session-1 ',
++    expires_in: '88.9',
++    trade_no: ' LD-1001 ',
++    need_query_password: 1,
++    complaint: {
++      status: '0',
++      status_label: ' 待平台处理 ',
++      reason: ' 描述不符 ',
++      content: ' 商品内容不一致 ',
++      images: ['https://cdn.example.test/a.png', 'javascript:alert(1)', null],
++      contact: ' buyer@example.test ',
++      created_at: '1710000000',
++      collect_image: 'https://cdn.example.test/qr.png',
++      can_complaint: '1',
++      messages: [
++        {identity: 'buyer', identity_label: '', content_type: 0, content: ' 买家补充 ', created_at: '1710000001'},
++        {identity: 'platform', identity_label: ' 平台客服 ', content_type: 1, content: 'https://cdn.example.test/reply.png', created_at: '1710000002'},
++        {identity: 'user', content_type: 'image', content: 'file:///tmp/leak.png'},
++        {identity: '<unsafe>', content_type: 'text', content: ' 协商回复 '},
++      ],
++      internal_note: 'must-not-leak',
++    },
++    internal: 'must-not-leak',
++  });
++
++  assert.deepEqual(result, {
++    session_id: 'session-1',
++    expires_in: 88,
++    trade_no: 'LD-1001',
++    need_query_password: true,
++    complaint: {
++      status: 0,
++      status_label: '待平台处理',
++      status_tone: 'pending',
++      reason: '描述不符',
++      content: '商品内容不一致',
++      images: ['https://cdn.example.test/a.png'],
++      contact: 'buyer@example.test',
++      created_at: '1710000000',
++      collect_image: 'https://cdn.example.test/qr.png',
++      messages: [
++        {identity: 'buyer', identity_label: '买家', content_type: 'text', content: '买家补充', created_at: '1710000001'},
++        {identity: 'platform', identity_label: '平台客服', content_type: 'image', content: 'https://cdn.example.test/reply.png', created_at: '1710000002'},
++        {identity: 'unknown', identity_label: '协商方', content_type: 'text', content: '协商回复', created_at: ''},
++      ],
++      can_complaint: true,
++    },
++  });
++  assert.equal(JSON.stringify(result).includes('must-not-leak'), false);
++});
++
++test('normalizes empty complaint history and classifies password and expiry errors', () => {
++  assert.deepEqual(normalizeComplaintHistoryResponse({need_query_password: false}, {trade_no: 'LD-FALLBACK'}), {
++    session_id: '',
++    expires_in: 0,
++    trade_no: 'LD-FALLBACK',
++    need_query_password: false,
++    complaint: null,
++  });
++  assert.deepEqual(complaintHistoryErrorState({code: 'order_query_password_required'}), {
++    sessionExpired: false,
++    passwordRequired: true,
++    passwordInvalid: false,
++    message: '请输入订单安全密码',
++  });
++  assert.deepEqual(complaintHistoryErrorState({status: 403, code: 'order_query_password_invalid', message: '密码错误'}), {
++    sessionExpired: false,
++    passwordRequired: false,
++    passwordInvalid: true,
++    message: '密码错误',
++  });
++  assert.equal(complaintHistoryErrorState({status: 410}).sessionExpired, true);
++});
++
+ test('creates and normalizes the exact complaint submission payload', () => {
+   const draft = createComplaintDraft({trade_no: ' LD-1001 '}, ' buyer@example.com ');
+   assert.deepEqual(draft.images, ['', '', '']);

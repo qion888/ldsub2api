@@ -1,0 +1,120 @@
+﻿ORDER COMPLAINT HISTORY VERIFICATION
+===================================
+
+SCOPE
+-----
+Branch: codex/task-10-order-complaint-history
+Baseline commit: 357b0ca (local main)
+Modified commit: d38501f
+Changed field: order-query complaint history flow (read-only official history lookup, password session handling/throttling, image/message normalization, history modal and image preview UI).
+Official write requests: 0 (the acceptance run used only read-only history/detail probes; no complaint submission, retry, cancellation, or upload write endpoint was called).
+
+DELIVERABLE PATHS
+-----------------
+MODIFIED_FILE: C:\Users\0\.codex\worktrees\2a5f\ldxp\artifacts\order-complaint-history\MODIFIED_FILE
+DIFF_FILE: C:\Users\0\.codex\worktrees\2a5f\ldxp\artifacts\order-complaint-history\DIFF_FILE
+VERIFICATION.txt: C:\Users\0\.codex\worktrees\2a5f\ldxp\artifacts\order-complaint-history\VERIFICATION.txt
+ROLLBACK.sh: C:\Users\0\.codex\worktrees\2a5f\ldxp\artifacts\order-complaint-history\ROLLBACK.sh
+ROLLBACK_BASELINE (rollback input): C:\Users\0\.codex\worktrees\2a5f\ldxp\artifacts\order-complaint-history\ROLLBACK_BASELINE
+
+ARTIFACT SHA256
+---------------
+MODIFIED_FILE  E305CCA4DCBFD5E1731A6F7B527BDE94EC02B57058CC5A0AF6BE8E439B84A5BA
+DIFF_FILE      94C9E2F5300FBB2495D0CE5213ACD8634BD63FB012564CAAD2834D50424791C8
+ROLLBACK_BASELINE  1E0749A823EB04B9EACAE3D3C658C7ACD7315BA1C2E4CD2BF89D5DD003CFA96B
+
+BASELINE TEST (input = git archive 357b0ca extracted to .runtime/task10/final/baseline-run-357b0ca)
+-------------------------------------------------------------------------------------
+Command: python -m unittest discover -s backend -p 'test*.py' -q
+Literal output:
+Ran 158 tests in 1.870s
+
+OK
+EXIT_STATUS=0
+Result: PASS (158 backend tests).
+
+Command: npm ci
+Literal output:
+
+added 61 packages in 9s
+
+9 packages are looking for funding
+  run `npm fund` for details
+EXIT_STATUS=0
+Result: PASS (dependencies installed from frontend/package-lock.json).
+
+Command: npm test
+Literal output (tail):
+ℹ tests 39
+ℹ suites 0
+ℹ pass 39
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+EXIT_STATUS=0
+Result: PASS (39 frontend tests).
+
+Command: npm run build
+Literal output (tail):
+[32m✓ built in 4.17s[39m
+EXIT_STATUS=0
+Result: PASS (Vite production build).
+
+MODIFIED TEST (input = current checkout d38501f)
+-------------------------------------------------
+Command: python -m unittest discover -s backend -p 'test*.py' -q
+Literal output:
+Ran 166 tests in 1.677s
+
+OK
+EXIT_STATUS=0
+Result: PASS (166 backend tests).
+
+Command: npm test
+Literal output (tail):
+ℹ tests 41
+ℹ suites 0
+ℹ pass 41
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+EXIT_STATUS=0
+Result: PASS (41 frontend tests).
+
+Command: npm run build
+Literal output (tail):
+[32m✓ built in 411ms[39m
+EXIT_STATUS=0
+Result: PASS (Vite production build).
+
+Command: git diff --check 357b0ca HEAD
+Literal output: (empty)
+EXIT_STATUS=0
+Result: PASS (no whitespace errors).
+
+ROLLBACK TEST (input = MODIFIED_FILE extracted to .runtime/task10/final/rollback-test-d38501f)
+---------------------------------------------------------------------------------------------
+Command (run from artifacts/order-complaint-history; Windows PowerShell):
+$sb=[scriptblock]::Create((Get-Content -Raw -LiteralPath './ROLLBACK.sh')); & $sb 'C:\Users\0\.codex\worktrees\2a5f\ldxp\.runtime\task10\final\rollback-test-d38501f'
+Literal output:
+Restored C:\Users\0\.codex\worktrees\2a5f\ldxp\.runtime\task10\final\rollback-test-d38501f to main 357b0ca; verified 11 files; MODIFIED_FILE unchanged E305CCA4DCBFD5E1731A6F7B527BDE94EC02B57058CC5A0AF6BE8E439B84A5BA
+EXIT_STATUS=0
+Result: PASS. All 11 selected files in the copy match the baseline SHA256 values; MODIFIED_FILE remains the modified archive hash above.
+Restored behavior/status: the rollback copy contains main 357b0ca source bytes and is ready for baseline tests; the working checkout and MODIFIED_FILE remain on the modified branch d38501f.
+
+SOURCE HASH COVERAGE
+--------------------
+The rollback script verifies these 11 files against baseline SHA256 values before reporting success:
+backend/main.py
+backend/order_query/client.py
+backend/order_query/complaint.py
+backend/order_query/routes.py
+backend/order_query/service.py
+backend/order_query/sessions.py
+backend/test_order_query_modules.py
+frontend/src/OrderQueryView.jsx
+frontend/src/orderQuery.css
+frontend/src/orderQueryModel.js
+frontend/src/orderQueryModel.test.js
