@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from unittest.mock import patch
 from io import BytesIO
 from pathlib import Path
@@ -211,8 +212,20 @@ class GoodsParserTests(unittest.TestCase):
                 "market_price": 3,
                 "description": "<p>说明 <strong>文本</strong></p>",
                 "contact_format": "any",
+                "coupon_status": 1,
                 "category": {"name": "测试分类"},
                 "user": {"nickname": "测试店铺"},
+                "multipleoffers": {
+                    "available": 1,
+                    "discount_type": 1,
+                    "rules": [{"condition": 10, "value": 8.8}],
+                },
+                "discount": {"available": 1, "rebate": 9.5},
+                "fullgift": {
+                    "available": 1,
+                    "gift_type": 1,
+                    "rules": [{"condition": 20, "value": 2}],
+                },
                 "extend": {"limit_count": 2, "query_password_status": 1},
             },
         }
@@ -223,6 +236,14 @@ class GoodsParserTests(unittest.TestCase):
         self.assertTrue(item["query_password_required"])
         self.assertEqual(item["description"], "说明 文本")
         self.assertEqual(item["stock_label"], "接口未公开数量")
+        tags = {tag["key"]: tag for tag in item["commerce_tags"]}
+        self.assertEqual(tags["multiple_offers"]["detail"], "购10件享8.8折")
+        self.assertEqual(tags["discount"]["detail"], "当前享9.5折")
+        self.assertEqual(tags["full_gift"]["detail"], "购20件赠2件")
+        self.assertEqual(tags["delivery"]["label"], "自动发货")
+        self.assertEqual(tags["minimum"]["label"], "2件起购")
+        self.assertIn("coupon", tags)
+        self.assertIn("query_password", tags)
 
     def test_accepts_shop_urls_and_rejects_foreign_hosts(self):
         token, url = main.parse_shop_url("https://pay.ldxp.cn/shop/SHOPTEST")
@@ -257,6 +278,9 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(item["specs"]["累计销量"], 12)
         self.assertEqual(item["limit_count"], 1)
         self.assertTrue(item["query_password_required"])
+        tags = {tag["key"]: tag for tag in item["commerce_tags"]}
+        self.assertEqual(tags["delivery"]["label"], "自动发货")
+        self.assertEqual(tags["minimum"]["label"], "1件起购")
 
     def test_checkout_treats_limit_count_as_minimum_purchase(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1127,6 +1151,38 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual([item["id"] for item in accounts], [1, 2, 3])
 
+    def test_sub2api_monitor_summary_reports_account_and_proxy_health(self):
+        now = datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc)
+        accounts = [
+            {"id": 1, "name": "Ready", "platform": "openai", "status": "active", "schedulable": True},
+            {
+                "id": 2, "name": "Limited", "platform": "openai", "status": "active", "schedulable": False,
+                "rate_limit_reset_at": "2026-08-30T09:00:00Z", "expires_at": 1788253200,
+            },
+            {
+                "id": 3, "name": "Broken", "platform": "anthropic", "status": "error", "schedulable": False,
+                "error_message": "Token revoked (401)", "updated_at": "2026-08-30T07:30:00Z",
+            },
+        ]
+        proxies = [
+            {"status": "active", "latency_status": "success"},
+            {"status": "active", "latency_status": "timeout", "expires_at": "2026-09-02T08:00:00Z"},
+        ]
+        groups = [{"status": "active"}, {"status": "inactive"}]
+
+        result = main._sub2api_monitor_summary(accounts, proxies, groups, now=now)
+
+        self.assertEqual(result["total_accounts"], 3)
+        self.assertEqual(result["active_accounts"], 2)
+        self.assertEqual(result["error_accounts"], 1)
+        self.assertEqual(result["schedulable_accounts"], 1)
+        self.assertEqual(result["rate_limited_accounts"], 1)
+        self.assertEqual(result["unhealthy_proxies"], 1)
+        self.assertEqual(result["expiring_proxies"], 1)
+        self.assertEqual(result["inactive_groups"], 1)
+        self.assertEqual(result["recent_errors"][0]["name"], "Broken")
+        self.assertEqual(result["platforms"][0]["platform"], "openai")
+
     def test_sub2api_automation_requires_import_proxy_group_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "test.db"
@@ -1214,6 +1270,7 @@ class GoodsParserTests(unittest.TestCase):
             "last_result": None,
             "pending_card_codes": ["team-CARD-1"],
             "imported_order_nos": [],
+            "run_history": [],
         }
         reclaim = {
             "ok": True,
@@ -1237,6 +1294,7 @@ class GoodsParserTests(unittest.TestCase):
         self.assertTrue(result["result"]["imported"])
         self.assertEqual(stored[-1]["pending_card_codes"], [])
         self.assertEqual(stored[-1]["imported_order_nos"], [])
+        self.assertEqual(stored[-1]["run_history"][-1]["status"], "success")
 
     def test_sub2api_automation_and_reclaim_progress_routes(self):
         with tempfile.TemporaryDirectory() as directory:

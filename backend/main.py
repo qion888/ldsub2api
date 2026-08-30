@@ -288,6 +288,115 @@ def _money(value: Any) -> str:
         return str(value)
 
 
+def _compact_number(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        number = Decimal(str(value))
+        return format(number.normalize(), "f")
+    except (InvalidOperation, ValueError):
+        return str(value)
+
+
+def _upstream_enabled(value: Any) -> bool:
+    return value is True or str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def commerce_tags_from_goods(item: dict[str, Any]) -> list[dict[str, str]]:
+    extend = item.get("extend") if isinstance(item.get("extend"), dict) else {}
+    tags: list[dict[str, str]] = []
+
+    multiple = item.get("multipleoffers") if isinstance(item.get("multipleoffers"), dict) else {}
+    multiple_rules = multiple.get("rules") if isinstance(multiple.get("rules"), list) else []
+    if _upstream_enabled(multiple.get("available")) and multiple_rules:
+        details = []
+        discount_type = str(multiple.get("discount_type") or "")
+        for rule in multiple_rules:
+            if not isinstance(rule, dict):
+                continue
+            condition = _compact_number(rule.get("condition"))
+            value = _compact_number(rule.get("value"))
+            if not condition or not value:
+                continue
+            if discount_type == "1":
+                details.append(f"购{condition}件享{value}折")
+            elif discount_type == "2":
+                details.append(f"购{condition}件减{value}元")
+            else:
+                details.append(f"购{condition}件优惠{value}")
+        tags.append({
+            "key": "multiple_offers",
+            "label": "多件折扣",
+            "tone": "promotion",
+            "detail": "；".join(details) or "购买多件可享优惠",
+        })
+
+    discount = item.get("discount") if isinstance(item.get("discount"), dict) else {}
+    if _upstream_enabled(discount.get("available")):
+        rebate = _compact_number(discount.get("rebate"))
+        tags.append({
+            "key": "discount",
+            "label": "折扣优惠",
+            "tone": "promotion",
+            "detail": f"当前享{rebate}折" if rebate else "当前商品参与折扣",
+        })
+
+    fullgift = item.get("fullgift") if isinstance(item.get("fullgift"), dict) else {}
+    gift_rules = fullgift.get("rules") if isinstance(fullgift.get("rules"), list) else []
+    if _upstream_enabled(fullgift.get("available")):
+        details = []
+        for rule in gift_rules:
+            if not isinstance(rule, dict):
+                continue
+            condition = _compact_number(rule.get("condition"))
+            value = _compact_number(rule.get("value"))
+            if condition and value:
+                details.append(f"购{condition}件赠{value}件")
+        tags.append({
+            "key": "full_gift",
+            "label": "满件赠送",
+            "tone": "promotion",
+            "detail": "；".join(details) or "达到门槛可获赠品",
+        })
+
+    if str(item.get("goods_type") or "").strip().lower() == "card":
+        tags.append({
+            "key": "delivery",
+            "label": "自动发货",
+            "tone": "success",
+            "detail": "卡密商品付款后由平台自动交付",
+        })
+
+    limit_value = _first_value(extend, ("limit_count", "limit"))
+    try:
+        minimum = max(1, int(limit_value or 1))
+    except (TypeError, ValueError):
+        minimum = 1
+    tags.append({
+        "key": "minimum",
+        "label": f"{minimum}件起购",
+        "tone": "info",
+        "detail": f"单次购买数量不得少于{minimum}件",
+    })
+
+    if _upstream_enabled(item.get("coupon_status")):
+        tags.append({
+            "key": "coupon",
+            "label": "支持优惠券",
+            "tone": "offer",
+            "detail": "结算时可输入有效优惠券",
+        })
+
+    if _upstream_enabled(extend.get("query_password_status")):
+        tags.append({
+            "key": "query_password",
+            "label": "密码保护",
+            "tone": "secure",
+            "detail": "查询订单或领取卡密时需要安全密码",
+        })
+    return tags
+
+
 def is_unlisted_error(value: Any) -> bool:
     message = str(value or "")
     return any(marker in message for marker in UNLISTED_ERROR_MARKERS)
@@ -311,7 +420,7 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "商品分类": category.get("name") or "未分类",
         "最低起购": limit_count if limit_count not in (None, "", 0) else 1,
         "联系方式": item.get("contact_format") or "任意",
-        "查询密码": "需要" if extend.get("query_password_status") == 1 else "不需要",
+        "查询密码": "需要" if _upstream_enabled(extend.get("query_password_status")) else "不需要",
         "店铺": seller.get("nickname") or "链动小铺",
     }
     return {
@@ -329,7 +438,8 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "specs": specs,
         "limit_count": int(limit_count) if str(limit_count or "").isdigit() else None,
         "contact_format": str(item.get("contact_format") or "any"),
-        "query_password_required": extend.get("query_password_status") == 1,
+        "query_password_required": _upstream_enabled(extend.get("query_password_status")),
+        "commerce_tags": commerce_tags_from_goods(item),
         "source_url": str(item.get("link") or f"https://{ALLOWED_HOST}/item/{goods_key}"),
         "raw_data": item,
     }
@@ -581,7 +691,7 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
         "商品类型": item.get("goods_type") or "未知",
         "商品分类": category.get("name") or item.get("category_name") or "未分类",
         "最低起购": limit_count if limit_count not in (None, "", 0) else 1,
-        "查询密码": "需要" if extend.get("query_password_status") == 1 else "未知",
+        "查询密码": "需要" if _upstream_enabled(extend.get("query_password_status")) else "未知",
         "店铺": seller.get("nickname") or shop_token,
         "店铺Token": shop_token,
     }
@@ -602,7 +712,8 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
         "specs": specs,
         "limit_count": int(limit_count) if str(limit_count or "").isdigit() else None,
         "contact_format": str(item.get("contact_format") or "any"),
-        "query_password_required": extend.get("query_password_status") == 1,
+        "query_password_required": _upstream_enabled(extend.get("query_password_status")),
+        "commerce_tags": commerce_tags_from_goods(item),
         "source_url": f"https://{ALLOWED_HOST}/item/{goods_key}",
         "raw_data": item,
     }
@@ -683,6 +794,15 @@ def serialize_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
         result["specs"]["最低起购"] = legacy_limit
     limit_value = result["specs"].get("最低起购")
     result["limit_count"] = int(limit_value) if str(limit_value).isdigit() else None
+    commerce_source = dict(result["raw_data"])
+    commerce_extend = commerce_source.get("extend") if isinstance(commerce_source.get("extend"), dict) else {}
+    commerce_extend = dict(commerce_extend)
+    if result["limit_count"] is not None:
+        commerce_extend.setdefault("limit_count", result["limit_count"])
+    if result["query_password_required"]:
+        commerce_extend.setdefault("query_password_status", 1)
+    commerce_source["extend"] = commerce_extend
+    result["commerce_tags"] = commerce_tags_from_goods(commerce_source)
     return result
 
 
@@ -1125,6 +1245,7 @@ def sub2api_automation_state() -> dict[str, Any]:
         "last_result": None,
         "pending_card_codes": [],
         "imported_order_nos": [],
+        "run_history": [],
     }
     value = _setting_json("sub2api_automation_state", fallback)
     if not isinstance(value, dict):
@@ -1133,12 +1254,15 @@ def sub2api_automation_state() -> dict[str, Any]:
     value["pending_card_codes"] = pending if isinstance(pending, list) else []
     imported = value.get("imported_order_nos")
     value["imported_order_nos"] = imported if isinstance(imported, list) else []
+    history = value.get("run_history")
+    value["run_history"] = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
     return {
         "last_run": value.get("last_run"),
         "last_error": str(value.get("last_error") or "")[:500],
         "last_result": value.get("last_result") if isinstance(value.get("last_result"), dict) else None,
         "pending_card_codes": value["pending_card_codes"][:100],
         "imported_order_nos": value["imported_order_nos"][-500:],
+        "run_history": value["run_history"][-20:],
     }
 
 
@@ -1663,6 +1787,116 @@ def reclaim_sub2api_401_accounts(
     }
 
 
+def _sub2api_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().replace(".", "", 1).isdigit():
+            return datetime.fromtimestamp(float(value), timezone.utc)
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _sub2api_monitor_summary(
+    accounts: list[dict[str, Any]],
+    proxies: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now(timezone.utc)
+    expiring_cutoff = current.timestamp() + (7 * 86400)
+    platform_counts: dict[str, dict[str, int]] = {}
+    recent_errors = []
+    active_accounts = 0
+    error_accounts = 0
+    schedulable_accounts = 0
+    rate_limited_accounts = 0
+    expiring_accounts = 0
+
+    for account in accounts:
+        status = str(account.get("status") or "unknown").strip().lower()
+        platform = str(account.get("platform") or "unknown").strip().lower() or "unknown"
+        bucket = platform_counts.setdefault(platform, {"count": 0, "errors": 0})
+        bucket["count"] += 1
+        if status == "active":
+            active_accounts += 1
+        if bool(account.get("schedulable", status == "active")):
+            schedulable_accounts += 1
+        error_message = str(account.get("error_message") or "").strip()
+        if status == "error" or error_message:
+            error_accounts += 1
+            bucket["errors"] += 1
+            recent_errors.append({
+                "id": account.get("id"),
+                "name": str(account.get("name") or f"账号 {account.get('id') or '-'}")[:160],
+                "platform": platform,
+                "status": status,
+                "error": error_message[:300] or "账号状态异常",
+                "updated_at": account.get("updated_at"),
+            })
+        account_expiry = _sub2api_datetime(account.get("expires_at"))
+        if account_expiry and current.timestamp() <= account_expiry.timestamp() <= expiring_cutoff:
+            expiring_accounts += 1
+        limited_until = max(
+            (
+                stamp.timestamp()
+                for stamp in (
+                    _sub2api_datetime(account.get("rate_limit_reset_at")),
+                    _sub2api_datetime(account.get("overload_until")),
+                    _sub2api_datetime(account.get("temp_unschedulable_until")),
+                )
+                if stamp is not None
+            ),
+            default=0,
+        )
+        if limited_until > current.timestamp():
+            rate_limited_accounts += 1
+
+    def error_sort_key(item: dict[str, Any]) -> float:
+        stamp = _sub2api_datetime(item.get("updated_at"))
+        return stamp.timestamp() if stamp else 0
+
+    recent_errors.sort(key=error_sort_key, reverse=True)
+    active_proxies = sum(1 for proxy in proxies if str(proxy.get("status") or "").lower() == "active")
+    unhealthy_proxies = sum(
+        1
+        for proxy in proxies
+        if str(proxy.get("status") or "").lower() not in ("", "active")
+        or str(proxy.get("latency_status") or "").lower() in {"error", "failed", "timeout", "unreachable"}
+    )
+    expiring_proxies = sum(
+        1
+        for proxy in proxies
+        if (expiry := _sub2api_datetime(proxy.get("expires_at")))
+        and current.timestamp() <= expiry.timestamp() <= expiring_cutoff
+    )
+    inactive_groups = sum(1 for group in groups if str(group.get("status") or "").lower() not in ("", "active"))
+    platforms = [
+        {"platform": platform, **counts}
+        for platform, counts in sorted(platform_counts.items(), key=lambda item: (-item[1]["count"], item[0]))
+    ]
+    return {
+        "fetched_at": utc_now(),
+        "total_accounts": len(accounts),
+        "active_accounts": active_accounts,
+        "error_accounts": error_accounts,
+        "inactive_accounts": max(0, len(accounts) - active_accounts - error_accounts),
+        "schedulable_accounts": schedulable_accounts,
+        "unschedulable_accounts": max(0, len(accounts) - schedulable_accounts),
+        "rate_limited_accounts": rate_limited_accounts,
+        "expiring_accounts": expiring_accounts,
+        "active_proxies": active_proxies,
+        "unhealthy_proxies": unhealthy_proxies,
+        "expiring_proxies": expiring_proxies,
+        "inactive_groups": inactive_groups,
+        "platforms": platforms,
+        "recent_errors": recent_errors[:8],
+    }
+
+
 def fetch_sub2api_options() -> dict[str, Any]:
     config = sub2api_settings(reveal=True)
     if not config["admin_key"]:
@@ -1700,6 +1934,14 @@ def fetch_sub2api_options() -> dict[str, Any]:
             "port": port,
             "status": str(item.get("status") or ""),
             "account_count": account_count,
+            "expires_at": item.get("expires_at"),
+            "fallback_mode": str(item.get("fallback_mode") or "none"),
+            "latency_ms": item.get("latency_ms"),
+            "latency_status": str(item.get("latency_status") or ""),
+            "quality_grade": str(item.get("quality_grade") or ""),
+            "quality_score": item.get("quality_score"),
+            "country_code": str(item.get("country_code") or ""),
+            "region": str(item.get("region") or "")[:120],
         })
 
     groups = []
@@ -1717,8 +1959,11 @@ def fetch_sub2api_options() -> dict[str, Any]:
             "platform": str(item.get("platform") or ""),
             "status": str(item.get("status") or ""),
             "account_count": account_count,
+            "subscription_type": str(item.get("subscription_type") or ""),
+            "rate_multiplier": item.get("rate_multiplier"),
         })
 
+    accounts = _sub2api_fetch_accounts(config)
     return {
         "ok": True,
         "proxy_service_available": True,
@@ -1726,6 +1971,7 @@ def fetch_sub2api_options() -> dict[str, Any]:
         "group_count": len(groups),
         "proxies": proxies,
         "groups": groups,
+        "monitor": _sub2api_monitor_summary(accounts, proxies, groups),
     }
 
 
@@ -1965,6 +2211,10 @@ def run_sub2api_automation_cycle() -> dict[str, Any]:
         "last_result": summary,
         "pending_card_codes": pending,
         "imported_order_nos": imported_order_nos,
+        "run_history": (
+            state.get("run_history", [])
+            + [{"run_at": utc_now(), "status": "success", **summary}]
+        )[-20:],
     }
     _store_sub2api_automation_state(state)
     return {"ok": True, "settings": settings, "state": state, "result": summary}
@@ -2457,6 +2707,10 @@ class Sub2ApiAutomationWorker(threading.Thread):
                 "last_result": previous.get("last_result"),
                 "pending_card_codes": previous.get("pending_card_codes", []),
                 "imported_order_nos": previous.get("imported_order_nos", []),
+                "run_history": (
+                    previous.get("run_history", [])
+                    + [{"run_at": utc_now(), "status": "error", "error": str(exc)[:500]}]
+                )[-20:],
             }
             _store_sub2api_automation_state(state)
             return {"ok": False, "detail": state["last_error"], "state": state}
