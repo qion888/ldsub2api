@@ -254,8 +254,10 @@ function Sub2ApiUsageStack({account, usage, usageError}) {
       <span><Activity size={13}/>{sourceLabel}</span>
       {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
     </div>
-    <Sub2ApiUsageWindow label="5 小时窗口" window={fiveHour} tone="five-hour" testId={`usage-5h-${account.id}`}/>
-    <Sub2ApiUsageWindow label="7 天窗口" window={sevenDay} tone="seven-day" testId={`usage-7d-${account.id}`}/>
+    <div className="account-usage-windows">
+      <Sub2ApiUsageWindow label="5 小时窗口" window={fiveHour} tone="five-hour" testId={`usage-5h-${account.id}`}/>
+      <Sub2ApiUsageWindow label="7 天窗口" window={sevenDay} tone="seven-day" testId={`usage-7d-${account.id}`}/>
+    </div>
     {usageError && <small className="account-usage-error"><AlertCircle size={13}/>{usageError}</small>}
   </div>;
 }
@@ -271,7 +273,18 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
         <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
       </div>
       <div className="account-table-wrap">
-        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 计费</th><th>实时状态</th><th>本地计费额度</th><th>上游使用窗口</th><th>代理 / 分组</th><th>操作</th></tr></thead><tbody>
+        <table className="account-table">
+          <colgroup>
+            <col className="account-col-identity"/>
+            <col className="account-col-platform"/>
+            <col className="account-col-state"/>
+            <col className="account-col-quota"/>
+            <col className="account-col-usage"/>
+            <col className="account-col-routing"/>
+            <col className="account-col-actions"/>
+          </colgroup>
+          <thead><tr><th scope="col">账号信息</th><th scope="col">平台计费</th><th scope="col">调度状态</th><th scope="col">本地额度</th><th scope="col">上游用量</th><th scope="col">路由归属</th><th scope="col">操作</th></tr></thead>
+          <tbody>
           {items.length ? items.map(account => {
             const id = Number(account.id);
             const test = tested[id];
@@ -283,16 +296,29 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
             const usageError = usageErrors[String(account.id)] || usageErrors[account.id] || usageErrors._;
             const accountName = account.name || `账号 ${account.id}`;
             return <tr key={account.id} data-account-state={state.key}>
-              <td><div className="account-name-line"><strong title={accountName}>{accountName}</strong><IconButton label={`复制账号名称：${accountName}`} onClick={() => onCopyName(account)}><Clipboard size={13}/></IconButton></div><small>#{account.id} · 创建于 {formatSub2ApiDateTime(account.created_at)}</small><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td>
-              <td><strong>{account.platform || '--'}</strong><small>{account.type || '--'}</small><Tooltip label="账号费用 = 标准费用 × 账号倍率"><span className="account-billing-rate">{Number.isFinite(multiplier) && multiplier === 0 ? '免费计费' : `账号倍率 ×${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '--'}`}</span></Tooltip><small>并发 {concurrency}</small></td>
-              <td><span className={`account-status ${state.tone}`}>{state.label}</span><small className="account-status-detail" title={state.detail}>{state.detail}</small></td>
-              <td><Sub2ApiQuotaStack account={account}/></td>
-              <td><Sub2ApiUsageStack account={account} usage={usage} usageError={usageError}/></td>
-              <td><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td>
-              <td><div className="account-row-actions"><IconButton label={test ? '重新测试账号' : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `测试通过 · ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td>
+              <td className="account-identity-cell" data-label="账号信息">
+                <div className="account-identity">
+                  <div className="account-name-line"><strong title={accountName}>{accountName}</strong><IconButton label={`复制账号名称：${accountName}`} onClick={() => onCopyName(account)}><Clipboard size={13}/></IconButton></div>
+                  <div className="account-identity-meta"><span>#{account.id}</span><span>创建 {formatSub2ApiDateTime(account.created_at)}</span></div>
+                  <small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small>
+                </div>
+              </td>
+              <td className="account-platform-cell" data-label="平台计费">
+                <div className="account-platform-block">
+                  <div className="account-platform-name"><strong>{account.platform || '--'}</strong><span>{account.type || '--'}</span></div>
+                  <Tooltip label="账号费用 = 标准费用 × 账号倍率"><span className="account-billing-rate">{Number.isFinite(multiplier) && multiplier === 0 ? '免费计费' : `账号倍率 ×${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '--'}`}</span></Tooltip>
+                  <div className="account-concurrency"><span>并发</span><strong>{concurrency}</strong></div>
+                </div>
+              </td>
+              <td className="account-state-cell" data-label="调度状态"><div className="account-state-block"><span className={`account-status ${state.tone}`}>{state.label}</span><small className="account-status-detail" title={state.detail}>{state.detail}</small></div></td>
+              <td className="account-quota-cell" data-label="本地额度"><Sub2ApiQuotaStack account={account}/></td>
+              <td className="account-usage-cell" data-label="上游用量"><Sub2ApiUsageStack account={account} usage={usage} usageError={usageError}/></td>
+              <td className="account-routing-cell" data-label="路由归属"><div className="account-routing"><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></div></td>
+              <td className="account-action-cell" data-label="操作"><div className="account-action-stack"><div className="account-row-actions"><IconButton label={test ? '重新测试账号' : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `测试通过 · ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</div></td>
             </tr>;
-          }) : <tr><td colSpan="7"><div className="account-table-empty">{busy ? <RefreshCw size={20} className="spin"/> : <Database size={20}/>}<span>{busy ? '正在加载账号列表' : error || '暂无匹配账号'}</span></div></td></tr>}
-        </tbody></table>
+          }) : <tr className="account-empty-row"><td colSpan="7"><div className="account-table-empty">{busy ? <RefreshCw size={20} className="spin"/> : <Database size={20}/>}<span>{busy ? '正在加载账号列表' : error || '暂无匹配账号'}</span></div></td></tr>}
+          </tbody>
+        </table>
       </div>
       <div className="account-pagination"><span>共 {data?.total ?? 0} 个账号 · 第 {data?.page || 1} / {data?.pages || 1} 页</span><div><IconButton label="上一页" onClick={() => onPage(Math.max(1, (data?.page || 1) - 1))} disabled={busy || (data?.page || 1) <= 1}><ChevronLeft size={16}/></IconButton><IconButton label="下一页" onClick={() => onPage(Math.min(data?.pages || 1, (data?.page || 1) + 1))} disabled={busy || (data?.page || 1) >= (data?.pages || 1)}><ChevronRight size={16}/></IconButton></div></div>
     </section>
