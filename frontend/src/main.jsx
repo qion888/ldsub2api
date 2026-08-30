@@ -906,6 +906,12 @@ function App() {
   const [sub2apiCodexFingerprintMode, setSub2apiCodexFingerprintMode] = useState('off');
   const [sub2apiReclaimBusy, setSub2apiReclaimBusy] = useState(false);
   const [sub2apiReclaimResult, setSub2apiReclaimResult] = useState(null);
+  const [sub2apiReclaimOrderNos, setSub2apiReclaimOrderNos] = useState([]);
+  const [sub2apiAccounts, setSub2apiAccounts] = useState({items: [], total: 0, page: 1, page_size: 12, pages: 1, usage: {}, usage_errors: {}});
+  const [sub2apiAccountFilters, setSub2apiAccountFilters] = useState({search: '', status: '', platform: ''});
+  const [sub2apiAccountBusy, setSub2apiAccountBusy] = useState(false);
+  const [sub2apiAccountActions, setSub2apiAccountActions] = useState({});
+  const [sub2apiTestedAccounts, setSub2apiTestedAccounts] = useState({});
   const [sub2apiAutomation, setSub2apiAutomation] = useState(DEFAULT_SUB2API_AUTOMATION);
   const [sub2apiAutomationState, setSub2apiAutomationState] = useState(null);
   const [sub2apiAutomationBusy, setSub2apiAutomationBusy] = useState(false);
@@ -1123,15 +1129,25 @@ function App() {
   useEffect(() => {
     if (activeView !== 'sub2api') return undefined;
     loadSub2ApiAutomation();
+    if (sub2apiConfig.admin_key_set) loadSub2ApiAccounts({quiet: true});
     const stateTimer = window.setInterval(() => loadSub2ApiAutomation(), 5000);
     const monitorTimer = window.setInterval(() => {
-      if (sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
+      if (sub2apiConfig.admin_key_set) {
+        loadSub2ApiOptions({quiet: true});
+        loadSub2ApiAccounts({quiet: true});
+      }
     }, 60000);
     return () => {
       window.clearInterval(stateTimer);
       window.clearInterval(monitorTimer);
     };
   }, [activeView, sub2apiConfig.admin_key_set]);
+
+  useEffect(() => {
+    if (activeView === 'sub2api' && sub2apiConfig.admin_key_set) {
+      loadSub2ApiAccounts({page: 1, quiet: true});
+    }
+  }, [activeView, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
 
   const fastestInterval = [...items, ...shops, ...preorders.filter(entry => entry.enabled)]
     .filter(item => item.enabled)
@@ -1820,6 +1836,8 @@ function App() {
     setSub2apiPayload(merged);
     setSub2apiFileName(filename);
     setSub2apiResult(null);
+    setSub2apiReclaimOrderNos([]);
+    setSub2apiReclaimOrderNos([...new Set(usable.map(item => item?.task?.order_no).filter(Boolean).map(String))].slice(0, 100));
     if (download) {
       const original = usable.length === 1 && usable[0].content_base64
         ? Uint8Array.from(window.atob(usable[0].content_base64), value => value.charCodeAt(0))
@@ -1888,6 +1906,7 @@ function App() {
       setSub2apiPayload(merged);
       setSub2apiFileName(files.length === 1 ? files[0].name : `${files.length} 个 JSON 文件`);
       setSub2apiResult(null);
+      setSub2apiReclaimOrderNos([]);
       notify(`已合并 ${files.length} 个文件、${merged.accounts.length} 个账号`);
     } catch (error) {
       setSub2apiPayload(null);
@@ -1934,6 +1953,60 @@ function App() {
       return null;
     } finally {
       setSub2apiOptionsBusy(false);
+    }
+  };
+
+  const loadSub2ApiAccounts = async ({page = 1, quiet = false} = {}) => {
+    if (!sub2apiConfig.admin_key_set) return null;
+    setSub2apiAccountBusy(true);
+    try {
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(sub2apiAccounts.page_size || 12),
+        search: sub2apiAccountFilters.search.trim(),
+        status: sub2apiAccountFilters.status,
+        platform: sub2apiAccountFilters.platform,
+      });
+      const result = await request(`/sub2api/accounts?${params.toString()}`);
+      setSub2apiAccounts(result);
+      return result;
+    } catch (error) {
+      if (!quiet) notify(error.message, 'error');
+      return null;
+    } finally {
+      setSub2apiAccountBusy(false);
+    }
+  };
+
+  const testSub2ApiAccount = async account => {
+    const id = Number(account?.id);
+    if (!Number.isInteger(id) || id < 1) return;
+    setSub2apiAccountActions(current => ({...current, [id]: 'test'}));
+    try {
+      const tested = await request(`/sub2api/accounts/${id}/test`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      setSub2apiTestedAccounts(current => ({...current, [id]: {...tested, tested_at: new Date().toISOString()}}));
+      notify(tested.ok ? `${account.name || `璐﹀彿 ${id}`} 娴嬭瘯閫氳繃` : `${account.name || `璐﹀彿 ${id}`} 娴嬭瘯澶辫触`, tested.ok ? 'info' : 'error');
+    } catch (error) {
+      setSub2apiTestedAccounts(current => ({...current, [id]: {ok: false, message: error.message, tested_at: new Date().toISOString()}}));
+      notify(error.message, 'error');
+    } finally {
+      setSub2apiAccountActions(current => ({...current, [id]: null}));
+    }
+  };
+
+  const deleteSub2ApiAccount = async account => {
+    const id = Number(account?.id);
+    if (!Number.isInteger(id) || id < 1) return;
+    if (!window.confirm(`纭畾鍒犻櫎璐﹀彿鈥?{account.name || id}鈥濓紵`)) return;
+    setSub2apiAccountActions(current => ({...current, [id]: 'delete'}));
+    try {
+      await request(`/sub2api/accounts/${id}`, {method: 'DELETE'});
+      notify('Sub2API 账号已删除');
+      await Promise.all([loadSub2ApiAccounts({page: sub2apiAccounts.page, quiet: true}), loadSub2ApiOptions({quiet: true})]);
+    } catch (error) {
+      notify(error.message, 'error');
+    } finally {
+      setSub2apiAccountActions(current => ({...current, [id]: null}));
     }
   };
 
@@ -2039,7 +2112,13 @@ function App() {
       const result = await request('/sub2api/automation/run', {method: 'POST'});
       setSub2apiAutomationState(result.state || null);
       const summary = result.result || result.state?.last_result;
-      notify(summary?.imported ? '自动找回完成，账号已导入 Sub2API' : '401 自动监控已执行');
+      const verification = summary?.import_result?.import_verification;
+      if (summary?.imported && verification && !verification.confirmed) {
+        notify(`自动导入未完全确认：${verification.matched}/${verification.expected} 个账号，请检查列表`, 'error');
+      } else {
+        notify(summary?.imported ? '自动找回完成，账号已导入 Sub2API' : '401 自动监控已执行');
+      }
+      if (summary?.imported) await loadSub2ApiAccounts({page: 1, quiet: true});
     } catch (error) {
       notify(error.message, 'error');
       await loadSub2ApiAutomation();
@@ -2060,13 +2139,29 @@ function App() {
         body: JSON.stringify({
           data: payload,
           assign_existing: assignExisting,
+          reclaim_order_nos: sub2apiReclaimOrderNos,
           proxy_id: proxyId,
           group_ids: sub2apiGroupIds,
           codex_fingerprint_mode: sub2apiCodexFingerprintMode,
         }),
       });
       setSub2apiResult(result);
-      notify('Sub2API 账号导入完成');
+      const verification = result.import_verification;
+      if (verification?.confirmed) {
+        notify(`导入并确认成功：${verification.matched} 个账号`);
+        setSub2apiPayload(null);
+        setReclaimPayload(null);
+        setSub2apiFileName('');
+        setSub2apiReclaimOrderNos([]);
+        await Promise.all([loadSub2ApiAccounts({page: 1, quiet: true}), loadSub2ApiOptions({quiet: true})]);
+        return;
+      }
+      if (verification) {
+        notify(`导入请求已返回，但仅确认 ${verification.matched}/${verification.expected} 个新账号，请检查账号列表`, 'error');
+        await loadSub2ApiAccounts({page: sub2apiAccounts.page, quiet: true});
+        return;
+      }
+      notify('Sub2API 导入请求已完成，请刷新账号列表确认结果', 'error');
     } catch (error) {
       notify(error.message, 'error');
     } finally {
@@ -2253,7 +2348,7 @@ function App() {
         ) : activeView === 'reclaim' ? (
           <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
         ) : (
-          <Sub2ApiView config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey} fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy} optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds} codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode} reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy} onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy} onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}/>
+          <Sub2ApiView config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey} fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy} optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds} codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode} reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy} onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy} onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()} accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters} accountBusy={sub2apiAccountBusy} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount}/>
         )}
       </main>
 
@@ -2297,7 +2392,47 @@ function ReclaimView({config, setConfig, cardCodes, setCardCodes, result, busy, 
   );
 }
 
-function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport}) {
+function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, actions, tested, onRefresh, onTest, onDelete, onPage}) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const usage = data?.usage && typeof data.usage === 'object' ? data.usage : {};
+  const formatQuota = value => {
+    if (value === null || value === undefined || value === '') return '--';
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toLocaleString('zh-CN', {maximumFractionDigits: 2}) : String(value);
+  };
+  const formatWindow = (account, key) => {
+    const accountUsage = usage[String(account.id)] || usage[account.id] || {};
+    const window = accountUsage?.[key] || account?.[key];
+    if (!window || typeof window !== 'object') return '--';
+    const used = window.used ?? window.usage ?? window.current;
+    const limit = window.limit ?? window.max;
+    if (used === undefined && limit === undefined) return '--';
+    return `${formatQuota(used)} / ${formatQuota(limit)}`;
+  };
+  const statusLabel = account => account.status === 'error' || account.error_message ? '异常' : account.status === 'active' ? '正常' : (account.status || '未知');
+  return (
+    <section className="account-management-panel">
+      <div className="account-management-head">
+        <div><span className="detail-kicker">SUB2API ACCOUNTS</span><h3>账号列表</h3><p>状态、额度、使用窗口和连接测试</p></div>
+        <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
+      </div>
+      <div className="account-table-wrap">
+        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 类型</th><th>状态</th><th>额度总量</th><th>日额度</th><th>周额度</th><th>5 小时窗口</th><th>7 天窗口</th><th>并发 / 分组</th><th>操作</th></tr></thead><tbody>
+          {items.length ? items.map(account => {
+            const id = Number(account.id);
+            const test = tested[id];
+            const accountGroups = Array.isArray(account.groups) ? account.groups.map(group => group.name).filter(Boolean).join('、') : '';
+            const error = account.error_message || account.temp_unschedulable_reason;
+            return <tr key={account.id}><td><strong>{account.name || `账号 ${account.id}`}</strong><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td><td><span>{account.platform || '--'}</span><small>{account.type || '--'}</small></td><td><span className={`account-status ${statusLabel(account) === '正常' ? 'ok' : 'bad'}`}>{statusLabel(account)}</span><small>{account.schedulable === false ? '不可调度' : '可调度'}{error ? ` · ${String(error).slice(0, 48)}` : ''}</small></td><td><strong>{formatQuota(account.quota_used)} / {formatQuota(account.quota_limit)}</strong></td><td>{formatQuota(account.quota_daily_used)} / {formatQuota(account.quota_daily_limit)}</td><td>{formatQuota(account.quota_weekly_used)} / {formatQuota(account.quota_weekly_limit)}</td><td>{formatWindow(account, 'five_hour')}</td><td>{formatWindow(account, 'seven_day')}</td><td><strong>{account.current_concurrency ?? account.concurrency ?? 0}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td><td><div className="account-row-actions"><IconButton label={test ? (test.ok ? '已测试' : '重新测试') : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `已测试 ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td></tr>;
+          }) : <tr><td colSpan="10"><div className="account-table-empty"><Database size={20}/><span>{busy ? '正在加载账号列表' : '暂无匹配账号'}</span></div></td></tr>}
+        </tbody></table>
+      </div>
+      <div className="account-pagination"><span>共 {data?.total ?? 0} 个账号 · 第 {data?.page || 1} / {data?.pages || 1} 页</span><div><IconButton label="上一页" onClick={() => onPage(Math.max(1, (data?.page || 1) - 1))} disabled={busy || (data?.page || 1) <= 1}><ChevronLeft size={16}/></IconButton><IconButton label="下一页" onClick={() => onPage(Math.min(data?.pages || 1, (data?.page || 1) + 1))} disabled={busy || (data?.page || 1) >= (data?.pages || 1)}><ChevronRight size={16}/></IconButton></div></div>
+    </section>
+  );
+}
+
+function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -2426,6 +2561,19 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payloa
             <div className="account-alert-list">{recentErrors.length ? recentErrors.map(account => <div key={account.id || account.name}><TriangleAlert size={15}/><span><strong>{account.name}</strong><small>{account.platform} · {account.error}</small></span><em>{account.status}</em></div>) : <div className="compact-empty"><ShieldCheck size={16}/>当前没有账号异常</div>}</div>
           </section>
         </div>
+
+        <Sub2ApiAccountsPanel
+          data={accountsData}
+          filters={accountFilters}
+          onFiltersChange={patch => { onAccountFiltersChange({...accountFilters, ...patch}); }}
+          busy={accountBusy}
+          actions={accountActions}
+          tested={testedAccounts}
+          onRefresh={onLoadAccounts}
+          onTest={onTestAccount}
+          onDelete={onDeleteAccount}
+          onPage={page => onLoadAccounts({page})}
+        />
       </div>
     </section>
   );

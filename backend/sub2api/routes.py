@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from .constants import DEFAULT_URL
@@ -17,6 +18,8 @@ def handle_get(
     automation_settings_loader: Callable[[], dict[str, Any]],
     automation_state_loader: Callable[[], dict[str, Any]],
     options_loader: Callable[[], dict[str, Any]],
+    account_loader: Callable[[dict[str, list[str]]], dict[str, Any]] | None = None,
+    query_values: dict[str, list[str]] | None = None,
 ) -> bool:
     if path == "/api/sub2api/config":
         send_json(settings_loader(), 200)
@@ -39,6 +42,16 @@ def handle_get(
         except RuntimeError as exc:
             send_json({"detail": str(exc)}, 502)
         return True
+    if path == "/api/sub2api/accounts":
+        if account_loader is None:
+            return False
+        try:
+            send_json(account_loader(query_values or {}), 200)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        except RuntimeError as exc:
+            send_json({"detail": str(exc)}, 502)
+        return True
     return False
 
 
@@ -48,10 +61,11 @@ def handle_post(
     *,
     send_json: SendJson,
     test_connection: Callable[[], dict[str, Any]],
-    reclaim_accounts: Callable[[], dict[str, Any]],
-    refresh_reclaim: Callable[[list[str]], dict[str, Any]],
+    reclaim_accounts: Callable[..., dict[str, Any]],
+    refresh_reclaim: Callable[..., dict[str, Any]],
     run_automation: Callable[[], dict[str, Any]],
     import_payload: Callable[..., dict[str, Any]],
+    test_account: Callable[[int], dict[str, Any]] | None = None,
 ) -> bool:
     if path == "/api/sub2api/test":
         try:
@@ -62,9 +76,26 @@ def handle_post(
             send_json({"detail": str(exc)}, 502)
         return True
 
+    account_test = re.fullmatch(r"/api/sub2api/accounts/(\d+)/test", path)
+    if account_test:
+        if test_account is None:
+            return False
+        try:
+            send_json(test_account(int(account_test.group(1))), 200)
+        except (TypeError, ValueError) as exc:
+            send_json({"detail": str(exc)}, 400)
+        except RuntimeError as exc:
+            send_json({"detail": str(exc)}, 502)
+        return True
+
     if path in ("/api/sub2api/reclaim-401", "/api/sub2api/reclaim401"):
         try:
-            result = reclaim_accounts()
+            exclude_order_nos = data.get("exclude_order_nos")
+            result = (
+                reclaim_accounts(exclude_order_nos=exclude_order_nos)
+                if isinstance(exclude_order_nos, list)
+                else reclaim_accounts()
+            )
             if not isinstance(result, dict):
                 send_json({"detail": "401 找回返回格式无效"}, 502)
                 return True
@@ -87,7 +118,12 @@ def handle_post(
             send_json({"detail": "请提供 card_codes 数组"}, 400)
             return True
         try:
-            result = refresh_reclaim(raw_codes)
+            exclude_order_nos = data.get("exclude_order_nos")
+            result = (
+                refresh_reclaim(raw_codes, exclude_order_nos=exclude_order_nos)
+                if isinstance(exclude_order_nos, list)
+                else refresh_reclaim(raw_codes)
+            )
             send_json(result, 200 if result["ok"] else 502)
         except ValueError as exc:
             send_json({"detail": str(exc)}, 400)
@@ -114,6 +150,7 @@ def handle_post(
                 ),
                 assign_existing=data.get("assign_existing") if "assign_existing" in data else None,
                 endpoint=str(data.get("endpoint") or "/api/v1/admin/accounts/data"),
+                reclaim_order_nos=data.get("reclaim_order_nos"),
             )
             send_json(result, 200)
         except (TypeError, ValueError) as exc:
@@ -122,6 +159,26 @@ def handle_post(
             send_json({"detail": str(exc)}, 502)
         return True
     return False
+
+
+def handle_delete(
+    path: str,
+    *,
+    send_json: SendJson,
+    delete_account: Callable[[int], dict[str, Any]] | None = None,
+) -> bool:
+    account_match = re.fullmatch(r"/api/sub2api/accounts/(\d+)", path)
+    if not account_match:
+        return False
+    if delete_account is None:
+        return False
+    try:
+        send_json(delete_account(int(account_match.group(1))), 200)
+    except (TypeError, ValueError) as exc:
+        send_json({"detail": str(exc)}, 400)
+    except RuntimeError as exc:
+        send_json({"detail": str(exc)}, 502)
+    return True
 
 
 def handle_put(

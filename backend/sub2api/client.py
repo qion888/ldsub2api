@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any, Callable
 from urllib.parse import urlencode
 
@@ -83,6 +84,256 @@ def codex_accounts(
     for account_type in ("oauth", "setup-token"):
         result.extend(accounts_loader(config, platform="openai", account_type=account_type))
     return result
+
+
+def _account_identity(account: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(account.get("name") or "").strip(),
+        str(account.get("platform") or "").strip().lower(),
+        str(account.get("type") or "").strip().lower(),
+    )
+
+
+def _positive_account_id(account: dict[str, Any]) -> int | None:
+    try:
+        account_id = int(account.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return account_id if account_id > 0 else None
+
+
+def _import_counts(payload: Any, expected: int) -> tuple[int, int]:
+    value = payload_data(payload)
+    if not isinstance(value, dict):
+        return expected, 0
+    accepted_value = value.get("success", value.get("account_created", expected))
+    failed_value = value.get("failed", value.get("account_failed", 0))
+    try:
+        accepted = max(0, min(expected, int(accepted_value)))
+    except (TypeError, ValueError):
+        accepted = expected
+    try:
+        failed = max(0, int(failed_value))
+    except (TypeError, ValueError):
+        failed = 0
+    return accepted, failed
+
+
+def verify_imported_accounts(
+    expected_accounts: list[dict[str, Any]],
+    before_accounts: list[dict[str, Any]],
+    after_accounts: list[dict[str, Any]],
+    import_payload: Any,
+) -> dict[str, Any]:
+    before_ids = {
+        account_id
+        for account in before_accounts
+        if (account_id := _positive_account_id(account)) is not None
+    }
+    new_accounts = [
+        account
+        for account in after_accounts
+        if (account_id := _positive_account_id(account)) is not None and account_id not in before_ids
+    ]
+    expected_counts = Counter(_account_identity(account) for account in expected_accounts)
+    observed_counts = Counter(_account_identity(account) for account in new_accounts)
+    matched = sum(min(count, observed_counts.get(identity, 0)) for identity, count in expected_counts.items())
+    missing = []
+    for identity, count in expected_counts.items():
+        remaining = max(0, count - observed_counts.get(identity, 0))
+        if remaining:
+            missing.append({
+                "name": identity[0],
+                "platform": identity[1],
+                "type": identity[2],
+                "count": remaining,
+            })
+    accepted, failed = _import_counts(import_payload, len(expected_accounts))
+    confirmed = accepted == len(expected_accounts) and failed == 0 and matched == len(expected_accounts)
+    return {
+        "confirmed": confirmed,
+        "expected": len(expected_accounts),
+        "accepted": accepted,
+        "failed": failed,
+        "observed_new": len(new_accounts),
+        "matched": matched,
+        "missing": missing[:50],
+        "new_account_ids": [
+            account_id
+            for account in new_accounts
+            if (account_id := _positive_account_id(account)) is not None
+        ],
+    }
+
+
+ACCOUNT_PUBLIC_FIELDS = (
+    "id", "name", "notes", "platform", "type", "proxy_id", "concurrency",
+    "current_concurrency", "priority", "rate_multiplier", "status", "error_message",
+    "schedulable", "expires_at", "created_at", "updated_at", "last_used_at",
+    "rate_limit_reset_at", "overload_until", "temp_unschedulable_until",
+    "temp_unschedulable_reason", "quota_limit", "quota_used", "quota_daily_limit",
+    "quota_daily_used", "quota_weekly_limit", "quota_weekly_used", "group_ids",
+    "five_hour", "seven_day", "usage_windows",
+)
+
+
+def _public_account(account: dict[str, Any]) -> dict[str, Any]:
+    result = {key: account.get(key) for key in ACCOUNT_PUBLIC_FIELDS if key in account}
+    groups = account.get("groups")
+    if isinstance(groups, list):
+        result["groups"] = [
+            {"id": group.get("id"), "name": str(group.get("name") or "")[:160]}
+            for group in groups
+            if isinstance(group, dict)
+        ]
+    return result
+
+
+def fetch_account_page(
+    config: dict[str, Any],
+    *,
+    request_json: JsonRequest,
+    page: int = 1,
+    page_size: int = 12,
+    search: str = "",
+    status_filter: str = "",
+    platform: str = "",
+) -> dict[str, Any]:
+    if not config["admin_key"]:
+        raise ValueError("请先配置 Sub2API 管理员密钥")
+    page = min(max(int(page), 1), 10000)
+    page_size = min(max(int(page_size), 1), 100)
+    params: dict[str, Any] = {
+        "page": page,
+        "page_size": page_size,
+        "sort_by": "created_at",
+        "sort_order": "desc",
+    }
+    search = str(search or "").strip()[:100]
+    if search:
+        params["search"] = search
+    status_filter = str(status_filter or "").strip().lower()
+    if status_filter in {"active", "inactive", "error"}:
+        params["status"] = status_filter
+    platform = str(platform or "").strip().lower()[:40]
+    if platform:
+        params["platform"] = platform
+
+    headers = {"x-api-key": config["admin_key"]}
+    status, payload, raw = request_json(
+        "GET",
+        config["base_url"] + "/api/v1/admin/accounts?" + urlencode(params),
+        headers=headers,
+        timeout=30,
+    )
+    if not 200 <= status < 300:
+        raise RuntimeError(f"Sub2API accounts 返回 HTTP {status}: {upstream_error(status, payload, raw)}")
+    value = payload_data(payload)
+    items = payload_list(payload, "accounts")
+    public_items = [_public_account(account) for account in items]
+    try:
+        total = max(0, int(value.get("total") if isinstance(value, dict) else len(items)))
+    except (TypeError, ValueError):
+        total = len(items)
+
+    usage: dict[str, Any] = {}
+    usage_errors: dict[str, str] = {}
+    account_ids = [
+        account_id
+        for account in public_items
+        if (account_id := _positive_account_id(account)) is not None
+    ]
+    if account_ids:
+        usage_status, usage_payload, usage_raw = request_json(
+            "POST",
+            config["base_url"] + "/api/v1/admin/accounts/usage/batch",
+            {"account_ids": account_ids, "force": False},
+            headers=headers,
+            timeout=45,
+        )
+        if 200 <= usage_status < 300:
+            usage_value = payload_data(usage_payload)
+            if isinstance(usage_value, dict):
+                raw_usage = usage_value.get("usage")
+                raw_errors = usage_value.get("errors")
+                usage = raw_usage if isinstance(raw_usage, dict) else {}
+                usage_errors = (
+                    {str(key): str(value)[:300] for key, value in raw_errors.items()}
+                    if isinstance(raw_errors, dict)
+                    else {}
+                )
+        else:
+            usage_errors["_"] = upstream_error(usage_status, usage_payload, usage_raw)
+    return {
+        "ok": True,
+        "items": public_items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, (total + page_size - 1) // page_size),
+        "usage": usage,
+        "usage_errors": usage_errors,
+    }
+
+
+def _sse_test_result(payload: Any, raw: str) -> dict[str, Any]:
+    candidates = []
+    value = payload_data(payload)
+    if isinstance(value, dict):
+        candidates.append(value)
+    for line in raw.splitlines():
+        if not line.lstrip().startswith("data:"):
+            continue
+        try:
+            candidate = json.loads(line.split(":", 1)[1].strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            candidates.append(candidate)
+    for candidate in reversed(candidates):
+        if "success" in candidate or candidate.get("type") in {"result", "error"}:
+            return candidate
+    return candidates[-1] if candidates else {}
+
+
+def test_account(config: dict[str, Any], account_id: int, *, request_json: JsonRequest) -> dict[str, Any]:
+    if not config["admin_key"]:
+        raise ValueError("请先配置 Sub2API 管理员密钥")
+    if account_id < 1:
+        raise ValueError("Sub2API 账号编号无效")
+    status, payload, raw = request_json(
+        "POST",
+        f"{config['base_url']}/api/v1/admin/accounts/{account_id}/test",
+        {},
+        headers={"x-api-key": config["admin_key"]},
+        timeout=90,
+    )
+    result = _sse_test_result(payload, raw)
+    ok = 200 <= status < 300 and result.get("success") is not False
+    message = result.get("message") or result.get("error") or ("账号连接测试通过" if ok else f"HTTP {status}")
+    return {
+        "ok": ok,
+        "account_id": account_id,
+        "upstream_status": status,
+        "message": str(message)[:500],
+        "latency_ms": result.get("latency_ms"),
+    }
+
+
+def delete_account(config: dict[str, Any], account_id: int, *, request_json: JsonRequest) -> dict[str, Any]:
+    if not config["admin_key"]:
+        raise ValueError("请先配置 Sub2API 管理员密钥")
+    if account_id < 1:
+        raise ValueError("Sub2API 账号编号无效")
+    status, payload, raw = request_json(
+        "DELETE",
+        f"{config['base_url']}/api/v1/admin/accounts/{account_id}",
+        headers={"x-api-key": config["admin_key"]},
+        timeout=30,
+    )
+    if not 200 <= status < 300:
+        raise RuntimeError(f"Sub2API 删除账号返回 HTTP {status}: {upstream_error(status, payload, raw)}")
+    return {"ok": True, "account_id": account_id, "result": payload_data(payload)}
 
 
 def reconcile_codex_fingerprint(
@@ -251,6 +502,7 @@ def import_payload(
     config: dict[str, Any],
     request_json: JsonRequest,
     fingerprint_reconciler: Callable[[dict[str, Any], dict[str, Any], str | None, Any], dict[str, Any]],
+    accounts_loader: Callable[[dict[str, Any]], list[dict[str, Any]]],
     proxy_id: Any = None,
     group_ids: Any = None,
     codex_fingerprint_mode: Any = None,
@@ -263,6 +515,7 @@ def import_payload(
     normalized, fingerprint_mode, codex_account_count = apply_codex_fingerprint_mode(
         normalized, codex_fingerprint_mode
     )
+    before_accounts = accounts_loader(config)
     if assign_existing is None:
         assign_existing = proxy_id not in (None, "") or bool(group_ids)
     if assign_existing:
@@ -300,6 +553,10 @@ def import_payload(
         fingerprint_verification = fingerprint_verification_error(
             fingerprint_mode, codex_account_count, exc
         )
+    after_accounts = accounts_loader(config)
+    import_verification = verify_imported_accounts(
+        normalized["accounts"], before_accounts, after_accounts, payload
+    )
     return {
         "ok": True,
         "mode": mode,
@@ -309,6 +566,7 @@ def import_payload(
         "codex_fingerprint_mode": fingerprint_mode,
         "codex_account_count": codex_account_count,
         "fingerprint_verification": fingerprint_verification,
+        "import_verification": import_verification,
         "result": payload_data(payload),
     }
 

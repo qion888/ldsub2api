@@ -2158,6 +2158,54 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .sub2api-import-panel .import-button { margin-top: 13px; }
 .sub2api-view .connection-result { font-size: 12px; }
 
+.account-management-panel { border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+.account-management-head { min-height: 70px; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.account-management-head h3 { margin: 4px 0 0; color: var(--ui-text); font-size: 17px; }
+.account-management-head p { margin: 5px 0 0; color: var(--ui-text-muted); font-size: 11px; }
+.account-management-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.account-management-actions select { min-width: 112px; height: 36px; }
+.account-search { width: min(240px, 30vw); height: 36px; margin: 0 !important; padding: 0 10px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
+.account-search input { width: 100%; height: 32px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
+.account-search input:focus { outline: none; box-shadow: none; }
+.account-table-wrap { overflow-x: auto; border-block: 1px solid var(--ui-border); }
+.account-table { width: 100%; min-width: 1180px; border-collapse: collapse; table-layout: fixed; }
+.account-table th, .account-table td { padding: 11px 12px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: middle; text-align: left; }
+.account-table th:last-child, .account-table td:last-child { border-right: 0; }
+.account-table th { color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 10px; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
+.account-table td { color: var(--ui-text); font-size: 12px; }
+.account-table td > strong, .account-table td > span, .account-table td > small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-table td > strong { font-size: 12px; font-weight: 700; }
+.account-table td > small { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; line-height: 1.35; }
+.account-table th:nth-child(1) { width: 190px; }
+.account-table th:nth-child(2) { width: 115px; }
+.account-table th:nth-child(3) { width: 170px; }
+.account-table th:nth-child(4), .account-table th:nth-child(5), .account-table th:nth-child(6) { width: 105px; }
+.account-table th:nth-child(7), .account-table th:nth-child(8) { width: 112px; }
+.account-table th:nth-child(9) { width: 120px; }
+.account-table th:nth-child(10) { width: 150px; }
+.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; font-size: 10px !important; font-weight: 700; }
+.account-status.ok { color: var(--ui-success); }
+.account-status.bad { color: var(--ui-danger); }
+.account-row-actions { display: flex; align-items: center; gap: 5px; }
+.account-row-actions .icon-button { width: 32px; height: 32px; }
+.account-test-result { max-width: 145px; }
+.account-test-result.ok { color: var(--ui-success) !important; }
+.account-test-result.bad { color: var(--ui-danger) !important; }
+.account-table-empty { min-height: 110px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
+.account-pagination { min-height: 52px; padding: 9px 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ui-text-muted); font-size: 11px; }
+.account-pagination > div { display: flex; gap: 5px; }
+.account-pagination .icon-button { width: 32px; height: 32px; }
+
+@media (max-width: 900px) {
+  .account-management-head { align-items: stretch; flex-direction: column; }
+  .account-management-actions { justify-content: stretch; flex-wrap: wrap; }
+  .account-search { width: min(100%, 320px); flex: 1 1 220px; }
+  .account-management-actions select { flex: 1 1 120px; }
+  .account-table { min-width: 1080px; }
+  .account-pagination { align-items: flex-start; flex-direction: column; }
+  .account-pagination > div { align-self: flex-end; }
+}
+
 .automation-console > .automation-head { min-height: 82px; padding: 14px 18px; }
 .sub2api-view .automation-head h2 { font-size: 19px; }
 .sub2api-view .automation-head p { margin-top: 6px; font-size: 12px; }

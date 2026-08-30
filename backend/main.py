@@ -347,6 +347,16 @@ def sub2api_automation_state() -> dict[str, Any]:
     return sub2api_config.read_automation_state(_setting_json)
 
 
+def _sub2api_imported_order_nos() -> list[str]:
+    try:
+        value = sub2api_automation_state().get("imported_order_nos", [])
+    except sqlite3.OperationalError:
+        # Standalone client operations may run before the local database is
+        # initialized (for example during a health check or unit test).
+        return []
+    return [str(item).strip() for item in value if str(item).strip()][:500]
+
+
 def _store_sub2api_automation_state(value: dict[str, Any]) -> None:
     _store_setting("sub2api_automation_state", value)
 
@@ -457,6 +467,45 @@ def _sub2api_fetch_accounts(
     )
 
 
+def fetch_sub2api_account_page(query_values: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    query_values = query_values or {}
+
+    def first(name: str, default: str = "") -> str:
+        value = query_values.get(name, [default])
+        return str(value[0] if isinstance(value, list) and value else default)
+
+    try:
+        page = int(first("page", "1"))
+        page_size = int(first("page_size", "12"))
+    except ValueError as exc:
+        raise ValueError("璐﹀彿鍒嗛〉鍙傛暟鏃犳晥") from exc
+    return sub2api_client.fetch_account_page(
+        sub2api_settings(reveal=True),
+        request_json=_external_json_request,
+        page=page,
+        page_size=page_size,
+        search=first("search")[:100],
+        status_filter=first("status")[:40],
+        platform=first("platform")[:40],
+    )
+
+
+def test_sub2api_account(account_id: int) -> dict[str, Any]:
+    return sub2api_client.test_account(
+        sub2api_settings(reveal=True),
+        int(account_id),
+        request_json=_external_json_request,
+    )
+
+
+def delete_sub2api_account(account_id: int) -> dict[str, Any]:
+    return sub2api_client.delete_account(
+        sub2api_settings(reveal=True),
+        int(account_id),
+        request_json=_external_json_request,
+    )
+
+
 def _sub2api_codex_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
     return sub2api_client.codex_accounts(config, accounts_loader=_sub2api_fetch_accounts)
 
@@ -524,6 +573,8 @@ def _download_reclaim_payloads(
 def reclaim_sub2api_401_accounts(
     *, include_downloads: bool = True, exclude_order_nos: list[str] | None = None
 ) -> dict[str, Any]:
+    if exclude_order_nos is None:
+        exclude_order_nos = _sub2api_imported_order_nos()
     return sub2api_reclaim.reclaim_401_accounts(
         config=sub2api_settings(reveal=True),
         accounts_loader=_sub2api_fetch_accounts,
@@ -578,8 +629,17 @@ def _sub2api_import_payload(
     codex_fingerprint_mode: Any = None,
     assign_existing: bool | None = None,
     endpoint: str | None = None,
+    reclaim_order_nos: list[str] | None = None,
 ) -> dict[str, Any]:
-    return sub2api_client.import_payload(
+    if reclaim_order_nos is not None:
+        if not isinstance(reclaim_order_nos, list):
+            raise ValueError("reclaim_order_nos 必须是数组")
+        reclaim_order_nos = list(dict.fromkeys(
+            value
+            for value in (str(item).strip() for item in reclaim_order_nos[:100])
+            if re.fullmatch(r"[A-Za-z0-9_-]{3,160}", value)
+        ))
+    result = sub2api_client.import_payload(
         source,
         config=sub2api_settings(reveal=True),
         request_json=_external_json_request,
@@ -589,7 +649,15 @@ def _sub2api_import_payload(
         codex_fingerprint_mode=codex_fingerprint_mode,
         assign_existing=assign_existing,
         endpoint=endpoint,
+        accounts_loader=_sub2api_fetch_accounts,
     )
+    if reclaim_order_nos and result.get("import_verification", {}).get("confirmed"):
+        state = sub2api_automation_state()
+        existing = [str(value).strip() for value in state.get("imported_order_nos", []) if str(value).strip()]
+        incoming = [str(value).strip() for value in reclaim_order_nos if str(value).strip()][:100]
+        state["imported_order_nos"] = list(dict.fromkeys(existing + incoming))[-500:]
+        _store_sub2api_automation_state(state)
+    return result
 
 
 def test_sub2api_connection() -> dict[str, Any]:
@@ -610,6 +678,8 @@ def save_sub2api_automation_settings(data: dict[str, Any]) -> dict[str, Any]:
 def refresh_sub2api_reclaim(
     card_codes: list[str], *, exclude_order_nos: list[str] | None = None
 ) -> dict[str, Any]:
+    if exclude_order_nos is None:
+        exclude_order_nos = _sub2api_imported_order_nos()
     return sub2api_reclaim.refresh_reclaim(
         card_codes,
         redeem_client_factory=_redeem_client,
@@ -867,6 +937,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             automation_settings_loader=sub2api_automation_settings,
             automation_state_loader=sub2api_automation_state,
             options_loader=fetch_sub2api_options,
+            account_loader=fetch_sub2api_account_page,
+            query_values=parse_qs(parsed.query),
         ):
             return
         if path == "/api/pay/juuid":
@@ -960,6 +1032,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             refresh_reclaim=refresh_sub2api_reclaim,
             run_automation=AUTOMATION_WORKER.run_once,
             import_payload=_sub2api_import_payload,
+            test_account=test_sub2api_account,
         ):
             return
 
@@ -1395,6 +1468,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path.rstrip("/")
+        if sub2api_routes.handle_delete(
+            path,
+            send_json=self._send_json,
+            delete_account=delete_sub2api_account,
+        ):
+            return
         preorder_match = re.fullmatch(r"/api/preorders/(\d+)", path)
         if preorder_match:
             with database() as connection:

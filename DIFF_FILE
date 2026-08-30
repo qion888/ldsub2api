@@ -1,0 +1,962 @@
+diff --git a/backend/main.py b/backend/main.py
+index 3e8b24f..3d6e24d 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -339,6 +339,16 @@ def sub2api_automation_state() -> dict[str, Any]:
+     return sub2api_config.read_automation_state(_setting_json)
+ 
+ 
++def _sub2api_imported_order_nos() -> list[str]:
++    try:
++        value = sub2api_automation_state().get("imported_order_nos", [])
++    except sqlite3.OperationalError:
++        # Standalone client operations may run before the local database is
++        # initialized (for example during a health check or unit test).
++        return []
++    return [str(item).strip() for item in value if str(item).strip()][:500]
++
++
+ def _store_sub2api_automation_state(value: dict[str, Any]) -> None:
+     _store_setting("sub2api_automation_state", value)
+ 
+@@ -449,6 +459,45 @@ def _sub2api_fetch_accounts(
+     )
+ 
+ 
++def fetch_sub2api_account_page(query_values: dict[str, list[str]] | None = None) -> dict[str, Any]:
++    query_values = query_values or {}
++
++    def first(name: str, default: str = "") -> str:
++        value = query_values.get(name, [default])
++        return str(value[0] if isinstance(value, list) and value else default)
++
++    try:
++        page = int(first("page", "1"))
++        page_size = int(first("page_size", "12"))
++    except ValueError as exc:
++        raise ValueError("璐﹀彿鍒嗛〉鍙傛暟鏃犳晥") from exc
++    return sub2api_client.fetch_account_page(
++        sub2api_settings(reveal=True),
++        request_json=_external_json_request,
++        page=page,
++        page_size=page_size,
++        search=first("search")[:100],
++        status_filter=first("status")[:40],
++        platform=first("platform")[:40],
++    )
++
++
++def test_sub2api_account(account_id: int) -> dict[str, Any]:
++    return sub2api_client.test_account(
++        sub2api_settings(reveal=True),
++        int(account_id),
++        request_json=_external_json_request,
++    )
++
++
++def delete_sub2api_account(account_id: int) -> dict[str, Any]:
++    return sub2api_client.delete_account(
++        sub2api_settings(reveal=True),
++        int(account_id),
++        request_json=_external_json_request,
++    )
++
++
+ def _sub2api_codex_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
+     return sub2api_client.codex_accounts(config, accounts_loader=_sub2api_fetch_accounts)
+ 
+@@ -516,6 +565,8 @@ def _download_reclaim_payloads(
+ def reclaim_sub2api_401_accounts(
+     *, include_downloads: bool = True, exclude_order_nos: list[str] | None = None
+ ) -> dict[str, Any]:
++    if exclude_order_nos is None:
++        exclude_order_nos = _sub2api_imported_order_nos()
+     return sub2api_reclaim.reclaim_401_accounts(
+         config=sub2api_settings(reveal=True),
+         accounts_loader=_sub2api_fetch_accounts,
+@@ -570,8 +621,17 @@ def _sub2api_import_payload(
+     codex_fingerprint_mode: Any = None,
+     assign_existing: bool | None = None,
+     endpoint: str | None = None,
++    reclaim_order_nos: list[str] | None = None,
+ ) -> dict[str, Any]:
+-    return sub2api_client.import_payload(
++    if reclaim_order_nos is not None:
++        if not isinstance(reclaim_order_nos, list):
++            raise ValueError("reclaim_order_nos 必须是数组")
++        reclaim_order_nos = list(dict.fromkeys(
++            value
++            for value in (str(item).strip() for item in reclaim_order_nos[:100])
++            if re.fullmatch(r"[A-Za-z0-9_-]{3,160}", value)
++        ))
++    result = sub2api_client.import_payload(
+         source,
+         config=sub2api_settings(reveal=True),
+         request_json=_external_json_request,
+@@ -581,7 +641,15 @@ def _sub2api_import_payload(
+         codex_fingerprint_mode=codex_fingerprint_mode,
+         assign_existing=assign_existing,
+         endpoint=endpoint,
++        accounts_loader=_sub2api_fetch_accounts,
+     )
++    if reclaim_order_nos and result.get("import_verification", {}).get("confirmed"):
++        state = sub2api_automation_state()
++        existing = [str(value).strip() for value in state.get("imported_order_nos", []) if str(value).strip()]
++        incoming = [str(value).strip() for value in reclaim_order_nos if str(value).strip()][:100]
++        state["imported_order_nos"] = list(dict.fromkeys(existing + incoming))[-500:]
++        _store_sub2api_automation_state(state)
++    return result
+ 
+ 
+ def test_sub2api_connection() -> dict[str, Any]:
+@@ -602,6 +670,8 @@ def save_sub2api_automation_settings(data: dict[str, Any]) -> dict[str, Any]:
+ def refresh_sub2api_reclaim(
+     card_codes: list[str], *, exclude_order_nos: list[str] | None = None
+ ) -> dict[str, Any]:
++    if exclude_order_nos is None:
++        exclude_order_nos = _sub2api_imported_order_nos()
+     return sub2api_reclaim.refresh_reclaim(
+         card_codes,
+         redeem_client_factory=_redeem_client,
+@@ -855,6 +925,8 @@ class ApiHandler(BaseHTTPRequestHandler):
+             automation_settings_loader=sub2api_automation_settings,
+             automation_state_loader=sub2api_automation_state,
+             options_loader=fetch_sub2api_options,
++            account_loader=fetch_sub2api_account_page,
++            query_values=parse_qs(parsed.query),
+         ):
+             return
+         if path == "/api/pay/juuid":
+@@ -948,6 +1020,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+             refresh_reclaim=refresh_sub2api_reclaim,
+             run_automation=AUTOMATION_WORKER.run_once,
+             import_payload=_sub2api_import_payload,
++            test_account=test_sub2api_account,
+         ):
+             return
+ 
+@@ -1352,6 +1425,12 @@ class ApiHandler(BaseHTTPRequestHandler):
+ 
+     def do_DELETE(self) -> None:
+         path = urlparse(self.path).path.rstrip("/")
++        if sub2api_routes.handle_delete(
++            path,
++            send_json=self._send_json,
++            delete_account=delete_sub2api_account,
++        ):
++            return
+         preorder_match = re.fullmatch(r"/api/preorders/(\d+)", path)
+         if preorder_match:
+             with database() as connection:
+diff --git a/backend/sub2api/automation.py b/backend/sub2api/automation.py
+index fd9f86a..0ff4461 100644
+--- a/backend/sub2api/automation.py
++++ b/backend/sub2api/automation.py
+@@ -21,7 +21,14 @@ def run_cycle(
+         return {"ok": True, "skipped": True, "reason": "disabled", "settings": settings, "state": state}
+ 
+     pending = state["pending_card_codes"]
+-    imported_order_nos = state["imported_order_nos"] if pending else []
++    # Keep the completed-order ledger across queue transitions.  Clearing it
++    # when pending work reaches zero causes the next cycle to download the same
++    # completed reclaim files again.
++    imported_order_nos = [
++        str(order_no).strip()
++        for order_no in state.get("imported_order_nos", [])
++        if str(order_no).strip()
++    ][-500:]
+     if pending:
+         reclaim = refresh_reclaim(pending, exclude_order_nos=imported_order_nos)
+     else:
+@@ -38,6 +45,7 @@ def run_cycle(
+     card_codes = reclaim.get("reclaim_card_codes")
+     card_codes = card_codes if isinstance(card_codes, list) else pending
+     import_result = None
++    import_confirmed = False
+     if downloads:
+         import_result = import_payload(
+             [
+@@ -50,16 +58,22 @@ def run_cycle(
+             codex_fingerprint_mode=settings["codex_fingerprint_mode"],
+             assign_existing=True,
+         )
+-        imported_order_nos = (
+-            imported_order_nos
+-            + [str(item.get("task", {}).get("order_no") or "") for item in downloads]
+-        )[-500:]
++        verification = (
++            import_result.get("import_verification")
++            if isinstance(import_result, dict)
++            else None
++        )
++        import_confirmed = bool(isinstance(verification, dict) and verification.get("confirmed"))
++        if import_confirmed:
++            imported_order_nos = list(dict.fromkeys(
++                imported_order_nos
++                + [str(item.get("task", {}).get("order_no") or "").strip() for item in downloads]
++            ))[-500:]
+ 
+     if int(result.get("queued") or 0) + int(result.get("already_running") or 0) > 0:
+         pending = card_codes
+     else:
+         pending = []
+-        imported_order_nos = []
+     summary = {
+         "ok": bool(reclaim.get("ok", False)),
+         "scanned_accounts": reclaim.get("scanned_accounts"),
+@@ -68,7 +82,15 @@ def run_cycle(
+         "queued": int(result.get("queued") or 0),
+         "done": int(result.get("done") or 0),
+         "downloaded": len(downloads),
+-        "imported": bool(import_result),
++        "skipped_downloads": max(
++            0,
++            len([
++                task for task in (result.get("all_tasks") or [])
++                if isinstance(task, dict) and task.get("status") == "done"
++            ]) - len(downloads),
++        ),
++        "import_attempted": bool(import_result),
++        "imported": import_confirmed,
+         "import_result": import_result,
+     }
+     state = {
+diff --git a/backend/sub2api/client.py b/backend/sub2api/client.py
+index df0e016..8b044d9 100644
+--- a/backend/sub2api/client.py
++++ b/backend/sub2api/client.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++from collections import Counter
+ from typing import Any, Callable
+ from urllib.parse import urlencode
+ 
+@@ -85,6 +86,256 @@ def codex_accounts(
+     return result
+ 
+ 
++def _account_identity(account: dict[str, Any]) -> tuple[str, str, str]:
++    return (
++        str(account.get("name") or "").strip(),
++        str(account.get("platform") or "").strip().lower(),
++        str(account.get("type") or "").strip().lower(),
++    )
++
++
++def _positive_account_id(account: dict[str, Any]) -> int | None:
++    try:
++        account_id = int(account.get("id"))
++    except (TypeError, ValueError):
++        return None
++    return account_id if account_id > 0 else None
++
++
++def _import_counts(payload: Any, expected: int) -> tuple[int, int]:
++    value = payload_data(payload)
++    if not isinstance(value, dict):
++        return expected, 0
++    accepted_value = value.get("success", value.get("account_created", expected))
++    failed_value = value.get("failed", value.get("account_failed", 0))
++    try:
++        accepted = max(0, min(expected, int(accepted_value)))
++    except (TypeError, ValueError):
++        accepted = expected
++    try:
++        failed = max(0, int(failed_value))
++    except (TypeError, ValueError):
++        failed = 0
++    return accepted, failed
++
++
++def verify_imported_accounts(
++    expected_accounts: list[dict[str, Any]],
++    before_accounts: list[dict[str, Any]],
++    after_accounts: list[dict[str, Any]],
++    import_payload: Any,
++) -> dict[str, Any]:
++    before_ids = {
++        account_id
++        for account in before_accounts
++        if (account_id := _positive_account_id(account)) is not None
++    }
++    new_accounts = [
++        account
++        for account in after_accounts
++        if (account_id := _positive_account_id(account)) is not None and account_id not in before_ids
++    ]
++    expected_counts = Counter(_account_identity(account) for account in expected_accounts)
++    observed_counts = Counter(_account_identity(account) for account in new_accounts)
++    matched = sum(min(count, observed_counts.get(identity, 0)) for identity, count in expected_counts.items())
++    missing = []
++    for identity, count in expected_counts.items():
++        remaining = max(0, count - observed_counts.get(identity, 0))
++        if remaining:
++            missing.append({
++                "name": identity[0],
++                "platform": identity[1],
++                "type": identity[2],
++                "count": remaining,
++            })
++    accepted, failed = _import_counts(import_payload, len(expected_accounts))
++    confirmed = accepted == len(expected_accounts) and failed == 0 and matched == len(expected_accounts)
++    return {
++        "confirmed": confirmed,
++        "expected": len(expected_accounts),
++        "accepted": accepted,
++        "failed": failed,
++        "observed_new": len(new_accounts),
++        "matched": matched,
++        "missing": missing[:50],
++        "new_account_ids": [
++            account_id
++            for account in new_accounts
++            if (account_id := _positive_account_id(account)) is not None
++        ],
++    }
++
++
++ACCOUNT_PUBLIC_FIELDS = (
++    "id", "name", "notes", "platform", "type", "proxy_id", "concurrency",
++    "current_concurrency", "priority", "rate_multiplier", "status", "error_message",
++    "schedulable", "expires_at", "created_at", "updated_at", "last_used_at",
++    "rate_limit_reset_at", "overload_until", "temp_unschedulable_until",
++    "temp_unschedulable_reason", "quota_limit", "quota_used", "quota_daily_limit",
++    "quota_daily_used", "quota_weekly_limit", "quota_weekly_used", "group_ids",
++    "five_hour", "seven_day", "usage_windows",
++)
++
++
++def _public_account(account: dict[str, Any]) -> dict[str, Any]:
++    result = {key: account.get(key) for key in ACCOUNT_PUBLIC_FIELDS if key in account}
++    groups = account.get("groups")
++    if isinstance(groups, list):
++        result["groups"] = [
++            {"id": group.get("id"), "name": str(group.get("name") or "")[:160]}
++            for group in groups
++            if isinstance(group, dict)
++        ]
++    return result
++
++
++def fetch_account_page(
++    config: dict[str, Any],
++    *,
++    request_json: JsonRequest,
++    page: int = 1,
++    page_size: int = 12,
++    search: str = "",
++    status_filter: str = "",
++    platform: str = "",
++) -> dict[str, Any]:
++    if not config["admin_key"]:
++        raise ValueError("请先配置 Sub2API 管理员密钥")
++    page = min(max(int(page), 1), 10000)
++    page_size = min(max(int(page_size), 1), 100)
++    params: dict[str, Any] = {
++        "page": page,
++        "page_size": page_size,
++        "sort_by": "created_at",
++        "sort_order": "desc",
++    }
++    search = str(search or "").strip()[:100]
++    if search:
++        params["search"] = search
++    status_filter = str(status_filter or "").strip().lower()
++    if status_filter in {"active", "inactive", "error"}:
++        params["status"] = status_filter
++    platform = str(platform or "").strip().lower()[:40]
++    if platform:
++        params["platform"] = platform
++
++    headers = {"x-api-key": config["admin_key"]}
++    status, payload, raw = request_json(
++        "GET",
++        config["base_url"] + "/api/v1/admin/accounts?" + urlencode(params),
++        headers=headers,
++        timeout=30,
++    )
++    if not 200 <= status < 300:
++        raise RuntimeError(f"Sub2API accounts 返回 HTTP {status}: {upstream_error(status, payload, raw)}")
++    value = payload_data(payload)
++    items = payload_list(payload, "accounts")
++    public_items = [_public_account(account) for account in items]
++    try:
++        total = max(0, int(value.get("total") if isinstance(value, dict) else len(items)))
++    except (TypeError, ValueError):
++        total = len(items)
++
++    usage: dict[str, Any] = {}
++    usage_errors: dict[str, str] = {}
++    account_ids = [
++        account_id
++        for account in public_items
++        if (account_id := _positive_account_id(account)) is not None
++    ]
++    if account_ids:
++        usage_status, usage_payload, usage_raw = request_json(
++            "POST",
++            config["base_url"] + "/api/v1/admin/accounts/usage/batch",
++            {"account_ids": account_ids, "force": False},
++            headers=headers,
++            timeout=45,
++        )
++        if 200 <= usage_status < 300:
++            usage_value = payload_data(usage_payload)
++            if isinstance(usage_value, dict):
++                raw_usage = usage_value.get("usage")
++                raw_errors = usage_value.get("errors")
++                usage = raw_usage if isinstance(raw_usage, dict) else {}
++                usage_errors = (
++                    {str(key): str(value)[:300] for key, value in raw_errors.items()}
++                    if isinstance(raw_errors, dict)
++                    else {}
++                )
++        else:
++            usage_errors["_"] = upstream_error(usage_status, usage_payload, usage_raw)
++    return {
++        "ok": True,
++        "items": public_items,
++        "total": total,
++        "page": page,
++        "page_size": page_size,
++        "pages": max(1, (total + page_size - 1) // page_size),
++        "usage": usage,
++        "usage_errors": usage_errors,
++    }
++
++
++def _sse_test_result(payload: Any, raw: str) -> dict[str, Any]:
++    candidates = []
++    value = payload_data(payload)
++    if isinstance(value, dict):
++        candidates.append(value)
++    for line in raw.splitlines():
++        if not line.lstrip().startswith("data:"):
++            continue
++        try:
++            candidate = json.loads(line.split(":", 1)[1].strip())
++        except json.JSONDecodeError:
++            continue
++        if isinstance(candidate, dict):
++            candidates.append(candidate)
++    for candidate in reversed(candidates):
++        if "success" in candidate or candidate.get("type") in {"result", "error"}:
++            return candidate
++    return candidates[-1] if candidates else {}
++
++
++def test_account(config: dict[str, Any], account_id: int, *, request_json: JsonRequest) -> dict[str, Any]:
++    if not config["admin_key"]:
++        raise ValueError("请先配置 Sub2API 管理员密钥")
++    if account_id < 1:
++        raise ValueError("Sub2API 账号编号无效")
++    status, payload, raw = request_json(
++        "POST",
++        f"{config['base_url']}/api/v1/admin/accounts/{account_id}/test",
++        {},
++        headers={"x-api-key": config["admin_key"]},
++        timeout=90,
++    )
++    result = _sse_test_result(payload, raw)
++    ok = 200 <= status < 300 and result.get("success") is not False
++    message = result.get("message") or result.get("error") or ("账号连接测试通过" if ok else f"HTTP {status}")
++    return {
++        "ok": ok,
++        "account_id": account_id,
++        "upstream_status": status,
++        "message": str(message)[:500],
++        "latency_ms": result.get("latency_ms"),
++    }
++
++
++def delete_account(config: dict[str, Any], account_id: int, *, request_json: JsonRequest) -> dict[str, Any]:
++    if not config["admin_key"]:
++        raise ValueError("请先配置 Sub2API 管理员密钥")
++    if account_id < 1:
++        raise ValueError("Sub2API 账号编号无效")
++    status, payload, raw = request_json(
++        "DELETE",
++        f"{config['base_url']}/api/v1/admin/accounts/{account_id}",
++        headers={"x-api-key": config["admin_key"]},
++        timeout=30,
++    )
++    if not 200 <= status < 300:
++        raise RuntimeError(f"Sub2API 删除账号返回 HTTP {status}: {upstream_error(status, payload, raw)}")
++    return {"ok": True, "account_id": account_id, "result": payload_data(payload)}
++
++
+ def reconcile_codex_fingerprint(
+     config: dict[str, Any],
+     normalized: dict[str, Any],
+@@ -251,6 +502,7 @@ def import_payload(
+     config: dict[str, Any],
+     request_json: JsonRequest,
+     fingerprint_reconciler: Callable[[dict[str, Any], dict[str, Any], str | None, Any], dict[str, Any]],
++    accounts_loader: Callable[[dict[str, Any]], list[dict[str, Any]]],
+     proxy_id: Any = None,
+     group_ids: Any = None,
+     codex_fingerprint_mode: Any = None,
+@@ -263,6 +515,7 @@ def import_payload(
+     normalized, fingerprint_mode, codex_account_count = apply_codex_fingerprint_mode(
+         normalized, codex_fingerprint_mode
+     )
++    before_accounts = accounts_loader(config)
+     if assign_existing is None:
+         assign_existing = proxy_id not in (None, "") or bool(group_ids)
+     if assign_existing:
+@@ -300,6 +553,10 @@ def import_payload(
+         fingerprint_verification = fingerprint_verification_error(
+             fingerprint_mode, codex_account_count, exc
+         )
++    after_accounts = accounts_loader(config)
++    import_verification = verify_imported_accounts(
++        normalized["accounts"], before_accounts, after_accounts, payload
++    )
+     return {
+         "ok": True,
+         "mode": mode,
+@@ -309,6 +566,7 @@ def import_payload(
+         "codex_fingerprint_mode": fingerprint_mode,
+         "codex_account_count": codex_account_count,
+         "fingerprint_verification": fingerprint_verification,
++        "import_verification": import_verification,
+         "result": payload_data(payload),
+     }
+ 
+diff --git a/backend/sub2api/routes.py b/backend/sub2api/routes.py
+index 8d7fa82..f89c24e 100644
+--- a/backend/sub2api/routes.py
++++ b/backend/sub2api/routes.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import re
+ from typing import Any, Callable
+ 
+ from .constants import DEFAULT_URL
+@@ -17,6 +18,8 @@ def handle_get(
+     automation_settings_loader: Callable[[], dict[str, Any]],
+     automation_state_loader: Callable[[], dict[str, Any]],
+     options_loader: Callable[[], dict[str, Any]],
++    account_loader: Callable[[dict[str, list[str]]], dict[str, Any]] | None = None,
++    query_values: dict[str, list[str]] | None = None,
+ ) -> bool:
+     if path == "/api/sub2api/config":
+         send_json(settings_loader(), 200)
+@@ -39,6 +42,16 @@ def handle_get(
+         except RuntimeError as exc:
+             send_json({"detail": str(exc)}, 502)
+         return True
++    if path == "/api/sub2api/accounts":
++        if account_loader is None:
++            return False
++        try:
++            send_json(account_loader(query_values or {}), 200)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        except RuntimeError as exc:
++            send_json({"detail": str(exc)}, 502)
++        return True
+     return False
+ 
+ 
+@@ -48,10 +61,11 @@ def handle_post(
+     *,
+     send_json: SendJson,
+     test_connection: Callable[[], dict[str, Any]],
+-    reclaim_accounts: Callable[[], dict[str, Any]],
+-    refresh_reclaim: Callable[[list[str]], dict[str, Any]],
++    reclaim_accounts: Callable[..., dict[str, Any]],
++    refresh_reclaim: Callable[..., dict[str, Any]],
+     run_automation: Callable[[], dict[str, Any]],
+     import_payload: Callable[..., dict[str, Any]],
++    test_account: Callable[[int], dict[str, Any]] | None = None,
+ ) -> bool:
+     if path == "/api/sub2api/test":
+         try:
+@@ -62,9 +76,26 @@ def handle_post(
+             send_json({"detail": str(exc)}, 502)
+         return True
+ 
++    account_test = re.fullmatch(r"/api/sub2api/accounts/(\d+)/test", path)
++    if account_test:
++        if test_account is None:
++            return False
++        try:
++            send_json(test_account(int(account_test.group(1))), 200)
++        except (TypeError, ValueError) as exc:
++            send_json({"detail": str(exc)}, 400)
++        except RuntimeError as exc:
++            send_json({"detail": str(exc)}, 502)
++        return True
++
+     if path in ("/api/sub2api/reclaim-401", "/api/sub2api/reclaim401"):
+         try:
+-            result = reclaim_accounts()
++            exclude_order_nos = data.get("exclude_order_nos")
++            result = (
++                reclaim_accounts(exclude_order_nos=exclude_order_nos)
++                if isinstance(exclude_order_nos, list)
++                else reclaim_accounts()
++            )
+             if not isinstance(result, dict):
+                 send_json({"detail": "401 找回返回格式无效"}, 502)
+                 return True
+@@ -87,7 +118,12 @@ def handle_post(
+             send_json({"detail": "请提供 card_codes 数组"}, 400)
+             return True
+         try:
+-            result = refresh_reclaim(raw_codes)
++            exclude_order_nos = data.get("exclude_order_nos")
++            result = (
++                refresh_reclaim(raw_codes, exclude_order_nos=exclude_order_nos)
++                if isinstance(exclude_order_nos, list)
++                else refresh_reclaim(raw_codes)
++            )
+             send_json(result, 200 if result["ok"] else 502)
+         except ValueError as exc:
+             send_json({"detail": str(exc)}, 400)
+@@ -114,6 +150,7 @@ def handle_post(
+                 ),
+                 assign_existing=data.get("assign_existing") if "assign_existing" in data else None,
+                 endpoint=str(data.get("endpoint") or "/api/v1/admin/accounts/data"),
++                reclaim_order_nos=data.get("reclaim_order_nos"),
+             )
+             send_json(result, 200)
+         except (TypeError, ValueError) as exc:
+@@ -124,6 +161,26 @@ def handle_post(
+     return False
+ 
+ 
++def handle_delete(
++    path: str,
++    *,
++    send_json: SendJson,
++    delete_account: Callable[[int], dict[str, Any]] | None = None,
++) -> bool:
++    account_match = re.fullmatch(r"/api/sub2api/accounts/(\d+)", path)
++    if not account_match:
++        return False
++    if delete_account is None:
++        return False
++    try:
++        send_json(delete_account(int(account_match.group(1))), 200)
++    except (TypeError, ValueError) as exc:
++        send_json({"detail": str(exc)}, 400)
++    except RuntimeError as exc:
++        send_json({"detail": str(exc)}, 502)
++    return True
++
++
+ def handle_put(
+     path: str,
+     data: dict[str, Any],
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index b4bd6d4..10778c5 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -889,6 +889,12 @@ function App() {
+   const [sub2apiCodexFingerprintMode, setSub2apiCodexFingerprintMode] = useState('off');
+   const [sub2apiReclaimBusy, setSub2apiReclaimBusy] = useState(false);
+   const [sub2apiReclaimResult, setSub2apiReclaimResult] = useState(null);
++  const [sub2apiReclaimOrderNos, setSub2apiReclaimOrderNos] = useState([]);
++  const [sub2apiAccounts, setSub2apiAccounts] = useState({items: [], total: 0, page: 1, page_size: 12, pages: 1, usage: {}, usage_errors: {}});
++  const [sub2apiAccountFilters, setSub2apiAccountFilters] = useState({search: '', status: '', platform: ''});
++  const [sub2apiAccountBusy, setSub2apiAccountBusy] = useState(false);
++  const [sub2apiAccountActions, setSub2apiAccountActions] = useState({});
++  const [sub2apiTestedAccounts, setSub2apiTestedAccounts] = useState({});
+   const [sub2apiAutomation, setSub2apiAutomation] = useState(DEFAULT_SUB2API_AUTOMATION);
+   const [sub2apiAutomationState, setSub2apiAutomationState] = useState(null);
+   const [sub2apiAutomationBusy, setSub2apiAutomationBusy] = useState(false);
+@@ -1069,9 +1075,13 @@ function App() {
+   useEffect(() => {
+     if (activeView !== 'sub2api') return undefined;
+     loadSub2ApiAutomation();
++    if (sub2apiConfig.admin_key_set) loadSub2ApiAccounts({quiet: true});
+     const stateTimer = window.setInterval(() => loadSub2ApiAutomation(), 5000);
+     const monitorTimer = window.setInterval(() => {
+-      if (sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
++      if (sub2apiConfig.admin_key_set) {
++        loadSub2ApiOptions({quiet: true});
++        loadSub2ApiAccounts({quiet: true});
++      }
+     }, 60000);
+     return () => {
+       window.clearInterval(stateTimer);
+@@ -1079,6 +1089,12 @@ function App() {
+     };
+   }, [activeView, sub2apiConfig.admin_key_set]);
+ 
++  useEffect(() => {
++    if (activeView === 'sub2api' && sub2apiConfig.admin_key_set) {
++      loadSub2ApiAccounts({page: 1, quiet: true});
++    }
++  }, [activeView, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
++
+   const fastestInterval = [...items, ...shops, ...preorders.filter(entry => entry.enabled)]
+     .filter(item => item.enabled)
+     .reduce((fastest, item) => Math.min(fastest, Number(item.interval_seconds || 60)), 60);
+@@ -1729,6 +1745,8 @@ function App() {
+     setSub2apiPayload(merged);
+     setSub2apiFileName(filename);
+     setSub2apiResult(null);
++    setSub2apiReclaimOrderNos([]);
++    setSub2apiReclaimOrderNos([...new Set(usable.map(item => item?.task?.order_no).filter(Boolean).map(String))].slice(0, 100));
+     if (download) {
+       const original = usable.length === 1 && usable[0].content_base64
+         ? Uint8Array.from(window.atob(usable[0].content_base64), value => value.charCodeAt(0))
+@@ -1797,6 +1815,7 @@ function App() {
+       setSub2apiPayload(merged);
+       setSub2apiFileName(files.length === 1 ? files[0].name : `${files.length} 个 JSON 文件`);
+       setSub2apiResult(null);
++      setSub2apiReclaimOrderNos([]);
+       notify(`已合并 ${files.length} 个文件、${merged.accounts.length} 个账号`);
+     } catch (error) {
+       setSub2apiPayload(null);
+@@ -1846,6 +1865,60 @@ function App() {
+     }
+   };
+ 
++  const loadSub2ApiAccounts = async ({page = 1, quiet = false} = {}) => {
++    if (!sub2apiConfig.admin_key_set) return null;
++    setSub2apiAccountBusy(true);
++    try {
++      const params = new URLSearchParams({
++        page: String(page),
++        page_size: String(sub2apiAccounts.page_size || 12),
++        search: sub2apiAccountFilters.search.trim(),
++        status: sub2apiAccountFilters.status,
++        platform: sub2apiAccountFilters.platform,
++      });
++      const result = await request(`/sub2api/accounts?${params.toString()}`);
++      setSub2apiAccounts(result);
++      return result;
++    } catch (error) {
++      if (!quiet) notify(error.message, 'error');
++      return null;
++    } finally {
++      setSub2apiAccountBusy(false);
++    }
++  };
++
++  const testSub2ApiAccount = async account => {
++    const id = Number(account?.id);
++    if (!Number.isInteger(id) || id < 1) return;
++    setSub2apiAccountActions(current => ({...current, [id]: 'test'}));
++    try {
++      const tested = await request(`/sub2api/accounts/${id}/test`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
++      setSub2apiTestedAccounts(current => ({...current, [id]: {...tested, tested_at: new Date().toISOString()}}));
++      notify(tested.ok ? `${account.name || `璐﹀彿 ${id}`} 娴嬭瘯閫氳繃` : `${account.name || `璐﹀彿 ${id}`} 娴嬭瘯澶辫触`, tested.ok ? 'info' : 'error');
++    } catch (error) {
++      setSub2apiTestedAccounts(current => ({...current, [id]: {ok: false, message: error.message, tested_at: new Date().toISOString()}}));
++      notify(error.message, 'error');
++    } finally {
++      setSub2apiAccountActions(current => ({...current, [id]: null}));
++    }
++  };
++
++  const deleteSub2ApiAccount = async account => {
++    const id = Number(account?.id);
++    if (!Number.isInteger(id) || id < 1) return;
++    if (!window.confirm(`纭畾鍒犻櫎璐﹀彿鈥?{account.name || id}鈥濓紵`)) return;
++    setSub2apiAccountActions(current => ({...current, [id]: 'delete'}));
++    try {
++      await request(`/sub2api/accounts/${id}`, {method: 'DELETE'});
++      notify('Sub2API 账号已删除');
++      await Promise.all([loadSub2ApiAccounts({page: sub2apiAccounts.page, quiet: true}), loadSub2ApiOptions({quiet: true})]);
++    } catch (error) {
++      notify(error.message, 'error');
++    } finally {
++      setSub2apiAccountActions(current => ({...current, [id]: null}));
++    }
++  };
++
+   const testSub2Api = async () => {
+     setSub2apiBusy(true);
+     try {
+@@ -1948,7 +2021,13 @@ function App() {
+       const result = await request('/sub2api/automation/run', {method: 'POST'});
+       setSub2apiAutomationState(result.state || null);
+       const summary = result.result || result.state?.last_result;
+-      notify(summary?.imported ? '自动找回完成，账号已导入 Sub2API' : '401 自动监控已执行');
++      const verification = summary?.import_result?.import_verification;
++      if (summary?.imported && verification && !verification.confirmed) {
++        notify(`自动导入未完全确认：${verification.matched}/${verification.expected} 个账号，请检查列表`, 'error');
++      } else {
++        notify(summary?.imported ? '自动找回完成，账号已导入 Sub2API' : '401 自动监控已执行');
++      }
++      if (summary?.imported) await loadSub2ApiAccounts({page: 1, quiet: true});
+     } catch (error) {
+       notify(error.message, 'error');
+       await loadSub2ApiAutomation();
+@@ -1969,13 +2048,29 @@ function App() {
+         body: JSON.stringify({
+           data: payload,
+           assign_existing: assignExisting,
++          reclaim_order_nos: sub2apiReclaimOrderNos,
+           proxy_id: proxyId,
+           group_ids: sub2apiGroupIds,
+           codex_fingerprint_mode: sub2apiCodexFingerprintMode,
+         }),
+       });
+       setSub2apiResult(result);
+-      notify('Sub2API 账号导入完成');
++      const verification = result.import_verification;
++      if (verification?.confirmed) {
++        notify(`导入并确认成功：${verification.matched} 个账号`);
++        setSub2apiPayload(null);
++        setReclaimPayload(null);
++        setSub2apiFileName('');
++        setSub2apiReclaimOrderNos([]);
++        await Promise.all([loadSub2ApiAccounts({page: 1, quiet: true}), loadSub2ApiOptions({quiet: true})]);
++        return;
++      }
++      if (verification) {
++        notify(`导入请求已返回，但仅确认 ${verification.matched}/${verification.expected} 个新账号，请检查账号列表`, 'error');
++        await loadSub2ApiAccounts({page: sub2apiAccounts.page, quiet: true});
++        return;
++      }
++      notify('Sub2API 导入请求已完成，请刷新账号列表确认结果', 'error');
+     } catch (error) {
+       notify(error.message, 'error');
+     } finally {
+@@ -2157,7 +2252,7 @@ function App() {
+         ) : activeView === 'reclaim' ? (
+           <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
+         ) : (
+-          <Sub2ApiView config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey} fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy} optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds} codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode} reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy} onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy} onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}/>
++          <Sub2ApiView config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey} fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy} optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds} codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode} reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationBusy={sub2apiAutomationBusy} onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onSave={saveSub2ApiConfig} onTest={testSub2Api} onLoadOptions={() => loadSub2ApiOptions()} onProxyChoice={changeSub2ApiProxy} onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()} accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters} accountBusy={sub2apiAccountBusy} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} onLoadAccounts={loadSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount}/>
+         )}
+       </main>
+ 
+@@ -2201,7 +2296,47 @@ function ReclaimView({config, setConfig, cardCodes, setCardCodes, result, busy,
+   );
+ }
+ 
+-function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport}) {
++function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, actions, tested, onRefresh, onTest, onDelete, onPage}) {
++  const items = Array.isArray(data?.items) ? data.items : [];
++  const usage = data?.usage && typeof data.usage === 'object' ? data.usage : {};
++  const formatQuota = value => {
++    if (value === null || value === undefined || value === '') return '--';
++    const number = Number(value);
++    return Number.isFinite(number) ? number.toLocaleString('zh-CN', {maximumFractionDigits: 2}) : String(value);
++  };
++  const formatWindow = (account, key) => {
++    const accountUsage = usage[String(account.id)] || usage[account.id] || {};
++    const window = accountUsage?.[key] || account?.[key];
++    if (!window || typeof window !== 'object') return '--';
++    const used = window.used ?? window.usage ?? window.current;
++    const limit = window.limit ?? window.max;
++    if (used === undefined && limit === undefined) return '--';
++    return `${formatQuota(used)} / ${formatQuota(limit)}`;
++  };
++  const statusLabel = account => account.status === 'error' || account.error_message ? '异常' : account.status === 'active' ? '正常' : (account.status || '未知');
++  return (
++    <section className="account-management-panel">
++      <div className="account-management-head">
++        <div><span className="detail-kicker">SUB2API ACCOUNTS</span><h3>账号列表</h3><p>状态、额度、使用窗口和连接测试</p></div>
++        <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
++      </div>
++      <div className="account-table-wrap">
++        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 类型</th><th>状态</th><th>额度总量</th><th>日额度</th><th>周额度</th><th>5 小时窗口</th><th>7 天窗口</th><th>并发 / 分组</th><th>操作</th></tr></thead><tbody>
++          {items.length ? items.map(account => {
++            const id = Number(account.id);
++            const test = tested[id];
++            const accountGroups = Array.isArray(account.groups) ? account.groups.map(group => group.name).filter(Boolean).join('、') : '';
++            const error = account.error_message || account.temp_unschedulable_reason;
++            return <tr key={account.id}><td><strong>{account.name || `账号 ${account.id}`}</strong><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td><td><span>{account.platform || '--'}</span><small>{account.type || '--'}</small></td><td><span className={`account-status ${statusLabel(account) === '正常' ? 'ok' : 'bad'}`}>{statusLabel(account)}</span><small>{account.schedulable === false ? '不可调度' : '可调度'}{error ? ` · ${String(error).slice(0, 48)}` : ''}</small></td><td><strong>{formatQuota(account.quota_used)} / {formatQuota(account.quota_limit)}</strong></td><td>{formatQuota(account.quota_daily_used)} / {formatQuota(account.quota_daily_limit)}</td><td>{formatQuota(account.quota_weekly_used)} / {formatQuota(account.quota_weekly_limit)}</td><td>{formatWindow(account, 'five_hour')}</td><td>{formatWindow(account, 'seven_day')}</td><td><strong>{account.current_concurrency ?? account.concurrency ?? 0}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td><td><div className="account-row-actions"><IconButton label={test ? (test.ok ? '已测试' : '重新测试') : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `已测试 ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td></tr>;
++          }) : <tr><td colSpan="10"><div className="account-table-empty"><Database size={20}/><span>{busy ? '正在加载账号列表' : '暂无匹配账号'}</span></div></td></tr>}
++        </tbody></table>
++      </div>
++      <div className="account-pagination"><span>共 {data?.total ?? 0} 个账号 · 第 {data?.page || 1} / {data?.pages || 1} 页</span><div><IconButton label="上一页" onClick={() => onPage(Math.max(1, (data?.page || 1) - 1))} disabled={busy || (data?.page || 1) <= 1}><ChevronLeft size={16}/></IconButton><IconButton label="下一页" onClick={() => onPage(Math.min(data?.pages || 1, (data?.page || 1) + 1))} disabled={busy || (data?.page || 1) >= (data?.pages || 1)}><ChevronRight size={16}/></IconButton></div></div>
++    </section>
++  );
++}
++
++function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, automation, automationState, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountActions, testedAccounts, onLoadAccounts, onTestAccount, onDeleteAccount}) {
+   const [dragging, setDragging] = useState(false);
+   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
+   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
+@@ -2330,6 +2465,19 @@ function Sub2ApiView({config, setConfig, adminKey, setAdminKey, fileName, payloa
+             <div className="account-alert-list">{recentErrors.length ? recentErrors.map(account => <div key={account.id || account.name}><TriangleAlert size={15}/><span><strong>{account.name}</strong><small>{account.platform} · {account.error}</small></span><em>{account.status}</em></div>) : <div className="compact-empty"><ShieldCheck size={16}/>当前没有账号异常</div>}</div>
+           </section>
+         </div>
++
++        <Sub2ApiAccountsPanel
++          data={accountsData}
++          filters={accountFilters}
++          onFiltersChange={patch => { onAccountFiltersChange({...accountFilters, ...patch}); }}
++          busy={accountBusy}
++          actions={accountActions}
++          tested={testedAccounts}
++          onRefresh={onLoadAccounts}
++          onTest={onTestAccount}
++          onDelete={onDeleteAccount}
++          onPage={page => onLoadAccounts({page})}
++        />
+       </div>
+     </section>
+   );
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index e7ee632..aa45e5d 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2156,6 +2156,54 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .sub2api-import-panel .import-button { margin-top: 13px; }
+ .sub2api-view .connection-result { font-size: 12px; }
+ 
++.account-management-panel { border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
++.account-management-head { min-height: 70px; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
++.account-management-head h3 { margin: 4px 0 0; color: var(--ui-text); font-size: 17px; }
++.account-management-head p { margin: 5px 0 0; color: var(--ui-text-muted); font-size: 11px; }
++.account-management-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
++.account-management-actions select { min-width: 112px; height: 36px; }
++.account-search { width: min(240px, 30vw); height: 36px; margin: 0 !important; padding: 0 10px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
++.account-search input { width: 100%; height: 32px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
++.account-search input:focus { outline: none; box-shadow: none; }
++.account-table-wrap { overflow-x: auto; border-block: 1px solid var(--ui-border); }
++.account-table { width: 100%; min-width: 1180px; border-collapse: collapse; table-layout: fixed; }
++.account-table th, .account-table td { padding: 11px 12px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: middle; text-align: left; }
++.account-table th:last-child, .account-table td:last-child { border-right: 0; }
++.account-table th { color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 10px; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
++.account-table td { color: var(--ui-text); font-size: 12px; }
++.account-table td > strong, .account-table td > span, .account-table td > small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.account-table td > strong { font-size: 12px; font-weight: 700; }
++.account-table td > small { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; line-height: 1.35; }
++.account-table th:nth-child(1) { width: 190px; }
++.account-table th:nth-child(2) { width: 115px; }
++.account-table th:nth-child(3) { width: 170px; }
++.account-table th:nth-child(4), .account-table th:nth-child(5), .account-table th:nth-child(6) { width: 105px; }
++.account-table th:nth-child(7), .account-table th:nth-child(8) { width: 112px; }
++.account-table th:nth-child(9) { width: 120px; }
++.account-table th:nth-child(10) { width: 150px; }
++.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; font-size: 10px !important; font-weight: 700; }
++.account-status.ok { color: var(--ui-success); }
++.account-status.bad { color: var(--ui-danger); }
++.account-row-actions { display: flex; align-items: center; gap: 5px; }
++.account-row-actions .icon-button { width: 32px; height: 32px; }
++.account-test-result { max-width: 145px; }
++.account-test-result.ok { color: var(--ui-success) !important; }
++.account-test-result.bad { color: var(--ui-danger) !important; }
++.account-table-empty { min-height: 110px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
++.account-pagination { min-height: 52px; padding: 9px 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ui-text-muted); font-size: 11px; }
++.account-pagination > div { display: flex; gap: 5px; }
++.account-pagination .icon-button { width: 32px; height: 32px; }
++
++@media (max-width: 900px) {
++  .account-management-head { align-items: stretch; flex-direction: column; }
++  .account-management-actions { justify-content: stretch; flex-wrap: wrap; }
++  .account-search { width: min(100%, 320px); flex: 1 1 220px; }
++  .account-management-actions select { flex: 1 1 120px; }
++  .account-table { min-width: 1080px; }
++  .account-pagination { align-items: flex-start; flex-direction: column; }
++  .account-pagination > div { align-self: flex-end; }
++}
++
+ .automation-console > .automation-head { min-height: 82px; padding: 14px 18px; }
+ .sub2api-view .automation-head h2 { font-size: 19px; }
+ .sub2api-view .automation-head p { margin-top: 6px; font-size: 12px; }

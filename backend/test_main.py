@@ -982,12 +982,13 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertTrue(test_result["ok"])
                 self.assertEqual(import_status, 200)
                 self.assertTrue(import_result["ok"])
-                self.assertEqual(len(requests), 4)
+                self.assertGreaterEqual(len(requests), 6)
                 for request in requests:
                     headers = {key.lower(): value for key, value in request.header_items()}
                     self.assertEqual(headers.get("x-api-key"), "secret-key")
                     self.assertNotIn("authorization", headers)
-                import_payload = json.loads(requests[1].data.decode("utf-8"))
+                batch_request = next(request for request in requests if request.full_url.endswith("/accounts/data"))
+                import_payload = json.loads(batch_request.data.decode("utf-8"))
                 self.assertEqual(
                     import_payload["data"]["accounts"][0]["extra"]["codex_fingerprint_mode"],
                     "full",
@@ -1379,7 +1380,12 @@ class GoodsParserTests(unittest.TestCase):
             "result": {"queued": 0, "already_running": 0, "done": 1},
         }
         stored = []
-        imported = {"ok": True, "mode": "assigned", "upstream_status": 200}
+        imported = {
+            "ok": True,
+            "mode": "assigned",
+            "upstream_status": 200,
+            "import_verification": {"confirmed": True, "matched": 1, "expected": 1},
+        }
         with patch.object(main, "sub2api_automation_settings", return_value=settings), \
              patch.object(main, "sub2api_automation_state", return_value=state), \
              patch.object(main, "refresh_sub2api_reclaim", return_value=reclaim) as refresh, \
@@ -1393,7 +1399,7 @@ class GoodsParserTests(unittest.TestCase):
         )
         self.assertTrue(result["result"]["imported"])
         self.assertEqual(stored[-1]["pending_card_codes"], [])
-        self.assertEqual(stored[-1]["imported_order_nos"], [])
+        self.assertEqual(stored[-1]["imported_order_nos"], ["ORDER-1"])
         self.assertEqual(stored[-1]["run_history"][-1]["status"], "success")
 
     def test_sub2api_automation_and_reclaim_progress_routes(self):
