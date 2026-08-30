@@ -3,13 +3,10 @@ from __future__ import annotations
 import html
 import base64
 import json
-import math
 import os
 import re
 import sqlite3
 import sys
-import threading
-import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -32,6 +29,11 @@ from monitor_settings import (
     update_shop_monitoring,
     update_watch_monitoring,
 )
+from monitor_core import database as monitor_database
+from monitor_core import history as monitor_history
+from monitor_core import settings as monitor_setting_store
+from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
+from monitor_core.workers import MonitorWorker as CoreMonitorWorker
 from sub2api import automation as sub2api_automation
 from sub2api import client as sub2api_client
 from sub2api import payloads as sub2api_payloads
@@ -76,147 +78,18 @@ def utc_now() -> str:
 
 
 def database() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
-
-
-def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
-    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
-
-
-def _add_column(connection: sqlite3.Connection, table: str, definition: str) -> None:
-    name = definition.split()[0]
-    if name not in _columns(connection, table):
-        connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+    return monitor_database.create_database(DB_PATH)
 
 
 def init_database() -> None:
-    with database() as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS watches (
-                id INTEGER PRIMARY KEY,
-                url TEXT UNIQUE NOT NULL,
-                name TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                last_run TEXT
-            );
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY,
-                watch_id INTEGER NOT NULL,
-                title TEXT,
-                price TEXT,
-                stock TEXT,
-                description TEXT,
-                specs TEXT,
-                fetched_at TEXT NOT NULL,
-                status TEXT NOT NULL,
-                error TEXT,
-                FOREIGN KEY (watch_id) REFERENCES watches(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS shops (
-                id INTEGER PRIMARY KEY,
-                url TEXT UNIQUE NOT NULL,
-                token TEXT UNIQUE NOT NULL,
-                name TEXT,
-                keywords TEXT NOT NULL DEFAULT '',
-                category_id INTEGER,
-                goods_type TEXT NOT NULL DEFAULT 'card',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                interval_seconds INTEGER NOT NULL DEFAULT 300,
-                last_run TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS shop_runs (
-                id INTEGER PRIMARY KEY,
-                shop_id INTEGER NOT NULL,
-                fetched_at TEXT NOT NULL,
-                status TEXT NOT NULL,
-                product_count INTEGER,
-                error TEXT,
-                FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS shop_products (
-                shop_id INTEGER NOT NULL,
-                goods_key TEXT NOT NULL,
-                watch_id INTEGER NOT NULL,
-                listed INTEGER NOT NULL DEFAULT 1,
-                last_seen TEXT NOT NULL,
-                PRIMARY KEY (shop_id, goods_key),
-                FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE,
-                FOREIGN KEY (watch_id) REFERENCES watches(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS shop_exclusions (
-                shop_id INTEGER NOT NULL,
-                goods_key TEXT NOT NULL,
-                removed_at TEXT NOT NULL,
-                PRIMARY KEY (shop_id, goods_key),
-                FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS preorders (
-                id INTEGER PRIMARY KEY,
-                watch_id INTEGER NOT NULL UNIQUE,
-                quantity INTEGER NOT NULL,
-                interval_seconds INTEGER NOT NULL DEFAULT 1,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'watching',
-                contact TEXT NOT NULL,
-                query_password TEXT NOT NULL DEFAULT '',
-                channel_id INTEGER NOT NULL DEFAULT 1,
-                last_check TEXT,
-                last_error TEXT,
-                trade_no TEXT,
-                payment_url TEXT,
-                amount TEXT,
-                created_at TEXT NOT NULL,
-                triggered_at TEXT,
-                FOREIGN KEY (watch_id) REFERENCES watches(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_snapshots_watch_time
-                ON snapshots(watch_id, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_shop_runs_shop_time
-                ON shop_runs(shop_id, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_preorders_status_check
-                ON preorders(status, enabled, last_check);
-            """
-        )
-        _add_column(connection, "watches", f"interval_seconds INTEGER NOT NULL DEFAULT {DEFAULT_INTERVAL}")
-        _add_column(connection, "watches", "created_at TEXT")
-        _add_column(connection, "snapshots", "market_price TEXT")
-        _add_column(connection, "snapshots", "image TEXT")
-        _add_column(connection, "snapshots", "sale_status TEXT")
-        _add_column(connection, "snapshots", "goods_key TEXT")
-        _add_column(connection, "snapshots", "raw_data TEXT")
-        connection.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('contact', ?)",
-            (json.dumps({"contact": "", "note": ""}, ensure_ascii=False),),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('redeem', ?)",
-            (json.dumps({"base_url": DEFAULT_REDEEM_URL}, ensure_ascii=False),),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('sub2api', ?)",
-            (json.dumps({"base_url": DEFAULT_SUB2API_URL, "admin_key": ""}, ensure_ascii=False),),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('sub2api_automation', ?)",
-            (json.dumps(DEFAULT_SUB2API_AUTOMATION, ensure_ascii=False),),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('sub2api_automation_state', ?)",
-            (json.dumps({"last_run": None, "last_error": "", "last_result": None, "pending_card_codes": []}, ensure_ascii=False),),
-        )
-        connection.execute(
-            "UPDATE watches SET created_at = COALESCE(created_at, ?) WHERE created_at IS NULL",
-            (utc_now(),),
-        )
+    monitor_database.initialize_database(
+        database,
+        now=utc_now,
+        default_interval=DEFAULT_INTERVAL,
+        default_redeem_url=DEFAULT_REDEEM_URL,
+        default_sub2api_url=DEFAULT_SUB2API_URL,
+        default_automation=DEFAULT_SUB2API_AUTOMATION,
+    )
 
 
 class DescriptionParser(HTMLParser):
@@ -1175,29 +1048,15 @@ def list_watches() -> list[dict[str, Any]]:
 
 
 def checkout_settings() -> dict[str, Any]:
-    with database() as connection:
-        row = connection.execute("SELECT value FROM settings WHERE key = 'checkout'").fetchone()
-        legacy = connection.execute("SELECT value FROM settings WHERE key = 'contact'").fetchone()
-    fallback = _json_value(legacy["value"] if legacy else None, {"contact": "", "note": ""})
-    fallback.update({"query_password": "", "channel_id": 1})
-    return _json_value(row["value"] if row else None, fallback)
+    return monitor_setting_store.read_checkout(database)
 
 
 def _setting_json(key: str, fallback: dict[str, Any]) -> dict[str, Any]:
-    with database() as connection:
-        row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    value = _json_value(row["value"] if row else None, fallback)
-    return value if isinstance(value, dict) else dict(fallback)
+    return monitor_setting_store.read_json(database, key, fallback)
 
 
 def _normalize_service_url(value: Any, default: str) -> str:
-    candidate = str(value or default).strip().rstrip("/")
-    parsed = urlparse(candidate)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("服务地址必须是 http 或 https URL")
-    if len(candidate) > 300:
-        raise ValueError("服务地址过长")
-    return candidate
+    return monitor_setting_store.normalize_service_url(value, default)
 
 
 def redeem_settings() -> dict[str, Any]:
@@ -1226,11 +1085,7 @@ def _store_sub2api_automation_state(value: dict[str, Any]) -> None:
 
 
 def _store_setting(key: str, value: dict[str, Any]) -> None:
-    with database() as connection:
-        connection.execute(
-            "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, json.dumps(value, ensure_ascii=False)),
-        )
+    monitor_setting_store.store_json(database, key, value)
 
 
 def _external_json_request(
@@ -1725,177 +1580,19 @@ def price_history(
     stock: str = "all",
     query: str = "",
 ) -> dict[str, Any]:
-    """Return a paged history view plus compact statistics for the price radar."""
-    limit = min(max(int(limit or 25), 1), 200)
-    offset = max(int(offset or 0), 0)
-    status = status if status in {"all", "success", "error"} else "all"
-    stock = stock if stock in {"all", "in", "out", "unknown"} else "all"
-    start_date = str(start_date or "").strip()[:10]
-    end_date = str(end_date or "").strip()[:10]
-    query = str(query or "").strip()[:120]
-
-    clauses = ["watch_id = ?"]
-    params: list[Any] = [watch_id]
-    if start_date:
-        clauses.append("fetched_at >= ?")
-        params.append(f"{start_date}T00:00:00")
-    if end_date:
-        clauses.append("fetched_at <= ?")
-        params.append(f"{end_date}T23:59:59")
-    if status != "all":
-        clauses.append("status = ?")
-        params.append(status)
-    numeric_stock = "stock IS NOT NULL AND stock != '' AND stock NOT GLOB '*[^0-9]*'"
-    if stock == "in":
-        clauses.append(f"{numeric_stock} AND CAST(stock AS INTEGER) > 0")
-    elif stock == "out":
-        clauses.append(f"{numeric_stock} AND CAST(stock AS INTEGER) <= 0")
-    elif stock == "unknown":
-        clauses.append(f"NOT ({numeric_stock})")
-    if query:
-        clauses.append("(title LIKE ? OR price LIKE ? OR stock LIKE ? OR sale_status LIKE ? OR error LIKE ?)")
-        pattern = f"%{query}%"
-        params.extend([pattern, pattern, pattern, pattern, pattern])
-
-    where_sql = " AND ".join(clauses)
-    with database() as connection:
-        exists = connection.execute("SELECT 1 FROM watches WHERE id = ?", (watch_id,)).fetchone()
-        if not exists:
-            raise KeyError("监控商品不存在")
-        total = int(connection.execute(f"SELECT COUNT(*) FROM snapshots WHERE {where_sql}", params).fetchone()[0])
-        stats_row = connection.execute(
-            f"""
-            SELECT
-                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
-                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
-                SUM(CASE WHEN status = 'success' AND {numeric_stock} AND CAST(stock AS INTEGER) > 0 THEN 1 ELSE 0 END) AS in_stock_count,
-                SUM(CASE WHEN status = 'success' AND {numeric_stock} AND CAST(stock AS INTEGER) <= 0 THEN 1 ELSE 0 END) AS out_stock_count,
-                SUM(CASE WHEN status = 'success' AND NOT ({numeric_stock}) THEN 1 ELSE 0 END) AS unknown_stock_count
-            FROM snapshots WHERE {where_sql}
-            """,
-            params,
-        ).fetchone()
-        page_params = [*params, limit, offset]
-        rows = connection.execute(
-            f"""
-            SELECT id, title, price, stock, sale_status, fetched_at, status, error
-            FROM snapshots WHERE {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?
-            """,
-            page_params,
-        ).fetchall()
-        trend_rows = connection.execute(
-            f"""
-            SELECT id, price, stock, sale_status, fetched_at, status, error FROM (
-                SELECT id, price, stock, sale_status, fetched_at, status, error
-                FROM snapshots WHERE {where_sql} AND status = 'success'
-                ORDER BY fetched_at DESC, id DESC LIMIT 720
-            ) ORDER BY fetched_at ASC, id ASC
-            """,
-            params,
-        ).fetchall()
-        analysis_rows = connection.execute(
-            f"""
-            SELECT id, price, stock, fetched_at
-            FROM snapshots WHERE {where_sql} AND status = 'success'
-            ORDER BY fetched_at ASC, id ASC
-            """,
-            params,
-        ).fetchall()
-
-    def serialize_history_row(row: sqlite3.Row) -> dict[str, Any]:
-        result = dict(row)
-        raw_stock = result.get("stock")
-        result["stock"] = int(raw_stock) if str(raw_stock or "").isdigit() else None
-        result["stock_label"] = str(raw_stock) if raw_stock not in (None, "") else "接口未公开数量"
-        return result
-
-    price_points: list[tuple[float, str]] = []
-    stock_points: list[int] = []
-    price_change_count = 0
-    restock_count = 0
-    sold_out_count = 0
-    previous_price_value: float | None = None
-    previous_stock_value: int | None = None
-    for row in analysis_rows:
-        try:
-            price_value = float(row["price"])
-        except (TypeError, ValueError):
-            price_value = None
-        if price_value is not None and not math.isfinite(price_value):
-            price_value = None
-        if price_value is not None:
-            if previous_price_value is not None and price_value != previous_price_value:
-                price_change_count += 1
-            price_points.append((price_value, row["fetched_at"]))
-            previous_price_value = price_value
-
-        raw_stock = row["stock"]
-        stock_value = int(raw_stock) if str(raw_stock or "").isdigit() else None
-        if stock_value is not None:
-            if previous_stock_value is not None:
-                if previous_stock_value <= 0 < stock_value:
-                    restock_count += 1
-                elif previous_stock_value > 0 >= stock_value:
-                    sold_out_count += 1
-            stock_points.append(stock_value)
-            previous_stock_value = stock_value
-
-    prices = [point[0] for point in price_points]
-    first_price = prices[0] if prices else None
-    latest_price = prices[-1] if prices else None
-    previous_price = prices[-2] if len(prices) > 1 else None
-    price_change = latest_price - first_price if latest_price is not None and first_price is not None else None
-    latest_change = latest_price - previous_price if latest_price is not None and previous_price is not None else None
-    average_price = sum(prices) / len(prices) if prices else None
-    variance = sum((value - average_price) ** 2 for value in prices) / len(prices) if prices else None
-    volatility_percent = ((variance ** 0.5) / average_price * 100) if variance is not None and average_price else None
-    numeric_stock_count = len(stock_points)
-    in_stock_count = sum(1 for value in stock_points if value > 0)
-    min_point = min(price_points, key=lambda point: point[0]) if price_points else None
-    max_point = max(price_points, key=lambda point: point[0]) if price_points else None
-
-    stats = {
-        "success_count": int(stats_row["success_count"] or 0),
-        "error_count": int(stats_row["error_count"] or 0),
-        "quoted_count": len(prices),
-        "min_price": _money(min_point[0]) if min_point else None,
-        "max_price": _money(max_point[0]) if max_point else None,
-        "average_price": _money(average_price) if average_price is not None else None,
-        "in_stock_count": int(stats_row["in_stock_count"] or 0),
-        "out_stock_count": int(stats_row["out_stock_count"] or 0),
-        "unknown_stock_count": int(stats_row["unknown_stock_count"] or 0),
-        "first_price": _money(first_price) if first_price is not None else None,
-        "latest_price": _money(latest_price) if latest_price is not None else None,
-        "previous_price": _money(previous_price) if previous_price is not None else None,
-        "price_change": _money(price_change) if price_change is not None else None,
-        "price_change_percent": round(price_change / first_price * 100, 2) if price_change is not None and first_price else None,
-        "latest_change": _money(latest_change) if latest_change is not None else None,
-        "latest_change_percent": round(latest_change / previous_price * 100, 2) if latest_change is not None and previous_price else None,
-        "volatility_percent": round(volatility_percent, 2) if volatility_percent is not None else None,
-        "price_change_count": price_change_count,
-        "restock_count": restock_count,
-        "sold_out_count": sold_out_count,
-        "availability_rate": round(in_stock_count / numeric_stock_count * 100, 2) if numeric_stock_count else None,
-        "first_at": price_points[0][1] if price_points else None,
-        "latest_at": price_points[-1][1] if price_points else None,
-        "min_price_at": min_point[1] if min_point else None,
-        "max_price_at": max_point[1] if max_point else None,
-    }
-    return {
-        "items": [serialize_history_row(row) for row in rows],
-        "trend": [serialize_history_row(row) for row in trend_rows],
-        "total": total,
-        "page": offset // limit + 1,
-        "page_size": limit,
-        "stats": stats,
-        "filters": {
-            "start_date": start_date,
-            "end_date": end_date,
-            "status": status,
-            "stock": stock,
-            "query": query,
-        },
-    }
+    return monitor_history.price_history(
+        database,
+        _money,
+        watch_id,
+        limit=limit,
+        offset=offset,
+        start_date=start_date,
+        end_date=end_date,
+        status=status,
+        stock=stock,
+        query=query,
+        missing_message="监控商品不存在",
+    )
 
 
 def delete_watches(watch_ids: list[int]) -> int:
@@ -1926,117 +1623,18 @@ def delete_watches(watch_ids: list[int]) -> int:
     return cursor.rowcount
 
 
-class MonitorWorker(threading.Thread):
+class MonitorWorker(CoreMonitorWorker):
     def __init__(self) -> None:
-        super().__init__(name="product-monitor", daemon=True)
-        self.stop_event = threading.Event()
-        self.fetch_lock = threading.Lock()
-
-    def run(self) -> None:
-        while not self.stop_event.wait(0.25):
-            current = time.time()
-            shop_refresh_cache: dict[int, dict[str, Any] | Exception] = {}
-            with database() as connection:
-                preorder_rows = connection.execute(
-                    """
-                    SELECT id, watch_id, last_check, interval_seconds FROM preorders
-                    WHERE enabled = 1 AND status = 'watching'
-                    """
-                ).fetchall()
-            for row in preorder_rows:
-                last_check = 0.0
-                if row["last_check"]:
-                    try:
-                        last_check = datetime.fromisoformat(row["last_check"]).timestamp()
-                    except ValueError:
-                        pass
-                if current - last_check < int(row["interval_seconds"] or 1):
-                    continue
-                if not self.fetch_lock.acquire(blocking=False):
-                    break
-                try:
-                    product = record_inventory_fetch(row["watch_id"], shop_refresh_cache)
-                    process_preorder(row["id"], product)
-                except Exception as exc:
-                    mark_preorder_check_error(row["id"], exc)
-                finally:
-                    self.fetch_lock.release()
-
-            with database() as connection:
-                rows = connection.execute(
-                    "SELECT id, last_run, interval_seconds FROM watches WHERE enabled = 1"
-                ).fetchall()
-            for row in rows:
-                last_run = 0.0
-                if row["last_run"]:
-                    try:
-                        last_run = datetime.fromisoformat(row["last_run"]).timestamp()
-                    except ValueError:
-                        pass
-                if current - last_run < int(row["interval_seconds"] or DEFAULT_INTERVAL):
-                    continue
-                if not self.fetch_lock.acquire(blocking=False):
-                    break
-                try:
-                    record_inventory_fetch(row["id"], shop_refresh_cache)
-                except Exception:
-                    pass
-                finally:
-                    self.fetch_lock.release()
-
-            with database() as connection:
-                shop_rows = connection.execute(
-                    """
-                    SELECT s.id, s.last_run, s.interval_seconds,
-                        (SELECT error FROM shop_runs WHERE shop_id = s.id ORDER BY id DESC LIMIT 1) AS last_error
-                    FROM shops s WHERE s.enabled = 1
-                    """
-                ).fetchall()
-            for row in shop_rows:
-                last_run = 0.0
-                if row["last_run"]:
-                    try:
-                        last_run = datetime.fromisoformat(row["last_run"]).timestamp()
-                    except ValueError:
-                        pass
-                retry_interval = int(row["interval_seconds"] or 300)
-                if "WAF" in str(row["last_error"] or ""):
-                    retry_interval = max(retry_interval, 3600)
-                if current - last_run < retry_interval:
-                    continue
-                if row["id"] in shop_refresh_cache:
-                    continue
-                if not self.fetch_lock.acquire(blocking=False):
-                    break
-                try:
-                    shop_refresh_cache[row["id"]] = record_shop_fetch(row["id"])
-                except Exception as exc:
-                    shop_refresh_cache[row["id"]] = exc
-                finally:
-                    self.fetch_lock.release()
-
-    def fetch(self, watch_id: int) -> dict[str, Any]:
-        with self.fetch_lock:
-            return record_inventory_fetch(watch_id)
-
-    def fetch_many(self, watch_ids: list[int]) -> list[dict[str, Any]]:
-        with self.fetch_lock:
-            shop_refresh_cache: dict[int, dict[str, Any] | Exception] = {}
-            results = []
-            for watch_id in watch_ids:
-                try:
-                    results.append({
-                        "id": watch_id,
-                        "ok": True,
-                        "data": record_inventory_fetch(watch_id, shop_refresh_cache),
-                    })
-                except Exception as exc:
-                    results.append({"id": watch_id, "ok": False, "error": str(exc)[:240]})
-            return results
-
-    def fetch_shop(self, shop_id: int) -> dict[str, Any]:
-        with self.fetch_lock:
-            return record_shop_fetch(shop_id)
+        # Lambdas resolve main-module names when work runs, preserving runtime
+        # overrides used by the HTTP layer and the existing test suite.
+        super().__init__(
+            database=lambda: database(),
+            record_inventory_fetch=lambda watch_id, cache=None: record_inventory_fetch(watch_id, cache),
+            record_shop_fetch=lambda shop_id: record_shop_fetch(shop_id),
+            process_preorder=lambda preorder_id, product: process_preorder(preorder_id, product),
+            mark_preorder_check_error=lambda preorder_id, error: mark_preorder_check_error(preorder_id, error),
+            default_interval=DEFAULT_INTERVAL,
+        )
 
 
 WORKER = MonitorWorker()
@@ -2056,168 +1654,19 @@ class Sub2ApiAutomationWorker(sub2api_worker.Sub2ApiAutomationWorker):
 AUTOMATION_WORKER = Sub2ApiAutomationWorker()
 
 
-class BrowserVerificationManager:
+class BrowserVerificationManager(CoreBrowserVerificationManager):
     def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.driver: Any = None
-        self.shop_id: int | None = None
-
-    @staticmethod
-    def _request_data(shop: sqlite3.Row, current: int) -> dict[str, Any]:
-        return {
-            "token": shop["token"],
-            "keywords": shop["keywords"] or "",
-            "category_id": shop["category_id"] or "",
-            "goods_type": shop["goods_type"] or "card",
-            "current": current,
-            "pageSize": 50,
-        }
-
-    @staticmethod
-    def _is_waf_html(text: str) -> bool:
-        encoded = text.encode("utf-8", "ignore")
-        return any(marker in encoded for marker in WAF_MARKERS)
-
-    def _close(self) -> None:
-        driver, self.driver, self.shop_id = self.driver, None, None
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-
-    def _browser_request(self, driver: Any, data: dict[str, Any]) -> dict[str, Any]:
-        driver.set_script_timeout(30)
-        result = driver.execute_async_script(
-            """
-            const payload = arguments[0];
-            const done = arguments[arguments.length - 1];
-            fetch('/shopApi/Shop/goodsList', {
-              method: 'POST',
-              credentials: 'include',
-              headers: {'Accept': 'application/json, text/plain, */*', 'Content-Type': 'application/json'},
-              body: JSON.stringify(payload)
-            }).then(async response => done({
-              status: response.status,
-              content_type: response.headers.get('content-type') || '',
-              text: await response.text()
-            })).catch(error => done({error: String(error)}));
-            """,
-            data,
+        super().__init__(
+            database=lambda: database(),
+            worker_lock=WORKER.fetch_lock,
+            record_shop_fetch=lambda shop_id, **kwargs: record_shop_fetch(shop_id, **kwargs),
+            goods_list_rows=lambda payload: _goods_list_rows(payload),
+            normalize_goods=lambda item, token: normalize_goods_list_item(item, token),
+            first_value=lambda item, keys: _first_value(item, keys),
+            waf_error=WafChallengeRequired,
+            waf_markers=WAF_MARKERS,
+            profile_path=Path(__file__).with_name("waf-browser-profile"),
         )
-        if not isinstance(result, dict) or result.get("error"):
-            raise RuntimeError(str((result or {}).get("error") or "浏览器同步请求失败")[:200])
-        text = str(result.get("text") or "")
-        if self._is_waf_html(text):
-            raise WafChallengeRequired(text)
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("浏览器会话仍未返回商品 JSON") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("浏览器会话返回的商品数据格式无效")
-        return payload
-
-    def _catalog(self, driver: Any, shop: sqlite3.Row, first_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        products: dict[str, dict[str, Any]] = {}
-        for current in range(1, 51):
-            payload = first_payload if current == 1 and first_payload is not None else self._browser_request(
-                driver, self._request_data(shop, current)
-            )
-            rows, pagination = _goods_list_rows(payload)
-            for row in rows:
-                product = normalize_goods_list_item(row, shop["token"])
-                products[product["goods_key"]] = product
-            total_value = _first_value(pagination, ("total", "count", "total_count"))
-            page_value = _first_value(pagination, ("last_page", "lastPage", "pages", "page_count"))
-            try:
-                total = int(total_value) if total_value not in (None, "") else None
-            except (TypeError, ValueError):
-                total = None
-            try:
-                pages = int(page_value) if page_value not in (None, "") else None
-            except (TypeError, ValueError):
-                pages = None
-            if not rows or len(rows) < 50 or (total is not None and current * 50 >= total) or (pages is not None and current >= pages):
-                break
-        return list(products.values())
-
-    def _render_challenge(self, driver: Any, html_text: str) -> dict[str, Any]:
-        try:
-            driver.execute_script("document.open(); document.write(arguments[0]); document.close();", html_text)
-        except Exception as exc:
-            self._close()
-            raise RuntimeError("无法在 Edge 中显示滑块验证页") from exc
-        return {
-            "status": "awaiting_verification",
-            "detail": "请在已打开的 Edge 窗口完成滑块，然后点击“验证完成并同步”",
-        }
-
-    def start(self, shop_id: int) -> dict[str, Any]:
-        with self.lock:
-            with database() as connection:
-                shop = connection.execute("SELECT * FROM shops WHERE id = ?", (shop_id,)).fetchone()
-            if shop is None:
-                raise KeyError("监控店铺不存在")
-            self._close()
-            try:
-                from selenium import webdriver
-                from selenium.webdriver.edge.options import Options
-            except ImportError as exc:
-                raise RuntimeError("缺少浏览器验证组件，请执行 python -m pip install -r backend/requirements.txt") from exc
-            options = Options()
-            options.add_argument(f"--user-data-dir={Path(__file__).with_name('waf-browser-profile')}")
-            options.add_argument("--start-maximized")
-            options.add_argument("--no-first-run")
-            options.add_argument("--disable-features=EdgeFirstRunExperience")
-            try:
-                driver = webdriver.Edge(options=options)
-            except Exception as exc:
-                raise RuntimeError("无法启动 Edge 浏览器验证会话") from exc
-            self.driver, self.shop_id = driver, shop_id
-            try:
-                driver.get(shop["url"])
-                first_payload = self._browser_request(driver, self._request_data(shop, 1))
-                products = self._catalog(driver, shop, first_payload)
-                with WORKER.fetch_lock:
-                    summary = record_shop_fetch(shop_id, products_override=products)
-                self._close()
-                return {"status": "success", "summary": summary}
-            except WafChallengeRequired as exc:
-                return self._render_challenge(driver, str(exc))
-            except Exception as exc:
-                self._close()
-                raise RuntimeError(f"浏览器验证同步失败：{str(exc)[:160]}") from exc
-
-    def complete(self, shop_id: int) -> dict[str, Any]:
-        with self.lock:
-            if self.driver is None or self.shop_id != shop_id:
-                raise RuntimeError("没有等待完成的浏览器验证会话")
-            driver = self.driver
-            with database() as connection:
-                shop = connection.execute("SELECT * FROM shops WHERE id = ?", (shop_id,)).fetchone()
-            if shop is None:
-                self._close()
-                raise KeyError("监控店铺不存在")
-            try:
-                source = driver.page_source
-                if self._is_waf_html(source):
-                    return {
-                        "status": "awaiting_verification",
-                        "detail": "滑块验证尚未完成，请在 Edge 窗口完成后重试",
-                    }
-                driver.get(shop["url"])
-                first_payload = self._browser_request(driver, self._request_data(shop, 1))
-                products = self._catalog(driver, shop, first_payload)
-                with WORKER.fetch_lock:
-                    summary = record_shop_fetch(shop_id, products_override=products)
-                self._close()
-                return {"status": "success", "summary": summary}
-            except WafChallengeRequired as exc:
-                return self._render_challenge(driver, str(exc))
-            except Exception as exc:
-                self._close()
-                raise RuntimeError(f"浏览器验证同步失败：{str(exc)[:160]}") from exc
 
 
 BROWSER_VERIFICATION = BrowserVerificationManager()
