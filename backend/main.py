@@ -37,6 +37,7 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 USER_AGENT = "LDXP-Local-Monitor/2.0"
 VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
 WAF_MARKERS = (b"aliyunCaptcha", b"aliyunCaptcha-sliding-slider", b"waf_nc", b"u_atoken")
+UNLISTED_ERROR_MARKERS = ("商品未上架", "商品不存在", "已下架", "已不在店铺列表")
 DEFAULT_REDEEM_URL = "https://30d.team"
 DEFAULT_SUB2API_URL = "http://127.0.0.1:8080"
 DEFAULT_SUB2API_AUTOMATION = {
@@ -287,6 +288,11 @@ def _money(value: Any) -> str:
         return str(value)
 
 
+def is_unlisted_error(value: Any) -> bool:
+    message = str(value or "")
+    return any(marker in message for marker in UNLISTED_ERROR_MARKERS)
+
+
 def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str, Any]:
     if payload.get("code") != 1 or not isinstance(payload.get("data"), dict):
         message = str(payload.get("msg") or "商品接口未返回有效数据")
@@ -296,9 +302,9 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
     extend = item.get("extend") if isinstance(item.get("extend"), dict) else {}
     category = item.get("category") if isinstance(item.get("category"), dict) else {}
     seller = item.get("user") if isinstance(item.get("user"), dict) else {}
-    stock_value = _stock_value(item)
     limit_count = extend.get("limit_count")
     sale_status = "on_sale" if item.get("status") == 1 else "off_sale"
+    stock_value = _stock_value(item) if sale_status == "on_sale" else None
     specs = {
         "商品编号": goods_key,
         "商品类型": item.get("goods_type") or "未知",
@@ -314,7 +320,9 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "price": _money(item.get("real_price") if item.get("real_price") not in (None, "") else item.get("price")),
         "market_price": _money(item.get("market_price")),
         "stock": stock_value,
-        "stock_label": str(stock_value) if stock_value is not None else "接口未公开数量",
+        "stock_label": (
+            str(stock_value) if stock_value is not None else "接口未公开数量"
+        ) if sale_status == "on_sale" else "未上架",
         "sale_status": sale_status,
         "description": plain_text(item.get("description")),
         "image": str(item.get("image") or ""),
@@ -563,11 +571,11 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
     extend = item.get("extend") if isinstance(item.get("extend"), dict) else {}
     category = item.get("category") if isinstance(item.get("category"), dict) else {}
     seller = item.get("user") if isinstance(item.get("user"), dict) else {}
-    stock_value = _stock_value(item)
     limit_count = _first_value(extend, ("limit_count", "limit"))
     sales = _first_value(item, ("sales", "sales_count", "sold", "sale_count"))
     status_value = _first_value(item, ("status", "goods_status", "is_sale"))
     sale_status = "on_sale" if status_value is None or str(status_value).lower() in {"1", "true", "on_sale"} else "off_sale"
+    stock_value = _stock_value(item) if sale_status == "on_sale" else None
     specs = {
         "商品编号": goods_key,
         "商品类型": item.get("goods_type") or "未知",
@@ -585,7 +593,9 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
         "price": _money(item.get("real_price") if item.get("real_price") not in (None, "") else item.get("price")),
         "market_price": _money(item.get("market_price")),
         "stock": stock_value,
-        "stock_label": str(stock_value) if stock_value not in (None, "") else "接口未公开数量",
+        "stock_label": (
+            str(stock_value) if stock_value not in (None, "") else "接口未公开数量"
+        ) if sale_status == "on_sale" else "未上架",
         "sale_status": sale_status,
         "description": plain_text(item.get("description")),
         "image": str(item.get("image") or item.get("cover") or ""),
@@ -664,6 +674,9 @@ def serialize_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
     raw_stock = result.get("stock")
     result["stock"] = int(raw_stock) if str(raw_stock or "").isdigit() else None
     result["stock_label"] = str(raw_stock) if raw_stock not in (None, "") else "接口未公开数量"
+    if result.get("sale_status") == "off_sale":
+        result["stock"] = None
+        result["stock_label"] = "未上架"
     result["query_password_required"] = result["specs"].get("查询密码") == "需要"
     legacy_limit = result["specs"].pop("单次限购", None)
     if "最低起购" not in result["specs"] and legacy_limit not in (None, ""):
@@ -671,6 +684,43 @@ def serialize_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
     limit_value = result["specs"].get("最低起购")
     result["limit_count"] = int(limit_value) if str(limit_value).isdigit() else None
     return result
+
+
+def effective_watch_product(
+    connection: sqlite3.Connection,
+    watch_id: int,
+    latest: sqlite3.Row | None = None,
+    attempt: sqlite3.Row | None = None,
+) -> dict[str, Any] | None:
+    if latest is None:
+        latest = connection.execute(
+            "SELECT * FROM snapshots WHERE watch_id = ? AND status = 'success' ORDER BY id DESC LIMIT 1",
+            (watch_id,),
+        ).fetchone()
+    product = serialize_snapshot(latest)
+    if product is None:
+        return None
+    if attempt is None:
+        attempt = connection.execute(
+            "SELECT fetched_at, status, error FROM snapshots WHERE watch_id = ? ORDER BY id DESC LIMIT 1",
+            (watch_id,),
+        ).fetchone()
+    shop_state = connection.execute(
+        """
+        SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN listed = 1 THEN 1 ELSE 0 END), 0) AS listed
+        FROM shop_products WHERE watch_id = ?
+        """,
+        (watch_id,),
+    ).fetchone()
+    removed_from_catalog = bool(shop_state and shop_state["total"] and not shop_state["listed"])
+    explicit_unlisted = bool(
+        attempt and attempt["status"] == "error" and is_unlisted_error(attempt["error"])
+    )
+    if product.get("sale_status") != "on_sale" or explicit_unlisted or removed_from_catalog:
+        product["sale_status"] = "off_sale"
+        product["stock"] = None
+        product["stock_label"] = "未上架"
+    return product
 
 
 def record_fetch(watch_id: int) -> dict[str, Any]:
@@ -978,7 +1028,7 @@ def list_watches() -> list[dict[str, Any]]:
             ).fetchone()
             watch = dict(row)
             watch["enabled"] = bool(watch["enabled"])
-            watch["latest"] = serialize_snapshot(latest)
+            watch["latest"] = effective_watch_product(connection, row["id"], latest, attempt)
             watch["last_attempt"] = dict(attempt) if attempt else None
             shop_links = connection.execute(
                 """
@@ -1930,7 +1980,7 @@ def list_preorders() -> list[dict[str, Any]]:
                 "SELECT * FROM snapshots WHERE watch_id = ? AND status = 'success' ORDER BY id DESC LIMIT 1",
                 (row["watch_id"],),
             ).fetchone()
-            product = serialize_snapshot(latest)
+            product = effective_watch_product(connection, row["watch_id"], latest)
             item = dict(row)
             item.pop("contact", None)
             item.pop("query_password", None)
@@ -1989,8 +2039,10 @@ def create_preorders(payload: dict[str, Any]) -> list[dict[str, Any]]:
             ).fetchone()
             if watch is None or latest is None:
                 raise PreorderConflict(f"商品 {watch_id} 尚无有效库存数据")
-            product = serialize_snapshot(latest)
+            product = effective_watch_product(connection, watch_id, latest)
             title = product.get("title") or watch["name"] or f"商品 {watch_id}"
+            if product.get("sale_status") != "on_sale":
+                raise PreorderConflict(f"{title} 当前未上架，不能启用预购")
             if product.get("stock") is None:
                 raise PreorderConflict(f"{title} 的库存数量未知，不能启用预购")
             if product["stock"] != 0:
@@ -2923,9 +2975,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ).fetchone()
                     if watch is None or latest is None:
                         return self._send_json({"detail": f"商品 {watch_id} 尚无有效抓取结果"}, 409)
-                    product = serialize_snapshot(latest)
+                    product = effective_watch_product(connection, watch_id, latest)
                     if product["sale_status"] != "on_sale":
-                        return self._send_json({"detail": f"{product['title']} 当前不是在售状态"}, 409)
+                        return self._send_json({"detail": f"{product['title']} 当前未上架"}, 409)
                     limit_count = product.get("limit_count")
                     if limit_count and quantity < limit_count:
                         return self._send_json({"detail": f"{product['title']} 最低 {limit_count} 件起购"}, 409)
@@ -2979,11 +3031,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "SELECT * FROM snapshots WHERE goods_key = ? AND status = 'success' ORDER BY id DESC LIMIT 1",
                         (goods_key,),
                     ).fetchone()
+                    product = effective_watch_product(connection, latest["watch_id"], latest) if latest else None
                 if latest is None:
                     raise ValueError("商品尚未完成有效同步")
-                product = serialize_snapshot(latest)
                 if product["sale_status"] != "on_sale":
-                    raise ValueError("商品当前已下架")
+                    raise ValueError("商品当前未上架")
                 if product.get("limit_count") and quantity < product["limit_count"]:
                     raise ValueError(f"最低 {product['limit_count']} 件起购")
                 result = create_official_payment_order(

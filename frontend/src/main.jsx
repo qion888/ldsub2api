@@ -7,20 +7,27 @@ import {
   BellRing,
   Check,
   ChevronRight,
+  CircleDollarSign,
   Clipboard,
   Clock3,
   Eye,
   EyeOff,
   FileUp,
+  Filter,
   History,
   Link2,
   ListChecks,
+  Moon,
   Minus,
   Package,
+  PanelRight,
   Plus,
   RefreshCw,
   Save,
+  Search,
   KeyRound,
+  Sun,
+  Tag,
   Upload,
   ShieldCheck,
   ShoppingBag,
@@ -58,7 +65,9 @@ async function request(path, options) {
 }
 
 function money(value) {
-  return value === null || value === undefined || value === '' ? '--' : `¥${Number(value).toFixed(2)}`;
+  if (value === null || value === undefined || value === '') return '--';
+  const number = Number(value);
+  return Number.isFinite(number) ? `¥${number.toFixed(2)}` : '--';
 }
 
 function compactTime(value) {
@@ -91,16 +100,22 @@ function ProductImage({item, size = 'normal'}) {
 }
 
 function StatusPill({item}) {
+  if (itemIsUnlisted(item)) {
+    return <span className="pill paused"><span className="dot"/>未上架</span>;
+  }
   if (item.last_attempt?.status === 'error') {
     return <span className="pill error"><AlertCircle size={12}/>抓取异常</span>;
   }
   if (!item.latest) return <span className="pill neutral"><Clock3 size={12}/>等待数据</span>;
   if (item.latest.sale_status === 'on_sale') return <span className="pill live"><span className="dot"/>在售</span>;
-  return <span className="pill paused"><span className="dot"/>已下架</span>;
+  return <span className="pill neutral"><Clock3 size={12}/>状态未知</span>;
 }
 
 function PriceBars({history}) {
-  const points = history.filter(point => point.status === 'success' && point.price !== null && point.price !== '');
+  const points = history.filter(point => {
+    if (point.status !== 'success' || point.price === null || point.price === undefined || point.price === '') return false;
+    return Number.isFinite(Number(point.price));
+  });
   if (!points.length) return <div className="chart-empty">完成两次抓取后显示价格走势</div>;
   const values = points.map(point => Number(point.price));
   const min = Math.min(...values);
@@ -122,6 +137,375 @@ function IconButton({label, children, tone = '', ...props}) {
   return <button className={`icon-button ${tone}`} title={label} aria-label={label} {...props}>{children}</button>;
 }
 
+function itemSpecValue(item, matcher) {
+  const specs = item?.latest?.specs;
+  if (!specs || typeof specs !== 'object') return '';
+  const key = Object.keys(specs).find(value => matcher.test(value));
+  return key ? String(specs[key] ?? '') : '';
+}
+
+function itemCategory(item) {
+  return itemSpecValue(item, /分类|category/i) || '未分类';
+}
+
+function itemShopName(item) {
+  return item?.shops?.[0]?.name || item?.shops?.[0]?.token || itemSpecValue(item, /店铺|seller|shop/i) || '独立商品';
+}
+
+function itemPrice(item) {
+  const raw = item?.latest?.price;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+const UNLISTED_ERROR_MARKERS = ['商品未上架', '商品不存在', '已下架', '已不在店铺列表'];
+
+function itemIsUnlisted(item) {
+  if (item?.latest?.sale_status === 'off_sale') return true;
+  const error = String(item?.last_attempt?.error || '');
+  return item?.last_attempt?.status === 'error' && UNLISTED_ERROR_MARKERS.some(marker => error.includes(marker));
+}
+
+function itemStock(item) {
+  if (itemIsUnlisted(item)) return {key: 'off', label: '未上架', value: null};
+  const raw = item?.latest?.stock;
+  if (raw === null || raw === undefined || raw === '') return {key: 'unknown', label: '库存未知', value: null};
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return {key: 'unknown', label: item?.latest?.stock_label || '库存未知', value: null};
+  return value > 0 ? {key: 'in', label: '有货', value} : {key: 'out', label: '缺货', value: 0};
+}
+
+function itemPurchasable(item) {
+  const stock = itemStock(item);
+  return !itemIsUnlisted(item) && item?.latest?.sale_status === 'on_sale' && stock.key !== 'out';
+}
+
+function itemStockLabel(item) {
+  const stock = itemStock(item);
+  return `${stock.label}${stock.value !== null ? ` · ${stock.value}` : ''}`;
+}
+
+function RadarStockPill({item}) {
+  const stock = itemStock(item);
+  return <span className={`radar-stock ${stock.key}`}><span className="radar-stock-dot"/>{itemStockLabel(item)}</span>;
+}
+
+// Keep the catalog order independent from mutable sync timestamps.
+function useStableItemOrder(items) {
+  const orderRef = useRef([]);
+  return useMemo(() => {
+    const present = new Set(items.map(item => item.id));
+    const next = orderRef.current.filter(id => present.has(id));
+    const seen = new Set(next);
+    items.forEach(item => {
+      if (!seen.has(item.id)) {
+        next.push(item.id);
+        seen.add(item.id);
+      }
+    });
+    orderRef.current = next;
+    return new Map(next.map((id, index) => [id, index]));
+  }, [items]);
+}
+
+function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, onSelect, onOpenDetail, onBuy, onAdd, onDirect, onRefresh}) {
+  const [query, setQuery] = useState('');
+  const [stockFilter, setStockFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [shopChoice, setShopChoice] = useState('all');
+  const [priceFilter, setPriceFilter] = useState('all');
+  const [sort, setSort] = useState('stable');
+
+  const categories = useMemo(() => [...new Set(items.map(itemCategory))].sort((a, b) => a.localeCompare(b, 'zh-CN')), [items]);
+  const filteredItems = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    const result = items.filter(item => {
+      const stock = itemStock(item);
+      const haystack = [item.latest?.title, item.name, item.url, itemShopName(item), itemCategory(item)].filter(Boolean).join(' ').toLowerCase();
+      if (needle && !haystack.includes(needle)) return false;
+      if (stockFilter !== 'all' && stock.key !== stockFilter) return false;
+      if (categoryFilter !== 'all' && itemCategory(item) !== categoryFilter) return false;
+      if (shopChoice === 'standalone' && item.shops?.length) return false;
+      if (shopChoice !== 'all' && shopChoice !== 'standalone' && !item.shops?.some(shop => String(shop.id) === shopChoice)) return false;
+      if (priceFilter === 'quoted' && itemPrice(item) === null) return false;
+      if (priceFilter === 'unquoted' && itemPrice(item) !== null) return false;
+      return true;
+    });
+    return result.sort((left, right) => {
+      if (sort === 'stable') return (stableOrder.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (stableOrder.get(right.id) ?? Number.MAX_SAFE_INTEGER);
+      if (sort === 'price-asc' || sort === 'price-desc') {
+        const a = itemPrice(left); const b = itemPrice(right);
+        if (a === null && b === null) return 0;
+        if (a === null) return 1;
+        if (b === null) return -1;
+        return sort === 'price-asc' ? a - b : b - a;
+      }
+      if (sort === 'name') return (left.latest?.title || left.name || '').localeCompare(right.latest?.title || right.name || '', 'zh-CN');
+      return new Date(right.last_attempt?.fetched_at || right.last_run || 0).getTime() - new Date(left.last_attempt?.fetched_at || left.last_run || 0).getTime();
+    });
+  }, [categoryFilter, items, priceFilter, query, shopChoice, sort, stableOrder, stockFilter]);
+  const categoryMinimums = useMemo(() => {
+    const result = new Map();
+    items.forEach(item => {
+      const price = itemPrice(item);
+      const category = itemCategory(item);
+      if (price !== null && itemStock(item).key !== 'off' && (!result.has(category) || price < result.get(category))) result.set(category, price);
+    });
+    return result;
+  }, [items]);
+  const quotedItems = filteredItems.filter(item => itemPrice(item) !== null);
+  const lowestPriceItems = quotedItems.filter(item => itemStock(item).key !== 'off');
+  const lowestPrice = lowestPriceItems.length ? Math.min(...lowestPriceItems.map(itemPrice)) : null;
+  const inStock = filteredItems.filter(item => itemStock(item).key === 'in').length;
+  const outOfStock = filteredItems.filter(item => itemStock(item).key === 'out').length;
+  const clearFilters = () => {
+    setQuery('');
+    setStockFilter('all');
+    setCategoryFilter('all');
+    setShopChoice('all');
+    setPriceFilter('all');
+    setSort('stable');
+  };
+  const hasFilters = query || stockFilter !== 'all' || categoryFilter !== 'all' || shopChoice !== 'all' || priceFilter !== 'all' || sort !== 'stable';
+
+  return <section className="product-overview-page" aria-label="商品总览">
+    <div className="overview-stat-strip">
+      <div><span>监控商品</span><strong>{filteredItems.length}</strong><small>全部 {items.length} 项</small></div>
+      <div><span>有效报价</span><strong>{quotedItems.length}</strong><small>覆盖 {categories.length} 个分类</small></div>
+      <div><span>当前有货</span><strong className="positive">{inStock}</strong><small>可直接进入购买流程</small></div>
+      <div><span>缺货 / 未上架</span><strong className="negative">{outOfStock + filteredItems.filter(item => itemStock(item).key === 'off').length}</strong><small>持续监控库存变化</small></div>
+      <div><span>全局最低报价</span><strong>{money(lowestPrice)}</strong><small>按当前筛选结果</small></div>
+    </div>
+
+    <div className="overview-category-bar" aria-label="商品分类">
+      <button className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}><Package size={16}/>全部分类<span>{items.length}</span></button>
+      {categories.map(category => {
+        const count = items.filter(item => itemCategory(item) === category).length;
+        return <button className={categoryFilter === category ? 'active' : ''} key={category} onClick={() => setCategoryFilter(category)}><Tag size={15}/>{category}<span>{count}</span></button>;
+      })}
+    </div>
+
+    <div className="overview-layout">
+      <aside className="overview-facets">
+        <div className="overview-panel-heading"><div><span>MONITORED SHOPS</span><h2>监控店铺</h2></div><strong>{shops.length}</strong></div>
+        <div className="overview-shop-list">
+          <button className={shopChoice === 'all' ? 'active' : ''} onClick={() => setShopChoice('all')}>
+            <span className="overview-shop-icon"><Store size={17}/></span>
+            <span><strong>全部来源</strong><small>全部监控商品</small></span>
+            <em>{items.length}</em>
+          </button>
+          {shops.map(shop => {
+            const shopItems = items.filter(item => item.shops?.some(link => link.id === shop.id));
+            const shopStock = shopItems.filter(item => itemStock(item).key === 'in').length;
+            return <button className={shopChoice === String(shop.id) ? 'active' : ''} key={shop.id} onClick={() => setShopChoice(String(shop.id))}>
+              <span className="overview-shop-icon"><Store size={17}/></span>
+              <span><strong>{shop.name || shop.token}</strong><small>{shopStock} 项有货 · {shop.token}</small></span>
+              <em>{shopItems.length}</em>
+            </button>;
+          })}
+          {items.some(item => !item.shops?.length) && <button className={shopChoice === 'standalone' ? 'active' : ''} onClick={() => setShopChoice('standalone')}>
+            <span className="overview-shop-icon"><Package size={17}/></span>
+            <span><strong>独立监控</strong><small>未通过整店同步关联</small></span>
+            <em>{items.filter(item => !item.shops?.length).length}</em>
+          </button>}
+        </div>
+        <div className="overview-facet-note"><CircleDollarSign size={17}/><div><strong>报价口径</strong><span>价格取自最近一次本地监控快照，同类最低价按商品分类计算。</span></div></div>
+      </aside>
+
+      <section className="overview-board">
+        <div className="overview-board-head">
+          <div><span>PRICE RADAR</span><h2>一体化价格雷达</h2><p>集中比较店铺报价、同类最低价、库存与最近同步状态</p></div>
+          <span className="overview-result-count">{filteredItems.length} 项结果</span>
+        </div>
+        <div className="overview-toolbar">
+          <label className="overview-search"><Search size={17}/><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索商品、店铺、分类或链接"/></label>
+          <label><span>库存状态</span><select aria-label="库存状态" value={stockFilter} onChange={event => setStockFilter(event.target.value)}><option value="all">全部库存</option><option value="in">仅看有货</option><option value="out">仅看缺货</option><option value="unknown">库存未知</option><option value="off">未上架</option></select></label>
+          <label><span>报价状态</span><select aria-label="报价状态" value={priceFilter} onChange={event => setPriceFilter(event.target.value)}><option value="all">全部报价</option><option value="quoted">仅看有报价</option><option value="unquoted">暂无报价</option></select></label>
+          <label><span>排序方式</span><select aria-label="排序方式" value={sort} onChange={event => setSort(event.target.value)}><option value="stable">当前顺序</option><option value="updated">最近同步</option><option value="price-asc">价格从低到高</option><option value="price-desc">价格从高到低</option><option value="name">商品名称</option></select></label>
+          <button className="overview-reset" onClick={clearFilters} disabled={!hasFilters}><X size={15}/>重置</button>
+        </div>
+
+        <div className="overview-table" role="table" aria-label="商品报价列表">
+          <div className="overview-table-head" role="row">
+            <span>商品 / 分类</span><span>店铺</span><span>当前报价</span><span>同类最低</span><span>库存</span><span>最近同步</span><span>操作</span>
+          </div>
+          <div className="overview-table-body">
+            {!filteredItems.length ? <div className="overview-empty"><CircleDollarSign size={28}/><strong>暂无匹配商品</strong><span>调整筛选条件后重试</span><button className="button secondary" onClick={clearFilters}>清除筛选</button></div> : filteredItems.map(item => {
+              const price = itemPrice(item);
+              const floor = categoryMinimums.get(itemCategory(item));
+              const unlisted = itemStock(item).key === 'off';
+              const isLowest = price !== null && floor !== undefined && price === floor && !unlisted;
+              return <article className={`overview-product-row ${selectedId === item.id ? 'selected' : ''}`} key={item.id} role="row">
+                <button type="button" className="overview-product-main" onClick={() => { onSelect(item.id); onOpenDetail(item.id); }} aria-label={`查看商品详情：${item.latest?.title || item.name || '等待商品数据'}`}>
+                  <ProductImage item={item}/>
+                  <span><strong>{item.latest?.title || item.name || '等待商品数据'}</strong><small><Tag size={12}/>{itemCategory(item)}{item.price_changed && <em>价格变化</em>}</small></span>
+                </button>
+                <div className="overview-shop-cell"><strong>{itemShopName(item)}</strong><small>{item.latest?.goods_key || '独立监控'}</small></div>
+                <div className="overview-price-cell"><strong>{money(price)}</strong><small>{Number(item.latest?.market_price) > 0 ? `参考 ${money(item.latest.market_price)}` : '实时监控价'}</small></div>
+                <div className="overview-floor-cell"><strong>{!unlisted && floor !== undefined ? money(floor) : '--'}</strong>{isLowest ? <span>当前最低</span> : <small>{unlisted ? '未上架' : price !== null && floor !== undefined ? `高 ${money(price - floor)}` : '暂无比较'}</small>}</div>
+                <div><RadarStockPill item={item}/></div>
+                <div className="overview-time-cell"><strong>{compactTime(item.last_attempt?.fetched_at)}</strong><small>{itemIsUnlisted(item) ? '未上架' : item.last_attempt?.status === 'error' ? '抓取异常' : intervalLabel(item.interval_seconds)}</small></div>
+                <div className="overview-row-actions">
+                  <IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>
+                  <IconButton label="直达商品页" onClick={() => onDirect(item)}><ArrowUpRight size={15}/></IconButton>
+                  <button className="overview-buy-button" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15}/>{busy[`buy-${item.id}`] ? '准备中' : '购买'}</button>
+                  <IconButton label="加入购买清单" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/></IconButton>
+                </div>
+              </article>;
+            })}
+          </div>
+        </div>
+      </section>
+    </div>
+  </section>;
+}
+
+function ProductOverviewDrawer({id, open, items, shops, stableOrder, busy = {}, selectedId, shopFilter, onClose, onSelect, onOpenDetail, onBuy, onAdd, onDirect, onRefresh, onShopFilter}) {
+  const [query, setQuery] = useState('');
+  const [stockFilter, setStockFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [shopChoice, setShopChoice] = useState('all');
+  const [priceFilter, setPriceFilter] = useState('all');
+  const [sort, setSort] = useState('stable');
+
+  const categories = useMemo(() => [...new Set(items.map(itemCategory))].sort((a, b) => a.localeCompare(b, 'zh-CN')), [items]);
+  const filteredItems = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    const result = items.filter(item => {
+      const stock = itemStock(item);
+      const haystack = [item.latest?.title, item.name, item.url, itemShopName(item), itemCategory(item)].filter(Boolean).join(' ').toLowerCase();
+      if (needle && !haystack.includes(needle)) return false;
+      if (stockFilter !== 'all' && stock.key !== stockFilter) return false;
+      if (categoryFilter !== 'all' && itemCategory(item) !== categoryFilter) return false;
+      if (shopChoice === 'standalone' && item.shops?.length) return false;
+      if (shopChoice !== 'all' && shopChoice !== 'standalone' && !item.shops?.some(shop => String(shop.id) === shopChoice)) return false;
+      if (priceFilter === 'quoted' && itemPrice(item) === null) return false;
+      if (priceFilter === 'unquoted' && itemPrice(item) !== null) return false;
+      return true;
+    });
+    return result.sort((left, right) => {
+      if (sort === 'stable') return (stableOrder.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (stableOrder.get(right.id) ?? Number.MAX_SAFE_INTEGER);
+      if (sort === 'price-asc' || sort === 'price-desc') {
+        const a = itemPrice(left); const b = itemPrice(right);
+        if (a === null && b === null) return 0;
+        if (a === null) return 1;
+        if (b === null) return -1;
+        return sort === 'price-asc' ? a - b : b - a;
+      }
+      if (sort === 'name') return (left.latest?.title || left.name || '').localeCompare(right.latest?.title || right.name || '', 'zh-CN');
+      return new Date(right.last_attempt?.fetched_at || right.last_run || 0).getTime() - new Date(left.last_attempt?.fetched_at || left.last_run || 0).getTime();
+    });
+  }, [categoryFilter, items, priceFilter, query, shopChoice, sort, stableOrder, stockFilter]);
+  const quotedItems = filteredItems.filter(item => itemPrice(item) !== null);
+  const inStock = filteredItems.filter(item => itemStock(item).key === 'in').length;
+  const outOfStock = filteredItems.filter(item => itemStock(item).key === 'out').length;
+  const lowestPriceItems = quotedItems.filter(item => itemStock(item).key !== 'off');
+  const lowestPrice = lowestPriceItems.length ? Math.min(...lowestPriceItems.map(itemPrice)) : null;
+  const categoryMinimums = useMemo(() => {
+    const result = new Map();
+    items.forEach(item => {
+      const price = itemPrice(item);
+      const category = itemCategory(item);
+      if (price !== null && itemStock(item).key !== 'off' && (!result.has(category) || price < result.get(category))) result.set(category, price);
+    });
+    return result;
+  }, [items]);
+
+  useEffect(() => {
+    setShopChoice(shopFilter === null ? 'all' : String(shopFilter));
+  }, [shopFilter]);
+
+  const chooseShop = value => {
+    setShopChoice(value === null ? 'all' : String(value));
+    onShopFilter(value === null ? null : Number(value));
+  };
+
+  return <>
+    <div className={`drawer-backdrop ${open ? 'open' : ''}`} onClick={onClose} aria-hidden="true" />
+    <aside id={id} className={`product-overview-drawer ${open ? 'open' : ''}`} aria-label="商品总览" aria-hidden={!open} inert={!open ? true : undefined}>
+      <div className="drawer-header">
+        <div><span className="drawer-kicker">PRICE RADAR</span><h2>商品总览</h2><p>报价、库存和店铺状态</p></div>
+        <IconButton label="关闭商品总览" onClick={onClose}><X size={17}/></IconButton>
+      </div>
+      <div className="radar-summary">
+        <div><span>监控商品</span><strong>{filteredItems.length}</strong></div>
+        <div><span>有货</span><strong className="positive">{inStock}</strong></div>
+        <div><span>缺货 / 未上架</span><strong className="negative">{outOfStock + filteredItems.filter(item => itemStock(item).key === 'off').length}</strong></div>
+        <div><span>最低报价</span><strong>{money(lowestPrice)}</strong></div>
+      </div>
+      <div className="drawer-section shop-radar-section">
+        <div className="drawer-section-head"><div><span className="drawer-kicker">MONITORED SHOPS</span><h3>监控店铺</h3></div><span className="drawer-count">{shops.length}</span></div>
+        <div className="radar-shop-list">
+          <button className={`radar-shop-chip ${shopChoice === 'all' && shopFilter === null ? 'active' : ''}`} onClick={() => chooseShop(null)}><Store size={14}/><span>全部店铺</span><strong>{items.length}</strong></button>
+          {shops.map(shop => {
+            const count = items.filter(item => item.shops?.some(link => link.id === shop.id)).length;
+            return <button className={`radar-shop-chip ${String(shop.id) === shopChoice ? 'active' : ''}`} key={shop.id} onClick={() => chooseShop(shop.id)}><Store size={14}/><span>{shop.name || shop.token}</span><strong>{count}</strong></button>;
+          })}
+          {items.some(item => !item.shops?.length) && <button className={`radar-shop-chip ${shopChoice === 'standalone' ? 'active' : ''}`} onClick={() => { setShopChoice('standalone'); onShopFilter(null); }}><Package size={14}/><span>独立监控</span><strong>{items.filter(item => !item.shops?.length).length}</strong></button>}
+        </div>
+      </div>
+      <div className="drawer-section radar-filter-section">
+        <div className="drawer-section-head"><div><span className="drawer-kicker">FILTERS</span><h3>筛选与排序</h3></div><Filter size={16}/></div>
+        <label className="radar-search"><Search size={15}/><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索商品、店铺或分类"/></label>
+        <div className="radar-filter-grid">
+          <label><span>库存</span><select value={stockFilter} onChange={event => setStockFilter(event.target.value)}><option value="all">全部库存</option><option value="in">仅看有货</option><option value="out">仅看缺货</option><option value="unknown">库存未知</option><option value="off">未上架</option></select></label>
+          <label><span>分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部分类</option>{categories.map(category => <option value={category} key={category}>{category}</option>)}</select></label>
+          <label><span>店铺</span><select value={shopChoice} onChange={event => chooseShop(event.target.value === 'all' ? null : event.target.value)}><option value="all">全部店铺</option>{shops.map(shop => <option value={shop.id} key={shop.id}>{shop.name || shop.token}</option>)}<option value="standalone">独立监控</option></select></label>
+          <label><span>报价</span><select value={priceFilter} onChange={event => setPriceFilter(event.target.value)}><option value="all">全部报价</option><option value="quoted">仅看有报价</option><option value="unquoted">暂无报价</option></select></label>
+          <label><span>排序</span><select value={sort} onChange={event => setSort(event.target.value)}><option value="stable">当前顺序</option><option value="updated">最近同步</option><option value="price-asc">报价从低到高</option><option value="price-desc">报价从高到低</option><option value="name">商品名称</option></select></label>
+        </div>
+      </div>
+      <div className="drawer-section radar-list-section">
+        <div className="drawer-section-head"><div><span className="drawer-kicker">QUOTE BOARD</span><h3>价格雷达</h3></div><span className="drawer-count">{quotedItems.length} 报价</span></div>
+        <div className="radar-list">
+          {!filteredItems.length ? <div className="radar-empty"><CircleDollarSign size={24}/><strong>暂无匹配商品</strong><span>调整筛选条件后重试</span></div> : filteredItems.map(item => {
+            const price = itemPrice(item);
+            const floor = categoryMinimums.get(itemCategory(item));
+            return <article className={`radar-item ${selectedId === item.id ? 'selected' : ''}`} key={item.id}>
+              <button type="button" className="radar-item-main" onClick={() => { onSelect(item.id); onOpenDetail(item.id); }} aria-label={`查看商品详情：${item.latest?.title || item.name || '等待商品数据'}`}>
+                <ProductImage item={item}/>
+                <div className="radar-copy"><strong title={item.latest?.title || item.name}>{item.latest?.title || item.name || '等待商品数据'}</strong><span>{itemShopName(item)} · {itemCategory(item)}</span><RadarStockPill item={item}/></div>
+                <div className="radar-quote"><strong>{money(price)}</strong><small>{floor !== undefined ? `最低 ${money(floor)}` : '暂无最低价'}</small>{item.price_changed && <em>变价</em>}</div>
+              </button>
+              <div className="radar-actions"><IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={14} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton><IconButton label="直达商品页" onClick={() => onDirect(item)}><ArrowUpRight size={14}/></IconButton><IconButton label="一键购买" tone="buy" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={14} className={busy[`buy-${item.id}`] ? 'spin' : ''}/></IconButton><IconButton label="加入购买清单" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={14}/></IconButton></div>
+            </article>;
+          })}
+        </div>
+      </div>
+      <div className="drawer-foot"><Tag size={14}/><span>报价为本地监控快照，最低价按全部监控商品分类计算</span></div>
+    </aside>
+  </>;
+}
+
+
+function ProductDetailDrawer({open, item, history, priceDelta, lowestPrice, busy = {}, onClose, onBuy, onAdd, onRefresh, onDirect}) {
+  const latest = item?.latest;
+  const stock = itemStock(item);
+  const specs = latest?.specs && typeof latest.specs === 'object' ? Object.entries(latest.specs) : [];
+  const sourceUrl = latest?.source_url || item?.url;
+  return <>
+    <div className={`drawer-backdrop detail-backdrop ${open ? 'open' : ''}`} onClick={onClose} aria-hidden="true"/>
+    <aside className={`product-detail-drawer ${open ? 'open' : ''}`} aria-label="商品详情" aria-hidden={!open} inert={!open ? true : undefined}>
+      <div className="drawer-header">
+        <div><span className="drawer-kicker">PRODUCT DETAIL</span><h2>商品详情</h2><p>{item ? itemShopName(item) : '未选择商品'}</p></div>
+        <IconButton label="关闭商品详情" onClick={onClose}><X size={17}/></IconButton>
+      </div>
+      {!item ? <div className="drawer-empty"><Package size={30}/><strong>请选择商品</strong><span>从价格雷达或商品目录打开详情</span></div> : <div className="detail-drawer-body">
+        <div className="detail-drawer-hero"><ProductImage item={item} size="large"/><div><span className="detail-kicker">{itemCategory(item)}</span><h3>{latest?.title || item.name || '等待商品数据'}</h3><span className="detail-source">{itemShopName(item)}</span></div></div>
+        <div className="detail-drawer-actions"><button className="button primary" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15}/>{busy[`buy-${item.id}`] ? '正在准备' : '一键购买'}</button><button className="button secondary" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/>加入清单</button><button className="button secondary" onClick={() => onDirect(item)}><ArrowUpRight size={15}/>直达商品页</button><IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton></div>
+        <div className="detail-price-board"><div><span>当前报价</span><strong>{money(itemPrice(item))}</strong></div><div><span>同类最低</span><strong>{money(lowestPrice)}</strong></div><div><span>参考价</span><strong>{Number(latest?.market_price) > 0 ? money(latest.market_price) : '--'}</strong></div><div><span>价格变化</span><strong className={priceDelta > 0 ? 'negative' : priceDelta < 0 ? 'positive' : ''}>{priceDelta === null || priceDelta === undefined ? '--' : priceDelta === 0 ? '不变' : `${priceDelta > 0 ? '+' : '-'}${money(Math.abs(priceDelta))}`}</strong></div></div>
+        <div className="detail-state-grid"><div><span>库存状态</span><strong className={`state-text ${stock.key}`}>{itemStockLabel(item)}</strong></div><div><span>销售状态</span><strong>{itemIsUnlisted(item) ? '未上架' : latest?.sale_status === 'on_sale' ? '在售' : '状态未知'}</strong></div><div><span>最低起购</span><strong>{latest?.limit_count || 1} 件</strong></div><div><span>最近同步</span><strong>{compactTime(item.last_attempt?.fetched_at)}</strong></div></div>
+        <div className="detail-drawer-chart"><div className="drawer-section-head"><div><span className="drawer-kicker">PRICE HISTORY</span><h3>价格走势</h3></div><span>{history.length} 次记录</span></div><PriceBars history={history}/></div>
+        <div className="detail-description"><span className="drawer-kicker">DESCRIPTION</span><h3>商品信息</h3><p>{latest?.description || '暂无商品描述'}</p></div>
+        {specs.length > 0 && <div className="detail-drawer-specs"><span className="drawer-kicker">SPECIFICATIONS</span><h3>规格参数</h3><div>{specs.map(([key, value]) => <dl key={key}><dt>{key}</dt><dd>{String(value)}</dd></dl>)}</div></div>}
+        {item.last_attempt?.status === 'error' && <div className="inline-error"><AlertCircle size={16}/><span>{item.last_attempt.error}</span></div>}
+        <a className="detail-direct-link" href={sourceUrl} target="_blank" rel="noreferrer"><Link2 size={14}/>打开官方商品页面<ArrowUpRight size={14}/></a>
+      </div>}
+    </aside>
+  </>;
+}
+
 function App() {
   const [items, setItems] = useState([]);
   const [shops, setShops] = useState([]);
@@ -136,6 +520,9 @@ function App() {
   const [shopFilter, setShopFilter] = useState(null);
   const [checkedIds, setCheckedIds] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
+  const [theme, setTheme] = useState(() => window.localStorage.getItem('ldxp-theme') === 'dark' ? 'dark' : 'light');
+  const [overviewOpen, setOverviewOpen] = useState(false);
+  const [detailOpen, setDetailOpen] = useState(false);
   const [history, setHistory] = useState([]);
   const [cart, setCart] = useState([]);
   const [contact, setContact] = useState({contact: '', note: ''});
@@ -176,6 +563,27 @@ function App() {
   const toastTimer = useRef(null);
   const preorderLoaded = useRef(false);
   const knownTriggeredPreorders = useRef(new Set());
+  const stableItemOrder = useStableItemOrder(items);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem('ldxp-theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const drawerOpen = overviewOpen || detailOpen;
+    document.body.classList.toggle('drawer-open', drawerOpen);
+    const closeOnEscape = event => {
+      if (event.key !== 'Escape') return;
+      if (detailOpen) setDetailOpen(false);
+      else if (overviewOpen) setOverviewOpen(false);
+    };
+    if (drawerOpen) window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.body.classList.remove('drawer-open');
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [detailOpen, overviewOpen]);
 
   const notify = (message, type = 'info') => {
     setToast({message, type});
@@ -277,7 +685,7 @@ function App() {
   const monitored = items.filter(item => item.enabled).length;
   const saleCount = items.filter(item => item.latest?.sale_status === 'on_sale').length;
   const changes = items.filter(item => item.price_changed).length;
-  const failures = items.filter(item => item.last_attempt?.status === 'error').length;
+  const failures = items.filter(item => item.last_attempt?.status === 'error' && !itemIsUnlisted(item)).length;
   const shopFailures = shops.filter(shop => shop.last_attempt?.status === 'error').length;
   const visibleItems = shopFilter
     ? items.filter(item => item.shops?.some(shop => shop.id === shopFilter))
@@ -285,7 +693,8 @@ function App() {
   const totalCart = cart.reduce((sum, entry) => sum + entry.quantity, 0);
   const estimatedTotal = cart.reduce((sum, entry) => {
     const item = items.find(candidate => candidate.id === entry.watch_id);
-    return sum + Number(item?.latest?.price || 0) * entry.quantity;
+    const unitPrice = Number(item?.latest?.price);
+    return sum + (Number.isFinite(unitPrice) ? unitPrice : 0) * entry.quantity;
   }, 0);
   const visibleCheckedIds = visibleItems.filter(item => checkedIds.includes(item.id)).map(item => item.id);
   const allVisibleChecked = visibleItems.length > 0 && visibleCheckedIds.length === visibleItems.length;
@@ -453,7 +862,10 @@ function App() {
       await request(`/watches/${item.id}`, {method: 'DELETE'});
       setCart(current => current.filter(entry => entry.watch_id !== item.id));
       setCheckedIds(current => current.filter(id => id !== item.id));
-      if (selectedId === item.id) setSelectedId(null);
+      if (selectedId === item.id) {
+        setSelectedId(null);
+        setDetailOpen(false);
+      }
       await loadItems({quiet: true});
       notify('监控商品已删除');
     } catch (error) {
@@ -493,7 +905,10 @@ function App() {
         body: JSON.stringify({ids: visibleCheckedIds}),
       });
       setCart(current => current.filter(entry => !visibleCheckedIds.includes(entry.watch_id)));
-      if (visibleCheckedIds.includes(selectedId)) setSelectedId(null);
+      if (visibleCheckedIds.includes(selectedId)) {
+        setSelectedId(null);
+        setDetailOpen(false);
+      }
       setCheckedIds(current => current.filter(id => !visibleCheckedIds.includes(id)));
       await loadItems({quiet: true});
       notify(`已从本地目录移除 ${result.deleted_count} 个商品`);
@@ -523,12 +938,16 @@ function App() {
         items: selectedItems.map(item => {
           const entry = byId.get(item.id);
           const product = entry?.ok ? entry.data : null;
+          const unlisted = itemIsUnlisted(item)
+            || product?.sale_status === 'off_sale'
+            || UNLISTED_ERROR_MARKERS.some(marker => String(entry?.error || '').includes(marker));
           const minimum = Math.max(1, Number(product?.limit_count || item.latest?.limit_count || 1));
           return {
             watch_id: item.id,
             title: product?.title || item.latest?.title || item.name || `商品 ${item.id}`,
-            stock: product?.stock ?? null,
-            stock_label: product?.stock_label || (entry?.error ? '库存刷新失败' : '数量待获取'),
+            stock: unlisted ? null : product?.stock ?? null,
+            stock_label: unlisted ? '未上架' : product?.stock_label || (entry?.error ? '库存刷新失败' : '数量待获取'),
+            sale_status: unlisted ? 'off_sale' : product?.sale_status || item.latest?.sale_status,
             minimum,
             quantity: minimum,
           };
@@ -553,7 +972,7 @@ function App() {
   };
 
   const savePreorders = async () => {
-    const eligible = preorderDraft.items.filter(entry => Number(entry.stock) === 0 && entry.stock !== null);
+    const eligible = preorderDraft.items.filter(entry => entry.sale_status === 'on_sale' && Number(entry.stock) === 0 && entry.stock !== null);
     if (!preorderDraft.enabled) return notify('请先勾选启用自动预购', 'error');
     if (!eligible.length) return notify('所选商品没有可预购的缺货商品', 'error');
     setBusy(value => ({...value, preorder: true}));
@@ -590,7 +1009,7 @@ function App() {
   };
 
   const addToCart = item => {
-    if (!item.latest || item.latest.sale_status !== 'on_sale') return notify('该商品当前不可加入清单', 'error');
+    if (!itemPurchasable(item)) return notify(itemStock(item).key === 'out' ? '该商品当前缺货，可设置自动预购' : '该商品当前不可加入清单', 'error');
     const minimum = Math.max(1, Number(item.latest.limit_count || 1));
     setCart(current => {
       const exists = current.find(entry => entry.watch_id === item.id);
@@ -744,6 +1163,7 @@ function App() {
   };
 
   const oneClickBuy = async item => {
+    if (!itemPurchasable(item)) return notify(itemStock(item).key === 'out' ? '该商品当前缺货，可设置自动预购' : '该商品当前不可购买', 'error');
     if (!savedCheckout.contact) return notify('请先在购买配置中保存联系方式', 'error');
     if (item.latest?.query_password_required && !savedCheckout.query_password) {
       return notify('该商品需要查询密码，请先在购买配置中保存', 'error');
@@ -1107,20 +1527,47 @@ function App() {
   };
 
   const selectedPriceDelta = useMemo(() => {
-    const prices = history.filter(point => point.status === 'success' && point.price !== '').map(point => Number(point.price));
+    const prices = history
+      .filter(point => point.status === 'success' && point.price !== null && point.price !== undefined && point.price !== '')
+      .map(point => Number(point.price))
+      .filter(value => Number.isFinite(value));
     if (prices.length < 2) return null;
     return prices[prices.length - 1] - prices[prices.length - 2];
   }, [history]);
+  const localLowestPrice = useMemo(() => {
+    const selectedCategory = selected ? itemCategory(selected) : null;
+    const prices = items.filter(item => (!selectedCategory || itemCategory(item) === selectedCategory) && itemStock(item).key !== 'off').map(itemPrice).filter(value => value !== null);
+    return prices.length ? Math.min(...prices) : null;
+  }, [items, selected]);
+  const openProductDetail = id => {
+    setSelectedId(id);
+    setOverviewOpen(false);
+    setDetailOpen(true);
+  };
+  const openDirectProduct = item => window.open(item.latest?.source_url || item.url, '_blank', 'noopener,noreferrer');
+  const switchView = view => {
+    setOverviewOpen(false);
+    setDetailOpen(false);
+    setActiveView(view);
+  };
+  const viewMeta = {
+    products: {title: '商品总览', description: '聚合监控店铺报价，快速比较最低价、库存与销售状态'},
+    monitor: {title: '店铺与商品监控', description: '汇总店铺商品，追踪库存、价格与在售状态'},
+    history: {title: '价格记录', description: '查看选中商品的抓取结果与价格变化'},
+    reclaim: {title: '卡密 401 找回', description: '检测并找回 30d.team 卡密关联的 401 账号'},
+    sub2api: {title: 'Sub2API 账号导入', description: '使用管理员密钥将账号 JSON 导入 Sub2API'},
+  }[activeView];
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark"><Activity size={18}/></div><div><strong>链动监控台</strong><span>LOCAL WATCH</span></div></div>
         <nav className="nav-list" aria-label="页面导航">
-          <button className={activeView === 'monitor' ? 'active' : ''} onClick={() => setActiveView('monitor')}><ListChecks size={18}/>监控面板</button>
-          <button className={activeView === 'history' ? 'active' : ''} onClick={() => setActiveView('history')}><History size={18}/>价格记录</button>
-          <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => setActiveView('reclaim')}><KeyRound size={18}/>401 找回</button>
-          <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => setActiveView('sub2api')}><Upload size={18}/>Sub2API 导入</button>
+          <button className={activeView === 'products' ? 'active' : ''} onClick={() => switchView('products')}><CircleDollarSign size={18}/>商品总览</button>
+          <button className={activeView === 'monitor' ? 'active' : ''} onClick={() => switchView('monitor')}><ListChecks size={18}/>监控面板</button>
+          <button className={activeView === 'history' ? 'active' : ''} onClick={() => switchView('history')}><History size={18}/>价格记录</button>
+          <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>
+          <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>
         </nav>
         <div className="sidebar-foot">
           <div className={`service-light ${serviceOnline ? 'online' : ''}`}><span/>{serviceOnline ? '本地服务在线' : '本地服务离线'}</div>
@@ -1130,10 +1577,14 @@ function App() {
 
       <main className="workspace">
         <header className="topbar">
-          <div><h1>{activeView === 'monitor' ? '店铺与商品监控' : activeView === 'history' ? '价格记录' : activeView === 'reclaim' ? '卡密 401 找回' : 'Sub2API 账号导入'}</h1><p>{activeView === 'monitor' ? '汇总店铺商品，追踪库存、价格与在售状态' : activeView === 'history' ? '查看选中商品的抓取结果与价格变化' : activeView === 'reclaim' ? '检测并找回 30d.team 卡密关联的 401 账号' : '使用管理员密钥将账号 JSON 导入 Sub2API'}</p></div>
-          <button className="button secondary" onClick={fetchAll} disabled={busy.fetchAll || (!items.length && !shops.length)}>
-            <RefreshCw size={16} className={busy.fetchAll ? 'spin' : ''}/>全部刷新
-          </button>
+          <div><h1>{viewMeta.title}</h1><p>{viewMeta.description}</p></div>
+          <div className="topbar-actions">
+            {['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary overview-button" onClick={() => { setDetailOpen(false); setOverviewOpen(true); }} aria-expanded={overviewOpen} aria-controls="product-overview-drawer"><PanelRight size={16}/>商品总览</button>}
+            <IconButton label={theme === 'dark' ? '切换日间模式' : '切换夜间模式'} onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={16}/> : <Moon size={16}/>}</IconButton>
+            {['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary refresh-all-button" onClick={fetchAll} disabled={busy.fetchAll || (!items.length && !shops.length)}>
+              <RefreshCw size={16} className={busy.fetchAll ? 'spin' : ''}/>全部刷新
+            </button>}
+          </div>
         </header>
 
         {['monitor', 'history'].includes(activeView) && <section className="metrics" aria-label="监控概览">
@@ -1143,7 +1594,9 @@ function App() {
           <div><span>抓取异常</span><strong className={failures + shopFailures ? 'negative' : ''}>{failures + shopFailures}</strong><small>{changes ? `${changes} 项价格变化` : '最近一次结果'}</small></div>
         </section>}
 
-        {activeView === 'monitor' ? (
+        {activeView === 'products' ? (
+          <ProductOverviewView items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={fetchOne}/>
+        ) : activeView === 'monitor' ? (
           <>
             <form className="watch-composer" onSubmit={addWatch}>
               <div className="composer-title"><div className="section-icon">{sourceMode === 'shop' ? <Store size={17}/> : <BellRing size={17}/>}</div><div><h2>添加监控</h2><div className="source-segment"><button type="button" className={sourceMode === 'shop' ? 'active' : ''} onClick={() => changeSourceMode('shop')}><Store size={13}/>整店</button><button type="button" className={sourceMode === 'item' ? 'active' : ''} onClick={() => changeSourceMode('item')}><Package size={13}/>单商品</button></div></div></div>
@@ -1180,31 +1633,23 @@ function App() {
                 <div className="table-head"><label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label><span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控</span><span>操作</span></div>
                 <div className="product-list">
                   {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>暂无商品数据</strong><span>在上方添加店铺或商品链接</span></div> : visibleItems.map(item => (
-                    <div className={`product-row ${selectedId === item.id ? 'selected' : ''} ${checkedIds.includes(item.id) ? 'checked' : ''}`} key={item.id} onClick={() => setSelectedId(item.id)}>
+                    <div className={`product-row ${selectedId === item.id ? 'selected' : ''} ${checkedIds.includes(item.id) ? 'checked' : ''}`} key={item.id} onClick={() => openProductDetail(item.id)}>
                       <label className="check-wrap checkbox-cell" title="选择商品" onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedIds.includes(item.id)} onChange={() => toggleChecked(item.id)}/></label>
                       <div className="product-cell"><ProductImage item={item}/><div className="product-copy"><strong>{item.latest?.title || item.name || '等待首次抓取'}</strong><span>{item.shops?.length ? `${item.shops[0].name || item.shops[0].token} · ${item.url}` : item.name && item.latest ? item.name : item.url}</span><small>{compactTime(item.last_attempt?.fetched_at)}</small></div></div>
                       <div className="price-cell"><strong>{money(item.latest?.price)}</strong>{item.price_changed && <span className="change-flag">有变化</span>}</div>
-                      <div className="state-cell"><StatusPill item={item}/><small>{item.latest?.stock_label || '数量待获取'}</small>{preorderByWatch.get(item.id)?.status === 'watching' && <small className="preorder-state">自动预购 {preorderByWatch.get(item.id).quantity} 件</small>}</div>
+                      <div className="state-cell"><StatusPill item={item}/><small>{itemStockLabel(item)}</small>{preorderByWatch.get(item.id)?.status === 'watching' && <small className="preorder-state">自动预购 {preorderByWatch.get(item.id).quantity} 件</small>}</div>
                       <div className="monitor-cell"><button className={`switch ${item.enabled ? 'on' : ''}`} role="switch" aria-checked={item.enabled} title={item.enabled ? '暂停自动监控' : '开启自动监控'} onClick={event => {event.stopPropagation(); updateWatch(item, {enabled: !item.enabled});}}><span/></button><small>{intervalLabel(item.interval_seconds)}</small></div>
                       <div className="row-actions" onClick={event => event.stopPropagation()}>
                         <IconButton label={item.shops?.length ? '同步所属店铺库存' : '立即抓取'} onClick={() => fetchOne(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>
                         <IconButton label="复制商品链接" onClick={() => copyLinks([item])}><Clipboard size={15}/></IconButton>
-                        <IconButton label="加入购买清单" onClick={() => addToCart(item)}><ShoppingBag size={15}/></IconButton>
-                        <IconButton label="使用已保存配置一键购买" tone="buy" onClick={() => oneClickBuy(item)} disabled={busy[`buy-${item.id}`]}><Zap size={15} className={busy[`buy-${item.id}`] ? 'spin' : ''}/></IconButton>
+                        <IconButton label="加入购买清单" onClick={() => addToCart(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/></IconButton>
+                        <IconButton label="使用已保存配置一键购买" tone="buy" onClick={() => oneClickBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15} className={busy[`buy-${item.id}`] ? 'spin' : ''}/></IconButton>
                         <IconButton label="删除监控" tone="danger" onClick={() => removeWatch(item)}><Trash2 size={15}/></IconButton>
                       </div>
                     </div>
                   ))}
                 </div>
 
-                {selected && <div className="product-detail">
-                  <div className="detail-lead"><ProductImage item={selected} size="large"/><div><span className="detail-kicker">选中商品</span><h2>{latest?.title || selected.name || '等待抓取'}</h2><a href={selected.url} target="_blank" rel="noreferrer">官方商品页<ArrowUpRight size={14}/></a></div><div className="detail-price"><span>当前价格</span><strong>{money(latest?.price)}</strong>{selectedPriceDelta !== null && <small className={selectedPriceDelta > 0 ? 'negative' : selectedPriceDelta < 0 ? 'positive' : ''}>{selectedPriceDelta === 0 ? '价格未变' : `${selectedPriceDelta > 0 ? '+' : '-'}¥${Math.abs(selectedPriceDelta).toFixed(2)}`}</small>}</div></div>
-                  <div className="detail-columns">
-                    <div className="description-block"><h3>商品信息</h3><p>{latest?.description || '暂无商品描述'}</p></div>
-                    <div className="spec-grid">{Object.entries(latest?.specs || {}).map(([key, value]) => <div key={key}><span>{key}</span><strong>{String(value)}</strong></div>)}</div>
-                  </div>
-                  {selected.last_attempt?.status === 'error' && <div className="inline-error"><AlertCircle size={16}/><span>{selected.last_attempt.error}</span></div>}
-                </div>}
               </section>
 
               <PurchasePanel items={items} cart={cart} setCart={setCart} totalCart={totalCart} estimatedTotal={estimatedTotal} setQuantity={setQuantity} contact={contact} setContact={setContact} saveCheckout={saveCheckout} queryPassword={queryPassword} setQueryPassword={setQueryPassword} passwordVisible={passwordVisible} setPasswordVisible={setPasswordVisible} paymentChannel={paymentChannel} setPaymentChannel={setPaymentChannel} prepareCheckout={prepareCheckout} busy={busy}/>
@@ -1213,7 +1658,7 @@ function App() {
         ) : activeView === 'history' ? (
           <section className="history-view">
             <div className="history-sidebar"><div className="section-heading"><div><h2>商品</h2><p>选择查看记录</p></div></div>{items.map(item => <button className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => setSelectedId(item.id)}><ProductImage item={item}/><span><strong>{item.latest?.title || item.name}</strong><small>{money(item.latest?.price)}</small></span><ChevronRight size={16}/></button>)}</div>
-            <div className="history-main"><div className="history-top"><div><span>最近 60 次记录</span><h2>{latest?.title || '请选择商品'}</h2></div><strong>{money(latest?.price)}</strong></div><PriceBars history={history}/><div className="history-table"><div className="history-row head"><span>抓取时间</span><span>价格</span><span>在售状态</span><span>结果</span></div>{[...history].reverse().map((point, index) => <div className="history-row" key={`${point.id}-${index}`}><span>{compactTime(point.fetched_at)}</span><strong>{money(point.price)}</strong><span>{point.sale_status === 'on_sale' ? '在售' : point.sale_status === 'off_sale' ? '已下架' : '--'}</span><span className={point.status === 'success' ? 'positive' : 'negative'}>{point.status === 'success' ? '成功' : point.error || '失败'}</span></div>)}</div></div>
+            <div className="history-main"><div className="history-top"><div><span>最近 60 次记录</span><h2>{latest?.title || '请选择商品'}</h2></div><strong>{money(latest?.price)}</strong></div><PriceBars history={history}/><div className="history-table"><div className="history-row head"><span>抓取时间</span><span>价格</span><span>在售状态</span><span>结果</span></div>{[...history].reverse().map((point, index) => <div className="history-row" key={`${point.id}-${index}`}><span>{compactTime(point.fetched_at)}</span><strong>{money(point.price)}</strong><span>{point.sale_status === 'on_sale' ? '在售' : point.sale_status === 'off_sale' ? '未上架' : '--'}</span><span className={point.status === 'success' ? 'positive' : 'negative'}>{point.status === 'success' ? '成功' : point.error || '失败'}</span></div>)}</div></div>
           </section>
         ) : activeView === 'reclaim' ? (
           <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onDownload={downloadReclaimed} onImport={() => { setActiveView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
@@ -1222,7 +1667,10 @@ function App() {
         )}
       </main>
 
-      {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
+      <ProductOverviewDrawer id="product-overview-drawer" open={overviewOpen} items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} shopFilter={shopFilter} onClose={() => setOverviewOpen(false)} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={fetchOne} onShopFilter={value => { setShopFilter(value); setCheckedIds([]); }}/>
+      <ProductDetailDrawer open={detailOpen} item={selected} history={history} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={fetchOne} onDirect={openDirectProduct}/>
+
+      {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
       {review && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setReview(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="购买确认"><div className="modal-head"><div><span>DIRECT CHECKOUT</span><h2>支付链接已准备</h2></div><IconButton label="关闭" onClick={() => setReview(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>{review.notice} 创建成功后会自动打开支付页面；下方仍保留“打开支付链接”入口，方便重复打开。</p></div><div className="review-list">{review.items.map(item => <div className="review-item" key={item.watch_id}><div><strong>{item.title}</strong><span>{money(item.unit_price)} × {item.quantity}</span><a className="payment-link" href={item.official_url} target="_blank" rel="noreferrer"><Link2 size={13}/>{item.official_url}</a></div><strong>{money(item.subtotal)}</strong><div className="review-actions"><button className="button secondary" onClick={() => copyPaymentLink(item)}><Clipboard size={15}/>复制商品链接</button></div></div>)}</div>{officialOrder && <div className="payment-order-result"><div><span>官方订单</span><strong>{officialOrder.trade_no}</strong></div><a href={officialOrder.payment_url} target="_blank" rel="noreferrer"><Link2 size={14}/>{officialOrder.payment_url}</a><small>{officialOrder.notice} 渠道：{officialOrder.channel === 'alipay' ? '支付宝' : '微信支付'}，金额：{money(officialOrder.amount)}</small><button className="button official" onClick={() => window.open(officialOrder.payment_url, '_blank', 'noopener,noreferrer')}><ArrowUpRight size={15}/>打开支付链接</button></div>}<div className="review-total"><span>清单合计</span><strong>{money(review.total)}</strong></div><div className="modal-foot"><span><ShieldCheck size={14}/>支付前请核对订单金额</span><div className="modal-foot-actions"><label className="payment-channel"><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><button className="button official auto-pay-button" onClick={createOfficialOrder} disabled={busy.officialOrder}><Package size={15}/>{busy.officialOrder ? '正在创建并跳转' : '创建订单并自动跳转'}</button><button className="button secondary" onClick={() => setReview(null)}>返回修改</button></div></div></div></div>}
       {toast && <div className={`toast ${toast.type}`}><span>{toast.type === 'error' ? <AlertCircle size={17}/> : <Check size={17}/>}</span>{toast.message}</div>}
     </div>

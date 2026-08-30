@@ -74,6 +74,27 @@ class GoodsParserTests(unittest.TestCase):
         )
         return watch_id
 
+    def seed_success_snapshot_followed_by_error(self, connection, error):
+        cursor = connection.execute(
+            "INSERT INTO watches(url, name, enabled, created_at) VALUES(?, ?, 1, ?)",
+            ("https://pay.ldxp.cn/item/stale-state-test", "旧快照商品", main.utc_now()),
+        )
+        watch_id = cursor.lastrowid
+        connection.execute(
+            """
+            INSERT INTO snapshots(
+                watch_id, title, price, stock, specs, sale_status, goods_key,
+                raw_data, fetched_at, status
+            ) VALUES(?, ?, '3.50', '7', ?, 'on_sale', 'stale-state-test', '{}', ?, 'success')
+            """,
+            (watch_id, "旧快照商品", json.dumps({"分类": "回归测试"}, ensure_ascii=False), main.utc_now()),
+        )
+        connection.execute(
+            "INSERT INTO snapshots(watch_id, fetched_at, status, error) VALUES(?, ?, 'error', ?)",
+            (watch_id, main.utc_now(), error),
+        )
+        return watch_id
+
     def test_fetch_buyer_juuid_follows_script_to_iframe(self):
         script = b"const iframe = document.createElement('iframe'); iframe.src = 'https://pay.ldxp.cn/shopApi/common/buyerBlackIframe';"
         iframe = b"<script> const juuid = 'ExampleJuuid123';window.parent.postMessage({type:'CloudBuyerBlack',juuid},'*');</script>"
@@ -269,6 +290,189 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertIn("最低 2 件起购", rejected["detail"])
                 self.assertEqual(accepted_status, 200)
                 self.assertEqual(accepted["items"][0]["quantity"], 8)
+
+    def test_explicit_unlisted_error_overrides_stale_on_sale_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    self.seed_success_snapshot_followed_by_error(
+                        connection, "商品未上架，如有疑问请联系商家"
+                    )
+
+                watch = main.list_watches()[0]
+
+                self.assertEqual(watch["latest"]["sale_status"], "off_sale")
+                self.assertIsNone(watch["latest"]["stock"])
+                self.assertEqual(watch["latest"]["stock_label"], "未上架")
+                self.assertEqual(watch["latest"]["title"], "旧快照商品")
+                self.assertEqual(watch["latest"]["price"], "3.50")
+                self.assertEqual(watch["last_attempt"]["status"], "error")
+                self.assertEqual(watch["last_attempt"]["error"], "商品未上架，如有疑问请联系商家")
+
+    def test_checkout_rejects_explicit_unlisted_error_after_success_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = self.seed_success_snapshot_followed_by_error(
+                        connection, "商品未上架，如有疑问请联系商家"
+                    )
+
+                status, result = self.request_api(
+                    "POST", "/api/checkout/prepare", {"items": [{"watch_id": watch_id, "quantity": 1}]}
+                )
+
+                self.assertEqual(status, 409)
+                self.assertRegex(result["detail"], "未上架|不是在售")
+
+    def test_official_order_rejects_explicit_unlisted_error_without_upstream_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    self.seed_success_snapshot_followed_by_error(
+                        connection, "商品未上架，如有疑问请联系商家"
+                    )
+
+                with patch.object(main, "create_official_payment_order") as create_order:
+                    status, result = self.request_api(
+                        "POST",
+                        "/api/pay/order",
+                        {
+                            "items": [{"goods_key": "stale-state-test", "quantity": 1}],
+                            "channel_id": 1,
+                            "contact": "buyer@example.test",
+                        },
+                    )
+
+                self.assertEqual(status, 400)
+                self.assertRegex(result["detail"], "未上架|下架")
+                create_order.assert_not_called()
+
+    def test_preorder_rejects_explicit_unlisted_error_after_zero_stock_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = self.seed_success_snapshot_followed_by_error(
+                        connection, "商品未上架，如有疑问请联系商家"
+                    )
+                    connection.execute(
+                        "UPDATE snapshots SET stock = '0' WHERE watch_id = ? AND status = 'success'",
+                        (watch_id,),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO settings(key, value) VALUES('checkout', ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (json.dumps({"contact": "buyer@example.test", "channel_id": 1}),),
+                    )
+
+                with self.assertRaises(main.PreorderConflict) as raised:
+                    main.create_preorders({
+                        "enabled": True,
+                        "interval_seconds": 1,
+                        "items": [{"watch_id": watch_id, "quantity": 1}],
+                    })
+
+                self.assertIn("未上架", str(raised.exception))
+
+    def test_removed_shop_product_blocks_checkout_and_official_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = self.seed_success_snapshot_followed_by_error(connection, "网络连接超时")
+                    shop = connection.execute(
+                        """
+                        INSERT INTO shops(url, token, name, goods_type, enabled, interval_seconds, created_at)
+                        VALUES(?, ?, ?, 'card', 1, 300, ?)
+                        """,
+                        ("https://pay.ldxp.cn/shop/REMOVED", "REMOVED", "已移除店铺", main.utc_now()),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen)
+                        VALUES(?, 'stale-state-test', ?, 0, ?)
+                        """,
+                        (shop.lastrowid, watch_id, main.utc_now()),
+                    )
+
+                watch = main.list_watches()[0]
+                self.assertEqual(watch["latest"]["sale_status"], "off_sale")
+                self.assertIsNone(watch["latest"]["stock"])
+                self.assertEqual(watch["latest"]["stock_label"], "未上架")
+
+                checkout_status, checkout = self.request_api(
+                    "POST", "/api/checkout/prepare", {"items": [{"watch_id": watch_id, "quantity": 1}]}
+                )
+                self.assertEqual(checkout_status, 409)
+                self.assertIn("未上架", checkout["detail"])
+
+                with patch.object(main, "create_official_payment_order") as create_order:
+                    order_status, order = self.request_api(
+                        "POST",
+                        "/api/pay/order",
+                        {
+                            "items": [{"goods_key": "stale-state-test", "quantity": 1}],
+                            "channel_id": 1,
+                            "contact": "buyer@example.test",
+                        },
+                    )
+                self.assertEqual(order_status, 400)
+                self.assertIn("未上架", order["detail"])
+                create_order.assert_not_called()
+
+    def test_network_error_keeps_stale_success_snapshot_purchasable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = self.seed_success_snapshot_followed_by_error(connection, "网络连接超时")
+
+                watch = main.list_watches()[0]
+                self.assertEqual(watch["latest"]["sale_status"], "on_sale")
+                self.assertEqual(watch["latest"]["stock"], 7)
+                self.assertEqual(watch["latest"]["stock_label"], "7")
+                self.assertEqual(watch["last_attempt"]["error"], "网络连接超时")
+
+                checkout_status, checkout = self.request_api(
+                    "POST", "/api/checkout/prepare", {"items": [{"watch_id": watch_id, "quantity": 1}]}
+                )
+                self.assertEqual(checkout_status, 200)
+                self.assertEqual(checkout["items"][0]["goods_key"], "stale-state-test")
+
+                with patch.object(
+                    main,
+                    "create_official_payment_order",
+                    return_value={
+                        "trade_no": "LD-NETWORK-ERROR",
+                        "payment_url": "https://pay.ldxp.cn/pay/LD-NETWORK-ERROR",
+                        "amount": "3.50",
+                        "channel": "alipay",
+                    },
+                ) as create_order:
+                    order_status, order = self.request_api(
+                        "POST",
+                        "/api/pay/order",
+                        {
+                            "items": [{"goods_key": "stale-state-test", "quantity": 1}],
+                            "channel_id": 1,
+                            "contact": "buyer@example.test",
+                        },
+                    )
+
+                self.assertEqual(order_status, 200)
+                self.assertEqual(order["trade_no"], "LD-NETWORK-ERROR")
+                create_order.assert_called_once()
 
     def test_legacy_limit_label_is_exposed_as_minimum_purchase(self):
         connection = sqlite3.connect(":memory:")
