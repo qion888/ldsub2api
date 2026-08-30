@@ -1,0 +1,308 @@
+diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
+index 1f7361c..c0fc21e 100644
+--- a/frontend/src/Sub2ApiView.jsx
++++ b/frontend/src/Sub2ApiView.jsx
+@@ -254,8 +254,10 @@ function Sub2ApiUsageStack({account, usage, usageError}) {
+       <span><Activity size={13}/>{sourceLabel}</span>
+       {updatedAt && <Tooltip label={`数据时间：${formatSub2ApiDateTime(updatedAt)}`}><small>更新 {compactTime(updatedAt)}</small></Tooltip>}
+     </div>
+-    <Sub2ApiUsageWindow label="5 小时窗口" window={fiveHour} tone="five-hour" testId={`usage-5h-${account.id}`}/>
+-    <Sub2ApiUsageWindow label="7 天窗口" window={sevenDay} tone="seven-day" testId={`usage-7d-${account.id}`}/>
++    <div className="account-usage-windows">
++      <Sub2ApiUsageWindow label="5 小时窗口" window={fiveHour} tone="five-hour" testId={`usage-5h-${account.id}`}/>
++      <Sub2ApiUsageWindow label="7 天窗口" window={sevenDay} tone="seven-day" testId={`usage-7d-${account.id}`}/>
++    </div>
+     {usageError && <small className="account-usage-error"><AlertCircle size={13}/>{usageError}</small>}
+   </div>;
+ }
+@@ -271,7 +273,18 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
+         <div className="account-management-actions"><label className="account-search"><Search size={15}/><input value={filters.search} onChange={event => onFiltersChange({search: event.target.value})} placeholder="搜索账号名称"/></label><select value={filters.status} onChange={event => onFiltersChange({status: event.target.value})}><option value="">全部状态</option><option value="active">正常</option><option value="inactive">停用</option><option value="error">异常</option></select><select value={filters.platform} onChange={event => onFiltersChange({platform: event.target.value})}><option value="">全部平台</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option></select><IconButton label="刷新账号列表" onClick={() => onRefresh({page: data?.page || 1})} disabled={busy}><RefreshCw size={16} className={busy ? 'spin' : ''}/></IconButton></div>
+       </div>
+       <div className="account-table-wrap">
+-        <table className="account-table"><thead><tr><th>账号</th><th>平台 / 计费</th><th>实时状态</th><th>本地计费额度</th><th>上游使用窗口</th><th>代理 / 分组</th><th>操作</th></tr></thead><tbody>
++        <table className="account-table">
++          <colgroup>
++            <col className="account-col-identity"/>
++            <col className="account-col-platform"/>
++            <col className="account-col-state"/>
++            <col className="account-col-quota"/>
++            <col className="account-col-usage"/>
++            <col className="account-col-routing"/>
++            <col className="account-col-actions"/>
++          </colgroup>
++          <thead><tr><th scope="col">账号信息</th><th scope="col">平台计费</th><th scope="col">调度状态</th><th scope="col">本地额度</th><th scope="col">上游用量</th><th scope="col">路由归属</th><th scope="col">操作</th></tr></thead>
++          <tbody>
+           {items.length ? items.map(account => {
+             const id = Number(account.id);
+             const test = tested[id];
+@@ -283,16 +296,29 @@ function Sub2ApiAccountsPanel({data, filters, onFiltersChange, busy, error, acti
+             const usageError = usageErrors[String(account.id)] || usageErrors[account.id] || usageErrors._;
+             const accountName = account.name || `账号 ${account.id}`;
+             return <tr key={account.id} data-account-state={state.key}>
+-              <td><div className="account-name-line"><strong title={accountName}>{accountName}</strong><IconButton label={`复制账号名称：${accountName}`} onClick={() => onCopyName(account)}><Clipboard size={13}/></IconButton></div><small>#{account.id} · 创建于 {formatSub2ApiDateTime(account.created_at)}</small><small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small></td>
+-              <td><strong>{account.platform || '--'}</strong><small>{account.type || '--'}</small><Tooltip label="账号费用 = 标准费用 × 账号倍率"><span className="account-billing-rate">{Number.isFinite(multiplier) && multiplier === 0 ? '免费计费' : `账号倍率 ×${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '--'}`}</span></Tooltip><small>并发 {concurrency}</small></td>
+-              <td><span className={`account-status ${state.tone}`}>{state.label}</span><small className="account-status-detail" title={state.detail}>{state.detail}</small></td>
+-              <td><Sub2ApiQuotaStack account={account}/></td>
+-              <td><Sub2ApiUsageStack account={account} usage={usage} usageError={usageError}/></td>
+-              <td><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></td>
+-              <td><div className="account-row-actions"><IconButton label={test ? '重新测试账号' : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `测试通过 · ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</td>
++              <td className="account-identity-cell" data-label="账号信息">
++                <div className="account-identity">
++                  <div className="account-name-line"><strong title={accountName}>{accountName}</strong><IconButton label={`复制账号名称：${accountName}`} onClick={() => onCopyName(account)}><Clipboard size={13}/></IconButton></div>
++                  <div className="account-identity-meta"><span>#{account.id}</span><span>创建 {formatSub2ApiDateTime(account.created_at)}</span></div>
++                  <small>{account.last_used_at ? `最近使用 ${compactTime(account.last_used_at)}` : `更新于 ${compactTime(account.updated_at)}`}</small>
++                </div>
++              </td>
++              <td className="account-platform-cell" data-label="平台计费">
++                <div className="account-platform-block">
++                  <div className="account-platform-name"><strong>{account.platform || '--'}</strong><span>{account.type || '--'}</span></div>
++                  <Tooltip label="账号费用 = 标准费用 × 账号倍率"><span className="account-billing-rate">{Number.isFinite(multiplier) && multiplier === 0 ? '免费计费' : `账号倍率 ×${Number.isFinite(multiplier) ? multiplier.toFixed(2) : '--'}`}</span></Tooltip>
++                  <div className="account-concurrency"><span>并发</span><strong>{concurrency}</strong></div>
++                </div>
++              </td>
++              <td className="account-state-cell" data-label="调度状态"><div className="account-state-block"><span className={`account-status ${state.tone}`}>{state.label}</span><small className="account-status-detail" title={state.detail}>{state.detail}</small></div></td>
++              <td className="account-quota-cell" data-label="本地额度"><Sub2ApiQuotaStack account={account}/></td>
++              <td className="account-usage-cell" data-label="上游用量"><Sub2ApiUsageStack account={account} usage={usage} usageError={usageError}/></td>
++              <td className="account-routing-cell" data-label="路由归属"><div className="account-routing"><strong>{accountProxy}</strong><small>{accountGroups || (Array.isArray(account.group_ids) ? `${account.group_ids.length} 个分组` : '未分组')}</small></div></td>
++              <td className="account-action-cell" data-label="操作"><div className="account-action-stack"><div className="account-row-actions"><IconButton label={test ? '重新测试账号' : '测试账号'} onClick={() => onTest(account)} disabled={actions[id] === 'test'} tone={test?.ok ? 'success' : ''}>{actions[id] === 'test' ? <RefreshCw size={15} className="spin"/> : test?.ok ? <Check size={15}/> : <Activity size={15}/>}</IconButton><IconButton label="删除账号" tone="danger" onClick={() => onDelete(account)} disabled={actions[id] === 'delete'}>{actions[id] === 'delete' ? <RefreshCw size={15} className="spin"/> : <Trash2 size={15}/>}</IconButton></div>{test && <small className={`account-test-result ${test.ok ? 'ok' : 'bad'}`}>{test.ok ? `测试通过 · ${compactTime(test.tested_at)}` : (test.message || '测试失败')}</small>}</div></td>
+             </tr>;
+-          }) : <tr><td colSpan="7"><div className="account-table-empty">{busy ? <RefreshCw size={20} className="spin"/> : <Database size={20}/>}<span>{busy ? '正在加载账号列表' : error || '暂无匹配账号'}</span></div></td></tr>}
+-        </tbody></table>
++          }) : <tr className="account-empty-row"><td colSpan="7"><div className="account-table-empty">{busy ? <RefreshCw size={20} className="spin"/> : <Database size={20}/>}<span>{busy ? '正在加载账号列表' : error || '暂无匹配账号'}</span></div></td></tr>}
++          </tbody>
++        </table>
+       </div>
+       <div className="account-pagination"><span>共 {data?.total ?? 0} 个账号 · 第 {data?.page || 1} / {data?.pages || 1} 页</span><div><IconButton label="上一页" onClick={() => onPage(Math.max(1, (data?.page || 1) - 1))} disabled={busy || (data?.page || 1) <= 1}><ChevronLeft size={16}/></IconButton><IconButton label="下一页" onClick={() => onPage(Math.min(data?.pages || 1, (data?.page || 1) + 1))} disabled={busy || (data?.page || 1) >= (data?.pages || 1)}><ChevronRight size={16}/></IconButton></div></div>
+     </section>
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index 53f11c2..53034ae 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -2309,104 +2309,161 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+ .card-history-pagination { min-height: 50px; padding: 7px 16px; font-size: 11px; }
+ 
+ .account-management-panel { border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+-.account-management-head { min-height: 68px; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
++.account-management-head { min-height: 66px; padding: 11px 15px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+ .account-management-head h3 { margin: 3px 0 0; color: var(--ui-text); font-size: 17px; }
+-.account-management-head p { margin: 4px 0 0; color: var(--ui-text-muted); font-size: 12px; }
+-.account-management-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+-.account-management-actions select { min-width: 112px; height: 36px; }
+-.account-search { width: min(240px, 32vw); height: 36px; margin: 0 !important; padding: 0 10px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
+-.account-search input { width: 100%; height: 32px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
++.account-management-head p { margin: 3px 0 0; color: var(--ui-text-muted); font-size: 11px; }
++.account-management-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
++.account-management-actions select { min-width: 108px; height: 34px; }
++.account-search { width: min(230px, 30vw); height: 34px; margin: 0 !important; padding: 0 9px; display: flex; align-items: center; gap: 7px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
++.account-search input { width: 100%; height: 30px !important; padding: 0 !important; border: 0 !important; background: transparent !important; }
+ .account-search input:focus { outline: none; box-shadow: none; }
++
+ .account-table-wrap { overflow-x: auto; border-block: 1px solid var(--ui-border); scrollbar-gutter: stable; }
+-.account-table { width: 100%; min-width: 1470px; border-collapse: collapse; table-layout: fixed; }
+-.account-table th, .account-table td { padding: 10px 11px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); vertical-align: top; text-align: left; }
++.account-table { width: 100%; min-width: 1300px; border-collapse: collapse; table-layout: fixed; }
++.account-col-identity { width: 190px; }
++.account-col-platform { width: 125px; }
++.account-col-state { width: 145px; }
++.account-col-quota { width: 195px; }
++.account-col-usage { width: 440px; }
++.account-col-routing { width: 120px; }
++.account-col-actions { width: 85px; }
++.account-table th, .account-table td { padding: 8px 10px; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); text-align: left; }
+ .account-table th:last-child, .account-table td:last-child { border-right: 0; }
+-.account-table th { color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 12px; font-weight: 700; letter-spacing: 0; white-space: nowrap; }
+-.account-table td { color: var(--ui-text); font-size: 13px; }
+-.account-table tbody tr { transition: background-color .15s ease; }
+-.account-table tbody tr:hover { background: color-mix(in srgb, var(--ui-surface-muted) 72%, transparent); }
+-.account-table td > strong, .account-table td > span, .account-table td > small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+-.account-table td > strong { font-size: 13px; font-weight: 700; }
+-.account-table td > small { margin-top: 4px; color: var(--ui-text-muted); font-size: 11px; line-height: 1.35; }
+-.account-table th:nth-child(1) { width: 225px; }
+-.account-table th:nth-child(2) { width: 145px; }
+-.account-table th:nth-child(3) { width: 175px; }
+-.account-table th:nth-child(4) { width: 235px; }
+-.account-table th:nth-child(5) { width: 385px; }
+-.account-table th:nth-child(6) { width: 145px; }
+-.account-table th:nth-child(7) { width: 110px; }
+-.account-name-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
+-.account-name-line > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+-.account-name-line .icon-button { width: 27px; height: 27px; flex: 0 0 27px; }
+-.account-billing-rate { width: fit-content; max-width: 100%; margin-top: 7px; padding: 3px 6px; display: inline-flex !important; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 11px; font-weight: 700; }
+-.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; border-radius: 3px; font-size: 11px !important; font-weight: 700; }
++.account-table th { position: sticky; top: 0; z-index: 1; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 11px; font-weight: 750; letter-spacing: 0; white-space: nowrap; }
++.account-table td { color: var(--ui-text); font-size: 12px; vertical-align: middle; }
++.account-table .account-quota-cell, .account-table .account-usage-cell { vertical-align: top; }
++.account-table tbody tr { background: var(--ui-surface); transition: background-color .15s ease; }
++.account-table tbody tr:hover { background: color-mix(in srgb, var(--ui-surface-muted) 68%, transparent); }
++.account-table tbody tr > td:first-child { border-left: 3px solid transparent; }
++.account-table tbody tr[data-account-state="active"] > td:first-child { border-left-color: var(--ui-success); }
++.account-table tbody tr:is([data-account-state="limited"], [data-account-state="temporary"], [data-account-state="quota"]) > td:first-child { border-left-color: var(--ui-warning); }
++.account-table tbody tr:is([data-account-state="overloaded"], [data-account-state="error"]) > td:first-child { border-left-color: var(--ui-danger); }
++
++.account-identity, .account-platform-block, .account-state-block, .account-routing, .account-action-stack { min-width: 0; }
++.account-name-line { min-width: 0; display: flex; align-items: center; gap: 6px; }
++.account-name-line > strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
++.account-name-line .icon-button { width: 26px; height: 26px; flex: 0 0 26px; }
++.account-identity-meta { margin-top: 5px; display: flex; align-items: center; gap: 5px; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; white-space: nowrap; }
++.account-identity-meta span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
++.account-identity-meta span + span::before { margin-right: 5px; color: var(--ui-text-faint); content: "·"; }
++.account-identity > small { display: block; margin-top: 3px; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
++
++.account-platform-name { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
++.account-platform-name strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
++.account-platform-name span { flex: 0 0 auto; color: var(--ui-text-muted); font-size: 10px; }
++.account-billing-rate { width: fit-content; max-width: 100%; margin-top: 6px; padding: 2px 5px; display: inline-flex !important; overflow: hidden; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
++.account-concurrency { margin-top: 5px; display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--ui-text-muted); font-size: 10px; }
++.account-concurrency strong { color: var(--ui-text); font-size: 10px; font-variant-numeric: tabular-nums; }
++
++.account-status { display: inline-flex !important; width: fit-content; padding: 3px 7px; border: 1px solid currentColor; border-radius: 3px; font-size: 10px !important; font-weight: 750; }
+ .account-status.success { color: var(--ui-success); background: color-mix(in srgb, var(--ui-success) 8%, transparent); }
+ .account-status.warning { color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 9%, transparent); }
+ .account-status.danger { color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); }
+ .account-status.muted { color: var(--ui-text-muted); background: var(--ui-surface-muted); }
+-.account-status-detail { max-width: 160px; margin-top: 6px !important; white-space: normal !important; line-height: 1.4 !important; }
+-.account-progress-stack { display: grid; gap: 8px; }
++.account-status-detail { margin-top: 5px; display: -webkit-box; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
++
++.account-progress-stack { display: grid; gap: 5px; }
+ .account-progress { min-width: 0; }
+-.account-progress-head { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+-.account-progress-head span { color: var(--ui-text-muted); font-size: 11px; font-weight: 700; }
+-.account-progress-head strong { color: var(--ui-text); font-size: 12px; font-weight: 700; }
+-.account-progress-track { width: 100%; height: 5px; margin-top: 5px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 70%, var(--ui-surface)); border-radius: 3px; }
++.account-progress-head { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 7px; line-height: 1.2; }
++.account-progress-head span { color: var(--ui-text-muted); font-size: 10px; font-weight: 700; }
++.account-progress-head strong { min-width: 0; overflow: hidden; color: var(--ui-text); font-size: 11px; font-weight: 750; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.account-progress-track { width: 100%; height: 4px; margin-top: 3px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 70%, var(--ui-surface)); border-radius: 2px; }
+ .account-progress-track > span { display: block; height: 100%; background: var(--ui-success); border-radius: inherit; transition: width .25s ease; }
+ .account-progress.warning .account-progress-track > span { background: var(--ui-warning); }
+ .account-progress.danger .account-progress-track > span { background: var(--ui-danger); }
+-.account-progress-meta { margin-top: 4px; display: flex; align-items: center; justify-content: space-between; gap: 7px; color: var(--ui-text-faint); }
+-.account-progress-meta > span { color: var(--ui-text-muted); font-size: 10px; font-weight: 700; }
+-.account-progress-meta > small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+-.account-usage-stack { display: grid; gap: 6px; }
+-.account-usage-stack-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); }
+-.account-usage-stack-meta > span { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700; }
+-.account-usage-stack-meta > small { min-width: 0; overflow: hidden; color: var(--ui-text-faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+-.account-usage-window { min-width: 0; padding: 7px 9px; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-left: 3px solid var(--ui-success); border-radius: 4px; }
+-.account-usage-window.seven-day { border-left-color: #5b7194; }
+-.account-usage-window.warning { border-left-color: var(--ui-warning); }
+-.account-usage-window.danger { border-left-color: var(--ui-danger); }
+-.account-usage-window-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+-.account-usage-window-head > span { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-muted); }
+-.account-usage-window-head > span > strong { color: var(--ui-text); font-size: 12px; }
+-.account-usage-percent { flex: 0 0 auto; color: var(--ui-text); font-size: 14px; font-variant-numeric: tabular-nums; }
+-.account-usage-track { width: 100%; height: 5px; margin-top: 6px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 72%, var(--ui-surface)); border-radius: 3px; }
++.account-progress-meta { margin-top: 2px; display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--ui-text-faint); line-height: 1.25; }
++.account-progress-meta > span { color: var(--ui-text-muted); font-size: 9px; font-weight: 700; }
++.account-progress-meta > small { min-width: 0; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
++
++.account-usage-stack { display: grid; gap: 5px; }
++.account-usage-stack-meta { display: flex; align-items: center; justify-content: space-between; gap: 9px; color: var(--ui-text-muted); line-height: 1.2; }
++.account-usage-stack-meta > span { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 700; }
++.account-usage-stack-meta > small { min-width: 0; overflow: hidden; color: var(--ui-text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-windows { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; align-items: stretch; }
++.account-usage-window { min-width: 0; min-height: 96px; padding: 6px 7px; background: color-mix(in srgb, var(--ui-success) 3%, var(--ui-surface-muted)); border: 1px solid var(--ui-border-soft); border-top: 2px solid var(--ui-success); border-radius: 4px; }
++.account-usage-window.seven-day { background: color-mix(in srgb, #5b7194 4%, var(--ui-surface-muted)); border-top-color: #5b7194; }
++.account-usage-window.warning { border-top-color: var(--ui-warning); }
++.account-usage-window.danger { border-top-color: var(--ui-danger); }
++.account-usage-window-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; line-height: 1.2; }
++.account-usage-window-head > span { min-width: 0; display: inline-flex; align-items: center; gap: 4px; overflow: hidden; color: var(--ui-text-muted); white-space: nowrap; }
++.account-usage-window-head > span > strong { overflow: hidden; color: var(--ui-text); font-size: 11px; text-overflow: ellipsis; }
++.account-usage-window-head svg { width: 13px; height: 13px; flex: 0 0 13px; }
++.account-usage-percent { flex: 0 0 auto; color: var(--ui-text); font-size: 13px; font-variant-numeric: tabular-nums; }
++.account-usage-track { width: 100%; height: 4px; margin-top: 5px; overflow: hidden; background: color-mix(in srgb, var(--ui-border) 72%, var(--ui-surface)); border-radius: 2px; }
+ .account-usage-track > span { display: block; height: 100%; background: var(--ui-success); border-radius: inherit; transition: width .25s ease; }
+ .account-usage-window.seven-day .account-usage-track > span { background: #5b7194; }
+ .account-usage-window.warning .account-usage-track > span { background: var(--ui-warning); }
+ .account-usage-window.danger .account-usage-track > span { background: var(--ui-danger); }
+-.account-usage-footnote { min-width: 0; margin-top: 5px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+-.account-usage-footnote > span { min-width: 0; }
+-.account-usage-reset { width: fit-content; display: inline-flex; align-items: center; gap: 4px; color: var(--ui-text-muted); font-size: 10px; font-weight: 650; white-space: nowrap; }
+-.account-usage-details { margin: 6px 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); }
+-.account-usage-details > div { min-width: 0; padding: 5px 5px 0; border-right: 1px solid var(--ui-border-soft); }
++.account-usage-footnote { min-width: 0; margin-top: 4px; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
++.account-usage-footnote > span { min-width: 0; max-width: 52%; }
++.account-usage-reset { width: fit-content; display: inline-flex; align-items: center; gap: 3px; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-reset svg { width: 11px; height: 11px; flex: 0 0 11px; }
++.account-usage-details { margin: 4px 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--ui-border-soft); }
++.account-usage-details > div { min-width: 0; padding: 4px 3px 0; border-right: 1px solid var(--ui-border-soft); }
+ .account-usage-details > div:first-child { padding-left: 0; }
+ .account-usage-details > div:last-child { padding-right: 0; border-right: 0; }
+-.account-usage-details dt { color: var(--ui-text-faint); font-size: 10px; white-space: nowrap; }
+-.account-usage-details dd { margin: 2px 0 0; overflow-wrap: anywhere; color: var(--ui-text); font-size: 12px; font-weight: 750; font-variant-numeric: tabular-nums; }
+-.account-usage-standard { width: fit-content; display: block; overflow: hidden; color: var(--ui-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; border-bottom: 1px dotted currentColor; }
+-.account-usage-window-empty { min-height: 30px; display: flex; align-items: center; color: var(--ui-text-muted); font-size: 11px; }
+-.account-usage-error { padding: 6px 8px; display: flex; align-items: flex-start; gap: 5px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-left: 2px solid var(--ui-danger); font-size: 11px; line-height: 1.4; }
++.account-usage-details dt { overflow: hidden; color: var(--ui-text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-details dd { margin: 1px 0 0; overflow: hidden; color: var(--ui-text); font-size: 10px; font-weight: 750; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
++.account-usage-standard { width: fit-content; display: block; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; border-bottom: 1px dotted currentColor; }
++.account-usage-window-empty { min-height: 48px; display: flex; align-items: center; color: var(--ui-text-muted); font-size: 10px; }
++.account-usage-error { padding: 5px 7px; display: flex; align-items: flex-start; gap: 5px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 8%, transparent); border-left: 2px solid var(--ui-danger); font-size: 10px; line-height: 1.35; }
+ .account-usage-error svg { flex: 0 0 auto; margin-top: 1px; }
+-.account-row-actions { display: flex; align-items: center; gap: 5px; }
+-.account-row-actions .icon-button { width: 32px; height: 32px; }
+-.account-test-result { max-width: 110px; white-space: normal !important; }
++
++.account-routing strong, .account-routing small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.account-routing strong { color: var(--ui-text); font-size: 12px; }
++.account-routing small { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; }
++.account-action-stack { display: grid; gap: 5px; justify-items: start; }
++.account-row-actions { display: flex; align-items: center; gap: 4px; }
++.account-row-actions .icon-button { width: 30px; height: 30px; }
++.account-test-result { max-width: 74px; display: -webkit-box; overflow: hidden; color: var(--ui-text-muted); font-size: 9px; line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+ .account-test-result.ok { color: var(--ui-success) !important; }
+ .account-test-result.bad { color: var(--ui-danger) !important; }
+-.account-table-empty { min-height: 92px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
+-.account-pagination { min-height: 50px; padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); font-size: 12px; }
++.account-table-empty { min-height: 90px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); }
++.account-pagination { min-height: 48px; padding: 7px 15px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ui-text-muted); font-size: 11px; }
+ .account-pagination > div { display: flex; gap: 5px; }
+-.account-pagination .icon-button { width: 32px; height: 32px; }
++.account-pagination .icon-button { width: 31px; height: 31px; }
+ 
+ @media (max-width: 900px) {
+   .account-management-head { align-items: stretch; flex-direction: column; }
+   .account-management-actions { justify-content: stretch; flex-wrap: wrap; }
+   .account-search { width: min(100%, 320px); flex: 1 1 220px; }
+   .account-management-actions select { flex: 1 1 120px; }
+-  .account-table { min-width: 1470px; }
+   .account-pagination { align-items: flex-start; flex-direction: column; }
+   .account-pagination > div { align-self: flex-end; }
+ }
+ 
++@media (max-width: 900px) {
++  .account-table-wrap { padding: 9px; overflow: visible; background: var(--ui-surface-muted); border-bottom: 1px solid var(--ui-border); }
++  .account-table { min-width: 0; display: block; }
++  .account-table colgroup { display: none; }
++  .account-table thead { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
++  .account-table tbody { display: grid; gap: 9px; }
++  .account-table tbody tr { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; }
++  .account-table tbody tr:hover { background: var(--ui-surface); }
++  .account-table tbody tr > td { min-width: 0; padding: 9px; display: block; border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); }
++  .account-table tbody tr > td:nth-child(even) { border-right: 0; }
++  .account-table tbody tr > td::before { margin-bottom: 6px; display: block; color: var(--ui-text-faint); content: attr(data-label); font-size: 9px; font-weight: 750; text-transform: uppercase; }
++  .account-table tbody tr > td:first-child { border-left-width: 3px; }
++  .account-table .account-identity-cell, .account-table .account-quota-cell, .account-table .account-usage-cell { grid-column: 1 / -1; border-right: 0; }
++  .account-table .account-quota-cell { vertical-align: top; }
++  .account-progress-stack { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
++  .account-usage-windows { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .account-action-stack { justify-items: end; }
++  .account-row-actions { justify-content: flex-end; }
++  .account-test-result { max-width: 100%; text-align: right; }
++  .account-empty-row { display: block !important; }
++  .account-empty-row td { border: 0 !important; }
++  .account-empty-row td::before { display: none !important; }
++}
++
++@media (max-width: 480px) {
++  .account-management-head { padding-inline: 13px; }
++  .account-management-actions .account-search { max-width: none; flex-basis: 100%; }
++  .account-table-wrap { padding: 7px; }
++  .account-usage-windows { grid-template-columns: 1fr; }
++  .account-usage-window { min-height: 92px; }
++}
++
+ .automation-console > .automation-head { min-height: 72px; padding: 12px 16px; }
+ .sub2api-view .automation-head h2 { font-size: 18px; }
+ .sub2api-view .automation-head p { margin-top: 4px; font-size: 12px; }
