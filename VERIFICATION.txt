@@ -37,7 +37,7 @@ ROLLBACK
 Command: $script = [scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-copy2
 Input: MODIFIED_FILE copied to rollback-test-copy2
 Literal output:
-Restored E:\soft\java\ldxp\rollback-test-copy2 from ROLLBACK_BASELINE
+Restored E:\soft\java\ldxp-sub2api-account-ops\rollback-test-copy2 from ROLLBACK_BASELINE
 Result: exit 0
 Restored hash: BEE18A2DA2D293FB6935F9B6544ACDC83D4F8D25BB626CBB5D632F6C8A8C1523
 Baseline hash: BEE18A2DA2D293FB6935F9B6544ACDC83D4F8D25BB626CBB5D632F6C8A8C1523
