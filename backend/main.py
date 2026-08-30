@@ -175,6 +175,7 @@ def fetch_shop_categories(shop_url: str, *, goods_type: str = "card") -> dict[st
         shop_url,
         goods_type=goods_type,
         post_api=_post_shop_api,
+        visitor_id=_random_visitor_id(),
     )
 
 

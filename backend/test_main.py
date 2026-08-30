@@ -203,6 +203,19 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(endpoint, "/shopApi/Shop/categoryList")
         self.assertEqual(payload, {"token": "JVVH1Q5N", "goods_type": "card", "category_key": ""})
         self.assertEqual(referer, "https://pay.ldxp.cn/shop/JVVH1Q5N")
+        self.assertTrue(post.call_args.kwargs["visitor_id"])
+
+    def test_shop_categories_accept_nested_data_and_empty_success(self):
+        with patch.object(main, "_post_shop_api", return_value={
+            "code": 1,
+            "data": {"list": [{"category_id": "108401", "category_name": "codex官方直充", "count": "4"}]},
+        }):
+            result = main.fetch_shop_categories("https://pay.ldxp.cn/shop/JVVH1Q5N")
+        self.assertEqual(result["categories"], [{"id": 108401, "name": "codex官方直充", "goods_count": 4}])
+
+        with patch.object(main, "_post_shop_api", return_value={"code": 1, "data": None}):
+            result = main.fetch_shop_categories("https://pay.ldxp.cn/shop/JVVH1Q5N")
+        self.assertEqual(result["categories"], [])
 
     def test_shop_category_and_batch_delete_routes(self):
         with tempfile.TemporaryDirectory() as directory:

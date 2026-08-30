@@ -932,6 +932,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .composer-fields { grid-template-columns: minmax(240px, 2fr) minmax(110px, .75fr) 105px auto; gap: 9px; }
 .composer-fields.shop-mode { grid-template-columns: minmax(210px, 2fr) minmax(95px, .7fr) minmax(190px, 1.25fr) 108px 105px auto; gap: 8px; }
 .shop-category-field { min-width: 0; }
+.shop-category-control { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.shop-category-control select { min-width: 0; flex: 1; }
+.category-retry { flex: 0 0 30px; width: 30px; height: 30px; }
 .shop-category-field select { overflow: hidden; text-overflow: ellipsis; }
 
 .shop-overview { margin-top: 14px; padding: 15px 16px 7px; }

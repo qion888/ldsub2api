@@ -404,6 +404,7 @@ def fetch_shop_categories(
     *,
     goods_type: str = "card",
     post_api: Callable[..., dict[str, Any]] = _post_shop_api,
+    visitor_id: str | None = None,
 ) -> dict[str, Any]:
     token, canonical_url = parse_shop_url(shop_url)
     normalized_type = str(goods_type or "card").strip()[:30]
@@ -413,30 +414,49 @@ def fetch_shop_categories(
         "/shopApi/Shop/categoryList",
         {"token": token, "goods_type": normalized_type, "category_key": ""},
         canonical_url,
+        visitor_id=visitor_id,
     )
-    if result.get("code") != 1 or not isinstance(result.get("data"), list):
+    if result.get("code") != 1:
         raise RuntimeError(str(result.get("msg") or "无法获取店铺分类")[:200])
+
+    raw_data = result.get("data")
+    if raw_data is None:
+        raw_data = []
+    elif isinstance(raw_data, dict):
+        for key in ("list", "items", "rows", "records", "categories", "data"):
+            if isinstance(raw_data.get(key), list):
+                raw_data = raw_data[key]
+                break
+        else:
+            raise RuntimeError("店铺分类接口返回格式无效")
+    if not isinstance(raw_data, list):
+        raise RuntimeError("店铺分类接口返回格式无效")
 
     categories: list[dict[str, Any]] = []
     seen: set[int] = set()
-    for entry in result["data"]:
+    for entry in raw_data:
         if not isinstance(entry, dict):
             continue
         try:
-            category_id = int(entry.get("id"))
+            category_id = int(entry.get("id") or entry.get("category_id"))
         except (TypeError, ValueError):
             continue
         if category_id < 1 or category_id in seen:
             continue
         seen.add(category_id)
         try:
-            goods_count = max(0, int(entry.get("goods_count") or 0))
+            goods_count = max(0, int(entry.get("goods_count") or entry.get("count") or 0))
         except (TypeError, ValueError):
             goods_count = 0
         categories.append(
             {
                 "id": category_id,
-                "name": str(entry.get("name") or f"分类 {category_id}").strip()[:100],
+                "name": str(
+                    entry.get("name")
+                    or entry.get("category_name")
+                    or entry.get("title")
+                    or f"分类 {category_id}"
+                ).strip()[:100],
                 "goods_count": goods_count,
             }
         )
