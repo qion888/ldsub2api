@@ -1,0 +1,194 @@
+diff --git a/backend/sub2api/settings.py b/backend/sub2api/settings.py
+index 7a608a6..97da4ab 100644
+--- a/backend/sub2api/settings.py
++++ b/backend/sub2api/settings.py
+@@ -121,8 +121,8 @@ def save_automation_settings(
+     if enabled:
+         if not has_admin_key():
+             raise ValueError("请先配置 Sub2API 管理员密钥")
+-        if auto_import and (proxy_id is None or not group_ids or mode == "off"):
+-            raise ValueError("启用自动监控前必须选择代理、至少一个分组和 Codex 指纹模式")
++        if auto_import and (proxy_id is None or not group_ids):
++            raise ValueError("启用自动导入前必须选择代理和至少一个分组")
+     value = {
+         "enabled": enabled,
+         "interval_seconds": interval,
+diff --git a/backend/test_main.py b/backend/test_main.py
+index 421fa84..a94ba66 100644
+--- a/backend/test_main.py
++++ b/backend/test_main.py
+@@ -1419,7 +1419,7 @@ class GoodsParserTests(unittest.TestCase):
+         self.assertEqual(result["recent_errors"][0]["name"], "Broken")
+         self.assertEqual(result["platforms"][0]["platform"], "openai")
+ 
+-    def test_sub2api_automation_requires_import_proxy_group_and_fingerprint(self):
++    def test_sub2api_automation_requires_import_assignment_and_allows_passthrough(self):
+         with tempfile.TemporaryDirectory() as directory:
+             database_path = Path(directory) / "test.db"
+             with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+@@ -1436,7 +1436,6 @@ class GoodsParserTests(unittest.TestCase):
+                 invalid = [
+                     {**base, "proxy_id": None},
+                     {**base, "group_ids": []},
+-                    {**base, "codex_fingerprint_mode": "off"},
+                 ]
+                 for payload in invalid:
+                     with self.subTest(payload=payload), self.assertRaises(ValueError):
+@@ -1454,6 +1453,14 @@ class GoodsParserTests(unittest.TestCase):
+                 self.assertFalse(monitor_only["auto_import"])
+                 self.assertIsNone(monitor_only["proxy_id"])
+ 
++                passthrough = main.save_sub2api_automation_settings({
++                    **base,
++                    "codex_fingerprint_mode": "off",
++                })
++                self.assertTrue(passthrough["enabled"])
++                self.assertTrue(passthrough["auto_import"])
++                self.assertEqual(passthrough["codex_fingerprint_mode"], "off")
++
+                 saved = main.save_sub2api_automation_settings({**base, "group_ids": [9, 3, 3]})
+                 self.assertTrue(saved["enabled"])
+                 self.assertEqual(saved["proxy_id"], 7)
+diff --git a/backend/test_sub2api_modules.py b/backend/test_sub2api_modules.py
+index e9935f5..9417fc9 100644
+--- a/backend/test_sub2api_modules.py
++++ b/backend/test_sub2api_modules.py
+@@ -307,6 +307,18 @@ class Sub2ApiModuleTests(unittest.TestCase):
+         self.assertEqual(value["codex_fingerprint_mode"], "session")
+         self.assertEqual(stored, [("sub2api_automation", value)])
+ 
++        passthrough = settings.save_automation_settings(
++            {
++                **value,
++                "codex_fingerprint_mode": "off",
++            },
++            has_admin_key=lambda: True,
++            store_setting=lambda key, data: stored.append((key, data)),
++        )
++        self.assertTrue(passthrough["auto_import"])
++        self.assertEqual(passthrough["codex_fingerprint_mode"], "off")
++        self.assertEqual(stored[-1], ("sub2api_automation", passthrough))
++
+     def test_401_detection_only_accepts_error_context(self) -> None:
+         self.assertTrue(
+             reclaim.account_is_401(
+diff --git a/frontend/src/Sub2ApiView.jsx b/frontend/src/Sub2ApiView.jsx
+index 69cf20a..39c4835 100644
+--- a/frontend/src/Sub2ApiView.jsx
++++ b/frontend/src/Sub2ApiView.jsx
+@@ -558,7 +558,15 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
+   const selectedGroups = options.groups.filter(group => groupIds.includes(group.id));
+   const activeGroups = options.groups.filter(group => !group.status || group.status === 'active');
+   const monitorReady = Boolean(config.admin_key_set);
+-  const importReady = Boolean(monitorReady && selectedProxy && groupIds.length && codexFingerprintMode !== 'off' && automation.auto_import);
++  const fingerprintModes = [
++    {value: 'off', label: '透传'},
++    {value: 'device', label: '设备'},
++    {value: 'session', label: '设备 + 会话'},
++    {value: 'full', label: '完全'},
++  ];
++  const fingerprintLabel = fingerprintModes.find(mode => mode.value === codexFingerprintMode)?.label || '透传';
++  const fingerprintConfigured = fingerprintModes.some(mode => mode.value === codexFingerprintMode);
++  const importReady = Boolean(monitorReady && selectedProxy && groupIds.length && fingerprintConfigured && automation.auto_import);
+   const automationReady = monitorReady;
+   const automationResult = automationState?.last_result;
+   const automationDisplayResult = automationRetryResult || automationResult;
+@@ -569,21 +577,14 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
+   const nextRun = automation.enabled && automationState?.last_run
+     ? new Date(new Date(automationState.last_run).getTime() + (Number(automation.interval_seconds || 0) * 1000))
+     : null;
+-  const fingerprintModes = [
+-    {value: 'off', label: '透传'},
+-    {value: 'device', label: '设备'},
+-    {value: 'session', label: '设备 + 会话'},
+-    {value: 'full', label: '完全'},
+-  ];
+   const readiness = [
+     {label: '管理员密钥', ready: Boolean(config.admin_key_set)},
+     {label: '固定代理', ready: Boolean(selectedProxy)},
+     {label: '导入分组', ready: groupIds.length > 0},
+-    {label: '指纹策略', ready: codexFingerprintMode !== 'off'},
++    {label: `指纹策略 · ${fingerprintLabel}`, ready: fingerprintConfigured},
+   ];
+   const importMissingCount = readiness.filter(item => !item.ready).length;
+   const proxyLabel = proxyChoice === 'json' ? `JSON 自带（${jsonProxyCount}）` : selectedProxy?.name || '不绑定代理';
+-  const fingerprintLabel = fingerprintModes.find(mode => mode.value === codexFingerprintMode)?.label || '透传';
+   const maxPlatformCount = Math.max(1, ...platforms.map(item => Number(item.count || 0)));
+   const selectActiveGroups = () => activeGroups.forEach(group => {
+     if (!groupIds.includes(group.id)) onToggleGroup(group.id);
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index fa1236c..dd91b50 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -46,7 +46,7 @@ import {
+   Zap,
+ } from 'lucide-react';
+ import './style.css';
+-import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
++import {buildSub2ApiAutomationSaveNotice, buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+ import {
+   CARD_RECLAIM_POLL_TIMEOUT_MS,
+   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
+@@ -2413,7 +2413,7 @@ function App() {
+       });
+       setSub2apiAutomation(result.settings);
+       setSub2apiAutomationState(result.state);
+-      notify(result.settings.enabled ? '401 自动找回与导入已启用' : '401 自动化配置已保存');
++      notify(buildSub2ApiAutomationSaveNotice(result.settings));
+     } catch (error) {
+       notify(error.message, 'error');
+     } finally {
+diff --git a/frontend/src/sub2apiNotices.js b/frontend/src/sub2apiNotices.js
+index c31354d..aae3698 100644
+--- a/frontend/src/sub2apiNotices.js
++++ b/frontend/src/sub2apiNotices.js
+@@ -72,3 +72,17 @@ export function sub2ApiHistoryDeleteErrorMessage(error, batch = false) {
+   }
+   return detail || (batch ? '批量删除导入记录失败' : '删除导入记录失败');
+ }
++
++export function buildSub2ApiAutomationSaveNotice(settings) {
++  const fingerprintLabels = {
++    off: '透传',
++    device: '设备',
++    session: '设备 + 会话',
++    full: '完全',
++  };
++  const fingerprint = fingerprintLabels[settings?.codex_fingerprint_mode] || '透传';
++  const scope = settings?.enabled
++    ? settings?.auto_import ? '定时找回与自动导入已启用' : '定时找回已启用'
++    : '定时找回与自动导入策略已保存';
++  return `保存成功：${scope}，Codex 指纹：${fingerprint}`;
++}
+diff --git a/frontend/src/sub2apiNotices.test.js b/frontend/src/sub2apiNotices.test.js
+index 388f69e..0ef18c6 100644
+--- a/frontend/src/sub2apiNotices.test.js
++++ b/frontend/src/sub2apiNotices.test.js
+@@ -1,7 +1,11 @@
+ import assert from 'node:assert/strict';
+ import test from 'node:test';
+ 
+-import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
++import {
++  buildSub2ApiAutomationSaveNotice,
++  buildSub2ApiImportNotice,
++  sub2ApiHistoryDeleteErrorMessage,
++} from './sub2apiNotices.js';
+ 
+ test('builds separate import and fingerprint sections for a confirmed import', () => {
+   const notice = buildSub2ApiImportNotice({
+@@ -52,3 +56,14 @@ test('distinguishes unavailable single and batch history deletion routes', () =>
+     '卡密导入记录不存在',
+   );
+ });
++
++test('reports successful automation save when fingerprint mode is passthrough', () => {
++  assert.equal(
++    buildSub2ApiAutomationSaveNotice({
++      enabled: true,
++      auto_import: true,
++      codex_fingerprint_mode: 'off',
++    }),
++    '保存成功：定时找回与自动导入已启用，Codex 指纹：透传',
++  );
++});

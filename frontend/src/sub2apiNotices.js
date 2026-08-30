@@ -72,3 +72,17 @@ export function sub2ApiHistoryDeleteErrorMessage(error, batch = false) {
   }
   return detail || (batch ? '批量删除导入记录失败' : '删除导入记录失败');
 }
+
+export function buildSub2ApiAutomationSaveNotice(settings) {
+  const fingerprintLabels = {
+    off: '透传',
+    device: '设备',
+    session: '设备 + 会话',
+    full: '完全',
+  };
+  const fingerprint = fingerprintLabels[settings?.codex_fingerprint_mode] || '透传';
+  const scope = settings?.enabled
+    ? settings?.auto_import ? '定时找回与自动导入已启用' : '定时找回已启用'
+    : '定时找回与自动导入策略已保存';
+  return `保存成功：${scope}，Codex 指纹：${fingerprint}`;
+}

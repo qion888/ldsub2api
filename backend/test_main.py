@@ -1419,7 +1419,7 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(result["recent_errors"][0]["name"], "Broken")
         self.assertEqual(result["platforms"][0]["platform"], "openai")
 
-    def test_sub2api_automation_requires_import_proxy_group_and_fingerprint(self):
+    def test_sub2api_automation_requires_import_assignment_and_allows_passthrough(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "test.db"
             with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
@@ -1436,7 +1436,6 @@ class GoodsParserTests(unittest.TestCase):
                 invalid = [
                     {**base, "proxy_id": None},
                     {**base, "group_ids": []},
-                    {**base, "codex_fingerprint_mode": "off"},
                 ]
                 for payload in invalid:
                     with self.subTest(payload=payload), self.assertRaises(ValueError):
@@ -1453,6 +1452,14 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertTrue(monitor_only["enabled"])
                 self.assertFalse(monitor_only["auto_import"])
                 self.assertIsNone(monitor_only["proxy_id"])
+
+                passthrough = main.save_sub2api_automation_settings({
+                    **base,
+                    "codex_fingerprint_mode": "off",
+                })
+                self.assertTrue(passthrough["enabled"])
+                self.assertTrue(passthrough["auto_import"])
+                self.assertEqual(passthrough["codex_fingerprint_mode"], "off")
 
                 saved = main.save_sub2api_automation_settings({**base, "group_ids": [9, 3, 3]})
                 self.assertTrue(saved["enabled"])

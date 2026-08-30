@@ -307,6 +307,18 @@ class Sub2ApiModuleTests(unittest.TestCase):
         self.assertEqual(value["codex_fingerprint_mode"], "session")
         self.assertEqual(stored, [("sub2api_automation", value)])
 
+        passthrough = settings.save_automation_settings(
+            {
+                **value,
+                "codex_fingerprint_mode": "off",
+            },
+            has_admin_key=lambda: True,
+            store_setting=lambda key, data: stored.append((key, data)),
+        )
+        self.assertTrue(passthrough["auto_import"])
+        self.assertEqual(passthrough["codex_fingerprint_mode"], "off")
+        self.assertEqual(stored[-1], ("sub2api_automation", passthrough))
+
     def test_401_detection_only_accepts_error_context(self) -> None:
         self.assertTrue(
             reclaim.account_is_401(

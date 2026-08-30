@@ -46,7 +46,7 @@ import {
   Zap,
 } from 'lucide-react';
 import './style.css';
-import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+import {buildSub2ApiAutomationSaveNotice, buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
 import {
   CARD_RECLAIM_POLL_TIMEOUT_MS,
   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
@@ -2413,7 +2413,7 @@ function App() {
       });
       setSub2apiAutomation(result.settings);
       setSub2apiAutomationState(result.state);
-      notify(result.settings.enabled ? '401 自动找回与导入已启用' : '401 自动化配置已保存');
+      notify(buildSub2ApiAutomationSaveNotice(result.settings));
     } catch (error) {
       notify(error.message, 'error');
     } finally {

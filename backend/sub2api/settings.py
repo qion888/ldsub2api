@@ -121,8 +121,8 @@ def save_automation_settings(
     if enabled:
         if not has_admin_key():
             raise ValueError("请先配置 Sub2API 管理员密钥")
-        if auto_import and (proxy_id is None or not group_ids or mode == "off"):
-            raise ValueError("启用自动监控前必须选择代理、至少一个分组和 Codex 指纹模式")
+        if auto_import and (proxy_id is None or not group_ids):
+            raise ValueError("启用自动导入前必须选择代理和至少一个分组")
     value = {
         "enabled": enabled,
         "interval_seconds": interval,

@@ -1,0 +1,68 @@
+Branch: codex/sub2api-automation-passthrough
+Changed field: Codex fingerprint strategy `off` (透传) is a valid scheduled recovery and automatic-import configuration; the UI treats it as ready and explicitly reports a successful save.
+Baseline commit: 3472dab7dc967eb114da8987f7d68a4e0c008faf
+
+Artifacts:
+- E:\soft\java\ldxp-sub2api-automation-passthrough\artifacts\sub2api-automation-passthrough\MODIFIED_FILE
+- E:\soft\java\ldxp-sub2api-automation-passthrough\artifacts\sub2api-automation-passthrough\DIFF_FILE
+- E:\soft\java\ldxp-sub2api-automation-passthrough\artifacts\sub2api-automation-passthrough\VERIFICATION.txt
+- E:\soft\java\ldxp-sub2api-automation-passthrough\artifacts\sub2api-automation-passthrough\ROLLBACK.sh
+
+Source copy:
+- Original source: E:\soft\java\ldxp\backend\sub2api\settings.py at main=3472dab
+- Original SHA256: 28A15C9998771A459AC115603BB619898DCD9D22C595FB4F76AA5536CCF28D13
+- Modified source copy: E:\soft\java\ldxp-sub2api-automation-passthrough\backend\sub2api\settings.py
+- Modified SHA256: F9954CE4FF3A24167544A45C62CD3A41C9D0F5C0C17DEF187786BD428BD47464
+- MODIFIED_FILE status: left changed after rollback-copy verification.
+
+BASELINE BACKEND
+Command: python -m unittest discover -s . -p "test_*.py"
+Input: E:\soft\java\ldxp\backend at main=3472dab
+Literal output/result: Ran 157 tests in 2.006s; OK
+Exit status: 0
+
+BASELINE FRONTEND
+Command: npm test
+Input: E:\soft\java\ldxp\frontend at main=3472dab
+Literal output/result: tests 38; pass 38; fail 0; duration_ms 190.3024
+Exit status: 0
+
+BASELINE BUILD
+Command: npm run build
+Input: E:\soft\java\ldxp\frontend at main=3472dab
+Literal output/result: vite v8.2.2; 2386 modules transformed; built in 441ms
+Exit status: 0
+
+MODIFIED BACKEND
+Command: python -m unittest discover -s . -p "test_*.py"
+Input: E:\soft\java\ldxp-sub2api-automation-passthrough\backend
+Literal output/result: Ran 157 tests in 1.973s; OK
+Exit status: 0
+
+MODIFIED FRONTEND
+Command: npm test
+Input: E:\soft\java\ldxp-sub2api-automation-passthrough\frontend
+Literal output/result: tests 39; pass 39; fail 0; duration_ms 150.4015
+Exit status: 0
+
+MODIFIED BUILD
+Command: npm run build
+Input: E:\soft\java\ldxp-sub2api-automation-passthrough\frontend
+Literal output/result: vite v8.2.2; 2386 modules transformed; built in 334ms
+Exit status: 0
+
+REQUEST-LEVEL ACCEPTANCE
+Command: python - (invokes sub2api.routes.handle_put for PUT /api/sub2api/automation)
+Input: {"enabled":true,"interval_seconds":300,"auto_import":true,"proxy_id":7,"group_ids":[3],"codex_fingerprint_mode":"off"}; isolated temporary database with a configured administrator key.
+Literal output/result: {"body":{"ok":true,"settings":{"auto_import":true,"codex_fingerprint_mode":"off","enabled":true,"group_ids":[3],"interval_seconds":300,"proxy_id":7},"state":{"imported_order_nos":[],"last_error":"","last_result":null,"last_run":null,"pending_card_codes":[],"retryable_card_codes":[],"run_history":[]}},"status":200}
+Exit status: 0
+
+ROLLBACK
+Command: $rollback=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw -Encoding utf8)); Push-Location .; & $rollback -Target E:\soft\java\ldxp-sub2api-automation-passthrough\.runtime\sub2api-automation-passthrough-rollback-copy.py; Pop-Location
+Input: a separate copy of MODIFIED_FILE.
+Literal output/result: Restored E:\soft\java\ldxp-sub2api-automation-passthrough\.runtime\sub2api-automation-passthrough-rollback-copy.py from ROLLBACK_BASELINE
+Exit status: 0
+Baseline hash: 28A15C9998771A459AC115603BB619898DCD9D22C595FB4F76AA5536CCF28D13
+Restored hash: 28A15C9998771A459AC115603BB619898DCD9D22C595FB4F76AA5536CCF28D13
+Modified artifact hash left changed: F9954CE4FF3A24167544A45C62CD3A41C9D0F5C0C17DEF187786BD428BD47464
+Restored behavior/status: the rollback copy matches the pre-change settings implementation byte-for-byte; MODIFIED_FILE retains the changed automatic-import validation that accepts `off`.

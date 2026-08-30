@@ -558,7 +558,15 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
   const selectedGroups = options.groups.filter(group => groupIds.includes(group.id));
   const activeGroups = options.groups.filter(group => !group.status || group.status === 'active');
   const monitorReady = Boolean(config.admin_key_set);
-  const importReady = Boolean(monitorReady && selectedProxy && groupIds.length && codexFingerprintMode !== 'off' && automation.auto_import);
+  const fingerprintModes = [
+    {value: 'off', label: '透传'},
+    {value: 'device', label: '设备'},
+    {value: 'session', label: '设备 + 会话'},
+    {value: 'full', label: '完全'},
+  ];
+  const fingerprintLabel = fingerprintModes.find(mode => mode.value === codexFingerprintMode)?.label || '透传';
+  const fingerprintConfigured = fingerprintModes.some(mode => mode.value === codexFingerprintMode);
+  const importReady = Boolean(monitorReady && selectedProxy && groupIds.length && fingerprintConfigured && automation.auto_import);
   const automationReady = monitorReady;
   const automationResult = automationState?.last_result;
   const automationDisplayResult = automationRetryResult || automationResult;
@@ -569,21 +577,14 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
   const nextRun = automation.enabled && automationState?.last_run
     ? new Date(new Date(automationState.last_run).getTime() + (Number(automation.interval_seconds || 0) * 1000))
     : null;
-  const fingerprintModes = [
-    {value: 'off', label: '透传'},
-    {value: 'device', label: '设备'},
-    {value: 'session', label: '设备 + 会话'},
-    {value: 'full', label: '完全'},
-  ];
   const readiness = [
     {label: '管理员密钥', ready: Boolean(config.admin_key_set)},
     {label: '固定代理', ready: Boolean(selectedProxy)},
     {label: '导入分组', ready: groupIds.length > 0},
-    {label: '指纹策略', ready: codexFingerprintMode !== 'off'},
+    {label: `指纹策略 · ${fingerprintLabel}`, ready: fingerprintConfigured},
   ];
   const importMissingCount = readiness.filter(item => !item.ready).length;
   const proxyLabel = proxyChoice === 'json' ? `JSON 自带（${jsonProxyCount}）` : selectedProxy?.name || '不绑定代理';
-  const fingerprintLabel = fingerprintModes.find(mode => mode.value === codexFingerprintMode)?.label || '透传';
   const maxPlatformCount = Math.max(1, ...platforms.map(item => Number(item.count || 0)));
   const selectActiveGroups = () => activeGroups.forEach(group => {
     if (!groupIds.includes(group.id)) onToggleGroup(group.id);

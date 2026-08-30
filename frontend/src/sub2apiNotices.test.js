@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+import {
+  buildSub2ApiAutomationSaveNotice,
+  buildSub2ApiImportNotice,
+  sub2ApiHistoryDeleteErrorMessage,
+} from './sub2apiNotices.js';
 
 test('builds separate import and fingerprint sections for a confirmed import', () => {
   const notice = buildSub2ApiImportNotice({
@@ -50,5 +54,16 @@ test('distinguishes unavailable single and batch history deletion routes', () =>
   assert.equal(
     sub2ApiHistoryDeleteErrorMessage(Object.assign(new Error('卡密导入记录不存在'), {status: 404})),
     '卡密导入记录不存在',
+  );
+});
+
+test('reports successful automation save when fingerprint mode is passthrough', () => {
+  assert.equal(
+    buildSub2ApiAutomationSaveNotice({
+      enabled: true,
+      auto_import: true,
+      codex_fingerprint_mode: 'off',
+    }),
+    '保存成功：定时找回与自动导入已启用，Codex 指纹：透传',
   );
 });
