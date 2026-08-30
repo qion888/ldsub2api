@@ -2123,19 +2123,123 @@ def mark_preorder_check_error(preorder_id: int, error: Exception) -> None:
         )
 
 
-def price_history(watch_id: int, limit: int) -> list[dict[str, Any]]:
+def price_history(
+    watch_id: int,
+    *,
+    limit: int,
+    offset: int = 0,
+    start_date: str = "",
+    end_date: str = "",
+    status: str = "all",
+    stock: str = "all",
+    query: str = "",
+) -> dict[str, Any]:
+    """Return a paged history view plus compact statistics for the price radar."""
+    limit = min(max(int(limit or 25), 1), 200)
+    offset = max(int(offset or 0), 0)
+    status = status if status in {"all", "success", "error"} else "all"
+    stock = stock if stock in {"all", "in", "out", "unknown"} else "all"
+    start_date = str(start_date or "").strip()[:10]
+    end_date = str(end_date or "").strip()[:10]
+    query = str(query or "").strip()[:120]
+
+    clauses = ["watch_id = ?"]
+    params: list[Any] = [watch_id]
+    if start_date:
+        clauses.append("fetched_at >= ?")
+        params.append(f"{start_date}T00:00:00")
+    if end_date:
+        clauses.append("fetched_at <= ?")
+        params.append(f"{end_date}T23:59:59")
+    if status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+    numeric_stock = "stock IS NOT NULL AND stock != '' AND stock NOT GLOB '*[^0-9]*'"
+    if stock == "in":
+        clauses.append(f"{numeric_stock} AND CAST(stock AS INTEGER) > 0")
+    elif stock == "out":
+        clauses.append(f"{numeric_stock} AND CAST(stock AS INTEGER) <= 0")
+    elif stock == "unknown":
+        clauses.append(f"NOT ({numeric_stock})")
+    if query:
+        clauses.append("(title LIKE ? OR price LIKE ? OR stock LIKE ? OR sale_status LIKE ? OR error LIKE ?)")
+        pattern = f"%{query}%"
+        params.extend([pattern, pattern, pattern, pattern, pattern])
+
+    where_sql = " AND ".join(clauses)
     with database() as connection:
         exists = connection.execute("SELECT 1 FROM watches WHERE id = ?", (watch_id,)).fetchone()
         if not exists:
             raise KeyError("监控商品不存在")
-        rows = connection.execute(
-            """
-            SELECT id, price, stock, sale_status, fetched_at, status, error
-            FROM snapshots WHERE watch_id = ? ORDER BY id DESC LIMIT ?
+        total = int(connection.execute(f"SELECT COUNT(*) FROM snapshots WHERE {where_sql}", params).fetchone()[0])
+        stats_row = connection.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
+                COUNT(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN 1 END) AS quoted_count,
+                MIN(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN CAST(price AS REAL) END) AS min_price,
+                MAX(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN CAST(price AS REAL) END) AS max_price,
+                AVG(CASE WHEN status = 'success' AND price IS NOT NULL AND price != '' THEN CAST(price AS REAL) END) AS average_price,
+                SUM(CASE WHEN {numeric_stock} AND CAST(stock AS INTEGER) > 0 THEN 1 ELSE 0 END) AS in_stock_count,
+                SUM(CASE WHEN {numeric_stock} AND CAST(stock AS INTEGER) <= 0 THEN 1 ELSE 0 END) AS out_stock_count,
+                SUM(CASE WHEN NOT ({numeric_stock}) THEN 1 ELSE 0 END) AS unknown_stock_count
+            FROM snapshots WHERE {where_sql}
             """,
-            (watch_id, limit),
+            params,
+        ).fetchone()
+        page_params = [*params, limit, offset]
+        rows = connection.execute(
+            f"""
+            SELECT id, title, price, stock, sale_status, fetched_at, status, error
+            FROM snapshots WHERE {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?
+            """,
+            page_params,
         ).fetchall()
-    return [dict(row) for row in reversed(rows)]
+        trend_rows = connection.execute(
+            f"""
+            SELECT id, price, stock, sale_status, fetched_at, status, error FROM (
+                SELECT id, price, stock, sale_status, fetched_at, status, error
+                FROM snapshots WHERE {where_sql} AND status = 'success'
+                ORDER BY id DESC LIMIT 240
+            ) ORDER BY id ASC
+            """,
+            params,
+        ).fetchall()
+
+    def serialize_history_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        raw_stock = result.get("stock")
+        result["stock"] = int(raw_stock) if str(raw_stock or "").isdigit() else None
+        result["stock_label"] = str(raw_stock) if raw_stock not in (None, "") else "接口未公开数量"
+        return result
+
+    stats = {
+        "success_count": int(stats_row["success_count"] or 0),
+        "error_count": int(stats_row["error_count"] or 0),
+        "quoted_count": int(stats_row["quoted_count"] or 0),
+        "min_price": _money(stats_row["min_price"]) if stats_row["min_price"] is not None else None,
+        "max_price": _money(stats_row["max_price"]) if stats_row["max_price"] is not None else None,
+        "average_price": _money(stats_row["average_price"]) if stats_row["average_price"] is not None else None,
+        "in_stock_count": int(stats_row["in_stock_count"] or 0),
+        "out_stock_count": int(stats_row["out_stock_count"] or 0),
+        "unknown_stock_count": int(stats_row["unknown_stock_count"] or 0),
+    }
+    return {
+        "items": [serialize_history_row(row) for row in rows],
+        "trend": [serialize_history_row(row) for row in trend_rows],
+        "total": total,
+        "page": offset // limit + 1,
+        "page_size": limit,
+        "stats": stats,
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "status": status,
+            "stock": stock,
+            "query": query,
+        },
+    }
 
 
 def delete_watches(watch_ids: list[int]) -> int:
@@ -2569,9 +2673,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._send_json(products)
         match = re.fullmatch(r"/api/watches/(\d+)/history", path)
         if match:
-            limit = min(max(int(parse_qs(parsed.query).get("limit", ["40"])[0]), 1), 200)
+            query_values = parse_qs(parsed.query)
+            def query_value(name: str, default: str = "") -> str:
+                return str(query_values.get(name, [default])[0] or default)
+
             try:
-                return self._send_json(price_history(int(match.group(1)), limit))
+                limit = int(query_value("limit", "25"))
+                offset = int(query_value("offset", "0"))
+            except ValueError:
+                return self._send_json({"detail": "分页参数无效"}, 400)
+            try:
+                return self._send_json(price_history(
+                    int(match.group(1)),
+                    limit=limit,
+                    offset=offset,
+                    start_date=query_value("start_date"),
+                    end_date=query_value("end_date"),
+                    status=query_value("status", "all"),
+                    stock=query_value("stock", "all"),
+                    query=query_value("query"),
+                ))
             except KeyError as exc:
                 return self._send_json({"detail": str(exc.args[0])}, 404)
         if path == "/api/settings/contact":

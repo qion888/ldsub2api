@@ -7,21 +7,12 @@ $requirements = Join-Path $backendDirectory 'requirements.txt'
 
 function Stop-StaleLdxpProcesses {
     $root = $PSScriptRoot.ToLowerInvariant()
-    $projectBackendPids = @(
-        Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalPort -ge 8000 -and $_.LocalPort -le 8050 } |
-            Select-Object -ExpandProperty OwningProcess -Unique
-    )
+    $backendScript = (Join-Path $root 'backend\main.py').ToLowerInvariant()
     Get-CimInstance Win32_Process | ForEach-Object {
         $commandLine = [string]$_.CommandLine
         if ([string]::IsNullOrWhiteSpace($commandLine)) { return }
         $normalized = $commandLine.ToLowerInvariant()
-        $isBackend = $normalized.Contains((Join-Path $root 'backend\main.py').ToLowerInvariant())
-        # `Start-Process python main.py` exposes only `main.py` in WMI; the
-        # listening-port check keeps cleanup limited to this app's dev range.
-        if (-not $isBackend -and $projectBackendPids -contains $_.ProcessId) {
-            $isBackend = $normalized -match '(python|python\.exe|py\.exe).*\bmain\.py\b'
-        }
+        $isBackend = $normalized.Contains($backendScript)
         $isFrontend = $normalized.Contains((Join-Path $root 'frontend\node_modules').ToLowerInvariant()) -and $normalized.Contains('vite')
         if (($isBackend -or $isFrontend) -and $_.ProcessId -ne $PID) {
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
@@ -68,8 +59,9 @@ $env:LDXP_PORT = [string]$backendPort
 $env:LDXP_FRONTEND_URL = "http://127.0.0.1:$frontendPort/"
 
 Write-Host "Starting backend at http://127.0.0.1:$backendPort"
+$backendScript = Join-Path $backendDirectory 'main.py'
 $backendProcess = Start-Process python `
-    -ArgumentList 'main.py' `
+    -ArgumentList ('"{0}"' -f $backendScript) `
     -WorkingDirectory $backendDirectory `
     -WindowStyle Hidden `
     -PassThru

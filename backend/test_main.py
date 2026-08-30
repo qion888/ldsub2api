@@ -1070,6 +1070,64 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertEqual(run_status, 200)
                 self.assertEqual(run_result, run_payload)
 
+    def test_price_history_supports_filters_statistics_and_pagination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
+                main.init_database()
+                with main.database() as connection:
+                    watch_id = connection.execute(
+                        "INSERT INTO watches(url, name, enabled) VALUES(?, ?, 1)",
+                        ("https://pay.ldxp.cn/item/history-test", "历史测试"),
+                    ).lastrowid
+                    rows = [
+                        ("2026-08-01T10:00:00", "5.00", "8", "on_sale", "success", None),
+                        ("2026-08-02T10:00:00", "4.50", "0", "off_sale", "success", None),
+                        ("2026-08-03T10:00:00", None, None, None, "error", "timeout"),
+                    ]
+                    connection.executemany(
+                        """
+                        INSERT INTO snapshots(
+                            watch_id, title, price, stock, sale_status, fetched_at, status, error
+                        ) VALUES(?, '历史测试', ?, ?, ?, ?, ?, ?)
+                        """,
+                        [(watch_id, price, stock, sale_status, fetched_at, status, error)
+                         for fetched_at, price, stock, sale_status, status, error in rows],
+                    )
+
+                result = main.price_history(
+                    watch_id,
+                    limit=2,
+                    offset=0,
+                    start_date="2026-08-01",
+                    end_date="2026-08-03",
+                )
+                self.assertEqual(result["total"], 3)
+                self.assertEqual(len(result["items"]), 2)
+                self.assertEqual(result["items"][0]["status"], "error")
+                self.assertEqual(result["stats"]["success_count"], 2)
+                self.assertEqual(result["stats"]["error_count"], 1)
+                self.assertEqual(result["stats"]["in_stock_count"], 1)
+                self.assertEqual(result["stats"]["out_stock_count"], 1)
+                self.assertEqual(result["stats"]["unknown_stock_count"], 1)
+                self.assertEqual(result["stats"]["min_price"], "4.50")
+                self.assertEqual(result["stats"]["max_price"], "5.00")
+
+                status, payload = self.request_api(
+                    "GET",
+                    f"/api/watches/{watch_id}/history?limit=1&offset=0&stock=out&status=success",
+                    {},
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["total"], 1)
+                self.assertEqual(payload["items"][0]["stock"], 0)
+                self.assertEqual(payload["trend"][0]["price"], "4.50")
+
+    def test_price_history_rejects_invalid_pagination(self):
+        status, payload = self.request_api("GET", "/api/watches/1/history?limit=invalid", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["detail"], "分页参数无效")
+
 
 if __name__ == "__main__":
     unittest.main()
