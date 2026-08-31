@@ -20,6 +20,7 @@ def run_cycle(
     state_loader: Callable[[], dict[str, Any]],
     refresh_reclaim: Callable[..., dict[str, Any]],
     reclaim_accounts: Callable[..., dict[str, Any]],
+    retry_reclaim: Callable[..., dict[str, Any]] | None = None,
     import_payload: Callable[..., dict[str, Any]],
     store_state: Callable[[dict[str, Any]], None],
     now: Callable[[], str],
@@ -35,6 +36,21 @@ def run_cycle(
         if str(value).strip()
     ][:100]
     auto_import = bool(settings.get("auto_import", False))
+    try:
+        max_reclaim_attempts = min(max(int(settings.get("max_reclaim_attempts") or 3), 1), 20)
+    except (TypeError, ValueError):
+        max_reclaim_attempts = 3
+    raw_attempts = state.get("reclaim_attempts")
+    attempt_counts = {
+        str(code).strip(): max(0, int(count))
+        for code, count in (raw_attempts.items() if isinstance(raw_attempts, dict) else [])
+        if str(code).strip() and str(count).strip().lstrip("-").isdigit()
+    }
+    limited_codes = {
+        str(value).strip()
+        for value in state.get("attempt_limited_card_codes", [])
+        if str(value).strip()
+    }
     # Keep the completed-order ledger across queue transitions.  Clearing it
     # when pending work reaches zero causes the next cycle to download the same
     # completed reclaim files again.
@@ -43,13 +59,27 @@ def run_cycle(
         for order_no in state.get("imported_order_nos", [])
         if str(order_no).strip()
     ][-500:]
-    if pending:
-        refresh_kwargs = {"exclude_order_nos": imported_order_nos}
+    operation_kwargs = {"exclude_order_nos": imported_order_nos}
+    # Always pass the configured limit, including the first scan when there
+    # is no persisted attempt state yet. Otherwise a custom limit would be
+    # silently replaced by reclaim.py's default.
+    attempt_kwargs = {
+        "attempt_counts": attempt_counts,
+        "max_reclaim_attempts": max_reclaim_attempts,
+        "exclude_card_codes": sorted(limited_codes),
+    }
+    previous_result = state.get("last_result") if isinstance(state.get("last_result"), dict) else {}
+    previous_summary = previous_result.get("reclaim_summary") if isinstance(previous_result.get("reclaim_summary"), dict) else {}
+    retry_terminal = pending and not _count(previous_summary.get("active")) and str(previous_result.get("outcome") or "") in {"failed", "partial", "error"}
+    if retry_terminal and retry_reclaim is not None:
+        reclaim = retry_reclaim(pending, **operation_kwargs, **attempt_kwargs)
+    elif pending:
+        refresh_kwargs = operation_kwargs.copy()
         if not auto_import:
             refresh_kwargs["include_downloads"] = False
         reclaim = refresh_reclaim(pending, **refresh_kwargs)
     else:
-        reclaim_kwargs = {"exclude_order_nos": imported_order_nos}
+        reclaim_kwargs = {**operation_kwargs, **attempt_kwargs}
         if not auto_import:
             reclaim_kwargs["include_downloads"] = False
         reclaim = reclaim_accounts(**reclaim_kwargs)
@@ -86,6 +116,16 @@ def run_cycle(
             reclaim[key] = value
     metadata = {**metadata, **{key: reclaim[key] for key in metadata if key in reclaim}}
 
+    raw_attempt_result = reclaim.get("attempt_counts")
+    if isinstance(raw_attempt_result, dict):
+        attempt_counts = {
+            str(code).strip(): max(0, int(count))
+            for code, count in raw_attempt_result.items()
+            if str(code).strip() and str(count).strip().lstrip("-").isdigit()
+        }
+    raw_limited_result = reclaim.get("attempt_limited_card_codes")
+    if isinstance(raw_limited_result, list):
+        limited_codes.update(str(value).strip() for value in raw_limited_result if str(value).strip())
     raw_retryable = reclaim.get("retryable_card_codes")
     if not isinstance(raw_retryable, list):
         raw_retryable = metadata["retryable_card_codes"]
@@ -107,6 +147,7 @@ def run_cycle(
         str(value).strip()
         for value in raw_retryable
         if str(value).strip() and str(value).strip() not in permanent_codes
+        and str(value).strip() not in limited_codes
     ][:100]
     raw_active_codes = reclaim.get("active_card_codes")
     if not isinstance(raw_active_codes, list):
@@ -115,6 +156,7 @@ def run_cycle(
         str(value).strip()
         for value in raw_active_codes
         if str(value).strip() and str(value).strip() not in permanent_codes
+        and str(value).strip() not in limited_codes
     ][:100]
     active = _count(metadata["reclaim_summary"].get("active"))
     outcome = str(metadata.get("outcome") or "error")
@@ -140,6 +182,9 @@ def run_cycle(
             "accounts_401": reclaim.get("accounts_401"),
             "card_code_count": reclaim.get("card_code_count", len(card_codes)),
             "retryable_card_codes": retryable_codes,
+            "attempt_limited_card_codes": sorted(limited_codes)[:100],
+            "attempt_counts": attempt_counts,
+            "max_reclaim_attempts": max_reclaim_attempts,
             "active_card_codes": metadata.get("active_card_codes", []),
             "retry_available": bool(retryable_codes),
             "reclaim_summary": metadata["reclaim_summary"],
@@ -156,6 +201,8 @@ def run_cycle(
             "last_result": summary,
             "pending_card_codes": retryable_codes[:100],
             "retryable_card_codes": retryable_codes[:100],
+            "reclaim_attempts": attempt_counts,
+            "attempt_limited_card_codes": sorted(limited_codes)[:100],
             "imported_order_nos": imported_order_nos,
             "run_history": (
                 state.get("run_history", [])
@@ -241,6 +288,9 @@ def run_cycle(
         "reclaim_summary": recovery_summary,
         "reclaim_failures": metadata["reclaim_failures"],
         "retryable_card_codes": retryable_codes,
+        "attempt_counts": attempt_counts,
+        "attempt_limited_card_codes": sorted(limited_codes)[:100],
+        "max_reclaim_attempts": max_reclaim_attempts,
         "active_card_codes": active_codes,
         "retry_available": bool(metadata["retry_available"]),
         "import_status": import_status,
@@ -256,6 +306,8 @@ def run_cycle(
         "last_result": summary,
         "pending_card_codes": next_pending,
         "retryable_card_codes": retryable_codes,
+        "reclaim_attempts": attempt_counts,
+        "attempt_limited_card_codes": sorted(limited_codes)[:100],
         "imported_order_nos": imported_order_nos,
         "run_history": (
             state.get("run_history", [])

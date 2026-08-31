@@ -330,6 +330,79 @@ class Sub2ApiModuleTests(unittest.TestCase):
                 {"name": "user401", "error_message": "upstream timeout"}
             )
         )
+        self.assertTrue(reclaim.account_is_401({
+            "status": "error",
+            "error_message": 'Authentication failed (401): {"code":"token_invalidated"}',
+        }))
+
+    def test_automation_settings_normalize_reclaim_attempt_limit(self) -> None:
+        value = settings.read_automation_settings(lambda key, fallback: {
+            **fallback,
+            "max_reclaim_attempts": 8,
+        })
+        self.assertEqual(value["max_reclaim_attempts"], 8)
+        saved = settings.save_automation_settings(
+            {"max_reclaim_attempts": 0, "group_ids": [], "codex_fingerprint_mode": "off"},
+            has_admin_key=lambda: False,
+            store_setting=lambda *_: None,
+        )
+        self.assertEqual(saved["max_reclaim_attempts"], 3)
+
+    def test_automation_passes_custom_attempt_limit_on_first_scan(self) -> None:
+        captured = []
+        stored = []
+        result = automation.run_cycle(
+            settings_loader=lambda: {
+                "enabled": True,
+                "auto_import": False,
+                "max_reclaim_attempts": 1,
+            },
+            state_loader=lambda: {"pending_card_codes": [], "imported_order_nos": [], "run_history": []},
+            reclaim_accounts=lambda **kwargs: captured.append(kwargs) or {
+                "ok": True,
+                "reclaim_card_codes": ["CARD-LIMIT"],
+                "attempt_counts": {"CARD-LIMIT": 1},
+                "attempt_limited_card_codes": ["CARD-LIMIT"],
+                "retryable_card_codes": [],
+                "result": {"ok": True, "failed": 1},
+            },
+            refresh_reclaim=lambda *args, **kwargs: self.fail("initial scan should use reclaim_accounts"),
+            import_payload=lambda *args, **kwargs: self.fail("auto import disabled"),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+
+        self.assertEqual(captured[0]["max_reclaim_attempts"], 1)
+        self.assertEqual(result["state"]["attempt_limited_card_codes"], ["CARD-LIMIT"])
+
+    def test_reclaim_skips_card_after_attempt_limit_and_reports_reason(self) -> None:
+        calls = []
+
+        class FakeClient:
+            def batch_reclaim(self, card_codes, mode="401"):
+                calls.append((card_codes, mode))
+                return {"ok": True, "failed": 1, "all_tasks": [{
+                    "card_code": card_codes[0], "status": "failed", "message": "temporary",
+                }]}
+
+        accounts = [{"id": 1, "name": "Account team-CARD-LIMIT", "status": "error", "error_message": "Authentication failed (401)"}]
+        first = reclaim.reclaim_401_accounts(
+            config={"admin_key": "secret"}, accounts_loader=lambda _: accounts,
+            redeem_client_factory=FakeClient, to_json=lambda value: value, max_payload_bytes=1024,
+            attempt_counts={}, max_reclaim_attempts=1,
+        )
+        self.assertEqual(calls, [(["team-CARD-LIMIT"], "401")])
+        self.assertEqual(first["attempt_limited_card_codes"], ["team-CARD-LIMIT"])
+        self.assertFalse(first["retry_available"])
+        second = reclaim.reclaim_401_accounts(
+            config={"admin_key": "secret"}, accounts_loader=lambda _: accounts,
+            redeem_client_factory=FakeClient, to_json=lambda value: value, max_payload_bytes=1024,
+            attempt_counts=first["attempt_counts"], max_reclaim_attempts=1,
+        )
+        self.assertEqual(calls, [(["team-CARD-LIMIT"], "401")])
+        self.assertEqual(second["reclaim_card_codes"], [])
+        self.assertEqual(second["attempt_limited_count"], 1)
+        self.assertIn("上限", second["reclaim_failures"][0]["reason"])
 
     def test_reclaim_summary_separates_permanent_and_retryable_tasks(self) -> None:
         summary = reclaim.summarize_reclaim_result(
@@ -769,6 +842,35 @@ class Sub2ApiModuleTests(unittest.TestCase):
         self.assertFalse(result["result"]["retry_available"])
         self.assertEqual(stored[-1]["pending_card_codes"], [])
         self.assertEqual(import_calls, [])
+
+    def test_automation_resubmits_terminal_retryable_queue(self) -> None:
+        stored = []
+        retry_calls = []
+        state = {
+            "pending_card_codes": ["CARD-500"],
+            "retryable_card_codes": ["CARD-500"],
+            "reclaim_attempts": {"CARD-500": 1},
+            "attempt_limited_card_codes": [],
+            "imported_order_nos": [],
+            "last_result": {"outcome": "failed", "reclaim_summary": {"active": 0}},
+            "run_history": [],
+        }
+        result = automation.run_cycle(
+            settings_loader=lambda: {"enabled": True, "auto_import": False, "max_reclaim_attempts": 3},
+            state_loader=lambda: state,
+            refresh_reclaim=lambda *args, **kwargs: self.fail("terminal work must be resubmitted"),
+            reclaim_accounts=lambda **kwargs: self.fail("pending work must use retry operation"),
+            retry_reclaim=lambda codes, **kwargs: retry_calls.append((codes, kwargs)) or {
+                "ok": True, "reclaim_card_codes": codes, "attempt_counts": {"CARD-500": 2},
+                "retryable_card_codes": codes, "result": {"ok": True, "failed": 1},
+            },
+            import_payload=lambda *args, **kwargs: self.fail("auto import disabled"),
+            store_state=stored.append,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+        )
+        self.assertEqual(retry_calls[0][0], ["CARD-500"])
+        self.assertEqual(stored[-1]["reclaim_attempts"]["CARD-500"], 2)
+        self.assertEqual(result["state"]["pending_card_codes"], ["CARD-500"])
 
     def test_automation_transport_failure_keeps_retry_context_and_import_fields(self) -> None:
         stored = []

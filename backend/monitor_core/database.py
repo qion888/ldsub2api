@@ -165,7 +165,7 @@ def initialize_database(
         )
         connection.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('sub2api_automation_state', ?)",
-            (json.dumps({"last_run": None, "last_error": "", "last_result": None, "pending_card_codes": []}, ensure_ascii=False),),
+            (json.dumps({"last_run": None, "last_error": "", "last_result": None, "pending_card_codes": [], "reclaim_attempts": {}, "attempt_limited_card_codes": []}, ensure_ascii=False),),
         )
         connection.execute(
             "UPDATE watches SET created_at = COALESCE(created_at, ?) WHERE created_at IS NULL",

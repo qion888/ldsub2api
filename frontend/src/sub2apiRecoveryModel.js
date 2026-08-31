@@ -18,7 +18,7 @@ const IMPORT_META = Object.freeze({
 
 const ACTIVE_STATUSES = new Set(['queued', 'already_running', 'running', 'pending', 'processing', 'submitted']);
 const DONE_STATUSES = new Set(['done', 'completed', 'success']);
-const PERMANENT_STATUSES = new Set(['unreclaimable', 'not_owned', 'skipped', 'permanent']);
+const PERMANENT_STATUSES = new Set(['unreclaimable', 'not_owned', 'skipped', 'permanent', 'attempt_limit']);
 const RETRYABLE_STATUSES = new Set(['failed', 'error', 'timeout', 'download_failed']);
 
 function isObject(value) {
@@ -109,9 +109,9 @@ function normalizeFailure(item) {
   const providerStatus = Number(item.provider_status);
   const explicitBucket = text(item.failure_bucket).toLowerCase();
   const failureBucket = category === 'unrecoverable'
-    ? (['unreclaimable', 'not_owned', 'skipped'].includes(explicitBucket)
+    ? (['unreclaimable', 'not_owned', 'skipped', 'attempt_limit'].includes(explicitBucket)
       ? explicitBucket
-      : ['unreclaimable', 'not_owned', 'skipped'].includes(status) ? status : 'unreclaimable')
+      : ['unreclaimable', 'not_owned', 'skipped', 'attempt_limit'].includes(status) ? status : 'unreclaimable')
     : category;
   const reason = text(
     item.reason,
