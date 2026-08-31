@@ -1,14 +1,27 @@
 # Local runtime data and credentials
-backend/*.db
-backend/*.db-*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+.runtime/
 backend/waf-browser-profile/
 backend/order-waf-browser-profile/
 backend/order_query/waf-browser-profile/
-backend/server.*.log
 frontend/server.*.log
-.runtime/
-artifacts/
 
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+credentials*.json
+secrets*.json
+service-account*.json
 
 # Reproducible dependencies and build output
 frontend/node_modules/
@@ -18,11 +31,14 @@ frontend/dist/
 
 # Local captures, archives, and verification output
 artifacts/
+ui-*.png
+*-before.png
+*-current-*.png
+*-final-*.png
 /DIFF_FILE
 /VERIFICATION.txt
 /MODIFIED_FILE
 /ROLLBACK_BASELINE
 /ROLLBACK.sh
-/acceptance-account-fix.db
 *.zip
 grab_*.txt
