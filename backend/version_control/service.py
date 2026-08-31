@@ -16,6 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from .archive import ArchiveUpdateManager
 from .backup import BackupManager
 from .errors import VersionControlError
 
@@ -23,6 +24,7 @@ from .errors import VersionControlError
 DEFAULT_REPOSITORY_URL = "https://github.com/qion888/ldsub2api.git"
 DEFAULT_BRANCH = "main"
 MAX_GITHUB_RESPONSE_BYTES = 1024 * 1024
+MAX_GITHUB_ARCHIVE_BYTES = 100 * 1024 * 1024
 _GITHUB_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -116,6 +118,7 @@ class VersionControlService:
             database_path or (config.root / "backend" / "monitor.db"),
             now=self._now,
         )
+        self._archives = ArchiveUpdateManager(config.root, now=self._now)
 
     def _run_git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         command = ["git", "-C", str(self.config.root), *arguments]
@@ -205,7 +208,35 @@ class VersionControlService:
             return "dev"
         return value[:80] or "dev"
 
+    def _is_git_installation(self) -> bool:
+        # GitHub's "Download ZIP" packages intentionally omit .git. Check the
+        # marker before invoking Git so archive installations never surface a
+        # raw "not a git repository" error.
+        return (self.config.root / ".git").exists()
+
     def _repository_state(self) -> dict[str, Any]:
+        if not self._is_git_installation():
+            installed = self._archives.installed_state()
+            installed_matches = (
+                _repository_key(str(installed.get("repository_url") or ""))
+                == _repository_key(self.config.repository_url)
+                and str(installed.get("branch") or "") == self.config.branch
+            )
+            current_commit = str(installed.get("commit") or "").strip().lower() if installed_matches else ""
+            return {
+                "current_version": self._read_current_version(),
+                "current_commit": current_commit,
+                "current_short_commit": current_commit[:8],
+                "branch": self.config.branch,
+                "target_branch": self.config.branch,
+                "remote": "github-archive",
+                "repository_url": self.config.github_url,
+                "worktree_clean": True,
+                "dirty_file_count": 0,
+                "repository_matches": True,
+                "can_update": True,
+                "installation_mode": "archive",
+            }
         inside = self._git_text("rev-parse", "--is-inside-work-tree").lower()
         if inside != "true":
             raise VersionControlError(
@@ -238,6 +269,7 @@ class VersionControlService:
                 and branch == self.config.branch
                 and repository_matches
             ),
+            "installation_mode": "git",
         }
 
     def version_info(self) -> dict[str, Any]:
@@ -266,8 +298,48 @@ class VersionControlService:
     def _write_last_update(self, payload: dict[str, Any]) -> None:
         self._backups.backup_dir.mkdir(parents=True, exist_ok=True)
         temporary = self._last_update_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, self._last_update_path)
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, self._last_update_path)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise VersionControlError(
+                "版本更新记录写入失败",
+                code="last_update_write_failed",
+                status=500,
+            ) from exc
+
+    @staticmethod
+    def _file_snapshot(path: Path) -> bytes | None:
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise VersionControlError(
+                "无法读取版本更新记录",
+                code="last_update_read_failed",
+                status=500,
+            ) from exc
+
+    @staticmethod
+    def _restore_file_snapshot(path: Path, snapshot: bytes | None) -> None:
+        temporary = path.with_suffix(f"{path.suffix}.tmp")
+        try:
+            if snapshot is None:
+                path.unlink(missing_ok=True)
+                temporary.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_bytes(snapshot)
+            os.replace(temporary, path)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise VersionControlError(
+                "版本更新记录恢复失败",
+                code="last_update_restore_failed",
+                status=500,
+            ) from exc
 
     def _github_json(self, path: str, *, allow_not_found: bool = False) -> Any:
         url = f"https://api.github.com/repos/{self.config.github_slug}/{path.lstrip('/')}"
@@ -327,8 +399,94 @@ class VersionControlService:
             return ""
         return value[:80]
 
+    def _archive_remote_metadata(self) -> dict[str, str]:
+        branch = quote(self.config.branch, safe="")
+        latest = self._github_json(f"commits/{branch}")
+        latest_commit = str(latest.get("sha") if isinstance(latest, dict) else "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", latest_commit):
+            raise VersionControlError(
+                "GitHub 未返回有效的最新提交",
+                code="github_invalid_commit",
+                status=502,
+                retryable=True,
+            )
+        latest_version = self._latest_version_file()
+        if not latest_version:
+            raise VersionControlError(
+                "GitHub 主分支缺少有效 VERSION 文件",
+                code="github_version_missing",
+                status=502,
+                retryable=True,
+            )
+        return {"commit": latest_commit, "version": latest_version}
+
+    def _download_archive(self) -> bytes:
+        branch = quote(self.config.branch, safe="")
+        url = f"https://codeload.github.com/{self.config.github_slug}/zip/{branch}"
+        request = Request(
+            url,
+            headers={"Accept": "application/zip", "User-Agent": "LDXPLocalMonitor-VersionUpdater"},
+            method="GET",
+        )
+        try:
+            with self._opener(request, timeout=60) as response:
+                payload = response.read(MAX_GITHUB_ARCHIVE_BYTES + 1)
+        except HTTPError as exc:
+            raise VersionControlError(
+                f"GitHub 源码下载返回 HTTP {exc.code}",
+                code="github_archive_http_error",
+                status=502,
+                retryable=True,
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise VersionControlError(
+                "GitHub 源码下载失败，请检查网络后重试",
+                code="github_archive_unavailable",
+                status=502,
+                retryable=True,
+            ) from exc
+        if len(payload) > MAX_GITHUB_ARCHIVE_BYTES:
+            raise VersionControlError("GitHub 源码包过大", code="github_archive_too_large", status=502)
+        return payload
+
+    def _check_archive_updates(self, state: dict[str, Any]) -> dict[str, Any]:
+        remote = self._archive_remote_metadata()
+        current_commit = str(state.get("current_commit") or "").lower()
+        same_commit = bool(current_commit and current_commit == remote["commit"])
+        same_version = state["current_version"].lstrip("v") == remote["version"].lstrip("v")
+        update_available = not same_commit if current_commit else not same_version
+        status = "update_available" if update_available else "up_to_date"
+        message = (
+            "发现可用源码更新，升级前将自动备份数据库和当前代码"
+            if update_available
+            else "当前已是 GitHub 最新版本"
+        )
+        return {
+            "ok": True,
+            **state,
+            "status": status,
+            "message": message,
+            "update_available": update_available,
+            "update_ready": update_available,
+            "latest_version": remote["version"],
+            "latest_commit": remote["commit"],
+            "latest_short_commit": remote["commit"][:8],
+            "ahead_by": 1 if update_available else 0,
+            "behind_by": 0,
+            "remote_ahead_by": 1 if update_available else 0,
+            "local_ahead_by": 0,
+            "comparison_source": "github-version",
+            "github_commit": remote["commit"],
+            "release": None,
+            "checked_at": self._now().isoformat(timespec="seconds"),
+            "database": self._backups.database_status(),
+            "last_update": self._read_last_update(),
+        }
+
     def check_updates(self) -> dict[str, Any]:
         state = self._repository_state()
+        if state["installation_mode"] == "archive":
+            return self._check_archive_updates(state)
         branch = quote(self.config.branch, safe="")
         self._fetch_remote()
         remote_commit = self._remote_commit().lower()
@@ -433,6 +591,111 @@ class VersionControlService:
                 status=409,
             )
 
+    def _install_archive_update(self, before: dict[str, Any]) -> dict[str, Any]:
+        remote = self._archive_remote_metadata()
+        current_commit = str(before.get("current_commit") or "").lower()
+        same_commit = bool(current_commit and current_commit == remote["commit"])
+        same_version = before["current_version"].lstrip("v") == remote["version"].lstrip("v")
+        if same_commit or (not current_commit and same_version):
+            return {
+                "ok": True,
+                **before,
+                "status": "up_to_date",
+                "updated": False,
+                "needs_restart": False,
+                "message": "当前已是 GitHub 最新版本",
+                "latest_version": remote["version"],
+                "latest_commit": remote["commit"],
+                "latest_short_commit": remote["commit"][:8],
+            }
+
+        payload = self._download_archive()
+        inspected = self._archives.inspect(payload)
+        if inspected["version"].lstrip("v") != remote["version"].lstrip("v"):
+            raise VersionControlError(
+                "GitHub 源码包与远端版本信息不一致，请稍后重试",
+                code="archive_version_mismatch",
+                status=409,
+                retryable=True,
+            )
+        backup = self._backups.create_backup(
+            reason="before-update",
+            code_commit=before["current_commit"],
+            code_version=before["current_version"],
+        )
+        previous_installed_state = self._archives.installed_state_snapshot()
+        previous_last_update = self._file_snapshot(self._last_update_path)
+        installed = self._archives.install(payload)
+        try:
+            self._archives.write_installed_state(
+                repository_url=self.config.github_url,
+                branch=self.config.branch,
+                commit=remote["commit"],
+                version=remote["version"],
+            )
+            after = self._repository_state()
+            if after["current_version"].lstrip("v") != remote["version"].lstrip("v"):
+                raise VersionControlError(
+                    "源码更新后的 VERSION 校验失败",
+                    code="archive_update_verification_failed",
+                    status=500,
+                )
+            last_update = {
+                "installation_mode": "archive",
+                "backup_id": backup["id"],
+                "code_backup_id": installed["code_backup"]["id"],
+                "previous_commit": before["current_commit"],
+                "updated_commit": remote["commit"],
+                "previous_version": before["current_version"],
+                "updated_version": after["current_version"],
+                "updated_at": self._now().astimezone(timezone.utc).isoformat(timespec="seconds"),
+            }
+            self._write_last_update(last_update)
+        except Exception as exc:
+            recovery_errors: list[str] = []
+            try:
+                self._archives.restore_code_backup(installed["code_backup"]["id"])
+            except Exception as recovery_exc:
+                recovery_errors.append(str(recovery_exc))
+            try:
+                self._archives.restore_installed_state(previous_installed_state)
+            except Exception as recovery_exc:
+                recovery_errors.append(str(recovery_exc))
+            try:
+                self._restore_file_snapshot(self._last_update_path, previous_last_update)
+            except Exception as recovery_exc:
+                recovery_errors.append(str(recovery_exc))
+            if recovery_errors:
+                raise VersionControlError(
+                    f"源码更新失败，自动恢复未完整完成：{'; '.join(recovery_errors)[:240]}",
+                    code="archive_update_recovery_failed",
+                    status=500,
+                ) from exc
+            detail = exc.detail if isinstance(exc, VersionControlError) else "源码更新收尾失败"
+            code = exc.code if isinstance(exc, VersionControlError) else "archive_update_finalize_failed"
+            raise VersionControlError(
+                f"{detail}，代码已自动恢复",
+                code=code,
+                status=500,
+                retryable=isinstance(exc, VersionControlError) and exc.retryable,
+            ) from exc
+        return {
+            "ok": True,
+            **after,
+            "status": "updated",
+            "updated": True,
+            "needs_restart": True,
+            "previous_commit": before["current_commit"],
+            "latest_commit": remote["commit"],
+            "latest_short_commit": remote["commit"][:8],
+            "message": "源码版已更新，数据库和本地运行数据已保留，请重启服务",
+            "backup": backup,
+            "code_backup_id": installed["code_backup"]["id"],
+            "updated_file_count": installed["file_count"],
+            "last_update": {**last_update, "can_rollback": True},
+            "database": self._backups.database_status(),
+        }
+
     def install_update(self) -> dict[str, Any]:
         if not self._update_lock.acquire(blocking=False):
             raise VersionControlError(
@@ -444,6 +707,8 @@ class VersionControlService:
         try:
             before = self._repository_state()
             self._require_update_ready(before)
+            if before["installation_mode"] == "archive":
+                return self._install_archive_update(before)
             self._fetch_remote()
 
             # Fetch can take time, so verify the mutable state again before merging.
@@ -495,6 +760,7 @@ class VersionControlService:
                     status=500,
                 )
             last_update = {
+                "installation_mode": "git",
                 "backup_id": backup["id"],
                 "previous_commit": before["current_commit"],
                 "updated_commit": remote_commit,
@@ -600,6 +866,44 @@ class VersionControlService:
                 code_commit=state["current_commit"],
                 code_version=state["current_version"],
             )
+            if str(last_update.get("installation_mode") or "git") == "archive":
+                code_backup_id = str(last_update.get("code_backup_id") or "").strip()
+                if not code_backup_id:
+                    raise VersionControlError(
+                        "下载版更新缺少代码备份，无法回退",
+                        code="rollback_code_backup_missing",
+                        status=409,
+                    )
+                self._archives.restore_code_backup(code_backup_id)
+                previous_commit = str(last_update.get("previous_commit") or "")
+                previous_version = str(last_update.get("previous_version") or self._read_current_version())
+                self._archives.write_installed_state(
+                    repository_url=self.config.github_url,
+                    branch=self.config.branch,
+                    commit=previous_commit,
+                    version=previous_version,
+                )
+                restored = None
+                if restore_data:
+                    restored = self._backups.restore_backup(
+                        selected_id,
+                        create_safety_backup=False,
+                        code_commit=previous_commit,
+                        code_version=previous_version,
+                    )
+                after = self._repository_state()
+                return {
+                    "ok": True,
+                    "status": "rolled_back",
+                    "previous_commit": after["current_commit"],
+                    "safety_backup_id": safety_backup["id"],
+                    "restored_backup_id": selected_id if restored else None,
+                    "data_restored": bool(restored),
+                    "needs_restart": True,
+                    "installation_mode": "archive",
+                    "database": self._backups.database_status(),
+                    "message": "下载版代码已回退，请重启服务；数据按选择处理",
+                }
             previous_commit = str(last_update.get("previous_commit") or "")
             if not re.fullmatch(r"[0-9a-fA-F]{40}", previous_commit):
                 raise VersionControlError(

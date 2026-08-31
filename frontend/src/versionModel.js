@@ -96,6 +96,7 @@ export function normalizeVersionInfo(value) {
     branch: String(source.branch || '').trim(),
     target_branch: String(source.target_branch || 'main').trim(),
     repository_url: safeGithubUrl(source.repository_url),
+    installation_mode: source.installation_mode === 'archive' ? 'archive' : 'git',
     worktree_clean: source.worktree_clean !== false,
     dirty_file_count: nonNegativeInteger(source.dirty_file_count),
     repository_matches: source.repository_matches !== false,

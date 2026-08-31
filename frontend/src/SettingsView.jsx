@@ -550,14 +550,14 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
           {versionError && <div className="settings-error version-error" role="alert">{versionError}</div>}
           {versionInfo ? <>
             <div className="version-overview">
-              <div className="version-identity"><span className="version-mark"><PackageCheck size={21}/></span><div><small>当前版本</small><strong>v{versionInfo.current_version.replace(/^v/i, '')}</strong><code>{versionInfo.current_short_commit || 'unknown'}</code></div></div>
+              <div className="version-identity"><span className="version-mark"><PackageCheck size={21}/></span><div><small>当前版本</small><strong>v{versionInfo.current_version.replace(/^v/i, '')}</strong><code>{versionInfo.current_short_commit || (versionInfo.installation_mode === 'archive' ? 'download' : 'unknown')}</code></div></div>
               <span className={`version-status version-status-${versionInfo.status}`}>{versionInfo.needs_restart ? <AlertTriangle size={14}/> : versionInfo.status === 'up_to_date' ? <CheckCircle2 size={14}/> : <GitBranch size={14}/>} {versionStatusLabel(versionInfo)}</span>
             </div>
             <div className="version-meta-grid">
-              <div><small>运行分支</small><strong>{versionInfo.branch || 'detached HEAD'}</strong><span>目标 {versionInfo.target_branch}</span></div>
+              <div><small>安装来源</small><strong>{versionInfo.installation_mode === 'archive' ? 'GitHub 下载版' : (versionInfo.branch || 'detached HEAD')}</strong><span>跟踪 {versionInfo.target_branch}</span></div>
               <div><small>GitHub 最新</small><strong>{versionInfo.latest_version ? `v${versionInfo.latest_version.replace(/^v/i, '')}` : '尚未检查'}</strong><span>{versionInfo.latest_short_commit || '点击检查更新'}{(versionInfo.remote_ahead_by || versionInfo.local_ahead_by) ? ` · 远端 +${versionInfo.remote_ahead_by} / 本地 +${versionInfo.local_ahead_by}` : ''}</span></div>
-              <div><small>工作树</small><strong>{versionInfo.worktree_clean ? '干净' : `${versionInfo.dirty_file_count} 项改动`}</strong><span>{versionInfo.repository_matches ? '更新源已核对' : '更新源不一致'}</span></div>
-              <div><small>更新方式</small><strong>GitHub 快进更新</strong><span>仅允许 fast-forward</span></div>
+              <div><small>{versionInfo.installation_mode === 'archive' ? '本地数据' : '工作树'}</small><strong>{versionInfo.installation_mode === 'archive' ? '原位置保留' : (versionInfo.worktree_clean ? '干净' : `${versionInfo.dirty_file_count} 项改动`)}</strong><span>{versionInfo.installation_mode === 'archive' ? '数据库、配置与依赖不会覆盖' : (versionInfo.repository_matches ? '更新源已核对' : '更新源不一致')}</span></div>
+              <div><small>更新方式</small><strong>{versionInfo.installation_mode === 'archive' ? 'GitHub 源码包更新' : 'GitHub 快进更新'}</strong><span>{versionInfo.installation_mode === 'archive' ? '升级前备份代码和数据' : '仅允许 fast-forward'}</span></div>
             </div>
             {(versionInfo.message || versionBlockReason(versionInfo) || versionInfo.needs_restart) && <div className={`version-callout ${versionInfo.needs_restart || versionBlockReason(versionInfo) ? 'warning' : 'success'}`}>
               {versionInfo.needs_restart || versionBlockReason(versionInfo) ? <AlertTriangle size={16}/> : <CheckCircle2 size={16}/>}<span>{versionInfo.needs_restart ? '新版本已安装，请重启后端与前端服务。' : versionBlockReason(versionInfo) || versionInfo.message}</span>
