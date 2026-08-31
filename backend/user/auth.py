@@ -625,6 +625,16 @@ class AuthService:
                         incoming.get("allow_registration", payload.get("allow_registration")),
                         default=status["allow_registration"],
                     )
+                    if mode == "external" and status["mode"] != "external":
+                        # Do not carry self-use guest capabilities into a
+                        # multi-user installation unless the administrator
+                        # explicitly supplies the external switches.
+                        if "force_login" not in incoming:
+                            system["force_login"] = True
+                        if "allow_user_reclaim" not in incoming:
+                            system["allow_user_reclaim"] = False
+                        if "allow_user_sub2api_import" not in incoming:
+                            system["allow_user_sub2api_import"] = False
                     if mode == "self_use":
                         allow_registration = False
                         system["force_login"] = False
