@@ -34,6 +34,7 @@ from order_query.errors import (
     OrderQueryPasswordRateLimited,
     OrderQueryPasswordRequired,
     OrderQuerySessionExpired,
+    OrderQueryWafVerificationRequired,
     OrderComplaintSubmissionUnknown,
     UpstreamOrderError,
 )
@@ -86,6 +87,7 @@ class FakeOrderClient:
         self.list_calls: list[dict[str, Any]] = []
         self.detail_calls: list[dict[str, Any]] = []
         self.detail_error: Exception | None = None
+        self.list_error: Exception | None = None
         self.expire_next_list = False
 
     def start_captcha(self, previous_code: str = "") -> CaptchaChallenge:
@@ -107,6 +109,8 @@ class FakeOrderClient:
         from order_query.errors import CaptchaVerificationExpired
 
         self.list_calls.append(kwargs)
+        if self.list_error is not None:
+            raise self.list_error
         if self.expire_next_list:
             self.expire_next_list = False
             raise CaptchaVerificationExpired()
@@ -904,6 +908,19 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(client.list_calls, [])
         self.assertEqual(client.start_count, 3)
 
+    def test_waf_response_preserves_session_context_for_browser_verification(self) -> None:
+        client = FakeOrderClient()
+        client.list_error = WafChallengeRequired("waf challenge")
+        service = self.service(client, FakeRecognizer(["AB12"]))
+
+        with self.assertRaises(OrderQueryWafVerificationRequired) as raised:
+            service.search({"keywords": "buyer", "status": 1, "page": 2, "page_size": 20})
+
+        error = raised.exception
+        self.assertTrue(error.session_id)
+        self.assertGreater(error.expires_in, 0)
+        self.assertEqual(error.request, {"status": 1, "page": 2, "page_size": 20})
+
     def test_expired_ticket_is_reverified_within_three_attempt_budget(self) -> None:
         client = FakeOrderClient()
         client.expire_next_list = True
@@ -1141,6 +1158,34 @@ class RouteTests(unittest.TestCase):
             "detail": "bad query",
             "code": "invalid_order_query",
             "retryable": False,
+        })])
+
+    def test_route_preserves_waf_session_context_for_browser_button(self) -> None:
+        responses: list[tuple[int, Any]] = []
+
+        def fail(data: dict[str, Any]) -> dict[str, Any]:
+            raise OrderQueryWafVerificationRequired(
+                session_id="abcdefghijklmnop",
+                expires_in=240,
+                request={"status": 999, "page": 1, "page_size": 10},
+            )
+
+        handled = routes.handle_post(
+            "/api/order-query/search",
+            {},
+            send_json=lambda value, status=200: responses.append((status, value)),
+            search=fail,
+            detail=lambda data: {},
+            complaint_preview=lambda data: {},
+        )
+        self.assertTrue(handled)
+        self.assertEqual(responses, [(409, {
+            "detail": "链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后重试",
+            "code": "waf_verification_required",
+            "retryable": True,
+            "session_id": "abcdefghijklmnop",
+            "expires_in": 240,
+            "waf_request": {"status": 999, "page": 1, "page_size": 10},
         })])
 
     def test_missing_history_operation_returns_distinct_service_error(self) -> None:

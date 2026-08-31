@@ -1164,6 +1164,22 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       clearStaleResult();
       if (requestError.code === 'waf_verification_required' || requestError.payload?.code === 'waf_verification_required') {
         setError('');
+        // Preserve the session created before the upstream WAF response so
+        // the browser-verification button has a usable context.
+        const wafPayload = requestError.payload || {};
+        const responseSessionId = String(wafPayload.session_id || '');
+        const responseRequest = wafPayload.waf_request;
+        if (responseSessionId) setSessionId(responseSessionId);
+        if (Number.isFinite(Number(wafPayload.expires_in))) setExpiresIn(Number(wafPayload.expires_in));
+        if (responseSessionId && responseRequest && typeof responseRequest === 'object') {
+          wafRequestRef.current = {
+            keywords: normalizedKeywords,
+            status: Number(responseRequest.status ?? statusValue),
+            page: Number(responseRequest.page ?? pageValue),
+            page_size: Number(responseRequest.page_size ?? pageSizeValue),
+          };
+        }
+        setSubmittedKeywords(normalizedKeywords);
         setWafVerification({status: 'required', detail: requestError.message || '订单接口触发阿里云 WAF 验证'});
         notify({type: 'warning', title: '需要完成浏览器验证', message: '订单接口返回 403，打开 Edge 完成阿里云 WAF 滑块后继续', duration: 7000});
         return false;
@@ -1180,7 +1196,12 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
 
   const runOrderWafVerification = async phase => {
     const requestSpec = wafRequestRef.current;
-    if (!requestSpec || !sessionId || !submittedKeywords || wafBusy || busy) return false;
+    if (!requestSpec || !sessionId || !submittedKeywords || wafBusy || busy) {
+      if (!wafBusy && !busy && (!requestSpec || !sessionId || !submittedKeywords)) {
+        notify('楠岃瘉浼氳瘽宸插け鏁堬紝璇峰厛閲嶆柊鏌ヨ', 'error');
+      }
+      return false;
+    }
     setWafBusy(phase);
     try {
       const response = await request(`/order-query/waf-verification/${phase}`, {

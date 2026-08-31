@@ -150,6 +150,10 @@ def handle_post(
             "code": exc.code,
             "retryable": exc.retryable,
         }
+        if hasattr(exc, "session_id"):
+            payload["session_id"] = str(getattr(exc, "session_id"))
+            payload["expires_in"] = int(getattr(exc, "expires_in", 0))
+            payload["waf_request"] = dict(getattr(exc, "request", {}))
         if hasattr(exc, "seconds"):
             payload["cooldown_seconds"] = int(getattr(exc, "seconds"))
         send_json(payload, exc.status)

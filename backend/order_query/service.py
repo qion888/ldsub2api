@@ -9,6 +9,8 @@ import threading
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from monitor_core.storefront import WafChallengeRequired
+
 from .captcha import CaptchaRecognizer, normalize_captcha_code
 from .client import BASE_URL, CaptchaChallenge, OrderQueryClient
 from .complaint import (
@@ -27,6 +29,7 @@ from .errors import (
     OrderQueryPasswordRateLimited,
     OrderQueryPasswordRequired,
     OrderQuerySessionExpired,
+    OrderQueryWafVerificationRequired,
     OrderComplaintInputError,
     OrderComplaintSubmissionConflict,
     OrderComplaintSubmissionUnknown,
@@ -167,6 +170,23 @@ class OrderQueryService:
             "captcha": {"image_data_url": self._image_data_url(image, mime_type)},
         }
 
+    def _with_waf_context(
+        self,
+        session: OrderQuerySession,
+        request: dict[str, Any],
+        operation: Callable[[], Any],
+    ) -> Any:
+        """Attach the live lookup session to any upstream WAF response."""
+        try:
+            return operation()
+        except WafChallengeRequired as exc:
+            raise OrderQueryWafVerificationRequired(
+                session_id=session.session_id,
+                expires_in=self.sessions.remaining(session),
+                request={"status": request["status"], "page": request["page"], "page_size": request["page_size"]},
+                detail=str(exc)[:240] or "链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后重试",
+            ) from exc
+
     def _automatic_ticket(
         self,
         session: OrderQuerySession,
@@ -241,7 +261,7 @@ class OrderQueryService:
         session = self._session(request)
         with session.lock:
             if request["refresh_captcha"]:
-                return self._manual_required(session, attempts=0)
+                return self._with_waf_context(session, request, lambda: self._manual_required(session, attempts=0))
 
             attempts = 0
             mode = "session"
@@ -249,48 +269,72 @@ class OrderQueryService:
                 mode = "manual"
                 challenge = session.challenge
                 if challenge is None:
-                    return self._manual_required(session, attempts=0)
+                    return self._with_waf_context(session, request, lambda: self._manual_required(session, attempts=0))
                 attempts = 1
-                ticket = session.client.check_captcha(challenge, request["captcha_code"])
+                ticket = self._with_waf_context(
+                    session,
+                    request,
+                    lambda: session.client.check_captcha(challenge, request["captcha_code"]),
+                )
                 if not ticket:
-                    return self._manual_required(
+                    return self._with_waf_context(
                         session,
-                        attempts=attempts,
-                        previous_code=request["captcha_code"],
+                        request,
+                        lambda: self._manual_required(
+                            session,
+                            attempts=attempts,
+                            previous_code=request["captcha_code"],
+                        ),
                     )
                 session.ticket = ticket
                 session.challenge = None
                 session.captcha_image = b""
             elif not session.ticket:
                 mode = "ocr"
-                ticket, attempts = self._automatic_ticket(session, attempts_used=0)
-                if not ticket:
-                    return self._manual_required(session, attempts=attempts)
-
-            try:
-                return self._query_verified(
+                ticket, attempts = self._with_waf_context(
                     session,
                     request,
-                    mode=mode,
-                    attempts=attempts,
+                    lambda: self._automatic_ticket(session, attempts_used=0),
+                )
+                if not ticket:
+                    return self._with_waf_context(session, request, lambda: self._manual_required(session, attempts=attempts))
+
+            try:
+                return self._with_waf_context(
+                    session,
+                    request,
+                    lambda: self._query_verified(
+                        session,
+                        request,
+                        mode=mode,
+                        attempts=attempts,
+                    ),
                 )
             except CaptchaVerificationExpired:
                 session.clear_verification()
 
             mode = "ocr"
-            ticket, attempts = self._automatic_ticket(session, attempts_used=attempts)
+            ticket, attempts = self._with_waf_context(
+                session,
+                request,
+                lambda: self._automatic_ticket(session, attempts_used=attempts),
+            )
             if not ticket:
-                return self._manual_required(session, attempts=attempts)
+                return self._with_waf_context(session, request, lambda: self._manual_required(session, attempts=attempts))
             try:
-                return self._query_verified(
+                return self._with_waf_context(
                     session,
                     request,
-                    mode=mode,
-                    attempts=attempts,
+                    lambda: self._query_verified(
+                        session,
+                        request,
+                        mode=mode,
+                        attempts=attempts,
+                    ),
                 )
             except CaptchaVerificationExpired:
                 session.clear_verification()
-                return self._manual_required(session, attempts=attempts)
+                return self._with_waf_context(session, request, lambda: self._manual_required(session, attempts=attempts))
 
     def search(self, data: Any) -> dict[str, Any]:
         if not self._slots.acquire(blocking=False):
