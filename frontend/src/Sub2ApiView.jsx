@@ -645,7 +645,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           onRun={onRunCardImport} onPush={onPushCards}
           historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
           historyPage={cardHistoryPage} historyPageSize={cardHistoryPageSize} onHistoryPage={onCardHistoryPage} onHistoryPageSize={onCardHistoryPageSize}
-          historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefresh={onRefreshCardHistory} onRetry={onRetryCardHistory} onDelete={onDeleteCardHistory} onCopyCode={onCopyCardCode}
+          historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onDeleteHistory={onDeleteCardHistory} onCopyCode={onCopyCardCode}
         />}
 
       {canConfigure && <div className="automation-console">
