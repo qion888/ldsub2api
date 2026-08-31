@@ -9,6 +9,7 @@ backend/waf-browser-profile/
 backend/order-waf-browser-profile/
 backend/order_query/waf-browser-profile/
 frontend/server.*.log
+artifacts/
 
 # Environment files and secrets
 .env
