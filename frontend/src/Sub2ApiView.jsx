@@ -492,7 +492,7 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
           {flow.error && <div className="card-flow-notice error"><TriangleAlert size={14}/><span>{flow.error}</span></div>}
           <div className="card-import-actions">
             <button className="button primary" type="button" onClick={onRun} disabled={isActive || !codesCount || (mode === 'auto' && !canAutoPush)} data-testid="run-card-import">{busy ? <RefreshCw size={15} className="spin"/> : mode === 'auto' ? <Send size={15}/> : <Download size={15}/>} {busy ? stageLabel : mode === 'auto' ? '核验、下载并推送' : '核验并下载'}</button>
-            {flow.accounts && payload && !pushConfirmed && <button className="button secondary" type="button" onClick={onPush} disabled={isActive}><Upload size={15}/>手动推送当前 JSON</button>}
+            {canAutoPush && flow.accounts && payload && !pushConfirmed && <button className="button secondary" type="button" onClick={onPush} disabled={isActive}><Upload size={15}/>手动推送当前 JSON</button>}
           </div>
         </div>
       </div>
@@ -556,7 +556,7 @@ function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false, 
   );
 }
 
-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName, onManualReclaim}) {
+export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName, onManualReclaim, canUseReclaim = true, canUseImport = true, canConfigure = true}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -565,6 +565,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
   const selectedGroups = options.groups.filter(group => groupIds.includes(group.id));
   const activeGroups = options.groups.filter(group => !group.status || group.status === 'active');
   const monitorReady = Boolean(config.admin_key_set);
+  const importEnabled = Boolean(canUseImport);
+  const reclaimEnabled = Boolean(canUseReclaim);
   const fingerprintModes = [
     {value: 'off', label: '透传'},
     {value: 'device', label: '设备'},
@@ -610,7 +612,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
       </div>
 
       <div className="tool-grid sub2api-primary-grid">
-        <div className="tool-panel sub2api-config-panel">
+        {canConfigure && <div className="tool-panel sub2api-config-panel">
           <div className="section-heading"><div><span className="detail-kicker">SUB2API ADMIN</span><h2>连接配置</h2><p>x-api-key · 后端代理</p></div><Settings2 size={21}/></div>
           <div className="sub2api-config-fields">
             <label><span>服务地址</span><input value={config.base_url} onChange={event => setConfig({...config, base_url: event.target.value})} placeholder="http://127.0.0.1:8080"/></label>
@@ -623,8 +625,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
             <Sub2ApiRecoveryResult result={reclaimResult} busy={reclaimBusy || retryBusy} onRetry={onRetry401}/>
           </>}
           <div className="sub2api-capability-grid"><div><span className={config.admin_key_set ? 'ready' : ''}/><small>管理认证</small><strong>{config.admin_key_set ? '已保存' : '待配置'}</strong></div><div><span className={options.loaded ? 'ready' : ''}/><small>账号读取</small><strong>{options.loaded ? '正常' : '待同步'}</strong></div><div><span className={options.proxy_service_available ? 'ready' : ''}/><small>代理资源</small><strong>{options.proxy_service_available ? `${options.proxy_count} 个` : '待同步'}</strong></div><div><span className={automationState ? 'ready' : ''}/><small>自动化状态</small><strong>{automationState ? '已连接' : '待同步'}</strong></div></div>
-        </div>
-        <div className="tool-panel sub2api-import-panel">
+        </div>}
+        {importEnabled && <div className="tool-panel sub2api-import-panel">
           <div className="section-heading"><div><span className="detail-kicker">ACCOUNT JSON</span><h2>账号导入</h2><p>sub2api-data / sub2api-bundle</p></div><FileUp size={21}/></div>
           <label className={`file-drop sub2api-file-drop ${dragging ? 'dragging' : ''}`} onDragEnter={event => { event.preventDefault(); setDragging(true); }} onDragOver={event => event.preventDefault()} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={event => { event.preventDefault(); setDragging(false); onFiles(event.dataTransfer.files); }}><input type="file" accept="application/json,.json" multiple onChange={onFile}/><FileUp size={22}/><strong>{fileName || '选择或拖入账号 JSON'}</strong><small>{accountCount ? `${accountCount} 个账号 · ${jsonProxyCount} 个代理` : '支持多文件合并'}</small></label>
           <div className="import-strategy-summary">
@@ -633,20 +635,20 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
             <div><ShieldCheck size={15}/><span>指纹<strong>{fingerprintLabel}</strong></span></div>
           </div>
           <button className="button primary import-button" onClick={onImport} disabled={!payload || busy}><Upload size={15}/>{busy ? '正在导入' : accountCount ? `导入 ${accountCount} 个账号` : '导入账号'}</button>
-        </div>
+        </div>}
       </div>
 
-      <Sub2ApiCardImportPanel
-        redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={onSaveRedeem}
-        codes={cardCodes} onCodes={onCardCodes} mode={cardMode} onMode={onCardMode}
-        busy={cardBusy} importing={busy} flow={cardFlow} payload={payload} canAutoPush={Boolean(config.admin_key_set)}
-        onRun={onRunCardImport} onPush={onPushCards}
-        historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
-        historyPage={cardHistoryPage} historyPageSize={cardHistoryPageSize} onHistoryPage={onCardHistoryPage} onHistoryPageSize={onCardHistoryPageSize}
-        historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onDeleteHistory={onDeleteCardHistory} onCopyCode={onCopyCardCode}
-      />
+      {reclaimEnabled && <Sub2ApiCardImportPanel
+          redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={onSaveRedeem}
+          codes={cardCodes} onCodes={onCardCodes} mode={cardMode} onMode={onCardMode}
+          busy={cardBusy} importing={busy} flow={cardFlow} payload={payload} canAutoPush={Boolean(config.admin_key_set && importEnabled)}
+          onRun={onRunCardImport} onPush={onPushCards}
+          historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
+          historyPage={cardHistoryPage} historyPageSize={cardHistoryPageSize} onHistoryPage={onCardHistoryPage} onHistoryPageSize={onCardHistoryPageSize}
+          historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefresh={onRefreshCardHistory} onRetry={onRetryCardHistory} onDelete={onDeleteCardHistory} onCopyCode={onCopyCardCode}
+        />}
 
-      <div className="automation-console">
+      {canConfigure && <div className="automation-console">
         <div className="automation-head">
           <div><span className="detail-kicker">401 AUTOMATION CONTROL</span><h2>定时找回与自动导入</h2><p>账号健康、找回队列与导入策略</p></div>
           <div className="automation-head-actions"><span className={`automation-readiness ${monitorReady ? 'ready' : ''}`}><ShieldCheck size={15}/>401 监控 {monitorReady ? '就绪' : '待配置'}</span><span className={`automation-readiness ${importReady ? 'ready' : ''}`}><Upload size={15}/>自动导入 {automation.auto_import ? (importReady ? '就绪' : `${importMissingCount} 项待配置`) : '已关闭'}</span><button className="button secondary" onClick={onRunAutomation} disabled={automationBusy || !automation.enabled}><RefreshCw size={15} className={automationBusy ? 'spin' : ''}/>立即检查</button><button className="button primary" onClick={onSaveAutomation} disabled={automationBusy}><Save size={15}/>{automationBusy ? '处理中' : '保存策略'}</button></div>
@@ -722,7 +724,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           onCopyName={onCopyAccountName}
           onPage={page => onLoadAccounts({page})}
         />
-      </div>
+      </div>}
     </section>
   );
 }

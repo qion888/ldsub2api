@@ -936,9 +936,11 @@ function HistoryView({
   </section>;
 }
 
-function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLogout, onLogin, onModeChange}) {
+function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, accessPolicy = {}, onLogout, onLogin, onModeChange}) {
   const admin = isAdmin(sessionUser);
   const canManageMonitor = canManageWorkspace(sessionUser, authMode);
+  const canUseReclaim = canAccessView('reclaim', sessionUser, authMode, accessPolicy);
+  const canUseSub2Api = canAccessView('sub2api', sessionUser, authMode, accessPolicy);
   const readOnly = !canManageMonitor;
   const [items, setItems] = useState([]);
   const [shops, setShops] = useState([]);
@@ -1049,10 +1051,10 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
   const stableItemOrder = useStableItemOrder(items);
 
   useEffect(() => {
-    if (!canAccessView(activeView, sessionUser, authMode)) {
+    if (!canAccessView(activeView, sessionUser, authMode, accessPolicy)) {
       setActiveView(defaultViewFor(sessionUser, authMode));
     }
-  }, [activeView, authMode, sessionUser]);
+  }, [activeView, authMode, sessionUser, accessPolicy]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1314,9 +1316,9 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
           }
         } else {
           const [redeem, config, automationResult] = await Promise.all([
-            redeemConfigLoaded.current ? Promise.resolve(null) : request('/redeem/config'),
+            canUseReclaim && !redeemConfigLoaded.current ? request('/redeem/config') : Promise.resolve(null),
             request('/sub2api/config'),
-            request('/sub2api/automation'),
+            canConfigure ? request('/sub2api/automation') : Promise.resolve({state: null}),
           ]);
           if (redeem) {
             setRedeemConfig(redeem);
@@ -1338,7 +1340,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
     };
     loadFeatureData();
     return undefined;
-  }, [activeView, featureLoadAttempt.reclaim, featureLoadAttempt.sub2api]);
+  }, [activeView, featureLoadAttempt.reclaim, featureLoadAttempt.sub2api, canUseReclaim, canUseSub2Api, canManageMonitor]);
 
   useEffect(() => {
     sub2apiCardHistoryFilterRef.current = sub2apiCardHistoryFilter;
@@ -1356,24 +1358,24 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
   useEffect(() => {
     if (activeView !== 'sub2api' || featureLoadState.sub2api.status !== 'ready') return undefined;
     if (sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
-    const stateTimer = window.setInterval(() => loadSub2ApiAutomation(), 5000);
+    const stateTimer = canManageMonitor ? window.setInterval(() => loadSub2ApiAutomation(), 5000) : null;
     const monitorTimer = window.setInterval(() => {
-      if (sub2apiConfig.admin_key_set) {
+      if (canManageMonitor && sub2apiConfig.admin_key_set) {
         loadSub2ApiOptions({quiet: true});
         loadSub2ApiAccounts({quiet: true});
       }
     }, 60000);
     return () => {
-      window.clearInterval(stateTimer);
+      if (stateTimer) window.clearInterval(stateTimer);
       window.clearInterval(monitorTimer);
     };
-  }, [activeView, featureLoadState.sub2api.status, sub2apiConfig.base_url, sub2apiConfig.admin_key_set]);
+  }, [activeView, featureLoadState.sub2api.status, sub2apiConfig.base_url, sub2apiConfig.admin_key_set, canManageMonitor]);
 
   useEffect(() => {
-    if (activeView === 'sub2api' && featureLoadState.sub2api.status === 'ready' && sub2apiConfig.admin_key_set) {
+    if (canManageMonitor && activeView === 'sub2api' && featureLoadState.sub2api.status === 'ready' && sub2apiConfig.admin_key_set) {
       loadSub2ApiAccounts({page: 1, quiet: true});
     }
-  }, [activeView, featureLoadState.sub2api.status, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
+  }, [canManageMonitor, activeView, featureLoadState.sub2api.status, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
 
   const fastestInterval = [...items, ...shops, ...preorders.filter(entry => entry.enabled)]
     .filter(item => item.enabled)
@@ -3014,7 +3016,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
   };
   const openDirectProduct = item => window.open(item.latest?.source_url || item.url, '_blank', 'noopener,noreferrer');
   const switchView = view => {
-    if (!canAccessView(view, sessionUser, authMode)) {
+    if (!canAccessView(view, sessionUser, authMode, accessPolicy)) {
       if (!sessionUser && onLogin) onLogin();
       return;
     }
@@ -3047,9 +3049,9 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
           <button className={activeView === 'monitor' ? 'active' : ''} onClick={() => switchView('monitor')}><ListChecks size={18}/>监控面板</button>
           <button className={activeView === 'history' ? 'active' : ''} onClick={() => switchView('history')}><History size={18}/>价格记录</button>
           <button className={activeView === 'orders' ? 'active' : ''} onClick={() => switchView('orders')}><ReceiptText size={18}/>订单查询</button>
-          {admin && <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>}
-          {admin && <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>}
-          {canAccessView('settings', sessionUser, authMode) && <button className={activeView === 'settings' ? 'active' : ''} onClick={() => switchView('settings')}><Settings2 size={18}/>系统设置</button>}
+          {canUseReclaim && <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>}
+          {canUseSub2Api && <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>}
+          {canAccessView('settings', sessionUser, authMode, accessPolicy) && <button className={activeView === 'settings' ? 'active' : ''} onClick={() => switchView('settings')}><Settings2 size={18}/>系统设置</button>}
         </nav>
         <div className="sidebar-foot">
           <div className="sidebar-account"><span className="sidebar-account-icon"><UserCircle size={17}/></span><span><strong>{sessionUser?.display_name || sessionUser?.username || '本机用户'}</strong><small>{sessionUser ? roleLabel(sessionUser) : '自用模式访客'}</small></span></div>
@@ -3096,7 +3098,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
               </div>
             </form>}
 
-            {!!shops.length && <section className="shop-overview">
+            {!!shops.length && <section className={`shop-overview ${canManageMonitor ? '' : 'readonly-mode'}`}>
               <div className="section-heading"><div><h2>店铺汇总</h2><p>店铺接口按设定频率分页同步</p></div>{shopFilter && <button className="clear-filter" onClick={() => { setShopFilter(null); setCheckedIds([]); }}><X size={13}/>显示全部商品</button>}</div>
               <div className="monitor-filter-bar shop-filter-bar">
                 <label className="monitor-search"><Search size={15}/><input value={shopQuery} onChange={event => setShopQuery(event.target.value)} placeholder="搜索店铺名称、Token 或分类" aria-label="搜索店铺"/></label>
@@ -3186,13 +3188,14 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
         ) : (
           <React.Suspense fallback={<FeatureLoadingState feature="401 找回界面" state={{status: 'loading'}}/>}>
-            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onRetry={retryLegacyReclaim} onDownload={downloadReclaimed} onImport={() => { switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
+            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onRetry={retryLegacyReclaim} onDownload={downloadReclaimed} canConfigure={canManageMonitor} canImport={canUseSub2Api} onImport={() => { switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
           </React.Suspense>
         ) : featureLoadState.sub2api.status !== 'ready' ? (
           <FeatureLoadingState feature="Sub2API" state={featureLoadState.sub2api} onRetry={() => retryFeature('sub2api')}/>
         ) : (
           <React.Suspense fallback={<FeatureLoadingState feature="Sub2API 界面" state={{status: 'loading'}}/>}>
             <Sub2ApiView
+            canUseReclaim={canUseReclaim} canUseImport={canUseSub2Api} canConfigure={canManageMonitor}
             config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey}
             redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={saveRedeemConfig}
             cardCodes={sub2apiCardCodes} onCardCodes={setSub2apiCardCodes} cardMode={sub2apiCardMode} onCardMode={setSub2apiCardMode}
@@ -3335,12 +3338,12 @@ function App() {
     setApiAuthToken('');
     window.localStorage.removeItem(AUTH_TOKEN_KEY);
     setAuth(current => ({
-      status: requiresLogin(current.mode) ? 'anonymous' : 'guest',
+      status: requiresLogin({...installStatus, mode: current.mode}) ? 'anonymous' : 'guest',
       mode: current.mode,
       user: null,
       token: '',
     }));
-  }, []);
+  }, [installStatus]);
 
   const applySession = payload => {
     const token = String(payload?.token || '').trim();
@@ -3371,11 +3374,11 @@ function App() {
   useEffect(() => {
     const handleExpired = () => {
       clearSession();
-      setLoginOpen(requiresLogin(auth.mode));
+      setLoginOpen(requiresLogin({...installStatus, mode: auth.mode}));
     };
     window.addEventListener('ldxp-auth-expired', handleExpired);
     return () => window.removeEventListener('ldxp-auth-expired', handleExpired);
-  }, [auth.mode, clearSession]);
+  }, [auth.mode, clearSession, installStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3420,7 +3423,7 @@ function App() {
         setApiAuthToken('');
         window.localStorage.removeItem(AUTH_TOKEN_KEY);
       }
-      if (!cancelled) setAuth({status: requiresLogin(status.mode) ? 'anonymous' : 'guest', mode: status.mode, user: null, token: ''});
+      if (!cancelled) setAuth({status: requiresLogin(status) ? 'anonymous' : 'guest', mode: status.mode, user: null, token: ''});
     };
     bootstrap();
     return () => { cancelled = true; };
@@ -3431,15 +3434,23 @@ function App() {
   const completeInstall = result => {
     const nextMode = normalizeMode(result?.mode || installStatus?.mode);
     const registration = result?.allow_registration ?? result?.installation?.allow_registration;
+    const policy = {
+      mode: nextMode,
+      auth_required: result?.auth_required ?? result?.installation?.auth_required,
+      force_login: result?.force_login ?? result?.installation?.force_login,
+      allow_user_reclaim: result?.allow_user_reclaim ?? result?.installation?.allow_user_reclaim,
+      allow_user_sub2api_import: result?.allow_user_sub2api_import ?? result?.installation?.allow_user_sub2api_import,
+    };
     setInstallStatus(current => ({
       ...(current || {}),
       configured: true,
       needs_setup: false,
       mode: nextMode,
       allow_registration: Boolean(registration),
+      ...Object.fromEntries(Object.entries(policy).filter(([, value]) => value !== undefined)),
     }));
     if (result?.token || result?.user) applySession({...result, mode: nextMode});
-    else setAuth({status: requiresLogin(nextMode) ? 'anonymous' : 'guest', mode: nextMode, user: null, token: ''});
+    else setAuth({status: requiresLogin(policy) ? 'anonymous' : 'guest', mode: nextMode, user: null, token: ''});
   };
 
   const logout = async () => {
@@ -3452,12 +3463,14 @@ function App() {
   };
 
   const handleModeChange = nextMode => {
-    const normalizedMode = normalizeMode(nextMode);
-    setInstallStatus(current => current ? {...current, mode: normalizedMode, auth_required: requiresLogin(normalizedMode)} : current);
+    const patch = nextMode && typeof nextMode === 'object' ? nextMode : {mode: nextMode};
+    const normalizedMode = normalizeMode(patch.mode);
+    const policy = {...patch, mode: normalizedMode};
+    setInstallStatus(current => current ? {...current, ...policy, mode: normalizedMode, auth_required: patch.auth_required ?? requiresLogin(policy)} : current);
     setAuth(current => ({
       ...current,
       mode: normalizedMode,
-      status: current.user || !requiresLogin(normalizedMode) ? (current.user ? 'authenticated' : 'guest') : 'anonymous',
+      status: current.user || !requiresLogin(policy) ? (current.user ? 'authenticated' : 'guest') : 'anonymous',
     }));
   };
 
@@ -3467,7 +3480,7 @@ function App() {
   if (auth.status === 'anonymous') return <LoginView request={request} mode={auth.mode} allowRegistration={Boolean(installStatus?.allow_registration)} onAuthenticated={applySession} onGuest={auth.mode === AUTH_MODES.SELF_USE ? () => setAuth(current => ({...current, status: 'guest'})) : undefined}/>;
 
   return <>
-    <WorkspaceApp sessionUser={auth.user} authMode={auth.mode} onLogout={logout} onLogin={() => setLoginOpen(true)} onModeChange={handleModeChange}/>
+    <WorkspaceApp sessionUser={auth.user} authMode={auth.mode} accessPolicy={installStatus || {}} onLogout={logout} onLogin={() => setLoginOpen(true)} onModeChange={handleModeChange}/>
     {loginOpen && <div className="auth-modal-host"><LoginView request={request} mode={auth.mode} allowRegistration={Boolean(installStatus?.allow_registration)} onAuthenticated={applySession} onBack={() => setLoginOpen(false)} onGuest={() => setLoginOpen(false)}/></div>}
   </>;
 }

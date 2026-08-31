@@ -18,7 +18,14 @@ import {
 import {AUTH_MODES, isAdmin, normalizeMode, normalizeUser, roleLabel} from './authModel.js';
 
 const EMPTY_BASIC = {site_name: '', announcement: '', contact_email: '', timezone: 'Asia/Shanghai', base_url: ''};
-const EMPTY_SYSTEM = {session_ttl_hours: 24, maintenance_mode: false, log_level: 'info'};
+const EMPTY_SYSTEM = {
+  session_ttl_hours: 24,
+  maintenance_mode: false,
+  log_level: 'info',
+  force_login: true,
+  allow_user_reclaim: false,
+  allow_user_sub2api_import: false,
+};
 
 function asUsers(payload) {
   const list = Array.isArray(payload) ? payload : payload?.items;
@@ -140,7 +147,14 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
       setSystem(settingsPart(result, 'system', system));
       setSettingsMode(normalizeMode(result?.mode || settingsMode));
       if (result?.allow_registration !== undefined) setAllowRegistration(Boolean(result.allow_registration));
-      onModeChange?.(normalizeMode(result?.mode || settingsMode));
+      const nextMode = normalizeMode(result?.mode || settingsMode);
+      onModeChange?.({
+        mode: nextMode,
+        auth_required: result?.auth_required,
+        force_login: result?.force_login ?? result?.system?.force_login,
+        allow_user_reclaim: result?.allow_user_reclaim ?? result?.system?.allow_user_reclaim,
+        allow_user_sub2api_import: result?.allow_user_sub2api_import ?? result?.system?.allow_user_sub2api_import,
+      });
       notify?.('系统设置已保存');
     } catch (requestError) {
       setError(requestError.message || '系统设置保存失败');
@@ -307,6 +321,9 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
             <label><span>会话有效期（小时）</span><input type="number" min="1" max="720" value={system.session_ttl_hours} onChange={event => setSystem({...system, session_ttl_hours: Math.max(1, Math.min(720, Number(event.target.value) || 1))})}/></label>
             <label><span>日志级别</span><select value={system.log_level} onChange={event => setSystem({...system, log_level: event.target.value})}><option value="debug">debug</option><option value="info">info</option><option value="warning">warning</option><option value="error">error</option></select></label>
             <label className="auth-check-row"><input type="checkbox" checked={allowRegistration} onChange={event => setAllowRegistration(event.target.checked)} disabled={settingsMode !== AUTH_MODES.EXTERNAL}/><span><strong>允许公开注册</strong><small>对外模式下开放注册入口</small></span></label>
+            <label className="auth-check-row"><input type="checkbox" checked={settingsMode === AUTH_MODES.EXTERNAL ? Boolean(system.force_login) : false} onChange={event => setSystem({...system, force_login: event.target.checked})} disabled={settingsMode !== AUTH_MODES.EXTERNAL}/><span><strong>强制登录</strong><small>关闭后允许匿名查看首页与公开数据</small></span></label>
+            <label className="auth-check-row"><input type="checkbox" checked={settingsMode === AUTH_MODES.EXTERNAL ? Boolean(system.allow_user_reclaim) : true} onChange={event => setSystem({...system, allow_user_reclaim: event.target.checked})} disabled={settingsMode !== AUTH_MODES.EXTERNAL}/><span><strong>普通用户使用 401 找回</strong><small>仅开放找回流程，不开放系统配置</small></span></label>
+            <label className="auth-check-row"><input type="checkbox" checked={settingsMode === AUTH_MODES.EXTERNAL ? Boolean(system.allow_user_sub2api_import) : true} onChange={event => setSystem({...system, allow_user_sub2api_import: event.target.checked})} disabled={settingsMode !== AUTH_MODES.EXTERNAL}/><span><strong>普通用户使用 Sub2API 导入</strong><small>仅开放账号 JSON 导入，不开放管理密钥</small></span></label>
             <label className="auth-check-row"><input type="checkbox" checked={Boolean(system.maintenance_mode)} onChange={event => setSystem({...system, maintenance_mode: event.target.checked})}/><span><strong>维护模式</strong><small>暂时阻止写入操作</small></span></label>
           </div>
           <div className="settings-mode-callout"><ShieldCheck size={16}/><span>{settingsMode === AUTH_MODES.EXTERNAL ? '对外模式：登录后按角色显示功能。' : '自用模式：保留本机工作流，可选择登录管理。'}</span></div>
