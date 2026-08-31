@@ -3404,17 +3404,19 @@ function App() {
       }
 
       const storedToken = String(window.localStorage.getItem(AUTH_TOKEN_KEY) || '').trim();
-      if (storedToken) {
-        setApiAuthToken(storedToken);
-        try {
-          const me = await request('/auth/me');
-          if (!cancelled && me?.authenticated && me?.user) {
-            applySession({...me, token: storedToken, mode: me.mode || status.mode});
-            return;
-          }
-        } catch {
-          // Expired tokens fall through to the login gate.
+      if (storedToken) setApiAuthToken(storedToken);
+      try {
+        // Always probe /auth/me so an HttpOnly cookie can restore a session
+        // even after the optional local Bearer token has been removed.
+        const me = await request('/auth/me', {}, {auth: Boolean(storedToken)});
+        if (!cancelled && me?.authenticated && me?.user) {
+          applySession({...me, token: storedToken, mode: me.mode || status.mode});
+          return;
         }
+      } catch {
+        // Expired or unavailable sessions fall through to the login gate.
+      }
+      if (storedToken) {
         setApiAuthToken('');
         window.localStorage.removeItem(AUTH_TOKEN_KEY);
       }
