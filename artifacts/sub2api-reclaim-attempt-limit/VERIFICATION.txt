@@ -1,0 +1,79 @@
+Branch: codex/task-10-reclaim-attempt-limit
+Changed field: Sub2API scheduled 401 recovery and automatic import now recognize Authentication failed (401)/token_invalidated, resubmit terminal retryable work, keep permanent failures separate, and stop each card after a configurable attempt limit.
+Baseline commit: 1d1f5eb78a8ad2d7d67fedcce65743d8c240bc38
+Modified commit: d2ce66719525c267c2cba8fd814437bde9bc1584
+
+Artifacts:
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-attempt-limit\MODIFIED_FILE
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-attempt-limit\DIFF_FILE
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-attempt-limit\VERIFICATION.txt
+- C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-attempt-limit\ROLLBACK.sh
+
+Source copy:
+- Original input: C:\Users\0\.codex\worktrees\baseline-task10\backend\sub2api\reclaim.py at baseline=1d1f5eb
+- Original SHA256: 762004CD93D9E653E09AC83212C996F03E7716479281E6D9889CD7C320AB1FA6
+- Modified input: C:\Users\0\.codex\worktrees\0d29\ldxp\backend\sub2api\reclaim.py at d2ce667
+- Modified SHA256: C69954E89A1DBBFD2100BFEFBD3FFD5CC268E650FCC838B31471691823F012FA
+- MODIFIED_FILE status: left changed after rollback-copy verification
+
+BASELINE BACKEND
+Command: python -m unittest discover -s backend -p 'test*.py' -q
+Input: C:\Users\0\.codex\worktrees\baseline-task10 at 1d1f5eb
+Literal output/result: Ran 166 tests in 2.200s; OK
+Exit status: 0
+
+BASELINE FRONTEND
+Command: npm test
+Input: C:\Users\0\.codex\worktrees\baseline-task10\frontend at 1d1f5eb
+Literal output/result: tests 41; pass 41; fail 0; duration_ms 252.5128
+Exit status: 0
+
+BASELINE BUILD
+Command: npm run build
+Input: C:\Users\0\.codex\worktrees\baseline-task10\frontend at 1d1f5eb
+Literal output/result: vite v8.2.2; 2386 modules transformed; built in 514ms
+Exit status: 0
+
+MODIFIED BACKEND
+Command: python -m unittest discover -s backend -p 'test*.py' -q
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\backend at d2ce667
+Literal output/result: Ran 170 tests in 1.964s; OK
+Exit status: 0
+
+MODIFIED FRONTEND
+Command: npm test
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\frontend at d2ce667
+Literal output/result: tests 42; pass 42; fail 0; duration_ms 161.1319
+Exit status: 0
+
+MODIFIED BUILD
+Command: npm run build
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\frontend at d2ce667
+Literal output/result: vite v8.2.2; 2386 modules transformed; built in 491ms
+Exit status: 0
+
+MODIFIED STATIC CHECKS
+Command: python -m compileall -q .; git diff --check
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp at d2ce667
+Literal output/result: no diagnostics
+Exit status: 0
+
+401 AND ATTEMPT-LIMIT SCENARIO
+Command: python -c "from backend.sub2api import reclaim; calls=[]; batch=lambda self,codes,mode='401': (calls.append((list(codes),mode)), {'ok':True,'failed':1,'all_tasks':[{'card_code':codes[0],'status':'failed','message':'temporary'}]})[1]; C=type('C',(),{'batch_reclaim':batch}); accounts=[{'id':1,'name':'Account team-CARD-LIMIT','status':'error','error_message':'Authentication failed (401)'}]; kw={'config':{'admin_key':'secret'},'accounts_loader':lambda _:accounts,'redeem_client_factory':C,'to_json':lambda x:x,'max_payload_bytes':1024,'max_reclaim_attempts':1}; first=reclaim.reclaim_401_accounts(attempt_counts={},**kw); second=reclaim.reclaim_401_accounts(attempt_counts=first['attempt_counts'],**kw); print('first_calls=',calls); print('second_submitted=',second['reclaim_card_codes']); print('reason=',second['reclaim_failures'][0]['reason'])"
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp
+Literal output/result:
+first_calls= [(['team-CARD-LIMIT'], '401')]
+second_submitted= []
+reason= 已达到自动找回次数上限（1 次）
+Exit status: 0
+
+ROLLBACK
+Command: $script=[scriptblock]::Create((Get-Content -LiteralPath .\ROLLBACK.sh -Raw)); & $script rollback-test-reclaim.py
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-attempt-limit
+Literal output/result:
+Restored C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-reclaim-attempt-limit\rollback-test-reclaim.py from ROLLBACK_BASELINE
+Baseline hash: 762004CD93D9E653E09AC83212C996F03E7716479281E6D9889CD7C320AB1FA6
+Restored hash: 762004CD93D9E653E09AC83212C996F03E7716479281E6D9889CD7C320AB1FA6
+Modified artifact hash left changed: C69954E89A1DBBFD2100BFEFBD3FFD5CC268E650FCC838B31471691823F012FA
+Restored behavior/status: rollback-test-reclaim.py matches ROLLBACK_BASELINE; MODIFIED_FILE remains changed.
+Exit status: 0
