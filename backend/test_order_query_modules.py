@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sys
 import threading
 import unittest
 from io import BytesIO
@@ -160,6 +161,40 @@ class CaptchaTests(unittest.TestCase):
         self.assertEqual(recognizer.recognize(b"png"), "Z9x8")
         self.assertEqual(recognizer.recognize(b"png"), "Z9x8")
         self.assertEqual(loads, [True])
+
+    def test_default_recognizer_uses_legacy_shop_captcha_model(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class DdddOcr:
+            def __init__(self, **kwargs: Any) -> None:
+                calls.append(kwargs)
+
+            def classification(self, image: bytes) -> str:
+                return "AB12"
+
+        fake_module = SimpleNamespace(DdddOcr=DdddOcr)
+        with patch.dict(sys.modules, {"ddddocr": fake_module}):
+            recognizer = CaptchaRecognizer()
+            self.assertEqual(recognizer.recognize(b"png"), "AB12")
+        self.assertEqual(calls, [{"show_ad": False, "old": True}])
+
+    def test_default_recognizer_falls_back_when_old_model_switch_is_unavailable(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class DdddOcr:
+            def __init__(self, **kwargs: Any) -> None:
+                calls.append(kwargs)
+                if "old" in kwargs:
+                    raise TypeError("old is unsupported")
+
+            def classification(self, image: bytes) -> str:
+                return "CD34"
+
+        fake_module = SimpleNamespace(DdddOcr=DdddOcr)
+        with patch.dict(sys.modules, {"ddddocr": fake_module}):
+            recognizer = CaptchaRecognizer()
+            self.assertEqual(recognizer.recognize(b"png"), "CD34")
+        self.assertEqual(calls, [{"show_ad": False, "old": True}, {"show_ad": False}])
 
 
 class ClientTests(unittest.TestCase):
