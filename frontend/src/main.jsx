@@ -3181,7 +3181,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLog
             <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact} checkoutProfile={savedCheckout} onSaveCheckout={async profile => { try { const saved = await persistCheckout(profile); notify(saved.storage_mode === 'browser' ? '购买配置已保存到浏览器缓存' : '购买配置已保存到本机'); } catch (error) { notify(error.message, 'error'); throw error; } }}/>
           </React.Suspense>
         ) : activeView === 'settings' ? (
-          <SettingsView request={request} user={sessionUser} mode={authMode} notify={notify} onModeChange={onModeChange}/>
+          <SettingsView request={request} user={sessionUser} mode={authMode} notify={notify} onModeChange={onModeChange} onPasswordChanged={onLogout}/>
         ) : activeView === 'reclaim' ? featureLoadState.reclaim.status !== 'ready' ? (
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
         ) : (

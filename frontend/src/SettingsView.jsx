@@ -33,7 +33,7 @@ function ErrorNotice({message}) {
   return message ? <div className="settings-error" role="alert">{message}</div> : null;
 }
 
-export default function SettingsView({request, user, mode, notify, onUserUpdated, onModeChange}) {
+export default function SettingsView({request, user, mode, notify, onUserUpdated, onModeChange, onPasswordChanged}) {
   const admin = isAdmin(user);
   const [tab, setTab] = useState(admin ? 'basic' : 'profile');
   const [basic, setBasic] = useState(EMPTY_BASIC);
@@ -50,6 +50,8 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
   const [resetId, setResetId] = useState(null);
   const [resetPassword, setResetPassword] = useState('');
   const [resetBusy, setResetBusy] = useState(false);
+  const [passwordForm, setPasswordForm] = useState({current_password: '', password: '', confirm_password: ''});
+  const [passwordBusy, setPasswordBusy] = useState(false);
 
   const loadUsers = async () => {
     if (!admin) return;
@@ -229,6 +231,36 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
     }
   };
 
+  const changeOwnPassword = async event => {
+    event.preventDefault();
+    const currentPassword = passwordForm.current_password;
+    const nextPassword = passwordForm.password;
+    if (!currentPassword || !nextPassword) {
+      setError('请输入当前密码和新密码');
+      return;
+    }
+    if (nextPassword !== passwordForm.confirm_password) {
+      setError('两次输入的新密码不一致');
+      return;
+    }
+    setPasswordBusy(true);
+    setError('');
+    try {
+      await request('/auth/password', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({current_password: currentPassword, password: nextPassword}),
+      });
+      setPasswordForm({current_password: '', password: '', confirm_password: ''});
+      notify?.('密码已更新，请重新登录');
+      await onPasswordChanged?.();
+    } catch (requestError) {
+      setError(requestError.message || '密码更新失败');
+    } finally {
+      setPasswordBusy(false);
+    }
+  };
+
   const userCountLabel = useMemo(() => `${users.length} 个用户`, [users.length]);
 
   return <section className="settings-view">
@@ -239,7 +271,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
     <div className="settings-layout">
       <nav className="settings-tabs" aria-label="设置分类">
         {admin && <button type="button" className={tab === 'basic' ? 'active' : ''} onClick={() => setTab('basic')}><SlidersHorizontal size={16}/>基础设置</button>}
-        {!admin && <button type="button" className={tab === 'profile' ? 'active' : ''} onClick={() => setTab('profile')}><UserCircle size={16}/>我的账号</button>}
+        <button type="button" className={tab === 'profile' ? 'active' : ''} onClick={() => setTab('profile')}><UserCircle size={16}/>我的账号</button>
         {admin && <button type="button" className={tab === 'system' ? 'active' : ''} onClick={() => setTab('system')}><Settings2 size={16}/>系统设置</button>}
         {admin && <button type="button" className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}><Users size={16}/>用户管理</button>}
       </nav>
@@ -249,6 +281,15 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
           <div className="settings-section-head"><div><span className="detail-kicker">ACCOUNT</span><h3>我的账号</h3></div><ShieldCheck size={19}/></div>
           <div className="profile-card"><span className="profile-avatar"><UserCircle size={25}/></span><div><strong>{user?.display_name || user?.username || '本机用户'}</strong><small>{user?.username || 'guest'} · {roleLabel(user)}</small></div><span className="settings-badge">{normalizeMode(mode) === AUTH_MODES.EXTERNAL ? '对外模式' : '自用模式'}</span></div>
           <div className="settings-note">普通用户可使用监控与订单查询；管理配置由管理员维护。</div>
+          {user && <form className="password-form" onSubmit={changeOwnPassword}>
+            <div className="settings-section-head password-form-head"><div><span className="detail-kicker">PASSWORD</span><h3>修改登录密码</h3></div><KeyRound size={19}/></div>
+            <div className="settings-form-grid">
+              <label><span>当前密码</span><input type="password" value={passwordForm.current_password} onChange={event => setPasswordForm({...passwordForm, current_password: event.target.value})} autoComplete="current-password" placeholder="输入当前密码"/></label>
+              <label><span>新密码</span><input type="password" value={passwordForm.password} onChange={event => setPasswordForm({...passwordForm, password: event.target.value})} autoComplete="new-password" placeholder="至少 8 个字符"/></label>
+              <label><span>确认新密码</span><input type="password" value={passwordForm.confirm_password} onChange={event => setPasswordForm({...passwordForm, confirm_password: event.target.value})} autoComplete="new-password" placeholder="再次输入新密码"/></label>
+            </div>
+            <div className="settings-actions"><button className="button primary" type="submit" disabled={passwordBusy || !passwordForm.current_password || !passwordForm.password || !passwordForm.confirm_password}><KeyRound size={15}/>{passwordBusy ? '更新中' : '更新密码'}</button></div>
+          </form>}
         </section> : tab === 'basic' ? <section className="settings-section">
           <div className="settings-section-head"><div><span className="detail-kicker">BASIC</span><h3>基础设置</h3></div><SlidersHorizontal size={19}/></div>
           <div className="settings-form-grid">
