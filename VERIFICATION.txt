@@ -1,51 +1,41 @@
-PURCHASE PROFILE SETTINGS VERIFICATION
+ORDER QUERY WAF VERIFICATION
 
 Changed branch/field:
-- branch: codex/purchase-profile-settings
-- fields: checkout.contact, checkout.query_password, checkout.channel_id, checkout.coupon_code, checkout.storage_mode
-- behavior: missing checkout profile opens a completion modal; browser/local persistence is selectable; order query can edit and save the shared profile; official orders forward coupon_code; raw pay.ldxp.cn/order source text is removed.
+- branch: codex/order-waf-fix merged fast-forward into main at b4d27ffd2cd0d91642790ab6a77e3edb2d8cdcf2
+- fields: order-query 403/Aliyun WAF detection, dedicated browser verification session, cookie sync, and retry flow
 
 Artifacts:
-- MODIFIED_FILE: archive of the seven modified source/test files
-- DIFF_FILE: patch from the main baseline
-- ROLLBACK_BASELINE: baseline archive for the six files
-- ROLLBACK.sh: executable PowerShell rollback and SHA256 verifier for seven files
+- MODIFIED_FILE: tar archive of changed files at b4d27ff
+- DIFF_FILE: binary git diff from baseline 2770c35 to b4d27ff
+- VERIFICATION.txt: this acceptance record
+- ROLLBACK.sh: executable PowerShell rollback script
 
 BASELINE
-Command: python -m unittest discover -s backend -q
-Input: baseline worktree E:\soft\java\ldxp-baseline-acceptance at main commit 27a64564
-Literal output/result:
-----------------------------------------------------------------------
-Ran 157 tests in 2.064s
-
-OK
+Command: .runtime\python\Scripts\python.exe -m unittest discover -s backend -p 'test*.py' -q
+Input: baseline worktree at commit 2770c35
+Literal output/result: Ran 168 tests in 1.649s; OK
 Exit status: 0
 
-Command: npm ci; npm test; npm run build
-Input: frontend directory in baseline worktree E:\soft\java\ldxp-baseline-acceptance
-Literal output/result: dependencies installed; 39 tests passed; Vite transformed 2386 modules and built successfully.
+Command: npm ci --ignore-scripts; npm test; npm run build
+Input: frontend directory in baseline worktree at commit 2770c35
+Literal output/result: 41 tests passed; Vite transformed 2386 modules and built successfully.
 Exit status: 0
 
 MODIFIED
-Command: python -m unittest discover -s backend -q
-Input: backend directory in this branch
-Literal output/result:
-----------------------------------------------------------------------
-Ran 158 tests in 2.083s
-
-OK
+Command: .runtime\python\Scripts\python.exe -m unittest discover -s backend -p 'test*.py' -q
+Input: main branch at commit b4d27ff
+Literal output/result: Ran 169 tests in 1.620s; OK
 Exit status: 0
 
-Command: npm ci; npm test; npm run build
-Input: frontend directory in this branch
-Literal output/result: 39 tests passed; Vite transformed 2386 modules and built successfully.
+Command: npm test; npm run build
+Input: frontend directory on main at commit b4d27ff
+Literal output/result: 41 tests passed; Vite transformed 2386 modules and built successfully.
 Exit status: 0
 
 ROLLBACK
-Command: powershell -ExecutionPolicy Bypass -File rollback-test-run-b.ps1 -TargetRoot rollback-test-purchase-20260831-b
-Input: fresh rollback-test-purchase-20260831-b directory and ROLLBACK_BASELINE
-Literal output/result:
-Restored E:\soft\java\ldxp-purchase-profile-settings\rollback-test-purchase-20260831; verified 7 files
+Command: powershell -ExecutionPolicy Bypass -File .runtime\ROLLBACK-order-waf-test.ps1 -TargetRoot .runtime\rollback-test-order-waf-20260831
+Input: copy populated from MODIFIED_FILE, with ROLLBACK_BASELINE beside the script
+Literal output/result: Restored E:\soft\java\ldxp\.runtime\rollback-test-order-waf-20260831; verified 9 files; removed backend/order_query/browser_verification.py
 Exit status: 0
 
-Rollback restored all seven baseline SHA256 values. The working branch remains modified and MODIFIED_FILE remains the changed archive.
+Rollback restored all baseline hashes and removed the feature-only browser verification module. The main working tree remains on b4d27ff with the WAF fix applied; MODIFIED_FILE remains the changed archive.

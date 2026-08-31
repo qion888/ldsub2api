@@ -6,20 +6,24 @@ $target = [IO.Path]::GetFullPath($TargetRoot)
 if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw "Target root does not exist: $target" }
 $archive = Join-Path $artifactRoot 'ROLLBACK_BASELINE'
 if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw "Missing rollback archive: $archive" }
+$newPath = Join-Path $target 'backend/order_query/browser_verification.py'
+if (Test-Path -LiteralPath $newPath -PathType Leaf) { Remove-Item -LiteralPath $newPath -Force }
 tar -xf $archive -C $target
 if ($LASTEXITCODE -ne 0) { throw "Rollback archive extraction failed with exit $LASTEXITCODE" }
 $expected = @{
-  'backend/main.py' = '373C2078ED58331634E001568EC7A22332FEAC6273742B574619B23841CEE953'
-  'backend/monitor_core/settings.py' = 'D4D1273380C601EC3A69A3ED3E2B84E9104EA929BD32E786E0F06D2EC875A827'
-  'backend/monitor_core/preorders.py' = 'F5408F5F3353D5D2CB7FC9CBA629619031B07B4D3465DDAB57460DC776AA33EE'
-  'backend/test_main.py' = 'ACF8CFF88213C814446FC40C3054BA2D912E9670C61D2599FCD8D75EAAE65875'
-  'frontend/src/main.jsx' = 'F77222831689AD60936578ADA3F3D17CE85BC26045D12761859F322E5C3D9B70'
-  'frontend/src/OrderQueryView.jsx' = '0091FEDE2A77007706A3E88C6E85B595E50B826E46A14127881524EB89279128'
-  'frontend/src/orderQuery.css' = 'D58953E6E8B4459745B8BFB1E5692F642A8C8D80084F7833AD15544DE67D1430'
+  '.gitignore' = '77C1E3F955B69EC777A3D84BE21398983298C99BEF709D1C1C1D0DDF5AD2D83F'
+  'backend/main.py' = 'B72CC7128A14F261F3A17EE742E5E3F249971F92160A8225B3329BD696368594'
+  'backend/monitor_core/storefront.py' = '4E3227F3E5671D4F834D2D3C3FF7CAC961245DDB04EF863F01682FEE52034AD8'
+  'backend/order_query/client.py' = 'E400DCC817CED1B37CA525C3E6B83A95EEFDD24FFB3D17ED3DAADE48D3FDC35F'
+  'backend/order_query/routes.py' = 'A2EFD070B7E0EE80DA01E74264333B41877560BB327C89C077B6FDE7051CE3A9'
+  'backend/test_order_query_modules.py' = '4F24DE6C195F25790047040E702B35D504F0F90861CA7CA43760B8049F6CBFB3'
+  'frontend/src/OrderQueryView.jsx' = '20E540F8D6432820786919430F93DAC8763A3F54C0D08D9240344FC2486E4BC0'
+  'frontend/src/orderQuery.css' = '0A5275AED3C4A3EB194C96AC48AA3F5E672C7F7922667EE963FEEFFE6CA821B1'
+  'frontend/src/orderQueryModel.js' = '2C42FAEC39D47C0F65846D4198AD143DD62856D8FCC0320F419A9B57F47B904A'
 }
 foreach ($path in $expected.Keys) {
   $actualPath = Join-Path $target $path
   $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $actualPath).Hash
   if ($actual -ne $expected[$path]) { throw "Rollback verification failed for ${path}: $actual" }
 }
-Write-Output "Restored $target; verified $($expected.Count) files"
+Write-Output "Restored $target; verified $($expected.Count) files; removed backend/order_query/browser_verification.py"

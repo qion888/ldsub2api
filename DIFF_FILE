@@ -1,491 +1,792 @@
-﻿diff --git a/backend/main.py b/backend/main.py
-index f811e37..7319a88 100644
+﻿diff --git a/.gitignore b/.gitignore
+index 7e2a30c..26891f9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,8 @@
+ backend/*.db
+ backend/*.db-*
+ backend/waf-browser-profile/
++backend/order-waf-browser-profile/
++backend/order_query/waf-browser-profile/
+ backend/server.*.log
+ frontend/server.*.log
+ .runtime/
+diff --git a/backend/main.py b/backend/main.py
+index 89e0a79..fe9dc11 100644
 --- a/backend/main.py
 +++ b/backend/main.py
-@@ -1480,6 +1480,7 @@ class ApiHandler(BaseHTTPRequestHandler):
-                             "official_url": watch["url"],
-                             "shop_token": shop_row["token"] if shop_row else "",
-                             "query_password_required": product["query_password_required"],
-+                            "coupon_supported": any(tag.get("key") == "coupon" for tag in product.get("commerce_tags", [])),
-                         }
-                     )
-             return self._send_json(
-@@ -1632,6 +1633,10 @@ class ApiHandler(BaseHTTPRequestHandler):
-             contact = str(data.get("contact") or "").strip()[:160]
-             note = str(data.get("note") or "").strip()[:160]
-             query_password = str(data.get("query_password") or "")[:160]
-+            coupon_code = str(data.get("coupon_code") or "").strip()[:120]
-+            storage_mode = str(data.get("storage_mode") or "local").strip().lower()
-+            if storage_mode not in {"local", "browser"}:
-+                return self._send_json({"detail": "存储方式无效"}, 400)
-             try:
-                 channel_id = int(data.get("channel_id", 1))
-             except (TypeError, ValueError):
-@@ -1643,6 +1648,8 @@ class ApiHandler(BaseHTTPRequestHandler):
-                 "note": note,
-                 "query_password": query_password,
-                 "channel_id": channel_id,
-+                "coupon_code": coupon_code,
-+                "storage_mode": storage_mode,
-             }
-             with database() as connection:
-                 connection.execute(
-diff --git a/backend/monitor_core/preorders.py b/backend/monitor_core/preorders.py
-index 47aa80e..4138ffb 100644
---- a/backend/monitor_core/preorders.py
-+++ b/backend/monitor_core/preorders.py
-@@ -55,6 +55,13 @@ def create_preorders(
-     if not isinstance(entries, list) or not entries or len(entries) > 100:
-         raise ValueError("预购清单应包含 1 到 100 个商品")
-     config = settings_loader()
-+    supplied_profile = payload.get("checkout_profile")
-+    if isinstance(supplied_profile, dict):
-+        config = {**config, **{
-+            "contact": supplied_profile.get("contact", config.get("contact")),
-+            "query_password": supplied_profile.get("query_password", config.get("query_password")),
-+            "channel_id": supplied_profile.get("channel_id", config.get("channel_id")),
-+        }}
-     try:
-         interval = interval_normalizer(payload.get("interval_seconds"), 1)
-         channel_id = int(config.get("channel_id", 1))
-diff --git a/backend/monitor_core/settings.py b/backend/monitor_core/settings.py
-index efb7f0a..6203c33 100644
---- a/backend/monitor_core/settings.py
-+++ b/backend/monitor_core/settings.py
-@@ -23,8 +23,17 @@ def read_checkout(database: DatabaseFactory) -> dict[str, Any]:
-         row = connection.execute("SELECT value FROM settings WHERE key = 'checkout'").fetchone()
-         legacy = connection.execute("SELECT value FROM settings WHERE key = 'contact'").fetchone()
-     fallback = json_value(legacy["value"] if legacy else None, {"contact": "", "note": ""})
--    fallback.update({"query_password": "", "channel_id": 1})
--    return json_value(row["value"] if row else None, fallback)
-+    fallback.update({"query_password": "", "channel_id": 1, "coupon_code": "", "storage_mode": "local"})
-+    value = json_value(row["value"] if row else None, fallback)
-+    if not isinstance(value, dict):
-+        value = dict(fallback)
-+    value.setdefault("contact", "")
-+    value.setdefault("note", "")
-+    value.setdefault("query_password", "")
-+    value.setdefault("channel_id", 1)
-+    value.setdefault("coupon_code", "")
-+    value.setdefault("storage_mode", "local")
-+    return value
+@@ -36,6 +36,7 @@ from monitor_core import storefront
+ from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
+ from monitor_core.workers import MonitorWorker as CoreMonitorWorker
+ from order_query.complaint import build_complaint_preview
++from order_query.browser_verification import OrderQueryBrowserVerificationManager
+ from order_query import routes as order_query_routes
+ from order_query.service import OrderQueryService
+ from sub2api import automation as sub2api_automation
+@@ -996,6 +997,11 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
+ 
+ BROWSER_VERIFICATION = BrowserVerificationManager()
+ ORDER_QUERY_SERVICE = OrderQueryService()
++ORDER_QUERY_BROWSER_VERIFICATION = OrderQueryBrowserVerificationManager(
++    sessions=ORDER_QUERY_SERVICE.sessions,
++    waf_markers=WAF_MARKERS,
++    profile_path=Path(__file__).with_name("order-waf-browser-profile"),
++)
  
  
- def read_json(database: DatabaseFactory, key: str, fallback: dict[str, Any]) -> dict[str, Any]:
-diff --git a/backend/test_main.py b/backend/test_main.py
-index a94ba66..fbc7d7f 100644
---- a/backend/test_main.py
-+++ b/backend/test_main.py
-@@ -643,6 +643,26 @@ class GoodsParserTests(unittest.TestCase):
-                 self.assertEqual(saved["channel_id"], 4)
-                 self.assertEqual(json.loads(row["value"]), saved)
+ class ApiHandler(BaseHTTPRequestHandler):
+@@ -1057,6 +1063,7 @@ class ApiHandler(BaseHTTPRequestHandler):
+                 "sub2api_card_import_history": True,
+                 "sub2api_card_import_history_delete": True,
+                 "order_query": True,
++                "order_query_waf_verification": True,
+                 "order_complaint_submit": True,
+                 "order_complaint_history": True,
+             })
+@@ -1169,6 +1176,19 @@ class ApiHandler(BaseHTTPRequestHandler):
+         ):
+             return
  
-+    def test_checkout_settings_accepts_storage_mode_and_coupon(self):
-+        with tempfile.TemporaryDirectory() as directory:
-+            database_path = Path(directory) / "test.db"
-+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)):
-+                main.init_database()
-+                status, saved = self.request_api(
-+                    "PUT", "/api/settings/checkout",
-+                    {
-+                        "contact": "buyer@example.test",
-+                        "query_password": "secret",
-+                        "coupon_code": "WELCOME10",
-+                        "storage_mode": "browser",
-+                        "channel_id": 1,
-+                    },
++        if path in (order_query_routes.ORDER_WAF_START_PATH, order_query_routes.ORDER_WAF_COMPLETE_PATH):
++            try:
++                result = (
++                    ORDER_QUERY_BROWSER_VERIFICATION.start(data)
++                    if path == order_query_routes.ORDER_WAF_START_PATH
++                    else ORDER_QUERY_BROWSER_VERIFICATION.complete(data)
 +                )
-+                self.assertEqual(status, 200)
-+                self.assertEqual(saved["coupon_code"], "WELCOME10")
-+                self.assertEqual(saved["storage_mode"], "browser")
-+                self.assertEqual(main.checkout_settings()["storage_mode"], "browser")
++                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
++            except order_query_routes.OrderQueryError as exc:
++                return self._send_json({"detail": exc.detail, "code": exc.code, "retryable": exc.retryable}, exc.status)
++            except RuntimeError as exc:
++                return self._send_json({"detail": str(exc)}, 502)
 +
-     def test_preorder_requires_explicit_enable(self):
-         with tempfile.TemporaryDirectory() as directory:
-             database_path = Path(directory) / "test.db"
+         if path == "/api/preorders":
+             try:
+                 result = create_preorders(data)
+@@ -1735,6 +1755,7 @@ def run() -> None:
+         WORKER.stop_event.set()
+         AUTOMATION_WORKER.stop_event.set()
+         BROWSER_VERIFICATION._close()
++        ORDER_QUERY_BROWSER_VERIFICATION._close()
+         ORDER_QUERY_SERVICE.sessions.clear()
+         server.server_close()
+ 
+diff --git a/backend/monitor_core/storefront.py b/backend/monitor_core/storefront.py
+index 3c8d82b..5eb7ddb 100644
+--- a/backend/monitor_core/storefront.py
++++ b/backend/monitor_core/storefront.py
+@@ -18,6 +18,11 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+ USER_AGENT = "LDXP-Local-Monitor/2.0"
+ VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
+ WAF_MARKERS = (b"aliyunCaptcha", b"aliyunCaptcha-sliding-slider", b"waf_nc", b"u_atoken")
++# Aliyun occasionally changes the challenge wrapper while keeping the response
++# status at 403.  Keep these secondary markers deliberately narrow and only
++# use them together with a 403/HTML response so normal JSON API errors are not
++# mistaken for a browser challenge.
++WAF_TEXT_MARKERS = (b"aliyun", b"waf", b"captcha", "滑块".encode("utf-8"), "人机验证".encode("utf-8"))
+ UNLISTED_ERROR_MARKERS = ("商品未上架", "商品不存在", "已下架", "已不在店铺列表")
+ 
+ 
+@@ -25,6 +30,24 @@ class WafChallengeRequired(RuntimeError):
+     pass
+ 
+ 
++def is_waf_response(raw: bytes, *, content_type: str = "", status: int | None = None) -> bool:
++    """Identify an Aliyun WAF challenge without treating business JSON as WAF.
++
++    The storefront normally returns challenge HTML with HTTP 403, but some
++    edge nodes return a 200/HTML wrapper or a 403 body without the canonical
++    ``aliyunCaptcha`` token.  Exact markers are checked first; fallback text is
++    accepted only for HTML or a 403 response.
++    """
++    body = bytes(raw or b"")
++    if any(marker.lower() in body.lower() for marker in WAF_MARKERS):
++        return True
++    is_html = "text/html" in str(content_type or "").lower()
++    if not (is_html or status == 403):
++        return False
++    lowered = body.lower()
++    return any(marker.lower() in lowered for marker in WAF_TEXT_MARKERS) or status == 403 and is_html
++
++
+ class DescriptionParser(HTMLParser):
+     def __init__(self) -> None:
+         super().__init__()
+@@ -286,15 +309,23 @@ def _post_shop_api(
+         with opener(request, timeout=15) as response:
+             raw = response.read(MAX_RESPONSE_BYTES + 1)
+             content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
++            status = int(getattr(response, "status", 200) or 200)
+             if len(raw) > MAX_RESPONSE_BYTES:
+                 raise RuntimeError("接口响应过大")
+     except HTTPError as exc:
++        try:
++            raw = exc.read(MAX_RESPONSE_BYTES + 1)
++        except Exception:
++            raw = b""
++        content_type = str(getattr(exc, "headers", {}).get("Content-Type", ""))
++        if is_waf_response(raw, content_type=content_type, status=exc.code) or exc.code == 403:
++            raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后同步") from exc
+         raise RuntimeError(f"链动小铺接口返回 HTTP {exc.code}") from exc
+     except URLError as exc:
+         raise RuntimeError("无法连接链动小铺接口") from exc
+-    if "text/html" in content_type.lower() or any(marker in raw for marker in WAF_MARKERS):
+-        if any(marker in raw for marker in WAF_MARKERS):
+-            raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后同步")
++    if is_waf_response(raw, content_type=content_type, status=status):
++        raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后同步")
++    if "text/html" in content_type.lower():
+         raise RuntimeError("链动小铺接口返回了 HTML 页面，不是商品 JSON")
+     try:
+         result = json.loads(raw.decode("utf-8"))
+diff --git a/backend/order_query/browser_verification.py b/backend/order_query/browser_verification.py
+new file mode 100644
+index 0000000..833a395
+--- /dev/null
++++ b/backend/order_query/browser_verification.py
+@@ -0,0 +1,316 @@
++"""Dedicated browser session for order-query WAF challenges.
++
++The monitor and order lookup flows intentionally use separate managers and
++profiles.  A monitor verification may be running while a buyer is solving an
++order lookup challenge; sharing the driver would mix cookies and requests.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++from http.cookiejar import Cookie
++from pathlib import Path
++from typing import Any
++
++# Keep imports explicit here instead of importing the service module (which
++# would create a service/manager cycle during application startup).
++from monitor_core.storefront import ALLOWED_HOST, WAF_MARKERS, WafChallengeRequired, is_waf_response
++
++from .client import BASE_URL, normalize_order_list
++from .errors import OrderQueryInputError, OrderQuerySessionExpired
++
++
++class OrderQueryBrowserVerificationManager:
++    """Open Edge, let the user solve Aliyun WAF, then replay one order query."""
++
++    def __init__(
++        self,
++        *,
++        sessions: Any,
++        waf_markers: tuple[bytes, ...] = WAF_MARKERS,
++        profile_path: Path,
++    ) -> None:
++        self._sessions = sessions
++        self._waf_markers = waf_markers
++        self._profile_path = profile_path
++        self.lock = threading.Lock()
++        self.driver: Any = None
++        self.session_id: str | None = None
++        self.keywords: str | None = None
++        self.request: dict[str, int] | None = None
++
++    @staticmethod
++    def _validated_request(data: Any) -> dict[str, Any]:
++        if not isinstance(data, dict):
++            raise OrderQueryInputError("WAF 验证参数必须是 JSON 对象")
++        keywords = str(data.get("keywords") or "").strip()
++        session_id = str(data.get("session_id") or "").strip()
++        if not keywords or len(keywords) > 160:
++            raise OrderQueryInputError("WAF 验证缺少有效的查询内容")
++        if not session_id or len(session_id) < 16 or len(session_id) > 128:
++            raise OrderQueryInputError("WAF 验证缺少有效的查询会话")
++        try:
++            status = int(data.get("status", 999))
++            page = int(data.get("page", 1))
++            page_size = int(data.get("page_size", 10))
++        except (TypeError, ValueError) as exc:
++            raise OrderQueryInputError("WAF 验证的订单分页参数无效") from exc
++        if status not in {999, 0, 1, 2, 3}:
++            raise OrderQueryInputError("WAF 验证的订单状态筛选无效")
++        if page < 1 or page > 1000 or page_size < 1 or page_size > 50:
++            raise OrderQueryInputError("WAF 验证的订单分页参数超出范围")
++        return {
++            "session_id": session_id,
++            "keywords": keywords,
++            "status": status,
++            "page": page,
++            "page_size": page_size,
++        }
++
++    @staticmethod
++    def _payload(session: Any, request: dict[str, Any]) -> dict[str, Any]:
++        return {
++            "status": request["status"],
++            "current": request["page"],
++            "pageSize": request["page_size"],
++            "keywords": request["keywords"],
++            "ticket": session.ticket,
++        }
++
++    def _is_waf_html(self, text: str) -> bool:
++        raw = str(text or "").encode("utf-8", "ignore")
++        # A normal /order document is also HTML; only challenge signatures
++        # may trigger the early page-source check.
++        lowered = raw.lower()
++        return any(marker.lower() in lowered for marker in self._waf_markers) or any(
++            marker in lowered for marker in ("滑块验证".encode("utf-8"), "人机验证".encode("utf-8"))
++        )
++
++    def _close(self) -> None:
++        driver, self.driver = self.driver, None
++        self.session_id = None
++        self.keywords = None
++        self.request = None
++        if driver is not None:
++            try:
++                driver.quit()
++            except Exception:
++                pass
++
++    @staticmethod
++    def _seed_browser_cookies(driver: Any, client: Any) -> None:
++        for cookie in client.cookie_jar:
++            domain = str(cookie.domain or ALLOWED_HOST).lstrip(".")
++            if domain != ALLOWED_HOST and not domain.endswith(f".{ALLOWED_HOST}"):
++                continue
++            value: dict[str, Any] = {
++                "name": str(cookie.name),
++                "value": str(cookie.value),
++                "path": str(cookie.path or "/"),
++                "secure": bool(cookie.secure),
++            }
++            if cookie.expiry:
++                value["expiry"] = int(cookie.expiry)
++            # Selenium rejects a leading dot on some Edge versions; the
++            # host-only domain is sufficient because the APIs share the host.
++            try:
++                driver.add_cookie(value)
++            except Exception:
++                continue
++
++    @staticmethod
++    def _sync_browser_cookies(driver: Any, client: Any) -> None:
++        for raw in driver.get_cookies() or []:
++            name = str(raw.get("name") or "").strip()
++            if not name:
++                continue
++            domain = str(raw.get("domain") or ALLOWED_HOST).lstrip(".")
++            if domain != ALLOWED_HOST and not domain.endswith(f".{ALLOWED_HOST}"):
++                continue
++            path = str(raw.get("path") or "/")
++            expiry = raw.get("expiry")
++            try:
++                expiry = int(expiry) if expiry is not None else None
++            except (TypeError, ValueError):
++                expiry = None
++            cookie = Cookie(
++                version=0,
++                name=name,
++                value=str(raw.get("value") or ""),
++                port=None,
++                port_specified=False,
++                domain=domain,
++                domain_specified=True,
++                domain_initial_dot=False,
++                path=path,
++                path_specified=True,
++                secure=bool(raw.get("secure")),
++                expires=expiry,
++                discard=expiry is None,
++                comment=None,
++                comment_url=None,
++                rest={"HttpOnly": bool(raw.get("httpOnly"))},
++                rfc2109=False,
++            )
++            client.cookie_jar.set_cookie(cookie)
++
++    def _browser_request(self, driver: Any, session: Any, request: dict[str, Any]) -> dict[str, Any]:
++        driver.set_script_timeout(30)
++        result = driver.execute_async_script(
++            """
++            const payload = arguments[0];
++            const visitorId = arguments[1];
++            const done = arguments[arguments.length - 1];
++            fetch('/shopApi/Order/list', {
++              method: 'POST',
++              credentials: 'include',
++              headers: {
++                'Accept': 'application/json, text/plain, */*',
++                'Content-Type': 'application/json',
++                'Visitorid': visitorId
++              },
++              body: JSON.stringify(payload)
++            }).then(async response => done({
++              status: response.status,
++              content_type: response.headers.get('content-type') || '',
++              text: await response.text()
++            })).catch(error => done({error: String(error)}));
++            """,
++            self._payload(session, request),
++            str(session.client.visitor_id),
++        )
++        if not isinstance(result, dict) or result.get("error"):
++            raise RuntimeError(str((result or {}).get("error") or "浏览器订单请求失败")[:200])
++        text = str(result.get("text") or "")
++        raw = text.encode("utf-8", "ignore")
++        status = int(result.get("status") or 200)
++        content_type = str(result.get("content_type") or "")
++        if is_waf_response(raw, content_type=content_type, status=status):
++            # Keep the challenge document intact; its inline slider script is
++            # required for the Edge page to complete verification.
++            raise WafChallengeRequired(text[:512_000])
++        try:
++            payload = json.loads(text)
++        except json.JSONDecodeError as exc:
++            raise RuntimeError("浏览器会话仍未返回订单 JSON") from exc
++        if not isinstance(payload, dict):
++            raise RuntimeError("浏览器会话返回的订单数据格式无效")
++        return payload
++
++    def _render_challenge(self, driver: Any, html_text: str) -> dict[str, Any]:
++        try:
++            driver.execute_script("document.open(); document.write(arguments[0]); document.close();", html_text)
++        except Exception as exc:
++            self._close()
++            raise RuntimeError("无法在 Edge 中显示订单 WAF 验证页") from exc
++        return {
++            "status": "awaiting_verification",
++            "detail": "请在已打开的 Edge 窗口完成阿里云滑块，然后点击“验证完成并继续查询”",
++        }
++
++    def _save_result(self, session: Any, request: dict[str, Any], result: dict[str, Any]) -> None:
++        cached = {
++            "orders": result["orders"],
++            "pagination": result["pagination"],
++        }
++        with session.lock:
++            session.remember_orders(cached["orders"])
++            if self._sessions.cache_seconds:
++                session.store_cache(
++                    (request["status"], request["page"], request["page_size"]),
++                    cached,
++                    self._sessions.now() + self._sessions.cache_seconds,
++                )
++
++    def _success(self, session: Any, request: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
++        self._sync_browser_cookies(self.driver, session.client)
++        self._save_result(session, request, result)
++        response = {
++            "status": "success",
++            "session_id": session.session_id,
++            "expires_in": self._sessions.remaining(session),
++            "verification": {"status": "verified", "mode": "browser", "attempts": 0},
++            **result,
++        }
++        self._close()
++        return response
++
++    def start(self, data: Any) -> dict[str, Any]:
++        request = self._validated_request(data)
++        with self.lock:
++            self._close()
++            try:
++                session = self._sessions.get(request["session_id"], request["keywords"])
++            except OrderQuerySessionExpired:
++                self._close()
++                raise
++            if not session.ticket:
++                raise OrderQuerySessionExpired()
++            try:
++                from selenium import webdriver
++                from selenium.webdriver.edge.options import Options
++            except ImportError as exc:
++                raise RuntimeError("缺少浏览器验证组件，请执行 python -m pip install -r backend/requirements.txt") from exc
++            options = Options()
++            options.add_argument(f"--user-data-dir={self._profile_path}")
++            options.add_argument("--start-maximized")
++            options.add_argument("--no-first-run")
++            options.add_argument("--disable-features=EdgeFirstRunExperience")
++            try:
++                driver = webdriver.Edge(options=options)
++                self.driver = driver
++                self.session_id = session.session_id
++                self.keywords = request["keywords"]
++                self.request = {key: request[key] for key in ("status", "page", "page_size")}
++                driver.get(f"{BASE_URL}/order")
++                self._seed_browser_cookies(driver, session.client)
++                # Cookies must be added after the first navigation, then reload
++                # so the browser request sees the verified urllib session.
++                driver.get(f"{BASE_URL}/order")
++                if self._is_waf_html(driver.page_source):
++                    return self._render_challenge(driver, driver.page_source)
++                payload = self._browser_request(driver, session, request)
++                normalized = normalize_order_list(payload, page=request["page"], page_size=request["page_size"])
++                return self._success(session, request, normalized)
++            except WafChallengeRequired as exc:
++                return self._render_challenge(driver, str(exc))
++            except OrderQuerySessionExpired:
++                self._close()
++                raise
++            except Exception as exc:
++                self._close()
++                raise RuntimeError(f"订单浏览器验证启动失败：{str(exc)[:160]}") from exc
++
++    def complete(self, data: Any) -> dict[str, Any]:
++        request = self._validated_request(data)
++        with self.lock:
++            if self.driver is None or self.session_id != request["session_id"] or self.keywords != request["keywords"]:
++                raise RuntimeError("没有等待完成的订单浏览器验证会话")
++            expected = self.request or {}
++            if any(expected.get(key) != request[key] for key in ("status", "page", "page_size")):
++                raise OrderQueryInputError("订单浏览器验证上下文已变化，请重新发起验证")
++            session = self._sessions.get(request["session_id"], request["keywords"])
++            if not session.ticket:
++                self._close()
++                raise OrderQuerySessionExpired()
++            driver = self.driver
++            try:
++                # Reload the first-party page before replaying the API call.
++                # Aliyun may leave the challenge DOM in place after the slider
++                # sets its cookie; reloading lets the browser use that cookie.
++                driver.get(f"{BASE_URL}/order")
++                payload = self._browser_request(driver, session, request)
++                normalized = normalize_order_list(payload, page=request["page"], page_size=request["page_size"])
++                return self._success(session, request, normalized)
++            except WafChallengeRequired as exc:
++                return self._render_challenge(driver, str(exc))
++            except OrderQuerySessionExpired:
++                self._close()
++                raise
++            except Exception as exc:
++                self._close()
++                raise RuntimeError(f"订单浏览器验证同步失败：{str(exc)[:160]}") from exc
++
++
++__all__ = ["OrderQueryBrowserVerificationManager"]
+diff --git a/backend/order_query/client.py b/backend/order_query/client.py
+index 981f917..b44665b 100644
+--- a/backend/order_query/client.py
++++ b/backend/order_query/client.py
+@@ -17,7 +17,7 @@ from urllib.error import HTTPError, URLError
+ from urllib.parse import quote, urlencode, urlparse
+ from urllib.request import HTTPCookieProcessor, Request, build_opener
+ 
+-from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired
++from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired, is_waf_response
+ 
+ from .captcha import captcha_sign
+ from .complaint import normalize_complaint_history
+@@ -229,6 +229,14 @@ class OrderQueryClient:
+         try:
+             return self.opener.open(request, timeout=self.timeout)
+         except HTTPError as exc:
++            try:
++                raw = exc.read(MAX_JSON_BYTES + 1)
++            except Exception:
++                raw = b""
++            content_type = str(getattr(exc, "headers", {}).get("Content-Type", ""))
++            is_order_api = urlparse(request.full_url).path.lower().startswith("/shopapi/order/")
++            if is_waf_response(raw, content_type=content_type, status=exc.code) or (exc.code == 403 and is_order_api):
++                raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后重试") from exc
+             if exc.code == 429:
+                 raise UpstreamOrderError(
+                     "链动小铺订单接口请求过于频繁",
+@@ -273,7 +281,7 @@ class OrderQueryClient:
+             content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
+         if len(raw) > MAX_JSON_BYTES:
+             raise UpstreamOrderError("订单接口响应过大", code="upstream_response_too_large")
+-        if any(marker in raw for marker in WAF_MARKERS):
++        if is_waf_response(raw, content_type=content_type, status=200):
+             raise WafChallengeRequired("链动小铺触发阿里云 WAF 验证")
+         if "text/html" in content_type.lower():
+             raise UpstreamOrderError("订单接口返回了 HTML 页面", code="invalid_order_response")
+@@ -296,7 +304,7 @@ class OrderQueryClient:
+     def _response_json(raw: bytes, content_type: str) -> dict[str, Any]:
+         if len(raw) > MAX_JSON_BYTES:
+             raise UpstreamOrderError("订单接口响应过大", code="upstream_response_too_large")
+-        if any(marker in raw for marker in WAF_MARKERS):
++        if is_waf_response(raw, content_type=content_type, status=200):
+             raise WafChallengeRequired("链动小铺触发阿里云 WAF 验证")
+         if "text/html" in content_type.lower():
+             raise UpstreamOrderError("订单接口返回了 HTML 页面", code="invalid_order_response")
+diff --git a/backend/order_query/routes.py b/backend/order_query/routes.py
+index 816a042..3865ed6 100644
+--- a/backend/order_query/routes.py
++++ b/backend/order_query/routes.py
+@@ -13,6 +13,8 @@ from .errors import OrderQueryError
+ SendJson = Callable[[Any, int], Any]
+ ORDER_QUERY_PATH = "/api/order-query/search"
+ ORDER_DETAIL_PATH = "/api/order-query/detail"
++ORDER_WAF_START_PATH = "/api/order-query/waf-verification/start"
++ORDER_WAF_COMPLETE_PATH = "/api/order-query/waf-verification/complete"
+ ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
+ ORDER_COMPLAINT_CONTEXT_PATH = "/api/order-query/complaints/context"
+ ORDER_COMPLAINT_HISTORY_PATH = "/api/order-query/complaints/history"
+@@ -22,6 +24,8 @@ ORDER_COMPLAINT_REMOVE_UPLOAD_PATH = "/api/order-query/complaints/upload/remove"
+ ORDER_QUERY_POST_PATHS = frozenset({
+     ORDER_QUERY_PATH,
+     ORDER_DETAIL_PATH,
++    ORDER_WAF_START_PATH,
++    ORDER_WAF_COMPLETE_PATH,
+     ORDER_COMPLAINT_PREVIEW_PATH,
+     ORDER_COMPLAINT_CONTEXT_PATH,
+     ORDER_COMPLAINT_HISTORY_PATH,
+diff --git a/backend/test_order_query_modules.py b/backend/test_order_query_modules.py
+index 591d7b5..8778a7e 100644
+--- a/backend/test_order_query_modules.py
++++ b/backend/test_order_query_modules.py
+@@ -9,9 +9,11 @@ from types import SimpleNamespace
+ from typing import Any
+ from unittest.mock import patch
+ from urllib.parse import parse_qs
++from urllib.error import HTTPError
+ from urllib.request import Request
+ 
+ import main
++from monitor_core.storefront import WafChallengeRequired
+ from order_query import routes
+ from order_query.captcha import CaptchaRecognizer, captcha_sign, normalize_captcha_code
+ from order_query.client import CaptchaChallenge, OrderQueryClient
+@@ -253,6 +255,26 @@ class ClientTests(unittest.TestCase):
+         with self.assertRaisesRegex(RuntimeError, "地址无效"):
+             OrderQueryClient(opener=opener).start_captcha()
+ 
++    def test_http_403_aliyun_challenge_is_exposed_as_browser_verification(self) -> None:
++        class WafOpener:
++            def open(self, request: Request, timeout: float) -> Any:
++                raise HTTPError(
++                    request.full_url,
++                    403,
++                    "forbidden",
++                    {"Content-Type": "text/html; charset=utf-8"},
++                    BytesIO(b"<html>aliyun captcha challenge</html>"),
++                )
++
++        with self.assertRaises(WafChallengeRequired):
++            OrderQueryClient(opener=WafOpener()).list_orders(
++                keywords="buyer@example.test",
++                ticket="ticket",
++                status=999,
++                page=1,
++                page_size=10,
++            )
++
+     def test_empty_order_result_keeps_one_pagination_page(self) -> None:
+         from order_query.client import normalize_order_list
+ 
 diff --git a/frontend/src/OrderQueryView.jsx b/frontend/src/OrderQueryView.jsx
-index 9e110ad..74474ce 100644
+index 3ea002b..a9e8d36 100644
 --- a/frontend/src/OrderQueryView.jsx
 +++ b/frontend/src/OrderQueryView.jsx
-@@ -20,6 +20,7 @@ import {
-   ReceiptText,
-   RefreshCw,
-   RotateCcw,
-+  Save,
-   Search,
-   Send,
-   ShieldCheck,
-@@ -431,7 +432,7 @@ function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint}) {
-   </tr>;
+@@ -104,7 +104,7 @@ function OrderImage({order}) {
+   return <img className="order-product-image" src={order.goods_image} alt="" onError={() => setFailed(true)}/>;
  }
  
--export default function OrderQueryView({request, notify, initialKeywords = ''}) {
-+export default function OrderQueryView({request, notify, initialKeywords = '', checkoutProfile = null, onSaveCheckout = null}) {
-   const [keywords, setKeywords] = useState(initialKeywords || '');
-   const [submittedKeywords, setSubmittedKeywords] = useState('');
-   const [activeStatus, setActiveStatus] = useState(999);
-@@ -453,6 +454,10 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
-   const [detailBusy, setDetailBusy] = useState(false);
-   const [detailError, setDetailError] = useState('');
-   const [detailSessionExpired, setDetailSessionExpired] = useState(false);
-+  const [profileContact, setProfileContact] = useState(checkoutProfile?.contact || initialKeywords || '');
-+  const [profilePassword, setProfilePassword] = useState(checkoutProfile?.query_password || '');
-+  const [profileStorageMode, setProfileStorageMode] = useState(checkoutProfile?.storage_mode || 'local');
-+  const [profileBusy, setProfileBusy] = useState(false);
-   const [complaintOrder, setComplaintOrder] = useState(null);
-   const [complaintDraft, setComplaintDraft] = useState(null);
-   const [complaintErrors, setComplaintErrors] = useState({});
-@@ -549,6 +554,13 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
-     setKeywords(current => current || initialKeywords);
-   }, [initialKeywords]);
+-function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaCode, onRefresh, onSubmit, expiresIn}) {
++function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaCode, onRefresh, onSubmit, expiresIn, waf, wafBusy, onStartWaf, onCompleteWaf}) {
+   const manualRequired = verification?.status === 'manual_required';
+   const attempts = Number(verification?.attempts || 0);
+   const state = busy ? 'busy' : manualRequired ? 'manual' : verification?.status === 'verified' ? 'verified' : 'idle';
+@@ -113,7 +113,9 @@ function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaC
+     : verificationLabel(verification);
+   const imageSource = captcha?.image_data_url || captcha?.image_url || '';
  
-+  useEffect(() => {
-+    if (!checkoutProfile) return;
-+    setProfileContact(checkoutProfile.contact || '');
-+    setProfilePassword(checkoutProfile.query_password || '');
-+    setProfileStorageMode(checkoutProfile.storage_mode || 'local');
-+  }, [checkoutProfile]);
-+
-   useEffect(() => {
-     if (!detailOrder) return undefined;
-     const previousOverflow = document.body.style.overflow;
-@@ -759,6 +771,19 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
-     runSearch({keywordValue: keywords, pageValue: 1, reuseSession: !manualRequired});
-   };
+-  return <section className={`order-verification ${state}`} aria-live="polite">
++  const wafPending = waf?.status === 'awaiting_verification';
++  const wafRequired = waf?.status === 'required' || wafPending;
++  return <section className={`order-verification ${state} ${wafRequired ? 'waf-required' : ''}`} aria-live="polite">
+     <div className="order-verification-head">
+       <span className="order-verification-icon">{state === 'busy' ? <RefreshCw className="spin" size={18}/> : state === 'verified' ? <Check size={18}/> : state === 'manual' ? <TriangleAlert size={18}/> : <ShieldCheck size={18}/>}</span>
+       <div><span>CAPTCHA SESSION</span><strong>{stateLabel}</strong></div>
+@@ -133,6 +135,12 @@ function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaC
+       <button className="button primary" type="submit" disabled={Boolean(busy) || !/^[A-Za-z0-9]{4}$/.test(captchaCode)}><ShieldCheck size={15}/>{busy === 'manual' ? '正在验证' : '验证并继续'}</button>
+       <small>{expiresIn ? `当前验证会话约 ${Math.max(1, Math.ceil(Number(expiresIn) / 60))} 分钟内有效` : '自动识别未通过，请确认图片内容'}</small>
+     </form>}
++    {wafRequired && <div className="order-waf-panel" role="status">
++      <div className="order-waf-copy"><span className="order-waf-icon"><ShieldCheck size={17}/></span><div><strong>需要完成阿里云 WAF 验证</strong><small>{wafPending ? 'Edge 浏览器已打开，请完成滑块后返回此处继续' : (waf?.detail || '订单接口暂时拦截了当前请求')}</small></div></div>
++      <div className="order-waf-actions">
++        {!wafPending ? <button className="button secondary" type="button" onClick={onStartWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ArrowUpRight size={14}/>{wafBusy === 'start' ? '正在打开浏览器' : '打开浏览器验证'}</button> : <button className="button primary" type="button" onClick={onCompleteWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ShieldCheck size={14}/>{wafBusy === 'complete' ? '正在同步订单' : '验证完成并继续查询'}</button>}
++      </div>
++    </div>}
+   </section>;
+ }
  
-+  const saveProfile = async event => {
-+    event.preventDefault();
-+    if (!onSaveCheckout) return;
-+    setProfileBusy(true);
-+    try {
-+      await onSaveCheckout({contact: profileContact, query_password: profilePassword, storage_mode: profileStorageMode});
-+    } catch {
-+      // Parent displays the persistence error.
-+    } finally {
-+      setProfileBusy(false);
-+    }
+@@ -561,6 +569,8 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+   const [expiresIn, setExpiresIn] = useState(0);
+   const [busy, setBusy] = useState('');
+   const [error, setError] = useState('');
++  const [wafVerification, setWafVerification] = useState(null);
++  const [wafBusy, setWafBusy] = useState('');
+   const [hasQueried, setHasQueried] = useState(false);
+   const [queriedAt, setQueriedAt] = useState(null);
+   const [detailOrder, setDetailOrder] = useState(null);
+@@ -615,6 +625,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+   const historyRequest = useRef(null);
+   const historyGeneration = useRef(0);
+   const runSearchRef = useRef(null);
++  const wafRequestRef = useRef(null);
+   const imagePreviewDialog = useRef(null);
+   const imagePreviewTrigger = useRef(null);
+   complaintUploadsRef.current = complaintUploads;
+@@ -1027,6 +1038,23 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
+   const manualRequired = verification?.status === 'manual_required';
+ 
++  const commitSearchResponse = (response, {keywords: normalizedKeywords, status, page, pageSize, quiet = false} = {}) => {
++    const normalized = normalizeOrderResponse(response, {page, pageSize});
++    setSessionId(String(response.session_id || ''));
++    setExpiresIn(Number(response.expires_in || 0));
++    setVerification(response.verification || null);
++    setSubmittedKeywords(normalizedKeywords);
++    setResult(normalized);
++    resultContext.current = {keywords: normalizedKeywords, status: Number(status), pageSize: Number(pageSize)};
++    setCaptcha(null);
++    setCaptchaCode('');
++    setHasQueried(true);
++    setQueriedAt(new Date());
++    setWafVerification(null);
++    if (!quiet) notify({type: 'success', title: '订单查询完成', message: `已获取 ${normalized.pagination.total} 笔订单`, duration: 4200});
++    return normalized;
 +  };
 +
-   const submitManualCaptcha = event => {
-     event.preventDefault();
-     runSearch({manualCode: captchaCode.trim(), pageValue: 1});
-@@ -773,7 +798,7 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
-     detailTriggerRef.current = trigger || document.activeElement;
-     setDetailOrder(order);
-     setOrderDetail(null);
--    setDetailPassword('');
-+    setDetailPassword(checkoutProfile?.query_password || '');
-     setDetailPasswordVisible(false);
-     setDetailBusy(false);
-     setDetailError(sessionAvailable ? '' : '订单查询会话已失效，请重新查询订单后再验证');
-@@ -1201,12 +1226,15 @@ export default function OrderQueryView({request, notify, initialKeywords = ''})
-   return <section className="order-query-view">
-     <section className="order-query-console">
-       <div className="order-query-form-panel">
--        <div className="order-section-heading"><div><span>LDXP ORDER LOOKUP</span><h2>链动小铺订单查询</h2><p>使用购买时预留的联系方式或订单号查询</p></div><a className="icon-button" href="https://pay.ldxp.cn/order" target="_blank" rel="noreferrer" aria-label="打开官方订单查询" title="打开官方订单查询"><ArrowUpRight size={16}/></a></div>
-+        <div className="order-section-heading"><div><span>LDXP ORDER LOOKUP</span><h2>链动小铺订单查询</h2><p>使用购买时预留的联系方式或订单号查询</p></div><span className="order-query-badge"><ShieldCheck size={14}/>安全查询</span></div>
-         <form className="order-search-form" onSubmit={submitSearch}>
-           <label><span>联系方式 / 订单号</span><div><Search size={16}/><input value={keywords} onChange={event => setKeywords(event.target.value)} placeholder="邮箱、手机号、QQ 或订单号" autoComplete="off" spellCheck="false"/></div></label>
-           <button className="button primary" type="submit" disabled={Boolean(busy) || !keywords.trim()}><ShieldCheck size={16}/>{busy === 'search' ? '正在查询' : '自动验证并查询'}</button>
-         </form>
--        <div className="order-query-source"><span><ShieldCheck size={13}/>数据来源</span><strong>pay.ldxp.cn/order</strong>{submittedKeywords && <em>当前查询：{submittedKeywords}</em>}</div>
-+        <form className="order-profile-form" onSubmit={saveProfile}>
-+          <div><span>购买配置</span><input value={profileContact} onChange={event => setProfileContact(event.target.value)} placeholder="联系方式" autoComplete="email"/><input type="password" value={profilePassword} onChange={event => setProfilePassword(event.target.value)} placeholder="安全密码（可选）" autoComplete="off"/><select value={profileStorageMode} onChange={event => setProfileStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select><button className="button secondary" type="submit" disabled={profileBusy || !profileContact.trim()}><Save size={14}/>{profileBusy ? '正在保存' : '保存配置'}</button></div>
-+          <small>保存后可在商品购买页面直接复用</small>
-+        </form>
-         {error && <div className="order-query-error"><TriangleAlert size={15}/><span>{error}</span><button type="button" onClick={() => runSearch({pageValue: result.pagination.page || 1})}>重试</button></div>}
-       </div>
-       <VerificationPanel
-diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
-index 249b14c..a7b693b 100644
---- a/frontend/src/main.jsx
-+++ b/frontend/src/main.jsx
-@@ -59,6 +59,7 @@ import {
- } from './sub2apiRecoveryModel.js';
- 
- const API = '/api';
-+const CHECKOUT_PROFILE_KEY = 'ldxp-checkout-profile-v1';
- const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
- const ProductDetailPriceChart = React.lazy(() => import('./PriceHistoryChart.jsx').then(module => ({default: module.ProductDetailPriceChart})));
- const loadOrderQueryView = () => import('./OrderQueryView.jsx');
-@@ -939,7 +940,10 @@ function App() {
-   const [cart, setCart] = useState([]);
-   const [contact, setContact] = useState({contact: '', note: ''});
-   const [queryPassword, setQueryPassword] = useState('');
--  const [savedCheckout, setSavedCheckout] = useState({contact: '', note: '', query_password: '', channel_id: 1});
-+  const [savedCheckout, setSavedCheckout] = useState({contact: '', note: '', query_password: '', channel_id: 1, coupon_code: '', storage_mode: 'local'});
-+  const [couponCode, setCouponCode] = useState('');
-+  const [checkoutStorageMode, setCheckoutStorageMode] = useState('local');
-+  const [checkoutPrompt, setCheckoutPrompt] = useState(null);
-   const [passwordVisible, setPasswordVisible] = useState(false);
-   const [review, setReview] = useState(null);
-   const [officialOrder, setOfficialOrder] = useState(null);
-@@ -1219,10 +1223,28 @@ function App() {
-       try {
-         const config = await request('/settings/checkout');
-         if (cancelled) return;
--        setContact({contact: config.contact || '', note: config.note || ''});
--        setQueryPassword(config.query_password || '');
--        setPaymentChannel(Number(config.channel_id || 1));
--        setSavedCheckout(config);
-+        let browserConfig = null;
-+        try {
-+          const raw = window.localStorage.getItem(CHECKOUT_PROFILE_KEY);
-+          browserConfig = raw ? JSON.parse(raw) : null;
-+        } catch {
-+          browserConfig = null;
-+        }
-+        const selected = browserConfig?.storage_mode === 'browser' ? browserConfig : config;
-+        const profile = {
-+          contact: selected.contact || '',
-+          note: selected.note || '',
-+          query_password: selected.query_password || '',
-+          channel_id: Number(selected.channel_id || 1),
-+          coupon_code: selected.coupon_code || '',
-+          storage_mode: selected.storage_mode === 'browser' ? 'browser' : 'local',
-+        };
-+        setContact({contact: profile.contact, note: profile.note});
-+        setQueryPassword(profile.query_password);
-+        setPaymentChannel(profile.channel_id);
-+        setCouponCode(profile.coupon_code);
-+        setCheckoutStorageMode(profile.storage_mode);
-+        setSavedCheckout(profile);
-       } catch {
-         // Checkout settings are optional for browsing the monitoring workspace.
-       }
-@@ -1727,6 +1749,7 @@ function App() {
-           enabled: true,
-           interval_seconds: preorderDraft.interval_seconds,
-           items: eligible.map(entry => ({watch_id: entry.watch_id, quantity: entry.quantity})),
-+          ...(checkoutStorageMode === 'browser' ? {checkout_profile: {...savedCheckout, contact: contact.contact || savedCheckout.contact, query_password: queryPassword || savedCheckout.query_password, channel_id: paymentChannel}} : {}),
-         }),
-       });
-       setPreorderDraft(null);
-@@ -1806,25 +1829,69 @@ function App() {
-     }
-   };
- 
--  const saveCheckout = async () => {
--    try {
--      const saved = await request('/settings/checkout', {
-+  const persistCheckout = async (overrides = {}) => {
-+    const profile = {
-+      contact: String(overrides.contact ?? contact.contact ?? '').trim(),
-+      note: String(overrides.note ?? contact.note ?? '').trim(),
-+      query_password: String(overrides.query_password ?? queryPassword ?? ''),
-+      channel_id: Number(overrides.channel_id ?? paymentChannel ?? 1),
-+      coupon_code: String(overrides.coupon_code ?? couponCode ?? '').trim(),
-+      storage_mode: (overrides.storage_mode !== undefined ? overrides.storage_mode : checkoutStorageMode) === 'browser' ? 'browser' : 'local',
-+    };
-+    if (!profile.contact) throw new Error('请先填写联系方式');
-+    if (profile.storage_mode === 'browser') {
-+      window.localStorage.setItem(CHECKOUT_PROFILE_KEY, JSON.stringify(profile));
-+    } else {
-+      await request('/settings/checkout', {
-         method: 'PUT',
-         headers: {'Content-Type': 'application/json'},
--        body: JSON.stringify({...contact, query_password: queryPassword, channel_id: paymentChannel}),
-+        body: JSON.stringify(profile),
-       });
--      setContact({contact: saved.contact, note: saved.note});
--      setQueryPassword(saved.query_password || '');
--      setPaymentChannel(Number(saved.channel_id || 1));
--      setSavedCheckout(saved);
--      notify('购买配置已保存到本机');
-+      window.localStorage.removeItem(CHECKOUT_PROFILE_KEY);
-+    }
-+    setContact({contact: profile.contact, note: profile.note});
-+    setQueryPassword(profile.query_password);
-+    setPaymentChannel(profile.channel_id);
-+    setCouponCode(profile.coupon_code);
-+    setCheckoutStorageMode(profile.storage_mode);
-+    setSavedCheckout(profile);
-+    return profile;
-+  };
-+
-+  const saveCheckout = async () => {
-+    try {
-+      await persistCheckout();
-+      notify(checkoutStorageMode === 'browser' ? '购买配置已保存到浏览器缓存' : '购买配置已保存到本机');
-     } catch (error) {
-       notify(error.message, 'error');
-     }
-   };
- 
--  const prepareCheckout = async () => {
-+  const requiresCheckoutPassword = target => {
-+    if (target?.latest?.query_password_required) return true;
-+    if (target?.items) return target.items.some(entry => entry.query_password_required);
-+    return cart.some(entry => items.find(item => item.id === entry.watch_id)?.latest?.query_password_required);
-+  };
-+
-+  const ensureCheckoutProfile = target => {
-+    const profile = {
-+      ...savedCheckout,
-+      contact: contact.contact || savedCheckout.contact,
-+      note: contact.note || savedCheckout.note,
-+      query_password: queryPassword || savedCheckout.query_password,
-+      channel_id: paymentChannel || savedCheckout.channel_id,
-+      coupon_code: couponCode || savedCheckout.coupon_code,
-+    };
-+    if (!profile.contact || (requiresCheckoutPassword(target) && !profile.query_password)) {
-+      setCheckoutPrompt({target, requiresPassword: requiresCheckoutPassword(target)});
-+      return false;
-+    }
-+    return true;
-+  };
-+
-+  const prepareCheckout = async (profileOverride = null) => {
-     if (!cart.length) return notify('请先加入商品', 'error');
-+    if (!profileOverride && !ensureCheckoutProfile({items: cart.map(entry => ({...entry, query_password_required: items.find(item => item.id === entry.watch_id)?.latest?.query_password_required}))})) return;
-     setBusy(value => ({...value, checkout: true}));
+   const sendSearch = async (payload, allowExpiredRetry = true) => {
      try {
-       const result = await request('/checkout/prepare', {
-@@ -1870,6 +1937,7 @@ function App() {
-         channel_id: config.channel_id,
-         contact: config.contact,
-         query_password: item.query_password_required ? config.query_password : '',
-+        coupon_code: config.coupon_code || '',
-         juuid: identity.juuid,
-         referer: item.official_url,
-         visitor_id: getVisitorId(),
-@@ -1895,6 +1963,7 @@ function App() {
-       await placeOfficialOrder(review, {
-         ...contact,
-         query_password: queryPassword,
-+        coupon_code: couponCode,
-         channel_id: paymentChannel,
-       }, paymentWindow.current);
-     } catch (error) {
-@@ -1905,12 +1974,9 @@ function App() {
+       return await request('/order-query/search', {
+@@ -1086,8 +1114,16 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+       setCaptchaCode('');
+       setSessionId('');
+       setExpiresIn(0);
++      setWafVerification(null);
++      wafRequestRef.current = null;
+       setQueriedAt(null);
      }
-   };
++    wafRequestRef.current = {
++      keywords: normalizedKeywords,
++      status: Number(statusValue),
++      page: Number(pageValue),
++      page_size: Number(pageSizeValue),
++    };
+     setBusy(refreshCaptcha ? 'refresh' : manualCode ? 'manual' : 'search');
+     setError('');
+     const payload = {
+@@ -1121,18 +1157,17 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+         return false;
+       }
  
--  const oneClickBuy = async item => {
-+  const oneClickBuy = async (item, profileOverride = null) => {
-     if (!itemPurchasable(item)) return notify(itemStock(item).key === 'out' ? '该商品当前缺货，可设置自动预购' : '该商品当前不可购买', 'error');
--    if (!savedCheckout.contact) return notify('请先在购买配置中保存联系方式', 'error');
--    if (item.latest?.query_password_required && !savedCheckout.query_password) {
--      return notify('该商品需要查询密码，请先在购买配置中保存', 'error');
--    }
-+    if (!profileOverride && !ensureCheckoutProfile(item)) return;
-     const minimum = Math.max(1, Number(item.latest?.limit_count || 1));
-     const openedWindow = window.open('', '_blank');
-     if (openedWindow) openedWindow.opener = null;
-@@ -1928,7 +1994,8 @@ function App() {
-       setReview(checkout);
-       setPaymentChannels(channels);
-       setPaymentChannel(channelId);
--      await placeOfficialOrder(checkout, {...savedCheckout, channel_id: channelId}, openedWindow);
-+      const profile = profileOverride || {...savedCheckout, contact: contact.contact || savedCheckout.contact, query_password: queryPassword || savedCheckout.query_password, coupon_code: couponCode || savedCheckout.coupon_code};
-+      await placeOfficialOrder(checkout, {...profile, channel_id: channelId}, openedWindow);
-     } catch (error) {
-       if (openedWindow && !openedWindow.closed) openedWindow.close();
-       notify(error.message, 'error');
-@@ -1937,6 +2004,23 @@ function App() {
-     }
-   };
- 
-+  const submitCheckoutPrompt = async () => {
-+    try {
-+      const profile = await persistCheckout();
-+      const target = checkoutPrompt?.target;
-+      setCheckoutPrompt(null);
-+      if (target?.id) {
-+        await oneClickBuy(target, profile);
-+      } else if (cart.length) {
-+        await prepareCheckout(profile);
+-      const normalized = normalizeOrderResponse(response, {page: pageValue, pageSize: pageSizeValue});
+-      setResult(normalized);
+-      resultContext.current = nextContext;
+-      setCaptcha(null);
+-      setCaptchaCode('');
+-      setHasQueried(true);
+-      setQueriedAt(new Date());
+-      if (!quiet) notify({type: 'success', title: '订单查询完成', message: `已获取 ${normalized.pagination.total} 笔订单`, duration: 4200});
++      const normalized = commitSearchResponse(response, {keywords: normalizedKeywords, status: statusValue, page: pageValue, pageSize: pageSizeValue, quiet});
+       return true;
+     } catch (requestError) {
+       if (version !== requestVersion.current) return false;
+       clearStaleResult();
++      if (requestError.code === 'waf_verification_required' || requestError.payload?.code === 'waf_verification_required') {
++        setError('');
++        setWafVerification({status: 'required', detail: requestError.message || '订单接口触发阿里云 WAF 验证'});
++        notify({type: 'warning', title: '需要完成浏览器验证', message: '订单接口返回 403，打开 Edge 完成阿里云 WAF 滑块后继续', duration: 7000});
++        return false;
 +      }
-+      return profile;
-+    } catch (error) {
-+      notify(error.message, 'error');
-+      return null;
+       setError(requestError.message || '订单查询失败');
+       notify(requestError.message || '订单查询失败', 'error');
+       return false;
+@@ -1143,6 +1178,44 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+ 
+   runSearchRef.current = runSearch;
+ 
++  const runOrderWafVerification = async phase => {
++    const requestSpec = wafRequestRef.current;
++    if (!requestSpec || !sessionId || !submittedKeywords || wafBusy || busy) return false;
++    setWafBusy(phase);
++    try {
++      const response = await request(`/order-query/waf-verification/${phase}`, {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify({...requestSpec, session_id: sessionId, keywords: submittedKeywords}),
++      });
++      if (response.status === 'awaiting_verification') {
++        setWafVerification({status: 'awaiting_verification', detail: response.detail || '请在 Edge 窗口完成滑块验证'});
++        notify({type: 'info', title: 'Edge 验证已打开', message: '完成滑块后点击“验证完成并继续查询”', duration: 6000});
++        return false;
++      }
++      commitSearchResponse(response, {
++        keywords: requestSpec.keywords,
++        status: requestSpec.status,
++        page: requestSpec.page,
++        pageSize: requestSpec.page_size,
++      });
++      return true;
++    } catch (requestError) {
++      if (requestError.status === 410) {
++        setSessionId('');
++        setVerification(null);
++        setExpiresIn(0);
++        setWafVerification(null);
++      } else {
++        setWafVerification({status: 'required', detail: requestError.message || '浏览器验证未完成，请重试'});
++      }
++      notify(requestError.message || '浏览器验证未完成', 'error');
++      return false;
++    } finally {
++      setWafBusy('');
 +    }
 +  };
 +
-   const openOfficial = async item => {
-     window.open(item.official_url, '_blank', 'noopener,noreferrer');
-     const lines = [
-@@ -2999,7 +3083,7 @@ function App() {
+   const submitSearch = event => {
+     event.preventDefault();
+     runSearch({keywordValue: keywords, pageValue: 1, reuseSession: !manualRequired});
+@@ -1623,6 +1696,10 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
+         onRefresh={() => runSearch({refreshCaptcha: true, quiet: true})}
+         onSubmit={submitManualCaptcha}
+         expiresIn={expiresIn}
++        waf={wafVerification}
++        wafBusy={wafBusy}
++        onStartWaf={() => runOrderWafVerification('start')}
++        onCompleteWaf={() => runOrderWafVerification('complete')}
+       />
+     </section>
  
-               </section>
- 
--              <PurchasePanel items={items} cart={cart} setCart={setCart} totalCart={totalCart} estimatedTotal={estimatedTotal} setQuantity={setQuantity} contact={contact} setContact={setContact} saveCheckout={saveCheckout} queryPassword={queryPassword} setQueryPassword={setQueryPassword} passwordVisible={passwordVisible} setPasswordVisible={setPasswordVisible} paymentChannel={paymentChannel} setPaymentChannel={setPaymentChannel} prepareCheckout={prepareCheckout} busy={busy}/>
-+              <PurchasePanel items={items} cart={cart} setCart={setCart} totalCart={totalCart} estimatedTotal={estimatedTotal} setQuantity={setQuantity} contact={contact} setContact={setContact} saveCheckout={saveCheckout} queryPassword={queryPassword} setQueryPassword={setQueryPassword} passwordVisible={passwordVisible} setPasswordVisible={setPasswordVisible} paymentChannel={paymentChannel} setPaymentChannel={setPaymentChannel} couponCode={couponCode} setCouponCode={setCouponCode} checkoutStorageMode={checkoutStorageMode} setCheckoutStorageMode={setCheckoutStorageMode} prepareCheckout={prepareCheckout} busy={busy}/>
-             </div>
-           </>
-         ) : activeView === 'history' ? (
-@@ -3021,7 +3105,7 @@ function App() {
-           />
-         ) : activeView === 'orders' ? (
-           <React.Suspense fallback={<FeatureLoadingState feature="订单查询界面" state={{status: 'loading'}}/>}>
--            <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact}/>
-+            <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact} checkoutProfile={savedCheckout} onSaveCheckout={async profile => { try { const saved = await persistCheckout(profile); notify(saved.storage_mode === 'browser' ? '购买配置已保存到浏览器缓存' : '购买配置已保存到本机'); } catch (error) { notify(error.message, 'error'); throw error; } }}/>
-           </React.Suspense>
-         ) : activeView === 'reclaim' ? featureLoadState.reclaim.status !== 'ready' ? (
-           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
-@@ -3063,6 +3147,7 @@ function App() {
-       <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={fetchOne} onDirect={openDirectProduct}/>
- 
-       {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
-+      {checkoutPrompt && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setCheckoutPrompt(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="完善购买配置"><div className="modal-head"><div><span>CHECKOUT PROFILE</span><h2>完善购买配置</h2></div><IconButton label="关闭" onClick={() => setCheckoutPrompt(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>购买前需要联系方式{checkoutPrompt.requiresPassword ? '和安全密码' : ''}，支付渠道与优惠券可按商品支持情况使用。</p></div><div className="purchase-form"><label><span>联系方式</span><input value={contact.contact} onChange={event => setContact({...contact, contact: event.target.value})} placeholder="邮箱、手机号或其他联系方式" autoComplete="email"/></label>{checkoutPrompt.requiresPassword && <label><span>安全密码</span><input type={passwordVisible ? 'text' : 'password'} value={queryPassword} onChange={event => setQueryPassword(event.target.value)} placeholder="用于查询订单详情" autoComplete="off"/></label>}<label><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><label><span>优惠券 <small>可选</small></span><input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="输入优惠券码" autoComplete="off"/></label><label><span>配置保存位置</span><select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select></label></div><div className="modal-foot"><span><ShieldCheck size={14}/>保存后会用于后续购买和订单查询</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setCheckoutPrompt(null)}>取消</button><button className="button official" onClick={submitCheckoutPrompt}><Save size={15}/>保存并继续</button></div></div></div></div>}
-       {review && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setReview(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="购买确认"><div className="modal-head"><div><span>DIRECT CHECKOUT</span><h2>支付链接已准备</h2></div><IconButton label="关闭" onClick={() => setReview(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>{review.notice} 创建成功后会自动打开支付页面；下方仍保留“打开支付链接”入口，方便重复打开。</p></div><div className="review-list">{review.items.map(item => <div className="review-item" key={item.watch_id}><div><strong>{item.title}</strong><span>{money(item.unit_price)} × {item.quantity}</span><a className="payment-link" href={item.official_url} target="_blank" rel="noreferrer"><Link2 size={13}/>{item.official_url}</a></div><strong>{money(item.subtotal)}</strong><div className="review-actions"><button className="button secondary" onClick={() => copyPaymentLink(item)}><Clipboard size={15}/>复制商品链接</button></div></div>)}</div>{officialOrder && <div className="payment-order-result"><div><span>官方订单</span><strong>{officialOrder.trade_no}</strong></div><a href={officialOrder.payment_url} target="_blank" rel="noreferrer"><Link2 size={14}/>{officialOrder.payment_url}</a><small>{officialOrder.notice} 渠道：{officialOrder.channel === 'alipay' ? '支付宝' : '微信支付'}，金额：{money(officialOrder.amount)}</small><button className="button official" onClick={() => window.open(officialOrder.payment_url, '_blank', 'noopener,noreferrer')}><ArrowUpRight size={15}/>打开支付链接</button></div>}<div className="review-total"><span>清单合计</span><strong>{money(review.total)}</strong></div><div className="modal-foot"><span><ShieldCheck size={14}/>支付前请核对订单金额</span><div className="modal-foot-actions"><label className="payment-channel"><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><button className="button official auto-pay-button" onClick={createOfficialOrder} disabled={busy.officialOrder}><Package size={15}/>{busy.officialOrder ? '正在创建并跳转' : '创建订单并自动跳转'}</button><button className="button secondary" onClick={() => setReview(null)}>返回修改</button></div></div></div></div>}
-       {toast && <div className={`toast ${toast.type} ${toast.sections?.length ? 'detailed' : ''}`} role={toast.type === 'error' ? 'alert' : 'status'} aria-live={toast.type === 'error' ? 'assertive' : 'polite'} aria-atomic="true" key={toast.id}>
-         <span className="toast-icon">{toast.type === 'error' ? <AlertCircle size={18}/> : toast.type === 'warning' ? <TriangleAlert size={18}/> : toast.type === 'info' ? <BellRing size={18}/> : <Check size={18}/>}</span>
-@@ -3082,7 +3167,7 @@ function App() {
-   );
- }
- 
--function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuantity, contact, setContact, saveCheckout, queryPassword, setQueryPassword, passwordVisible, setPasswordVisible, paymentChannel, setPaymentChannel, prepareCheckout, busy}) {
-+function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuantity, contact, setContact, saveCheckout, queryPassword, setQueryPassword, passwordVisible, setPasswordVisible, paymentChannel, setPaymentChannel, couponCode, setCouponCode, checkoutStorageMode, setCheckoutStorageMode, prepareCheckout, busy}) {
-   const requiresPassword = cart.some(entry => items.find(item => item.id === entry.watch_id)?.latest?.query_password_required);
-   return (
-     <aside className="purchase-panel">
-@@ -3149,7 +3234,18 @@ function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuan
-         <div><span>预计合计</span><strong>{money(estimatedTotal)}</strong></div>
-       </div>
-       <button className="button checkout" onClick={prepareCheckout} disabled={!cart.length || busy.checkout}><ShieldCheck size={17}/>{busy.checkout ? '正在校验' : '核对并打开支付链接'}</button>
--      <p className="local-note"><ShieldCheck size={14}/>配置保存在本机 SQLite；商品不要求密码时不会提交密码</p>
-+      <label>
-+        <span>优惠券 <small>商品支持时生效</small></span>
-+        <input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="可选，输入优惠券码" autoComplete="off"/>
-+      </label>
-+      <label>
-+        <span>配置保存位置</span>
-+        <select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}>
-+          <option value="local">本机数据库</option>
-+          <option value="browser">浏览器缓存</option>
-+        </select>
-+      </label>
-+      <p className="local-note"><ShieldCheck size={14}/>联系方式与安全密码会按所选位置保存，商品不要求密码时不会提交密码</p>
-     </aside>
-   );
- }
 diff --git a/frontend/src/orderQuery.css b/frontend/src/orderQuery.css
-index e42d008..130b702 100644
+index 82ae2b8..f3006df 100644
 --- a/frontend/src/orderQuery.css
 +++ b/frontend/src/orderQuery.css
-@@ -80,6 +80,13 @@
- .order-query-source span { display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-faint); }
- .order-query-source strong { color: var(--ui-text-muted); font-weight: 650; }
- .order-query-source em { min-width: 0; margin-left: auto; overflow: hidden; color: var(--ui-text-faint); font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
-+.order-query-badge { display: inline-flex !important; align-items: center; gap: 5px; padding: 6px 9px; color: var(--ui-success) !important; background: color-mix(in srgb, var(--ui-success) 8%, var(--ui-surface)); border: 1px solid color-mix(in srgb, var(--ui-success) 25%, var(--ui-border)); font-size: 10px !important; font-weight: 700 !important; white-space: nowrap; }
-+.order-profile-form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--ui-border-soft); }
-+.order-profile-form > div { display: grid; grid-template-columns: auto minmax(120px, 1fr) minmax(120px, 1fr) 130px auto; gap: 7px; align-items: center; }
-+.order-profile-form > div > span { color: var(--ui-text-muted); font-size: 10px; font-weight: 700; }
-+.order-profile-form input, .order-profile-form select { min-width: 0; height: 34px; padding: 0 9px; color: var(--ui-text); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 4px; font-size: 11px; }
-+.order-profile-form .button { min-height: 34px; white-space: nowrap; }
-+.order-profile-form > small { display: block; margin-top: 6px; color: var(--ui-text-faint); font-size: 9px; }
- .order-query-error { min-height: 36px; margin-top: 10px; padding: 8px 10px; display: flex; align-items: center; gap: 8px; color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 7%, var(--ui-surface)); border-left: 3px solid var(--ui-danger); font-size: 10px; }
- .order-query-error span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
- .order-query-error button { border: 0; padding: 3px 5px; color: inherit; background: transparent; font-weight: 700; }
-@@ -428,6 +435,9 @@ body.order-complaint-open .toast { display: none; }
-   .order-search-form .button { width: 100%; }
-   .order-query-source { align-items: flex-start; flex-wrap: wrap; }
-   .order-query-source em { width: 100%; margin-left: 0; }
-+  .order-profile-form > div { grid-template-columns: 1fr 1fr; }
-+  .order-profile-form > div > span { grid-column: 1 / -1; }
-+  .order-profile-form .button { width: 100%; }
-   .order-verification-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@@ -114,6 +114,16 @@
+ .order-captcha-form .button { min-height: 38px; white-space: nowrap; }
+ .order-captcha-form > small { grid-column: 1 / -1; color: var(--ui-text-faint); font-size: 9px; }
+ 
++.order-verification.waf-required { background: color-mix(in srgb, var(--ui-warning) 4%, var(--ui-surface-muted)); }
++.order-waf-panel { margin-top: 14px; padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid color-mix(in srgb, var(--ui-warning) 35%, var(--ui-border)); background: var(--ui-surface); }
++.order-waf-copy { min-width: 0; display: flex; align-items: center; gap: 10px; }
++.order-waf-copy > div { min-width: 0; display: grid; gap: 4px; }
++.order-waf-copy strong { color: var(--ui-text); font-size: 11px; }
++.order-waf-copy small { color: var(--ui-text-muted); font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }
++.order-waf-icon { width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center; color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 10%, var(--ui-surface)); border-radius: 50%; }
++.order-waf-actions { flex: 0 0 auto; }
++.order-waf-actions .button { min-height: 34px; white-space: nowrap; }
++
+ .order-results-panel { position: relative; min-width: 0; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; overflow: hidden; }
+ .order-results-panel.updating .order-table-wrap { opacity: .66; }
+ .order-results-head { min-height: 76px; padding: 17px 18px; align-items: center; }
+@@ -538,6 +548,8 @@ body.order-history-open { overflow: hidden; }
    .order-captcha-form { grid-template-columns: 1fr; }
    .order-captcha-form .button,
+   .order-captcha-form > small { grid-column: 1; }
++  .order-waf-panel { align-items: stretch; flex-direction: column; }
++  .order-waf-actions .button { width: 100%; }
+   .order-results-head { min-height: 70px; padding: 14px; align-items: flex-start; }
+   .order-results-head p { max-width: 190px; }
+   .order-results-actions label { display: none; }
+diff --git a/frontend/src/orderQueryModel.js b/frontend/src/orderQueryModel.js
+index f42c7b0..2874485 100644
+--- a/frontend/src/orderQueryModel.js
++++ b/frontend/src/orderQueryModel.js
+@@ -518,5 +518,6 @@ export function verificationLabel(verification = {}) {
+   if (verification?.status !== 'verified') return '等待查询';
+   if (verification?.mode === 'manual') return '手工验证通过';
+   if (verification?.mode === 'session') return '会话验证有效';
++  if (verification?.mode === 'browser') return '浏览器验证通过';
+   return '自动识别通过';
+ }
