@@ -1,5 +1,0 @@
-MODIFIED_FILE -text
-ROLLBACK_BASELINE -text
-DIFF_FILE -text
-VERIFICATION.txt text eol=crlf
-ROLLBACK.sh text eol=lf

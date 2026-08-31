@@ -16,5 +16,11 @@ frontend/dist/
 
 # Local captures, archives, and verification output
 artifacts/
+/DIFF_FILE
+/VERIFICATION.txt
+/MODIFIED_FILE
+/ROLLBACK_BASELINE
+/ROLLBACK.sh
+/acceptance-account-fix.db
 *.zip
 grab_*.txt
