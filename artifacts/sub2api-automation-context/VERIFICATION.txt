@@ -55,3 +55,19 @@ Literal output/result: Restored rollback-test-main.py; restored SHA256 65F924849
 Exit status: 0
 
 Restored behavior/status: rollback-test-main.py matches ROLLBACK_BASELINE while MODIFIED_FILE remains modified.
+
+MAIN INTEGRATION
+Command: python -m unittest discover -s backend -p 'test*.py' -q with a temporary LDXP_DB_PATH
+Input: E:\soft\java\ldxp at main commit 00abf35
+Literal output/result: Ran 179 tests in 1.454s; OK
+Exit status: 0
+
+Command: npm test; npm run build
+Input: E:\soft\java\ldxp\frontend at main commit 00abf35
+Literal output/result: 42 tests passed; Vite transformed 2386 modules and built successfully
+Exit status: 0
+
+Command: GET http://127.0.0.1:8000/api/health; GET http://127.0.0.1:5173/
+Input: running local main services
+Literal output/result: api_health_ok=True; frontend_status=200
+Exit status: 0
