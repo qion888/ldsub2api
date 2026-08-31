@@ -33,7 +33,7 @@ Sub2API 导入：
 ## 运行要求
 
 - Windows PowerShell；
-- 可用的 `python`、`npm` 命令；
+- 可联网安装依赖；脚本会自动检查并引导安装 Python、Node.js/npm；
 - 能访问链动小铺及已配置的 401 找回/Sub2API 服务；
 - 使用 WAF 验证功能时，系统需要安装 Edge，Selenium 会使用独立浏览器会话。
 
@@ -45,6 +45,19 @@ Sub2API 导入：
 
 ```powershell
 .\start.ps1
+```
+
+首次运行会检查 Python 3.10-3.13、Node.js LTS、npm 及项目依赖。缺少 Python 或 Node.js 时，脚本会用中文询问是否通过 `winget` 自动安装；直接回车即可确认。也可使用以下参数：
+
+```powershell
+# 自动确认并安装缺失依赖
+.\start.ps1 -AutoInstall
+
+# 只安装/检查依赖，不启动服务
+.\start.ps1 -AutoInstall -BootstrapOnly
+
+# 不允许自动安装，缺少运行环境时直接显示手动安装地址
+.\start.ps1 -SkipInstall
 ```
 
 脚本会自动：
