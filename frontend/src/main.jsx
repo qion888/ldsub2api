@@ -1304,6 +1304,12 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   useEffect(() => {
     const feature = activeView === 'reclaim' || activeView === 'sub2api' ? activeView : null;
     if (!feature || featureLoadState[feature].status !== 'idle') return undefined;
+    // A permission change can render this effect once before the navigation
+    // guard switches away from a now-inaccessible view. Avoid issuing a
+    // request that would immediately expire the user's session.
+    if ((feature === 'reclaim' && !canUseReclaim) || (feature === 'sub2api' && !canUseSub2Api)) {
+      return undefined;
+    }
     FEATURE_MODULE_LOADERS[feature]();
     setFeatureStatus(feature, 'loading');
     const loadFeatureData = async () => {
@@ -1317,14 +1323,17 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         } else {
           const [redeem, config, automationResult] = await Promise.all([
             canUseReclaim && !redeemConfigLoaded.current ? request('/redeem/config') : Promise.resolve(null),
-            request('/sub2api/config'),
-            canConfigure ? request('/sub2api/automation') : Promise.resolve({state: null}),
+            // External ordinary users can import through the server-side
+            // configuration, but must not depend on the admin configuration
+            // endpoint just to render the import surface.
+            canManageMonitor ? request('/sub2api/config') : Promise.resolve(null),
+            canManageMonitor ? request('/sub2api/automation') : Promise.resolve({state: null}),
           ]);
           if (redeem) {
             setRedeemConfig(redeem);
             redeemConfigLoaded.current = true;
           }
-          setSub2apiConfig(config);
+          if (config) setSub2apiConfig(config);
           setSub2apiAutomationState(automationResult.state || null);
           if (automationResult.settings) {
             setSub2apiAutomation(automationResult.settings);
