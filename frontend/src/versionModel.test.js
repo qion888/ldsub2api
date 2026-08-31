@@ -24,6 +24,8 @@ test('normalizes update metadata and safe GitHub links', () => {
   assert.equal(info.latest_short_commit, 'bbbbbbbb');
   assert.equal(info.repository_url, 'https://github.com/qion888/ldsub2api');
   assert.equal(info.ahead_by, 3);
+  assert.equal(info.remote_ahead_by, 3);
+  assert.equal(info.local_ahead_by, 0);
   assert.equal(info.update_ready, true);
   assert.equal(versionStatusLabel(info), '发现新版本');
 });

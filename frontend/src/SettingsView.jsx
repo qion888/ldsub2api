@@ -499,7 +499,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
             </div>
             <div className="version-meta-grid">
               <div><small>运行分支</small><strong>{versionInfo.branch || 'detached HEAD'}</strong><span>目标 {versionInfo.target_branch}</span></div>
-              <div><small>GitHub 最新</small><strong>{versionInfo.latest_version ? `v${versionInfo.latest_version.replace(/^v/i, '')}` : '尚未检查'}</strong><span>{versionInfo.latest_short_commit || '点击检查更新'}</span></div>
+              <div><small>GitHub 最新</small><strong>{versionInfo.latest_version ? `v${versionInfo.latest_version.replace(/^v/i, '')}` : '尚未检查'}</strong><span>{versionInfo.latest_short_commit || '点击检查更新'}{(versionInfo.remote_ahead_by || versionInfo.local_ahead_by) ? ` · 远端 +${versionInfo.remote_ahead_by} / 本地 +${versionInfo.local_ahead_by}` : ''}</span></div>
               <div><small>工作树</small><strong>{versionInfo.worktree_clean ? '干净' : `${versionInfo.dirty_file_count} 项改动`}</strong><span>{versionInfo.repository_matches ? '更新源已核对' : '更新源不一致'}</span></div>
               <div><small>更新方式</small><strong>GitHub 快进更新</strong><span>仅允许 fast-forward</span></div>
             </div>
