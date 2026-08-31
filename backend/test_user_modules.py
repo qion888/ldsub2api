@@ -278,3 +278,41 @@ class MainUserRouteTests(unittest.TestCase):
             self.assertEqual(admin_read_status, 200)
             self.assertEqual(admin_read["contact"], "admin@example.test")
             self.assertEqual(admin_read["query_password"], "admin-secret")
+
+    def test_authenticated_user_can_change_own_password_and_old_session_is_revoked(self):
+        with patch.object(main, "database", side_effect=lambda: isolated_database(self.path)):
+            main.init_database()
+            setup_status, setup = self.request_api(
+                "POST",
+                "/api/install/setup",
+                {"username": "admin", "password": "password123", "mode": "external"},
+            )
+            self.assertEqual(setup_status, 200)
+            reader = main.USER_SERVICE.create_user({"username": "reader", "password": "reader123"})
+            reader_login = main.USER_SERVICE.login({"username": "reader", "password": "reader123"})
+            headers = {"Authorization": f"Bearer {reader_login['token']}"}
+
+            wrong_status, wrong = self.request_api(
+                "POST",
+                "/api/auth/password",
+                {"current_password": "wrong-pass", "password": "reader456"},
+                headers=headers,
+            )
+            self.assertEqual(wrong_status, 401)
+            self.assertEqual(wrong["code"], "invalid_credentials")
+
+            changed_status, changed = self.request_api(
+                "POST",
+                "/api/auth/password",
+                {"current_password": "reader123", "password": "reader456"},
+                headers=headers,
+            )
+            self.assertEqual(changed_status, 200)
+            self.assertEqual(changed["user_id"], reader["user"]["id"])
+
+            old_me_status, old_me = self.request_api("GET", "/api/auth/me", headers=headers)
+            self.assertEqual(old_me_status, 200)
+            self.assertFalse(old_me["authenticated"])
+
+            new_login = main.USER_SERVICE.login({"username": "reader", "password": "reader456"})
+            self.assertTrue(new_login["authenticated"])

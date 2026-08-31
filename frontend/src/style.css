@@ -2809,6 +2809,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .settings-form-grid label > span { display: block; }
 .settings-actions { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; }
 .settings-note, .settings-mode-callout { margin-top: 15px; padding: 10px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 4px; font-size: 11px; line-height: 1.5; }
+.password-form { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--ui-border-soft); }
+.password-form-head { min-height: 30px; }
 .settings-mode-callout { display: flex; align-items: center; gap: 7px; }
 .settings-mode-callout svg { flex: 0 0 auto; color: var(--ui-success); }
 .profile-card { margin-top: 16px; padding: 13px; display: flex; align-items: center; gap: 10px; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 4px; }
