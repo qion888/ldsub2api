@@ -1,0 +1,35 @@
+TASK: Verify that a user copy can update from an older release to the latest GitHub main commit.
+BRANCH: main (live test fixture cloned from https://github.com/qion888/ldsub2api.git)
+CHANGED_FIELDS: VERSION 2.1.0 -> 2.1.1; Git HEAD 193e336 -> 84f0466; SQLite data preservation
+REMOTE_CHECK: GitHub main 84f0466b9fd11219a19970e98eab3e836fd8283a, VERSION 2.1.1, commit message "Update version"
+
+ARTIFACTS
+- MODIFIED_FILE: E:\soft\java\ldxp\artifacts\version-update-live\MODIFIED_FILE
+- DIFF_FILE: E:\soft\java\ldxp\artifacts\version-update-live\DIFF_FILE
+- VERIFICATION.txt: E:\soft\java\ldxp\artifacts\version-update-live\VERIFICATION.txt
+- ROLLBACK.sh: E:\soft\java\ldxp\artifacts\version-update-live\ROLLBACK.sh
+- ROLLBACK_BASELINE: E:\soft\java\ldxp\artifacts\version-update-live\ROLLBACK_BASELINE
+
+BASELINE
+Command: git -C <live-test-repo> checkout -B main 193e336; python -c "create backend/monitor.db with settings=before-update"
+Input: real GitHub clone; origin=https://github.com/qion888/ldsub2api.git; user HEAD=193e336c7271a0573b33ae238342fd965bc8dc90; VERSION=2.1.0; clean worktree
+Literal output/result: HEAD=193e336c7271a0573b33ae238342fd965bc8dc90; VERSION=2.1.0; status output empty
+Exit status: 0
+
+MODIFIED
+Command: python - <live-test-repo> (VersionControlService.install_update)
+Input: RepositoryConfig(repository_url=https://github.com/qion888/ldsub2api.git, branch=main, remote=origin)
+Literal output/result: {"backup_id":"20260831T112246Z-4aae4106","database_value":"before-update","latest_commit":"84f0466b9fd11219a19970e98eab3e836fd8283a","needs_restart":true,"previous_commit":"193e336c7271a0573b33ae238342fd965bc8dc90","previous_version":"2.1.0","status":"updated","updated":true,"updated_version":"2.1.1"}
+Exit status: 0
+
+Command: git -C <live-test-repo> rev-parse HEAD; Get-Content VERSION; git status --porcelain --untracked-files=all
+Input: updated live-test-repo
+Literal output/result: HEAD=84f0466b9fd11219a19970e98eab3e836fd8283a; VERSION=2.1.1; status output empty
+Exit status: 0
+
+ROLLBACK
+Command: Copy-Item MODIFIED_FILE ROLLBACK_TEST_COPY; Copy-Item ROLLBACK_BASELINE ROLLBACK_TEST_COPY
+Input: separate copy E:\soft\java\ldxp\artifacts\version-update-live\ROLLBACK_TEST_COPY
+Literal output/result: BEFORE=7b3ff271f1373cfb97e9e53349794e1450f3794e4c0788c54a2060c7596da821; BASELINE=c89b87c262e9d5ffd20e73aac74a1772adcc9f5a21682cc33adcf5086e5fef5c; AFTER=c89b87c262e9d5ffd20e73aac74a1772adcc9f5a21682cc33adcf5086e5fef5c; RESTORED=True
+Exit status: 0
+Restored behavior/status: rollback copy matches ROLLBACK_BASELINE; MODIFIED_FILE remains 2.1.1 and changed.
