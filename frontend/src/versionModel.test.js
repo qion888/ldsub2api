@@ -51,6 +51,13 @@ test('preserves restart status after a completed update', () => {
   assert.equal(versionStatusLabel(info), '等待重启');
 });
 
+test('identifies a GitHub download installation without treating it as a git checkout', () => {
+  const info = normalizeVersionInfo({installation_mode: 'archive', branch: 'main', can_update: true});
+  assert.equal(info.installation_mode, 'archive');
+  assert.equal(info.branch, 'main');
+  assert.equal(info.can_update, true);
+});
+
 test('normalizes database compatibility, backup history, and rollback metadata', () => {
   const info = normalizeVersionInfo({
     database: {
