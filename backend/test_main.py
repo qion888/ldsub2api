@@ -1247,6 +1247,42 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(submitted[0][0][0], "team-EXAMPLE-401-CARD")
         self.assertNotIn("user401", submitted[0][0])
 
+    def test_sub2api_reclaim_wrappers_accept_automation_attempt_context(self):
+        captured = []
+
+        def fake_reclaim(**kwargs):
+            captured.append(("reclaim", kwargs))
+            return {"ok": True, "attempt_counts": {"team-CARD-1": 1}}
+
+        def fake_retry(codes, **kwargs):
+            captured.append(("retry", codes, kwargs))
+            return {"ok": True, "attempt_counts": {"team-CARD-1": 2}}
+
+        with patch.object(main, "sub2api_settings", return_value={"admin_key": "secret"}), \
+             patch.object(main, "_persist_sub2api_reclaim_attempts"), \
+             patch.object(main.sub2api_reclaim, "reclaim_401_accounts", side_effect=fake_reclaim), \
+             patch.object(main.sub2api_reclaim, "retry_reclaim", side_effect=fake_retry):
+            main.reclaim_sub2api_401_accounts(
+                exclude_order_nos=[],
+                attempt_counts={"team-CARD-1": 1},
+                max_reclaim_attempts=2,
+                exclude_card_codes=["team-CARD-BLOCKED"],
+            )
+            main.retry_sub2api_401_accounts(
+                ["team-CARD-1"],
+                exclude_order_nos=[],
+                attempt_counts={"team-CARD-1": 1},
+                max_reclaim_attempts=2,
+                exclude_card_codes=["team-CARD-BLOCKED"],
+            )
+
+        self.assertEqual(captured[0][0], "reclaim")
+        self.assertEqual(captured[0][1]["attempt_counts"], {"team-CARD-1": 1})
+        self.assertEqual(captured[0][1]["max_reclaim_attempts"], 2)
+        self.assertEqual(captured[0][1]["exclude_card_codes"], ["team-CARD-BLOCKED"])
+        self.assertEqual(captured[1][0], "retry")
+        self.assertEqual(captured[1][2]["attempt_counts"], {"team-CARD-1": 1})
+
     def test_sub2api_401_reclaim_route_accepts_legacy_alias_and_surfaces_failure(self):
         handler = object.__new__(main.ApiHandler)
         handler.path = "/api/sub2api/reclaim401"
