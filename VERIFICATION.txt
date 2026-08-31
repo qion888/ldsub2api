@@ -1,41 +1,47 @@
-ORDER QUERY CAPTCHA OCR VERIFICATION
+ORDER QUERY WAF BUTTON VERIFICATION
 
 Changed branch/field:
-- branch: main at 239c947 (from codex/order-waf-fix lineage)
-- fields: CaptchaRecognizer default model selection; legacy ddddocr model for chain-store captcha noise; compatibility fallback
+- branch: main at 80d71ed
+- fields: WAF 409 session context, browser-verification start payload, WAF handling during captcha/list requests, and stale-session button feedback
+- behavior: WAF responses now return session_id, expires_in, and waf_request so “打开浏览器验证” can start the Edge flow
 
 Artifacts:
-- MODIFIED_FILE: tar archive of captcha OCR source and tests at 239c947
-- DIFF_FILE: binary git diff from baseline 0ebda1d to 239c947
+- MODIFIED_FILE: tar archive of changed files at 80d71ed
+- DIFF_FILE: binary git diff from baseline 8c31ab8 to 80d71ed
 - VERIFICATION.txt: this acceptance record
 - ROLLBACK.sh: executable PowerShell rollback script
 
 BASELINE
 Command: .runtime\python\Scripts\python.exe -m unittest discover -s backend -p 'test*.py' -q
-Input: baseline worktree at commit 0ebda1d
-Literal output/result: Ran 173 tests in 1.637s; OK
+Input: baseline worktree at commit 8c31ab8
+Literal output/result: Ran 176 tests in 1.461s; OK
 Exit status: 0
 
 Command: npm ci --ignore-scripts; npm test; npm run build
-Input: frontend directory in baseline worktree at commit 0ebda1d
+Input: frontend directory in baseline worktree at commit 8c31ab8
 Literal output/result: 42 tests passed; Vite transformed 2386 modules and built successfully.
 Exit status: 0
 
 MODIFIED
 Command: .runtime\python\Scripts\python.exe -m unittest discover -s backend -p 'test*.py' -q
-Input: main branch at commit 239c947
-Literal output/result: Ran 175 tests in 1.864s; OK
+Input: main branch at commit 80d71ed with an isolated LDXP_DB_PATH
+Literal output/result: Ran 178 tests in 1.226s; OK
 Exit status: 0
 
 Command: npm test; npm run build
-Input: frontend directory on main at commit 239c947
+Input: frontend directory on main at commit 80d71ed
 Literal output/result: 42 tests passed; Vite transformed 2386 modules and built successfully.
 Exit status: 0
 
-ROLLBACK
-Command: powershell -ExecutionPolicy Bypass -File .runtime\ROLLBACK-captcha-test.ps1 -TargetRoot .runtime\rollback-test-captcha-20260831
-Input: copy populated from MODIFIED_FILE, with ROLLBACK_BASELINE beside the script
-Literal output/result: Restored .runtime\rollback-test-captcha-20260831; verified 2 files
+Command: .runtime\python\Scripts\python.exe -m compileall -q backend
+Input: main branch at commit 80d71ed
+Literal output/result: backend compilation completed successfully.
 Exit status: 0
 
-Rollback restored both baseline SHA256 values. The main working tree remains on 239c947 with legacy OCR enabled; MODIFIED_FILE remains the changed archive.
+ROLLBACK
+Command: powershell -ExecutionPolicy Bypass -File .runtime\ROLLBACK-order-waf-context-test.ps1 -TargetRoot .runtime\rollback-test-order-waf-context-20260831
+Input: copy populated from MODIFIED_FILE, with ROLLBACK_BASELINE beside the script
+Literal output/result: Restored .runtime\rollback-test-order-waf-context-20260831; verified 5 files
+Exit status: 0
+
+Rollback restored all five baseline SHA256 values. The main working tree remains on 80d71ed with WAF session context applied; MODIFIED_FILE remains the changed archive.

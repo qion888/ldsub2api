@@ -9,8 +9,11 @@ if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw "Missing roll
 tar -xf $archive -C $target
 if ($LASTEXITCODE -ne 0) { throw "Rollback archive extraction failed with exit $LASTEXITCODE" }
 $expected = @{
-  'backend/order_query/captcha.py' = '73233DF1A3C1BC44CE491C2D2A1DEE2B6BC2BD5CBC5690B6434863E0A228AAD5'
-  'backend/test_order_query_modules.py' = '104B41662AAF9FA11842BDDFA7AFEEFB575EE7A465F1C16DB5823D2A4DC470C0'
+  'backend/order_query/errors.py' = '79DA405F53ABBC84EC62A3CB106D5CD1AF2D62646961784348A319EACC372B2D'
+  'backend/order_query/routes.py' = '40EBA2ED68D59897F56DB531AF51FD51347C60C6C27832A51F123A0F6804FB92'
+  'backend/order_query/service.py' = '6189A816B3F33DD04AB3A4961CDC58CD86E52936EB5FE98ACD0D6DAA445DF167'
+  'backend/test_order_query_modules.py' = '46D11BCECA94F2FC7B705A50A5C7709D3AF9B2A7630769B55CE611DB0C04F1D6'
+  'frontend/src/OrderQueryView.jsx' = '40D183A841AE2028C6D92409560716E7921409F68E9D9844E55B08E1EB96ED06'
 }
 foreach ($path in $expected.Keys) {
   $actualPath = Join-Path $target $path
