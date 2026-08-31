@@ -29,6 +29,10 @@ frontend/dist/
 **/__pycache__/
 *.py[cod]
 
+# Local test code and test output
+**/test_*.py
+**/*_test.py
+
 # Local captures, archives, and verification output
 artifacts/
 ui-*.png
