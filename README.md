@@ -95,6 +95,24 @@ Vite 会把 `/api` 请求代理到 `127.0.0.1:8000`。后端端口变更时，�
 $env:LDXP_API_TARGET = 'http://127.0.0.1:<backend-port>'
 ```
 
+## 版本更新
+
+管理员可在“系统设置 -> 版本与更新”查看当前版本、Git 提交、运行分支和工作树状态，并从 GitHub 检查或安装更新。自动更新只会在以下条件同时满足时执行：
+
+- 当前分支与目标分支一致；
+- 工作树没有未提交或未跟踪文件；
+- `origin` 与配置的 GitHub 仓库一致；
+- 远端提交可通过 fast-forward 合并。
+
+更新成功后需重启后端与前端服务。默认更新源为 `https://github.com/qion888/ldsub2api.git` 的 `main` 分支，可通过环境变量配置：
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `LDXP_UPDATE_REPOSITORY` | `https://github.com/qion888/ldsub2api.git` | GitHub 更新仓库 |
+| `LDXP_UPDATE_BRANCH` | `main` | 允许自动更新的目标分支 |
+| `LDXP_UPDATE_REMOTE` | `origin` | Git 远端名称 |
+| `LDXP_GITHUB_TOKEN` | 空 | GitHub API 令牌，可提高访问限额或读取私有仓库 |
+
 ## 主要功能
 
 ### 店铺和商品监控

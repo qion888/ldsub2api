@@ -30,6 +30,11 @@ _USER_PASSWORD = r"/api/users/(\d+)/password"
 _WATCH_HISTORY = re.compile(r"/api/watches/\d+/history$")
 _SHOP_PRODUCTS = re.compile(r"/api/shops/\d+/products$")
 _CARD_IMPORT_RECORD = re.compile(r"/api/sub2api/card-import-records(?:/\d+)?(?:/retry)?$")
+_VERSION_PATHS = frozenset({
+    "/api/version",
+    "/api/version/check",
+    "/api/version/update",
+})
 
 AUTH_BOOTSTRAP_GET = frozenset({
     "/api/health",
@@ -68,7 +73,7 @@ USER_IMPORT_EXACT = frozenset({
 def _self_use_guest_legacy(method: str, path: str) -> bool:
     """Keep local legacy APIs open while retaining the new admin boundary."""
     method = method.upper()
-    if path in {USERS_PATH, AUTH_PASSWORD_PATH, SETTINGS_SYSTEM_PATH}:
+    if path in {USERS_PATH, AUTH_PASSWORD_PATH, SETTINGS_SYSTEM_PATH} or path in _VERSION_PATHS:
         return False
     if re.fullmatch(_USER_ID, path) or re.fullmatch(_USER_PASSWORD, path):
         return False
