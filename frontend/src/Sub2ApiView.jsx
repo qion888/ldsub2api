@@ -556,7 +556,7 @@ function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false, 
   );
 }
 
-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName}) {
+export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName, onManualReclaim}) {
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -699,7 +699,11 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           </section>
           <section className="automation-activity-panel">
             <div className="activity-panel-head"><div><span className="detail-kicker">ACCOUNT ALERTS</span><h3>最近账号异常</h3></div><span>{monitor.error_accounts ?? 0} 个</span></div>
-            <div className="account-alert-list">{recentErrors.length ? recentErrors.map(account => <div key={account.id || account.name}><TriangleAlert size={15}/><span><strong>{account.name}</strong><small>{account.platform} · {account.error}</small></span><em>{account.status}</em></div>) : <div className="compact-empty"><ShieldCheck size={16}/>当前没有账号异常</div>}</div>
+            <div className="account-alert-list">{recentErrors.length ? recentErrors.map(account => {
+              const cardCode = String(account.card_code || '').trim();
+              const canReclaim = Boolean(account.is_401 && cardCode && onManualReclaim);
+              return <div key={account.id || account.name}><TriangleAlert size={15}/><span><strong>{account.name}</strong><small>{account.platform} · {account.error}</small></span><span className="account-alert-actions"><em>{account.is_401 ? '401' : account.status}</em>{canReclaim && <button className="button secondary account-alert-reclaim" type="button" onClick={() => onManualReclaim(account)} disabled={retryBusy} title={`手动找回 ${cardCode}`}>{retryBusy ? <RefreshCw size={12} className="spin"/> : <KeyRound size={12}/>}手动找回</button>}</span></div>;
+            }) : <div className="compact-empty"><ShieldCheck size={16}/>当前没有账号异常</div>}</div>
           </section>
         </div>
 

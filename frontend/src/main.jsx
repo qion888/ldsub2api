@@ -2541,6 +2541,27 @@ function App() {
 
   const retrySub2Api401 = () => retrySub2ApiReclaim(sub2apiReclaimResult, 'direct');
   const retrySub2ApiAutomation = () => retrySub2ApiReclaim(sub2apiAutomationRetryResult || sub2apiAutomationState?.last_result, 'automation');
+  const manualSub2ApiAccountReclaim = async account => {
+    const directCode = String(account?.card_code || '').trim();
+    const name = String(account?.name || '').trim();
+    const match = name.match(/(?:^|\s)([A-Za-z0-9][A-Za-z0-9-]{3,127})$/);
+    const cardCode = directCode || (match ? match[1] : '');
+    if (!cardCode) {
+      notify('该异常账号未找到可用卡密，请检查账号名称末尾是否包含卡密', 'error');
+      return;
+    }
+    await retrySub2ApiReclaim({
+      ok: true,
+      outcome: 'failed',
+      recovery_status: 'failed',
+      recovery_message: `手动找回账号：${name || cardCode}`,
+      reclaim_card_codes: [cardCode],
+      retryable_card_codes: [cardCode],
+      retry_available: true,
+      reclaim_summary: {active: 0, failed: 1},
+    }, 'direct');
+    await loadSub2ApiOptions({quiet: true});
+  };
 
   const saveSub2ApiAutomation = async () => {
     setSub2apiAutomationBusy(true);
@@ -3138,7 +3159,7 @@ function App() {
             onToggleGroup={toggleSub2ApiGroup} onFile={parseSub2ApiFile} onFiles={loadSub2ApiFiles} onImport={() => importSub2Api()}
             accountsData={sub2apiAccounts} accountFilters={sub2apiAccountFilters} onAccountFiltersChange={setSub2apiAccountFilters}
             accountBusy={sub2apiAccountBusy} accountError={sub2apiAccountError} accountActions={sub2apiAccountActions} testedAccounts={sub2apiTestedAccounts} accountRefresh={sub2apiAccountRefresh}
-            onLoadAccounts={loadSub2ApiAccounts} onRefreshAllAccounts={refreshAllSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount} onCopyAccountName={copySub2ApiAccountName}
+            onLoadAccounts={loadSub2ApiAccounts} onRefreshAllAccounts={refreshAllSub2ApiAccounts} onTestAccount={testSub2ApiAccount} onDeleteAccount={deleteSub2ApiAccount} onCopyAccountName={copySub2ApiAccountName} onManualReclaim={manualSub2ApiAccountReclaim}
             />
           </React.Suspense>
         )}

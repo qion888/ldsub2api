@@ -334,6 +334,11 @@ class Sub2ApiModuleTests(unittest.TestCase):
             "status": "error",
             "error_message": 'Authentication failed (401): {"code":"token_invalidated"}',
         }))
+        self.assertTrue(reclaim.account_is_401({
+            "status": "error",
+            "message": "provider response",
+            "extra": {"response": {"status": 401}},
+        }))
 
     def test_automation_settings_normalize_reclaim_attempt_limit(self) -> None:
         value = settings.read_automation_settings(lambda key, fallback: {

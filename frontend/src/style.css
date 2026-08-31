@@ -2282,6 +2282,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .account-alert-list strong { color: var(--ui-text); font-size: 9px; }
 .account-alert-list small { margin-top: 3px; color: var(--ui-text-muted); font-size: 8px; }
 .account-alert-list em { color: var(--ui-danger); font-size: 8px; font-style: normal; }
+.account-alert-actions { display: flex; align-items: center; gap: 6px; }
+.account-alert-reclaim { min-height: 24px; padding: 0 7px; gap: 4px; font-size: 9px; white-space: nowrap; }
 .automation-run-list .compact-empty, .account-alert-list .compact-empty { min-height: 55px; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--ui-text-faint); font-size: 9px; }
 
 /* Keep the Sub2API console compact without dropping below readable desktop type. */
@@ -2628,6 +2630,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .account-alert-list > div { min-height: 42px; padding: 6px 4px; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 7px; }
 .account-alert-list strong { font-size: 12px; }
 .account-alert-list small, .account-alert-list em { font-size: 11px; }
+.account-alert-reclaim { min-height: 28px; font-size: 11px; }
 .automation-run-list .compact-empty, .account-alert-list .compact-empty { min-height: 56px; font-size: 11px; }
 
 @media (max-width: 1200px) {
