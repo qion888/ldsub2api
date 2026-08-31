@@ -397,6 +397,54 @@ def _store_sub2api_automation_state(value: dict[str, Any]) -> None:
     _store_setting("sub2api_automation_state", value)
 
 
+def _sub2api_reclaim_attempt_context() -> tuple[dict[str, int], int, list[str]]:
+    try:
+        settings = sub2api_automation_settings()
+        state = sub2api_automation_state()
+    except sqlite3.OperationalError:
+        settings = {"max_reclaim_attempts": 3}
+        state = {}
+    attempts = state.get("reclaim_attempts") if isinstance(state.get("reclaim_attempts"), dict) else {}
+    normalized = {
+        str(code).strip(): max(0, int(count))
+        for code, count in attempts.items()
+        if str(code).strip() and str(count).strip().lstrip("-").isdigit()
+    }
+    try:
+        maximum = min(max(int(settings.get("max_reclaim_attempts") or 3), 1), 20)
+    except (TypeError, ValueError):
+        maximum = 3
+    limited = [
+        str(value).strip()
+        for value in state.get("attempt_limited_card_codes", [])
+        if str(value).strip()
+    ]
+    limited = list(dict.fromkeys(limited + [code for code, count in normalized.items() if count >= maximum]))
+    return normalized, maximum, limited
+
+
+def _persist_sub2api_reclaim_attempts(result: dict[str, Any]) -> None:
+    if not isinstance(result, dict) or not isinstance(result.get("attempt_counts"), dict):
+        return
+    try:
+        state = sub2api_automation_state()
+    except sqlite3.OperationalError:
+        return
+    attempts = {
+        str(code).strip(): max(0, int(count))
+        for code, count in result["attempt_counts"].items()
+        if str(code).strip() and str(count).strip().lstrip("-").isdigit()
+    }
+    limited = state.get("attempt_limited_card_codes") if isinstance(state.get("attempt_limited_card_codes"), list) else []
+    limited.extend(result.get("attempt_limited_card_codes") if isinstance(result.get("attempt_limited_card_codes"), list) else [])
+    state = {
+        **state,
+        "reclaim_attempts": attempts,
+        "attempt_limited_card_codes": list(dict.fromkeys(str(code).strip() for code in limited if str(code).strip()))[:100],
+    }
+    _store_sub2api_automation_state(state)
+
+
 def _store_setting(key: str, value: dict[str, Any]) -> None:
     monitor_setting_store.store_json(database, key, value)
 
@@ -611,7 +659,8 @@ def reclaim_sub2api_401_accounts(
 ) -> dict[str, Any]:
     if exclude_order_nos is None:
         exclude_order_nos = _sub2api_imported_order_nos()
-    return sub2api_reclaim.reclaim_401_accounts(
+    attempts, maximum, limited = _sub2api_reclaim_attempt_context()
+    result = sub2api_reclaim.reclaim_401_accounts(
         config=sub2api_settings(reveal=True),
         accounts_loader=_sub2api_fetch_accounts,
         redeem_client_factory=_redeem_client,
@@ -619,7 +668,12 @@ def reclaim_sub2api_401_accounts(
         max_payload_bytes=MAX_EXTERNAL_JSON_BYTES,
         include_downloads=include_downloads,
         exclude_order_nos=exclude_order_nos,
+        attempt_counts=attempts,
+        max_reclaim_attempts=maximum,
+        exclude_card_codes=limited,
     )
+    _persist_sub2api_reclaim_attempts(result)
+    return result
 
 
 def _sub2api_datetime(value: Any) -> datetime | None:
@@ -733,14 +787,20 @@ def retry_sub2api_401_accounts(
 ) -> dict[str, Any]:
     if exclude_order_nos is None:
         exclude_order_nos = _sub2api_imported_order_nos()
-    return sub2api_reclaim.retry_reclaim(
+    attempts, maximum, limited = _sub2api_reclaim_attempt_context()
+    result = sub2api_reclaim.retry_reclaim(
         card_codes,
         redeem_client_factory=_redeem_client,
         to_json=_dataclass_to_json,
         max_payload_bytes=MAX_EXTERNAL_JSON_BYTES,
         exclude_order_nos=exclude_order_nos,
         include_downloads=include_downloads,
+        attempt_counts=attempts,
+        max_reclaim_attempts=maximum,
+        exclude_card_codes=limited,
     )
+    _persist_sub2api_reclaim_attempts(result)
+    return result
 
 
 def persist_sub2api_automation_retry(result: dict[str, Any]) -> dict[str, Any]:
@@ -771,6 +831,16 @@ def persist_sub2api_automation_retry(result: dict[str, Any]) -> dict[str, Any]:
         for value in raw_retry_codes
         if str(value).strip() and str(value).strip() not in permanent_codes
     ][:100]
+    attempt_counts = result.get("attempt_counts") if isinstance(result.get("attempt_counts"), dict) else state.get("reclaim_attempts", {})
+    attempt_counts = {
+        str(code).strip(): max(0, int(count))
+        for code, count in attempt_counts.items()
+        if str(code).strip() and str(count).strip().lstrip("-").isdigit()
+    }
+    limited_codes = state.get("attempt_limited_card_codes") if isinstance(state.get("attempt_limited_card_codes"), list) else []
+    limited_codes.extend(result.get("attempt_limited_card_codes") if isinstance(result.get("attempt_limited_card_codes"), list) else [])
+    limited_codes = list(dict.fromkeys(str(code).strip() for code in limited_codes if str(code).strip()))[:100]
+    retry_codes = [code for code in retry_codes if code not in limited_codes]
     raw_submitted_codes = result.get("reclaim_card_codes")
     raw_submitted_codes = raw_submitted_codes if isinstance(raw_submitted_codes, list) else []
     submitted_codes = [
@@ -783,7 +853,9 @@ def persist_sub2api_automation_retry(result: dict[str, Any]) -> dict[str, Any]:
     active_codes = [
         str(value).strip()
         for value in raw_active_codes
-        if str(value).strip() and str(value).strip() not in permanent_codes
+        if str(value).strip()
+        and str(value).strip() not in permanent_codes
+        and str(value).strip() not in limited_codes
     ][:100]
     def _reclaim_count(value: Any) -> int:
         try:
@@ -833,7 +905,9 @@ def persist_sub2api_automation_retry(result: dict[str, Any]) -> dict[str, Any]:
         "reclaim_summary": reclaim_summary,
         "reclaim_failures": result.get("reclaim_failures") if isinstance(result.get("reclaim_failures"), list) else [],
         "retryable_card_codes": retry_codes,
-        "retry_available": bool(result.get("retry_available", retry_codes)),
+        "attempt_counts": attempt_counts,
+        "attempt_limited_card_codes": limited_codes,
+        "retry_available": bool(result.get("retry_available", bool(retry_codes)) and retry_codes),
         "import_status": result.get("import_status", "not_attempted"),
         "import_error": str(result.get("import_error") or "")[:500],
         "import_attempted": bool(result.get("import_attempted", False)),
@@ -847,6 +921,8 @@ def persist_sub2api_automation_retry(result: dict[str, Any]) -> dict[str, Any]:
         "last_result": compact_result,
         "pending_card_codes": pending,
         "retryable_card_codes": retry_codes,
+        "reclaim_attempts": attempt_counts,
+        "attempt_limited_card_codes": limited_codes,
         "run_history": (
             state.get("run_history", [])
             + [{
@@ -868,6 +944,7 @@ def run_sub2api_automation_cycle() -> dict[str, Any]:
         state_loader=sub2api_automation_state,
         refresh_reclaim=refresh_sub2api_reclaim,
         reclaim_accounts=reclaim_sub2api_401_accounts,
+        retry_reclaim=retry_sub2api_401_accounts,
         import_payload=_sub2api_import_payload,
         store_state=_store_sub2api_automation_state,
         now=utc_now,

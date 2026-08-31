@@ -32,6 +32,10 @@ def read_automation_settings(read_setting: ReadSetting) -> dict[str, Any]:
         interval = min(max(int(value.get("interval_seconds") or 300), 10), 86400)
     except (TypeError, ValueError):
         interval = 300
+    try:
+        max_reclaim_attempts = min(max(int(value.get("max_reclaim_attempts") or 3), 1), 20)
+    except (TypeError, ValueError):
+        max_reclaim_attempts = 3
     proxy_id = value.get("proxy_id")
     try:
         proxy_id = int(proxy_id) if proxy_id not in (None, "") else None
@@ -51,6 +55,7 @@ def read_automation_settings(read_setting: ReadSetting) -> dict[str, Any]:
         "enabled": bool(value.get("enabled", False)),
         "interval_seconds": interval,
         "auto_import": bool(value.get("auto_import", False)),
+        "max_reclaim_attempts": max_reclaim_attempts,
         "proxy_id": proxy_id,
         "group_ids": group_ids,
         "codex_fingerprint_mode": mode,
@@ -64,6 +69,8 @@ def read_automation_state(read_setting: ReadSetting) -> dict[str, Any]:
         "last_result": None,
         "pending_card_codes": [],
         "retryable_card_codes": [],
+        "reclaim_attempts": {},
+        "attempt_limited_card_codes": [],
         "imported_order_nos": [],
         "run_history": [],
     }
@@ -72,10 +79,23 @@ def read_automation_state(read_setting: ReadSetting) -> dict[str, Any]:
         return fallback
     pending = value.get("pending_card_codes")
     retryable = value.get("retryable_card_codes")
+    raw_attempts = value.get("reclaim_attempts")
+    attempts = {}
+    if isinstance(raw_attempts, dict):
+        for code, count in raw_attempts.items():
+            code = str(code).strip()
+            try:
+                count = max(0, int(count))
+            except (TypeError, ValueError):
+                continue
+            if code and count:
+                attempts[code[:160]] = count
+    limited = value.get("attempt_limited_card_codes")
     imported = value.get("imported_order_nos")
     history = value.get("run_history")
     pending = pending if isinstance(pending, list) else []
     retryable = retryable if isinstance(retryable, list) else []
+    limited = limited if isinstance(limited, list) else []
     imported = imported if isinstance(imported, list) else []
     history = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
     return {
@@ -84,6 +104,8 @@ def read_automation_state(read_setting: ReadSetting) -> dict[str, Any]:
         "last_result": value.get("last_result") if isinstance(value.get("last_result"), dict) else None,
         "pending_card_codes": pending[:100],
         "retryable_card_codes": retryable[:100],
+        "reclaim_attempts": dict(list(attempts.items())[:500]),
+        "attempt_limited_card_codes": [str(item).strip() for item in limited if str(item).strip()][:100],
         "imported_order_nos": imported[-500:],
         "run_history": history[-20:],
     }
@@ -99,6 +121,10 @@ def save_automation_settings(
         interval = min(max(int(data.get("interval_seconds") or 300), 10), 86400)
     except (TypeError, ValueError) as exc:
         raise ValueError("自动监控间隔必须是 10 到 86400 秒") from exc
+    try:
+        max_reclaim_attempts = min(max(int(data.get("max_reclaim_attempts") or 3), 1), 20)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("401 reclaim attempts must be between 1 and 20") from exc
     mode = str(data.get("codex_fingerprint_mode") or "off").strip().lower()
     if mode not in CODEX_FINGERPRINT_MODES:
         raise ValueError("Codex 指纹收敛模式无效")
@@ -127,6 +153,7 @@ def save_automation_settings(
         "enabled": enabled,
         "interval_seconds": interval,
         "auto_import": auto_import,
+        "max_reclaim_attempts": max_reclaim_attempts,
         "proxy_id": proxy_id,
         "group_ids": group_ids,
         "codex_fingerprint_mode": mode,

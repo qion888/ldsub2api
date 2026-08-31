@@ -46,6 +46,27 @@ test('permanent markers win when an upstream item also says retryable', () => {
   assert.deepEqual(model.retryCodes, []);
 });
 
+test('shows attempt-limit failures as permanent and removes retry action', () => {
+  const model = normalizeSub2ApiRecoveryResult({
+    outcome: 'unrecoverable',
+    reclaim_summary: {unreclaimable: 1, failed: 0, active: 0},
+    reclaim_failures: [{
+      card_code: 'CARD-LIMIT',
+      status: 'attempt_limit',
+      failure_bucket: 'attempt_limit',
+      reason: '已达到自动找回次数上限（3 次）',
+      retryable: false,
+      permanent: true,
+    }],
+    retryable_card_codes: ['CARD-LIMIT'],
+    retry_available: true,
+  });
+  assert.equal(model.failures[0].retryable, false);
+  assert.equal(model.failures[0].failure_bucket, 'attempt_limit');
+  assert.deepEqual(model.retryCodes, []);
+  assert.equal(model.retryAvailable, false);
+});
+
 test('does not duplicate a permanent task when aggregate counters repeat it', () => {
   const model = normalizeSub2ApiRecoveryResult({
     ok: true,

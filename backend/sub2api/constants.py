@@ -5,6 +5,7 @@ DEFAULT_AUTOMATION = {
     "enabled": False,
     "interval_seconds": 300,
     "auto_import": False,
+    "max_reclaim_attempts": 3,
     "proxy_id": None,
     "group_ids": [],
     "codex_fingerprint_mode": "off",

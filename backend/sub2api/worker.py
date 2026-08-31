@@ -40,6 +40,8 @@ class Sub2ApiAutomationWorker(threading.Thread):
                 "last_result": previous.get("last_result"),
                 "pending_card_codes": previous.get("pending_card_codes", []),
                 "retryable_card_codes": previous.get("retryable_card_codes", []),
+                "reclaim_attempts": previous.get("reclaim_attempts", {}),
+                "attempt_limited_card_codes": previous.get("attempt_limited_card_codes", []),
                 "imported_order_nos": previous.get("imported_order_nos", []),
                 "run_history": (
                     previous.get("run_history", [])

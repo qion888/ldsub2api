@@ -43,8 +43,9 @@ function LegacyRecoveryResult({result, busy, onRetry}) {
           const retryable = Boolean(failure.retryable);
           const subject = failure.card_code || failure.order_no || failure.name || `项目 ${index + 1}`;
           const reason = failure.reason || failure.message || '未返回具体原因';
+          const attemptLimited = ['attempt_limit', 'attempts_exhausted'].includes(String(failure.failure_bucket || failure.status || '').toLowerCase());
           return <div className={`recovery-failure-item ${retryable ? 'retryable' : 'permanent'}`} key={`${subject}-${index}`}>
-            {retryable ? <RefreshCw size={13}/> : <TriangleAlert size={13}/>}<span><strong>{subject}</strong><small>{reason}{failure.provider_status ? ` · HTTP ${failure.provider_status}` : ''}</small></span><em>{retryable ? '可重试' : '无法找回'}</em>
+            {retryable ? <RefreshCw size={13}/> : <TriangleAlert size={13}/>}<span><strong>{subject}</strong><small>{reason}{failure.provider_status ? ` · HTTP ${failure.provider_status}` : ''}</small></span><em>{retryable ? '可重试' : attemptLimited ? '已达上限' : '无法找回'}</em>
           </div>;
         })}</div>
         {failures.length > 20 && <small className="recovery-failure-more">仅显示前 20 条明细</small>}

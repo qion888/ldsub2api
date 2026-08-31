@@ -545,8 +545,9 @@ function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false, 
         <div className="recovery-failure-head"><strong>无法自动处理的项目</strong><span>{failures.length} 条明细</span></div>
         <div className="recovery-failure-items">{failures.slice(0, 20).map((failure, index) => {
           const retryable = Boolean(failure.retryable);
+          const attemptLimited = ['attempt_limit', 'attempts_exhausted'].includes(String(failure.failure_bucket || failure.status || '').toLowerCase());
           return <div className={`recovery-failure-item ${retryable ? 'retryable' : 'permanent'}`} key={`${recoveryFailureSubject(failure, index)}-${index}`}>
-            {retryable ? <RefreshCw size={13}/> : <TriangleAlert size={13}/>}<span><strong>{recoveryFailureSubject(failure, index)}</strong><small>{failure.reason || failure.message || '未返回具体原因'}{failure.provider_status ? ` · HTTP ${failure.provider_status}` : ''}</small></span><em>{retryable ? '可重试' : '无法找回'}</em>
+            {retryable ? <RefreshCw size={13}/> : <TriangleAlert size={13}/>}<span><strong>{recoveryFailureSubject(failure, index)}</strong><small>{failure.reason || failure.message || '未返回具体原因'}{failure.provider_status ? ` · HTTP ${failure.provider_status}` : ''}</small></span><em>{retryable ? '可重试' : attemptLimited ? '已达上限' : '无法找回'}</em>
           </div>;
         })}</div>
         {failures.length > 20 && <small className="recovery-failure-more">仅显示前 20 条明细</small>}
@@ -669,6 +670,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
             <label className="automation-check-row"><input type="checkbox" checked={automation.auto_import} disabled={!monitorReady} onChange={event => onAutomationChange(current => ({...current, auto_import: event.target.checked}))}/><span><strong>找回后自动导入</strong><small>{monitorReady ? '应用右侧固定分配策略' : '先保存 Sub2API 管理员密钥'}</small></span></label>
             <label className="automation-interval"><span>检查间隔</span><div><input type="number" min="10" max="86400" value={automation.interval_seconds} onChange={event => onAutomationChange(current => ({...current, interval_seconds: Math.max(10, Math.min(86400, Number(event.target.value) || 10))}))} inputMode="numeric"/><span>秒</span></div></label>
             <div className="interval-presets">{[60, 300, 900, 3600].map(seconds => <button className={Number(automation.interval_seconds) === seconds ? 'active' : ''} key={seconds} onClick={() => onAutomationChange(current => ({...current, interval_seconds: seconds}))}>{intervalLabel(seconds)}</button>)}</div>
+            <label className="automation-interval"><span>单个账号最多找回次数</span><div><input type="number" min="1" max="20" value={automation.max_reclaim_attempts ?? 3} onChange={event => onAutomationChange(current => ({...current, max_reclaim_attempts: Math.max(1, Math.min(20, Number(event.target.value) || 1))}))} inputMode="numeric"/><span>次</span></div></label>
+            <small className="automation-attempt-hint">达到上限后自动停止提交，并保留原因</small>
             <div className="automation-readiness-grid">{readiness.map(item => <span className={item.ready ? 'ready' : ''} key={item.label}>{item.ready ? <Check size={13}/> : <AlertCircle size={13}/>} {item.label}</span>)}</div>
           </section>
 

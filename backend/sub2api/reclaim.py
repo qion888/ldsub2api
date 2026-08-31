@@ -16,6 +16,10 @@ ERROR_401_TEXT_PATTERNS = (
     re.compile(r"(?i)\bunauthorized\s*[:=()\[\]-]*\s*401\b"),
     re.compile(r"(?i)\b401\s*[:=()\[\]-]*\s*unauthorized\b"),
     re.compile(
+        r"(?i)\b(?:authentication|authorization)\s+failed\b[^\r\n]{0,80}\(\s*401\s*\)"
+    ),
+    re.compile(r"(?i)\b(?:token[_ -]?invalidated|token[_ -]?revoked)\b"),
+    re.compile(
         r"(?i)\b(?:token\s+revoked|invalid(?:ated)?\s+oauth\s+token)\b"
         r"[^\r\n]{0,80}\(\s*401\s*\)"
     ),
@@ -46,6 +50,9 @@ def structured_error_is_401(value: Any, *, error_context: bool = False) -> bool:
                         return True
                 except (TypeError, ValueError):
                     pass
+            if normalized_key in ("code", "error_code") and isinstance(child, str):
+                if re.search(r"(?i)\b(?:token[_ -]?invalidated|token[_ -]?revoked)\b", child):
+                    return True
             if child_context and normalized_key in ("status", "code"):
                 try:
                     if int(child) == 401:
@@ -71,7 +78,10 @@ def account_is_401(account: dict[str, Any]) -> bool:
                 return True
         except (TypeError, ValueError):
             pass
-    for key in ("error_message", "temp_unschedulable_reason", "last_error", "error", "detail"):
+    for key in (
+        "error_message", "temp_unschedulable_reason", "last_error", "error", "detail",
+        "error_code", "code",
+    ):
         value = account.get(key)
         if error_text_is_401(value) or structured_error_is_401(value, error_context=True):
             return True
@@ -754,6 +764,9 @@ def reclaim_401_accounts(
     max_payload_bytes: int,
     include_downloads: bool = True,
     exclude_order_nos: list[str] | None = None,
+    exclude_card_codes: list[str] | None = None,
+    attempt_counts: dict[str, int] | None = None,
+    max_reclaim_attempts: int = 3,
 ) -> dict[str, Any]:
     if not config["admin_key"]:
         raise ValueError("请先配置 Sub2API 管理员密钥")
@@ -764,11 +777,33 @@ def reclaim_401_accounts(
 
     card_codes: list[str] = []
     missing: list[dict[str, Any]] = []
+    attempt_limited: list[str] = []
+    try:
+        max_reclaim_attempts = min(max(int(max_reclaim_attempts), 1), 20)
+    except (TypeError, ValueError):
+        max_reclaim_attempts = 3
+    normalized_attempts = {
+        _text(code, 160): max(0, int(count))
+        for code, count in (attempt_counts or {}).items()
+        if _text(code, 160)
+        and isinstance(count, (int, float, str))
+        and str(count).strip().lstrip("-").isdigit()
+    }
+    excluded_codes = {
+        _text(value, 160) for value in (exclude_card_codes or []) if _text(value, 160)
+    }
+    excluded_codes.update(
+        code for code, count in normalized_attempts.items() if count >= max_reclaim_attempts
+    )
     seen: set[str] = set()
     for account in accounts_401:
         card_code = extract_card_code_from_name(str(account.get("name") or ""))
         if not card_code or len(card_code) < 8 or "-" not in card_code:
             missing.append({"id": account.get("id"), "name": str(account.get("name") or "")[:200]})
+            continue
+        if card_code in excluded_codes:
+            if card_code not in attempt_limited:
+                attempt_limited.append(card_code)
             continue
         if card_code not in seen:
             seen.add(card_code)
@@ -791,6 +826,9 @@ def reclaim_401_accounts(
                 exclude_order_nos=exclude_order_nos,
                 max_payload_bytes=max_payload_bytes,
             )
+    next_attempts = dict(normalized_attempts)
+    for code in card_codes:
+        next_attempts[code] = next_attempts.get(code, 0) + 1
     metadata = summarize_reclaim_result(
         reclaim_result,
         submitted_card_codes=card_codes,
@@ -799,6 +837,69 @@ def reclaim_401_accounts(
         exclude_order_nos=exclude_order_nos,
         downloads_requested=include_downloads,
     )
+    retryable_after_submit = set(metadata.get("retryable_card_codes") or [])
+    reached_limit = [
+        code for code in card_codes
+        if next_attempts.get(code, 0) >= max_reclaim_attempts and code in retryable_after_submit
+    ]
+    limited_codes = list(dict.fromkeys(attempt_limited + reached_limit))
+    if limited_codes:
+        existing_codes = {
+            str(item.get("card_code") or "").strip()
+            for item in metadata.get("reclaim_failures", [])
+            if isinstance(item, dict) and item.get("status") == "attempt_limit"
+        }
+        failures = list(metadata.get("reclaim_failures") or [])
+        for item in failures:
+            if isinstance(item, dict) and str(item.get("card_code") or "").strip() in limited_codes:
+                item.update({
+                    "status": "attempt_limit",
+                    "reason": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                    "message": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                    "retryable": False,
+                    "permanent": True,
+                    "category": "unrecoverable",
+                    "failure_bucket": "attempt_limit",
+                })
+        for code in limited_codes:
+            if code in existing_codes:
+                continue
+            failures.append({
+                "card_code": code,
+                "status": "attempt_limit",
+                "reason": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                "message": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                "retryable": False,
+                "permanent": True,
+                "category": "unrecoverable",
+                "failure_bucket": "attempt_limit",
+            })
+        deduped = []
+        seen_limit = set()
+        for item in failures:
+            code = str(item.get("card_code") or "").strip() if isinstance(item, dict) else ""
+            if isinstance(item, dict) and item.get("status") == "attempt_limit" and code in limited_codes:
+                if code in seen_limit:
+                    continue
+                seen_limit.add(code)
+            deduped.append(item)
+        failures = deduped
+        metadata["reclaim_failures"] = failures[:MAX_RECLAIM_CODES]
+        metadata["retryable_card_codes"] = [
+            code for code in metadata.get("retryable_card_codes", []) if code not in limited_codes
+        ]
+        metadata["retry_available"] = bool(metadata["retryable_card_codes"])
+        summary = dict(metadata.get("reclaim_summary") or {})
+        newly_limited = len(seen_limit)
+        summary["unreclaimable"] = int(summary.get("unreclaimable") or 0) + newly_limited
+        summary["failed"] = max(0, int(summary.get("failed") or 0) - newly_limited)
+        metadata["reclaim_summary"] = summary
+        metadata["unreclaimable"] = summary["unreclaimable"]
+        if metadata.get("outcome") in {"no_401", "failed"}:
+            metadata["outcome"] = "unrecoverable" if not metadata.get("retryable_card_codes") else "partial"
+            metadata["recovery_status"] = metadata["outcome"]
+            metadata["recovery_ok"] = False
+        metadata["recovery_message"] = f"有 {len(limited_codes)} 个项目已达到自动找回次数上限（{max_reclaim_attempts} 次）"
     return {
         "ok": reclaim_result is None or _bool(reclaim_result.get("ok"), True),
         "scanned_accounts": len(accounts),
@@ -808,6 +909,10 @@ def reclaim_401_accounts(
         "skipped_non_401": len(accounts) - len(accounts_401),
         "submitted": bool(card_codes),
         "missing_card_code_accounts": missing[:50],
+        "attempt_limited_card_codes": limited_codes[:MAX_RECLAIM_CODES],
+        "attempt_limited_count": len(limited_codes),
+        "attempt_counts": next_attempts,
+        "max_reclaim_attempts": max_reclaim_attempts,
         "reclaim_card_codes": card_codes,
         "downloaded_payloads": downloaded_payloads,
         **metadata,
@@ -823,6 +928,9 @@ def retry_reclaim(
     max_payload_bytes: int,
     exclude_order_nos: list[str] | None = None,
     include_downloads: bool = True,
+    attempt_counts: dict[str, int] | None = None,
+    max_reclaim_attempts: int = 3,
+    exclude_card_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Submit an explicit retry without rescanning the Sub2API account list."""
     normalized = list(dict.fromkeys(
@@ -830,6 +938,56 @@ def retry_reclaim(
     ))
     if not normalized or len(normalized) > MAX_RECLAIM_CODES:
         raise ValueError(f"卡密数量应为 1 到 {MAX_RECLAIM_CODES} 个")
+    try:
+        max_reclaim_attempts = min(max(int(max_reclaim_attempts), 1), 20)
+    except (TypeError, ValueError):
+        max_reclaim_attempts = 3
+    current_attempts = {
+        _text(code, 160): max(0, int(count))
+        for code, count in (attempt_counts or {}).items()
+        if _text(code, 160) and str(count).strip().lstrip("-").isdigit()
+    }
+    blocked = {
+        _text(value, 160) for value in (exclude_card_codes or []) if _text(value, 160)
+    }
+    blocked.update(code for code, count in current_attempts.items() if count >= max_reclaim_attempts)
+    limited = [code for code in normalized if code in blocked]
+    normalized = [code for code in normalized if code not in blocked]
+    next_attempts = dict(current_attempts)
+    for code in normalized:
+        next_attempts[code] = next_attempts.get(code, 0) + 1
+    if not normalized:
+        return {
+            "ok": True,
+            "retry": True,
+            "reclaim_card_codes": [],
+            "attempt_limited_card_codes": limited,
+            "attempt_limited_count": len(limited),
+            "attempt_counts": next_attempts,
+            "max_reclaim_attempts": max_reclaim_attempts,
+            "retryable_card_codes": [],
+            "retry_available": False,
+            "outcome": "unrecoverable",
+            "recovery_status": "unrecoverable",
+            "recovery_ok": False,
+            "recovery_message": f"有 {len(limited)} 个项目已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+            "reclaim_summary": {
+                "queued": 0, "already_running": 0, "active": 0, "done": 0,
+                "downloaded": 0, "download_failed": 0, "download_skipped": 0,
+                "unreclaimable": len(limited), "not_owned": 0, "skipped": 0,
+                "failed": 0, "submitted": 0,
+            },
+            "reclaim_failures": [{
+                "card_code": code,
+                "status": "attempt_limit",
+                "reason": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                "message": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                "retryable": False,
+                "permanent": True,
+                "category": "unrecoverable",
+                "failure_bucket": "attempt_limit",
+            } for code in limited],
+        }
     client = redeem_client_factory()
     raw_reclaim_result = to_json(client.batch_reclaim(normalized, mode="401"))
     reclaim_result = (
@@ -854,9 +1012,66 @@ def retry_reclaim(
         exclude_order_nos=exclude_order_nos,
         downloads_requested=include_downloads,
     )
+    limited_codes = list(dict.fromkeys(limited + [
+        code for code in normalized if next_attempts.get(code, 0) >= max_reclaim_attempts
+    ]))
+    if limited_codes:
+        metadata["retryable_card_codes"] = [
+            code for code in metadata.get("retryable_card_codes", []) if code not in limited_codes
+        ]
+        metadata["retry_available"] = bool(metadata["retryable_card_codes"])
+        failures = list(metadata.get("reclaim_failures") or [])
+        for item in failures:
+            if isinstance(item, dict) and str(item.get("card_code") or "").strip() in limited_codes:
+                item.update({
+                    "status": "attempt_limit",
+                    "reason": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                    "message": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                    "retryable": False,
+                    "permanent": True,
+                    "category": "unrecoverable",
+                    "failure_bucket": "attempt_limit",
+                })
+        known = {str(item.get("card_code") or "").strip() for item in failures if isinstance(item, dict) and item.get("status") == "attempt_limit"}
+        for code in limited_codes:
+            if code not in known:
+                failures.append({
+                    "card_code": code,
+                    "status": "attempt_limit",
+                    "reason": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                    "message": f"已达到自动找回次数上限（{max_reclaim_attempts} 次）",
+                    "retryable": False,
+                    "permanent": True,
+                    "category": "unrecoverable",
+                    "failure_bucket": "attempt_limit",
+                })
+        deduped = []
+        seen_limit = set()
+        for item in failures:
+            code = str(item.get("card_code") or "").strip() if isinstance(item, dict) else ""
+            if isinstance(item, dict) and item.get("status") == "attempt_limit" and code in limited_codes:
+                if code in seen_limit:
+                    continue
+                seen_limit.add(code)
+            deduped.append(item)
+        failures = deduped
+        metadata["reclaim_failures"] = failures[:MAX_RECLAIM_CODES]
+        summary = dict(metadata.get("reclaim_summary") or {})
+        newly_limited = len(seen_limit)
+        summary["unreclaimable"] = int(summary.get("unreclaimable") or 0) + newly_limited
+        summary["failed"] = max(0, int(summary.get("failed") or 0) - newly_limited)
+        metadata["reclaim_summary"] = summary
+        metadata["unreclaimable"] = summary["unreclaimable"]
+        metadata["outcome"] = "unrecoverable"
+        metadata["recovery_status"] = "unrecoverable"
+        metadata["recovery_ok"] = False
+        metadata["recovery_message"] = f"有 {len(limited_codes)} 个项目已达到自动找回次数上限（{max_reclaim_attempts} 次）"
     return {
         "ok": bool(isinstance(reclaim_result, dict) and _bool(reclaim_result.get("ok"), True)),
         "retry": True,
+        "attempt_counts": next_attempts,
+        "attempt_limited_card_codes": limited_codes,
+        "max_reclaim_attempts": max_reclaim_attempts,
         "reclaim_card_codes": normalized,
         "downloaded_payloads": downloaded_payloads,
         **metadata,

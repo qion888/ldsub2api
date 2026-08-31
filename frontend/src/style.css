@@ -2162,6 +2162,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .interval-presets { margin-top: 7px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
 .interval-presets button { min-width: 0; height: 27px; border: 1px solid var(--ui-border); padding: 0 3px; color: var(--ui-text-muted); background: var(--ui-surface-muted); font-size: 9px; white-space: nowrap; }
 .interval-presets button:hover, .interval-presets button.active { color: #fff; background: var(--ui-black); border-color: var(--ui-black); }
+.automation-attempt-hint { display: block; margin-top: 5px; color: var(--ui-text-muted); font-size: 8px; }
 .automation-readiness-grid { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--ui-border-soft); }
 .automation-readiness-grid > span { min-width: 0; min-height: 31px; padding: 6px 7px; display: flex; align-items: center; gap: 5px; color: var(--ui-warning); border-right: 1px solid var(--ui-border-soft); border-bottom: 1px solid var(--ui-border-soft); font-size: 9px; }
 .automation-readiness-grid > span:nth-child(even) { border-right: 0; }

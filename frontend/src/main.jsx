@@ -73,6 +73,7 @@ const DEFAULT_SUB2API_AUTOMATION = {
   enabled: false,
   interval_seconds: 300,
   auto_import: false,
+  max_reclaim_attempts: 3,
 };
 const EMPTY_CARD_IMPORT_HISTORY = {
   items: [],
