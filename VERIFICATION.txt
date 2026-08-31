@@ -1,41 +1,41 @@
-ORDER QUERY WAF VERIFICATION
+ORDER QUERY CAPTCHA OCR VERIFICATION
 
 Changed branch/field:
-- branch: codex/order-waf-fix merged fast-forward into main at b4d27ffd2cd0d91642790ab6a77e3edb2d8cdcf2
-- fields: order-query 403/Aliyun WAF detection, dedicated browser verification session, cookie sync, and retry flow
+- branch: main at 239c947 (from codex/order-waf-fix lineage)
+- fields: CaptchaRecognizer default model selection; legacy ddddocr model for chain-store captcha noise; compatibility fallback
 
 Artifacts:
-- MODIFIED_FILE: tar archive of changed files at b4d27ff
-- DIFF_FILE: binary git diff from baseline 2770c35 to b4d27ff
+- MODIFIED_FILE: tar archive of captcha OCR source and tests at 239c947
+- DIFF_FILE: binary git diff from baseline 0ebda1d to 239c947
 - VERIFICATION.txt: this acceptance record
 - ROLLBACK.sh: executable PowerShell rollback script
 
 BASELINE
 Command: .runtime\python\Scripts\python.exe -m unittest discover -s backend -p 'test*.py' -q
-Input: baseline worktree at commit 2770c35
-Literal output/result: Ran 168 tests in 1.649s; OK
+Input: baseline worktree at commit 0ebda1d
+Literal output/result: Ran 173 tests in 1.637s; OK
 Exit status: 0
 
 Command: npm ci --ignore-scripts; npm test; npm run build
-Input: frontend directory in baseline worktree at commit 2770c35
-Literal output/result: 41 tests passed; Vite transformed 2386 modules and built successfully.
+Input: frontend directory in baseline worktree at commit 0ebda1d
+Literal output/result: 42 tests passed; Vite transformed 2386 modules and built successfully.
 Exit status: 0
 
 MODIFIED
 Command: .runtime\python\Scripts\python.exe -m unittest discover -s backend -p 'test*.py' -q
-Input: main branch at commit b4d27ff
-Literal output/result: Ran 169 tests in 1.620s; OK
+Input: main branch at commit 239c947
+Literal output/result: Ran 175 tests in 1.864s; OK
 Exit status: 0
 
 Command: npm test; npm run build
-Input: frontend directory on main at commit b4d27ff
-Literal output/result: 41 tests passed; Vite transformed 2386 modules and built successfully.
+Input: frontend directory on main at commit 239c947
+Literal output/result: 42 tests passed; Vite transformed 2386 modules and built successfully.
 Exit status: 0
 
 ROLLBACK
-Command: powershell -ExecutionPolicy Bypass -File .runtime\ROLLBACK-order-waf-test.ps1 -TargetRoot .runtime\rollback-test-order-waf-20260831
+Command: powershell -ExecutionPolicy Bypass -File .runtime\ROLLBACK-captcha-test.ps1 -TargetRoot .runtime\rollback-test-captcha-20260831
 Input: copy populated from MODIFIED_FILE, with ROLLBACK_BASELINE beside the script
-Literal output/result: Restored E:\soft\java\ldxp\.runtime\rollback-test-order-waf-20260831; verified 9 files; removed backend/order_query/browser_verification.py
+Literal output/result: Restored .runtime\rollback-test-captcha-20260831; verified 2 files
 Exit status: 0
 
-Rollback restored all baseline hashes and removed the feature-only browser verification module. The main working tree remains on b4d27ff with the WAF fix applied; MODIFIED_FILE remains the changed archive.
+Rollback restored both baseline SHA256 values. The main working tree remains on 239c947 with legacy OCR enabled; MODIFIED_FILE remains the changed archive.
