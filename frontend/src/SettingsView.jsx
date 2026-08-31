@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 
 import {AUTH_MODES, isAdmin, normalizeMode, normalizeUser, roleLabel} from './authModel.js';
-import {normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
+import {normalizeBackupList, normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
 
 const EMPTY_BASIC = {site_name: '', announcement: '', contact_email: '', timezone: 'Asia/Shanghai', base_url: ''};
 const EMPTY_SYSTEM = {
@@ -41,6 +41,29 @@ function asUsers(payload) {
 
 function settingsPart(payload, key, fallback) {
   return payload?.[key] && typeof payload[key] === 'object' ? {...fallback, ...payload[key]} : {...fallback};
+}
+
+function formatVersionDate(value) {
+  if (!value) return '未知时间';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '未知时间' : date.toLocaleString('zh-CN', {hour12: false});
+}
+
+function formatBackupSize(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function backupReasonLabel(value) {
+  return ({
+    manual: '手动备份',
+    'before-update': '升级前自动备份',
+    'before-restore': '恢复前安全备份',
+    'before-rollback': '回退前安全备份',
+  })[String(value || '')] || '系统备份';
 }
 
 function ErrorNotice({message}) {
@@ -69,6 +92,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
   const [versionInfo, setVersionInfo] = useState(null);
   const [versionBusy, setVersionBusy] = useState('');
   const [versionError, setVersionError] = useState('');
+  const [backupBusy, setBackupBusy] = useState('');
 
   const loadUsers = async () => {
     if (!admin) return;
@@ -88,7 +112,14 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
     setVersionBusy('load');
     setVersionError('');
     try {
-      setVersionInfo(normalizeVersionInfo(await request('/version')));
+      const info = await request('/version');
+      let backups = info?.backups;
+      try {
+        backups = await request('/version/backups');
+      } catch (requestError) {
+        if (requestError.status !== 404) throw requestError;
+      }
+      setVersionInfo(normalizeVersionInfo({...info, backups: normalizeBackupList(backups)}));
     } catch (requestError) {
       setVersionError(requestError.message || '版本信息加载失败');
     } finally {
@@ -328,6 +359,75 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
     }
   };
 
+  const createVersionBackup = async () => {
+    setBackupBusy('create');
+    setVersionError('');
+    try {
+      const result = await request('/version/backup', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({reason: 'manual'}),
+      });
+      const created = result?.backup;
+      setVersionInfo(current => normalizeVersionInfo({
+        ...(current || {}),
+        database: result?.database || current?.database,
+        backups: {
+          ...(current?.backups || {}),
+          items: created ? [created, ...(current?.backups?.items || []).filter(item => item.id !== created.id)] : current?.backups?.items,
+          total: created ? Number(current?.backups?.total || 0) + 1 : current?.backups?.total,
+          latest: created || current?.backups?.latest,
+        },
+      }));
+      notify?.('数据备份已完成');
+    } catch (requestError) {
+      setVersionError(requestError.message || '数据备份失败');
+    } finally {
+      setBackupBusy('');
+    }
+  };
+
+  const restoreVersionBackup = async backup => {
+    if (!backup?.id) return;
+    if (!window.confirm(`将数据库恢复到 ${formatVersionDate(backup.created_at)} 的备份，现有数据会自动备份，继续吗？`)) return;
+    setBackupBusy(`restore:${backup.id}`);
+    setVersionError('');
+    try {
+      const result = await request('/version/restore', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({backup_id: backup.id}),
+      });
+      setVersionInfo(current => normalizeVersionInfo({...current, ...result, backups: current?.backups}));
+      notify?.(result.message || '数据已恢复，请重启服务');
+    } catch (requestError) {
+      setVersionError(requestError.message || '数据恢复失败');
+    } finally {
+      setBackupBusy('');
+    }
+  };
+
+  const rollbackVersionUpdate = async () => {
+    const lastUpdate = versionInfo?.last_update;
+    if (!lastUpdate?.can_rollback) return;
+    if (!window.confirm('将恢复升级前的代码，并保留现有数据。回退后需重启服务，继续吗？')) return;
+    setBackupBusy('rollback');
+    setVersionError('');
+    try {
+      const result = await request('/version/rollback', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({backup_id: lastUpdate.backup_id, restore_data: false}),
+      });
+      setVersionInfo(current => normalizeVersionInfo({...current, ...result, status: 'updated', needs_restart: true, last_update: null}));
+      notify?.(result.message || '代码已回退，请重启服务');
+    } catch (requestError) {
+      setVersionError(requestError.message || '代码回退失败');
+    } finally {
+      setBackupBusy('');
+    }
+  };
+
   const userCountLabel = useMemo(() => `${users.length} 个用户`, [users.length]);
 
   return <section className="settings-view">
@@ -399,7 +499,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
             </div>
             <div className="version-meta-grid">
               <div><small>运行分支</small><strong>{versionInfo.branch || 'detached HEAD'}</strong><span>目标 {versionInfo.target_branch}</span></div>
-              <div><small>GitHub 最新</small><strong>{versionInfo.latest_version ? `v${versionInfo.latest_version.replace(/^v/i, '')}` : '尚未检查'}</strong><span>{versionInfo.latest_short_commit || '点击检查更新'}</span></div>
+              <div><small>GitHub 最新</small><strong>{versionInfo.latest_version ? `v${versionInfo.latest_version.replace(/^v/i, '')}` : '尚未检查'}</strong><span>{versionInfo.latest_short_commit || '点击检查更新'}{(versionInfo.remote_ahead_by || versionInfo.local_ahead_by) ? ` · 远端 +${versionInfo.remote_ahead_by} / 本地 +${versionInfo.local_ahead_by}` : ''}</span></div>
               <div><small>工作树</small><strong>{versionInfo.worktree_clean ? '干净' : `${versionInfo.dirty_file_count} 项改动`}</strong><span>{versionInfo.repository_matches ? '更新源已核对' : '更新源不一致'}</span></div>
               <div><small>更新方式</small><strong>GitHub 快进更新</strong><span>仅允许 fast-forward</span></div>
             </div>
@@ -407,6 +507,34 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
               {versionInfo.needs_restart || versionBlockReason(versionInfo) ? <AlertTriangle size={16}/> : <CheckCircle2 size={16}/>}<span>{versionInfo.needs_restart ? '新版本已安装，请重启后端与前端服务。' : versionBlockReason(versionInfo) || versionInfo.message}</span>
             </div>}
             {versionInfo.checked_at && <div className="version-checked">最近检查：{new Date(versionInfo.checked_at).toLocaleString('zh-CN', {hour12: false})}</div>}
+            <div className="version-data-panel">
+              <div className="version-panel-head">
+                <div><span className="detail-kicker">DATA INTEGRITY</span><h4>数据兼容与备份</h4></div>
+                <span className={`version-integrity ${versionInfo.database.integrity ? 'ok' : 'error'}`}><ShieldCheck size={14}/>{versionInfo.database.integrity ? 'SQLite 完整性正常' : '需要检查数据库'}</span>
+              </div>
+              <div className="version-data-grid">
+                <div><small>数据库</small><strong>{versionInfo.database.file_name || 'monitor.db'}</strong><span>{formatBackupSize(versionInfo.database.size_bytes)} · schema {versionInfo.database.schema_version ?? 0}</span></div>
+                <div><small>数据兼容</small><strong>{versionInfo.database.compatibility === 'sqlite-preserved' ? '原库保留' : versionInfo.database.compatibility}</strong><span>{versionInfo.database.integrity_message || '升级不修改 SQLite 结构'}</span></div>
+                <div><small>备份记录</small><strong>{versionInfo.backups.total || versionInfo.database.backup_count} 份</strong><span>{versionInfo.backups.latest ? `最近 ${formatVersionDate(versionInfo.backups.latest.created_at)}` : '尚无备份'}</span></div>
+              </div>
+              <div className="version-panel-actions">
+                <button className="button secondary" type="button" onClick={createVersionBackup} disabled={Boolean(versionBusy) || Boolean(backupBusy)}><Save size={15}/>{backupBusy === 'create' ? '备份中' : '立即备份'}</button>
+                {versionInfo.last_update?.can_rollback && <button className="button secondary" type="button" onClick={rollbackVersionUpdate} disabled={Boolean(versionBusy) || Boolean(backupBusy)}><RefreshCw size={15}/>{backupBusy === 'rollback' ? '回退中' : '回退上次升级'}</button>}
+              </div>
+            </div>
+            <div className="version-backups-panel">
+              <div className="version-panel-head">
+                <div><span className="detail-kicker">BACKUP HISTORY</span><h4>数据备份记录</h4></div>
+                <span className="settings-count">{versionInfo.backups.total} 份</span>
+              </div>
+              {versionInfo.backups.items.length ? <div className="version-backup-list">
+                {versionInfo.backups.items.map(backup => <div className="version-backup-row" key={backup.id}>
+                  <div className="version-backup-main"><strong>{backupReasonLabel(backup.reason)}</strong><small>{formatVersionDate(backup.created_at)} · {formatBackupSize(backup.size_bytes)} · schema {backup.schema_version ?? 0}</small></div>
+                  <code title={backup.sha256}>{backup.sha256 ? `${backup.sha256.slice(0, 12)}…` : '无校验摘要'}</code>
+                  <button className="icon-button" type="button" title="恢复此备份" aria-label={`恢复 ${formatVersionDate(backup.created_at)} 的备份`} onClick={() => restoreVersionBackup(backup)} disabled={Boolean(versionBusy) || Boolean(backupBusy)}><RefreshCw size={15} className={backupBusy === `restore:${backup.id}` ? 'spin' : ''}/></button>
+                </div>)}
+              </div> : <div className="settings-state version-backup-empty">暂无数据备份，升级前会自动创建安全备份</div>}
+            </div>
           </> : <div className="settings-state" role="status"><RefreshCw size={18} className={versionBusy ? 'spin' : ''}/>{versionBusy ? '正在读取版本信息' : '暂无版本信息'}</div>}
           <div className="settings-actions version-actions">
             {versionInfo?.repository_url && <a className="button secondary" href={versionInfo.repository_url} target="_blank" rel="noreferrer"><ExternalLink size={15}/>查看 GitHub</a>}
