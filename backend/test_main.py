@@ -1438,7 +1438,23 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(result["expiring_proxies"], 1)
         self.assertEqual(result["inactive_groups"], 1)
         self.assertEqual(result["recent_errors"][0]["name"], "Broken")
+        self.assertEqual(result["recent_errors"][0]["card_code"], "")
+        self.assertTrue(result["recent_errors"][0]["is_401"])
         self.assertEqual(result["platforms"][0]["platform"], "openai")
+
+    def test_sub2api_monitor_summary_exposes_401_card_code_for_manual_reclaim(self):
+        result = main._sub2api_monitor_summary([
+            {
+                "id": 9,
+                "name": "账号 team-6ca5c0-PTRW-087D100B983F",
+                "platform": "openai",
+                "status": "error",
+                "error_message": "Authentication failed (401): token_invalidated",
+            }
+        ], [], [], now=datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(result["recent_errors"][0]["card_code"], "team-6ca5c0-PTRW-087D100B983F")
+        self.assertTrue(result["recent_errors"][0]["is_401"])
 
     def test_sub2api_automation_requires_import_assignment_and_allows_passthrough(self):
         with tempfile.TemporaryDirectory() as directory:

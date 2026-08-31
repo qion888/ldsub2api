@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import re
 from typing import Any, Callable
 
 from .constants import (
@@ -221,6 +222,24 @@ def monitor_summary(
     rate_limited_accounts = 0
     expiring_accounts = 0
 
+    def reclaim_card_code(account: dict[str, Any]) -> str:
+        direct = account.get("card_code")
+        if direct:
+            return str(direct).strip()[:160]
+        extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+        nested = extra.get("card_code") or extra.get("reclaim_card_code")
+        if nested:
+            return str(nested).strip()[:160]
+        name = str(account.get("name") or "").strip()
+        match = re.search(r"(?:^|\s)([A-Za-z0-9][A-Za-z0-9-]{3,127})$", name)
+        candidate = match.group(1) if match else ""
+        return candidate if len(candidate) >= 8 and "-" in candidate else ""
+
+    def account_is_401_marker(account: dict[str, Any]) -> bool:
+        # Import lazily so payload normalization stays independent at startup.
+        from .reclaim import account_is_401
+        return account_is_401(account)
+
     for account in accounts:
         status = str(account.get("status") or "unknown").strip().lower()
         platform = str(account.get("platform") or "unknown").strip().lower() or "unknown"
@@ -239,6 +258,8 @@ def monitor_summary(
                 "name": str(account.get("name") or f"账号 {account.get('id') or '-'}")[:160],
                 "platform": platform,
                 "status": status,
+                "card_code": reclaim_card_code(account),
+                "is_401": account_is_401_marker(account),
                 "error": error_message[:300] or "账号状态异常",
                 "updated_at": account.get("updated_at"),
             })

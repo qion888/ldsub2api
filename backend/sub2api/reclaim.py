@@ -73,19 +73,21 @@ def structured_error_is_401(value: Any, *, error_context: bool = False) -> bool:
 
 def account_is_401(account: dict[str, Any]) -> bool:
     for key in ("status_code", "http_status", "http_status_code", "upstream_status", "status"):
+        value = account.get(key)
         try:
-            if int(account.get(key)) == 401:
+            if int(value) == 401:
                 return True
         except (TypeError, ValueError):
-            pass
+            if error_text_is_401(value):
+                return True
     for key in (
         "error_message", "temp_unschedulable_reason", "last_error", "error", "detail",
-        "error_code", "code",
+        "message", "description", "response", "last_response", "error_code", "code",
     ):
         value = account.get(key)
         if error_text_is_401(value) or structured_error_is_401(value, error_context=True):
             return True
-    return structured_error_is_401(account.get("extra"), error_context=False)
+    return structured_error_is_401(account.get("extra"), error_context=True)
 
 
 _ACTIVE_TASK_STATUSES = {

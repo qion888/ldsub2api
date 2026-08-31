@@ -1,0 +1,65 @@
+SUB2API MANUAL 401 RECLAIM VERIFICATION
+
+Changed branch/field:
+- branch: codex/task-10-reclaim-attempt-limit
+- backend: nested and textual 401 markers are detected in account errors
+- monitor payload: recent_errors exposes is_401 and an extracted card_code
+- frontend: only reclaimable 401 alerts show the manual reclaim action
+- permanent errors such as deactivated_workspace remain non-reclaimable
+
+Artifacts:
+- MODIFIED_FILE: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-manual-reclaim\MODIFIED_FILE
+- DIFF_FILE: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-manual-reclaim\DIFF_FILE
+- VERIFICATION.txt: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-manual-reclaim\VERIFICATION.txt
+- ROLLBACK.sh: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\sub2api-manual-reclaim\ROLLBACK.sh
+
+BASELINE
+Command: python -m unittest discover -s backend -p 'test*.py' -q
+Input: C:\Users\0\.codex\worktrees\0d29\baseline-manual-reclaim at commit 6a3f514
+Literal output/result: Ran 170 tests; OK
+Exit status: 0
+
+Command: npm test
+Input: C:\Users\0\.codex\worktrees\0d29\baseline-manual-reclaim\frontend
+Literal output/result: 42 tests passed; 0 failed
+Exit status: 0
+
+Command: npm run build
+Input: C:\Users\0\.codex\worktrees\0d29\baseline-manual-reclaim\frontend
+Literal output/result: vite transformed 2386 modules and built successfully
+Exit status: 0
+
+MODIFIED
+Command: python -m unittest discover -s backend -p 'test*.py' -q
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\backend with manual-reclaim changes
+Literal output/result: Ran 171 tests; OK
+Exit status: 0
+
+Command: npm test
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\frontend
+Literal output/result: 42 tests passed; 0 failed
+Exit status: 0
+
+Command: npm run build
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp\frontend
+Literal output/result: vite transformed 2386 modules and built successfully
+Exit status: 0
+
+Command: python -m compileall -q .; git diff --check
+Input: C:\Users\0\.codex\worktrees\0d29\ldxp
+Literal output/result: no diagnostics
+Exit status: 0
+
+401 classification scenario
+Command: python -c "from backend.sub2api.payloads import monitor_summary; a=[{'name':'Account team-CARD-401','status':'error','error_message':'Authentication failed (401): token_invalidated'},{'name':'Account team-CARD-PERM','status':'error','error_message':'{\"code\":\"deactivated_workspace\"}'}]; print(monitor_summary(a,[],[])['recent_errors'])"
+Input: local monitor normalizer
+Literal output/result: first row is_401=True with card_code=team-CARD-401; second row is_401=False
+Exit status: 0
+
+ROLLBACK
+Command: $env:ROLLBACK_ARTIFACT_ROOT=(Resolve-Path .).Path; $script=[scriptblock]::Create((Get-Content .\ROLLBACK.sh -Raw)); & $script rollback-test-payloads.py
+Input: fresh rollback-test-payloads.py copied from MODIFIED_FILE and ROLLBACK_BASELINE
+Literal output/result: Restored rollback-test-payloads.py; restored SHA256 3EB6FA9FDC755E64436A69AF88B73D49D5CAFF6E787426E4A6A9AE4299A71756 equals baseline; MODIFIED_FILE SHA256 478506908FA5673CEA5EFEB04ABB7E73F33BF078A9E385FA4B315F73119A64AE remains changed
+Exit status: 0
+
+Restored behavior/status: rollback-test-payloads.py matches ROLLBACK_BASELINE while MODIFIED_FILE remains modified.
