@@ -17,7 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired
+from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired, is_waf_response
 
 from .captcha import captcha_sign
 from .complaint import normalize_complaint_history
@@ -229,6 +229,14 @@ class OrderQueryClient:
         try:
             return self.opener.open(request, timeout=self.timeout)
         except HTTPError as exc:
+            try:
+                raw = exc.read(MAX_JSON_BYTES + 1)
+            except Exception:
+                raw = b""
+            content_type = str(getattr(exc, "headers", {}).get("Content-Type", ""))
+            is_order_api = urlparse(request.full_url).path.lower().startswith("/shopapi/order/")
+            if is_waf_response(raw, content_type=content_type, status=exc.code) or (exc.code == 403 and is_order_api):
+                raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后重试") from exc
             if exc.code == 429:
                 raise UpstreamOrderError(
                     "链动小铺订单接口请求过于频繁",
@@ -273,7 +281,7 @@ class OrderQueryClient:
             content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
         if len(raw) > MAX_JSON_BYTES:
             raise UpstreamOrderError("订单接口响应过大", code="upstream_response_too_large")
-        if any(marker in raw for marker in WAF_MARKERS):
+        if is_waf_response(raw, content_type=content_type, status=200):
             raise WafChallengeRequired("链动小铺触发阿里云 WAF 验证")
         if "text/html" in content_type.lower():
             raise UpstreamOrderError("订单接口返回了 HTML 页面", code="invalid_order_response")
@@ -296,7 +304,7 @@ class OrderQueryClient:
     def _response_json(raw: bytes, content_type: str) -> dict[str, Any]:
         if len(raw) > MAX_JSON_BYTES:
             raise UpstreamOrderError("订单接口响应过大", code="upstream_response_too_large")
-        if any(marker in raw for marker in WAF_MARKERS):
+        if is_waf_response(raw, content_type=content_type, status=200):
             raise WafChallengeRequired("链动小铺触发阿里云 WAF 验证")
         if "text/html" in content_type.lower():
             raise UpstreamOrderError("订单接口返回了 HTML 页面", code="invalid_order_response")

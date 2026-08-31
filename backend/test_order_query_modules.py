@@ -9,9 +9,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 from urllib.parse import parse_qs
+from urllib.error import HTTPError
 from urllib.request import Request
 
 import main
+from monitor_core.storefront import WafChallengeRequired
 from order_query import routes
 from order_query.captcha import CaptchaRecognizer, captcha_sign, normalize_captcha_code
 from order_query.client import CaptchaChallenge, OrderQueryClient
@@ -252,6 +254,26 @@ class ClientTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(RuntimeError, "地址无效"):
             OrderQueryClient(opener=opener).start_captcha()
+
+    def test_http_403_aliyun_challenge_is_exposed_as_browser_verification(self) -> None:
+        class WafOpener:
+            def open(self, request: Request, timeout: float) -> Any:
+                raise HTTPError(
+                    request.full_url,
+                    403,
+                    "forbidden",
+                    {"Content-Type": "text/html; charset=utf-8"},
+                    BytesIO(b"<html>aliyun captcha challenge</html>"),
+                )
+
+        with self.assertRaises(WafChallengeRequired):
+            OrderQueryClient(opener=WafOpener()).list_orders(
+                keywords="buyer@example.test",
+                ticket="ticket",
+                status=999,
+                page=1,
+                page_size=10,
+            )
 
     def test_empty_order_result_keeps_one_pagination_page(self) -> None:
         from order_query.client import normalize_order_list

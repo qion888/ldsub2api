@@ -518,5 +518,6 @@ export function verificationLabel(verification = {}) {
   if (verification?.status !== 'verified') return '等待查询';
   if (verification?.mode === 'manual') return '手工验证通过';
   if (verification?.mode === 'session') return '会话验证有效';
+  if (verification?.mode === 'browser') return '浏览器验证通过';
   return '自动识别通过';
 }

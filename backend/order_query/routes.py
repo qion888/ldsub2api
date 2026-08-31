@@ -13,6 +13,8 @@ from .errors import OrderQueryError
 SendJson = Callable[[Any, int], Any]
 ORDER_QUERY_PATH = "/api/order-query/search"
 ORDER_DETAIL_PATH = "/api/order-query/detail"
+ORDER_WAF_START_PATH = "/api/order-query/waf-verification/start"
+ORDER_WAF_COMPLETE_PATH = "/api/order-query/waf-verification/complete"
 ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
 ORDER_COMPLAINT_CONTEXT_PATH = "/api/order-query/complaints/context"
 ORDER_COMPLAINT_HISTORY_PATH = "/api/order-query/complaints/history"
@@ -22,6 +24,8 @@ ORDER_COMPLAINT_REMOVE_UPLOAD_PATH = "/api/order-query/complaints/upload/remove"
 ORDER_QUERY_POST_PATHS = frozenset({
     ORDER_QUERY_PATH,
     ORDER_DETAIL_PATH,
+    ORDER_WAF_START_PATH,
+    ORDER_WAF_COMPLETE_PATH,
     ORDER_COMPLAINT_PREVIEW_PATH,
     ORDER_COMPLAINT_CONTEXT_PATH,
     ORDER_COMPLAINT_HISTORY_PATH,

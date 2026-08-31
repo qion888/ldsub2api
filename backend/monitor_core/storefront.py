@@ -18,11 +18,34 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 USER_AGENT = "LDXP-Local-Monitor/2.0"
 VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
 WAF_MARKERS = (b"aliyunCaptcha", b"aliyunCaptcha-sliding-slider", b"waf_nc", b"u_atoken")
+# Aliyun occasionally changes the challenge wrapper while keeping the response
+# status at 403.  Keep these secondary markers deliberately narrow and only
+# use them together with a 403/HTML response so normal JSON API errors are not
+# mistaken for a browser challenge.
+WAF_TEXT_MARKERS = (b"aliyun", b"waf", b"captcha", "滑块".encode("utf-8"), "人机验证".encode("utf-8"))
 UNLISTED_ERROR_MARKERS = ("商品未上架", "商品不存在", "已下架", "已不在店铺列表")
 
 
 class WafChallengeRequired(RuntimeError):
     pass
+
+
+def is_waf_response(raw: bytes, *, content_type: str = "", status: int | None = None) -> bool:
+    """Identify an Aliyun WAF challenge without treating business JSON as WAF.
+
+    The storefront normally returns challenge HTML with HTTP 403, but some
+    edge nodes return a 200/HTML wrapper or a 403 body without the canonical
+    ``aliyunCaptcha`` token.  Exact markers are checked first; fallback text is
+    accepted only for HTML or a 403 response.
+    """
+    body = bytes(raw or b"")
+    if any(marker.lower() in body.lower() for marker in WAF_MARKERS):
+        return True
+    is_html = "text/html" in str(content_type or "").lower()
+    if not (is_html or status == 403):
+        return False
+    lowered = body.lower()
+    return any(marker.lower() in lowered for marker in WAF_TEXT_MARKERS) or status == 403 and is_html
 
 
 class DescriptionParser(HTMLParser):
@@ -286,15 +309,23 @@ def _post_shop_api(
         with opener(request, timeout=15) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
             content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
+            status = int(getattr(response, "status", 200) or 200)
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise RuntimeError("接口响应过大")
     except HTTPError as exc:
+        try:
+            raw = exc.read(MAX_RESPONSE_BYTES + 1)
+        except Exception:
+            raw = b""
+        content_type = str(getattr(exc, "headers", {}).get("Content-Type", ""))
+        if is_waf_response(raw, content_type=content_type, status=exc.code) or exc.code == 403:
+            raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后同步") from exc
         raise RuntimeError(f"链动小铺接口返回 HTTP {exc.code}") from exc
     except URLError as exc:
         raise RuntimeError("无法连接链动小铺接口") from exc
-    if "text/html" in content_type.lower() or any(marker in raw for marker in WAF_MARKERS):
-        if any(marker in raw for marker in WAF_MARKERS):
-            raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后同步")
+    if is_waf_response(raw, content_type=content_type, status=status):
+        raise WafChallengeRequired("链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后同步")
+    if "text/html" in content_type.lower():
         raise RuntimeError("链动小铺接口返回了 HTML 页面，不是商品 JSON")
     try:
         result = json.loads(raw.decode("utf-8"))
