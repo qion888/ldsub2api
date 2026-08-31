@@ -33,42 +33,19 @@ Sub2API 导入：
 ## 运行要求
 
 - Windows PowerShell；
-- 可联网安装依赖；脚本会自动检查并引导安装 Python、Node.js/npm；
-- 能访问链动小铺及已配置的 401 找回/Sub2API 服务；
-- 使用 WAF 验证功能时，系统需要安装 Edge，Selenium 会使用独立浏览器会话。
+- 可联网安装依赖；脚本会**自动检查并引导安装 Python、Node.js/npm；**
 
 ## 快速启动
 
-### 一键启动（推荐）
+### 一键启动命令（推荐）
 
-在项目根目录打开 PowerShell：
-
-```powershell
-.\start.ps1
-```
-
-首次运行会检查 Python 3.10-3.13、Node.js LTS、npm 及项目依赖。缺少 Python 或 Node.js 时，脚本会用中文询问是否通过 `winget` 自动安装；直接回车即可确认。也可使用以下参数：
-
-```powershell
-# 自动确认并安装缺失依赖
-.\start.ps1 -AutoInstall
-
-# 只安装/检查依赖，不启动服务
-.\start.ps1 -AutoInstall -BootstrapOnly
-
-# 不允许自动安装，缺少运行环境时直接显示手动安装地址
-.\start.ps1 -SkipInstall
-```
-
-### Downloaded Windows copy
-
-To avoid PowerShell blocking a downloaded `start.ps1`, double-click `start.cmd` in the project root or run:
+为避免下载的 `start.ps1` 被 PowerShell 阻止，可以直接双击项目根目录中的 `start.cmd`，或在 PowerShell 中运行：
 
 ```powershell
 .\start.cmd
 ```
 
-The launcher uses a process-only execution-policy bypass and sets `LDXP_AUTO_INSTALL=1`, so missing Python, Node.js, npm, and project dependencies are installed through `winget` when available. Extra arguments are forwarded, for example:
+该启动器仅对当前进程临时绕过执行策略，并设置 `LDXP_AUTO_INSTALL=1`。如果可用，缺少的 Python、Node.js、npm 和项目依赖会通过 `winget` 自动安装。也可以传入以下参数：
 
 ```powershell
 .\start.cmd -BootstrapOnly
@@ -134,12 +111,12 @@ $env:LDXP_API_TARGET = 'http://127.0.0.1:<backend-port>'
 
 更新成功后需重启后端与前端服务。默认更新源为 `https://github.com/qion888/ldsub2api.git` 的 `main` 分支，可通过环境变量配置：
 
-| 环境变量 | 默认值 | 用途 |
-| --- | --- | --- |
-| `LDXP_UPDATE_REPOSITORY` | `https://github.com/qion888/ldsub2api.git` | GitHub 更新仓库 |
-| `LDXP_UPDATE_BRANCH` | `main` | 允许自动更新的目标分支 |
-| `LDXP_UPDATE_REMOTE` | `origin` | Git 远端名称 |
-| `LDXP_GITHUB_TOKEN` | 空 | GitHub API 令牌，可提高访问限额或读取私有仓库 |
+| 环境变量                     | 默认值                                        | 用途                           |
+| ------------------------ | ------------------------------------------ | ---------------------------- |
+| `LDXP_UPDATE_REPOSITORY` | `https://github.com/qion888/ldsub2api.git` | GitHub 更新仓库                  |
+| `LDXP_UPDATE_BRANCH`     | `main`                                     | 允许自动更新的目标分支                  |
+| `LDXP_UPDATE_REMOTE`     | `origin`                                   | Git 远端名称                     |
+| `LDXP_GITHUB_TOKEN`      | 空                                          | GitHub API 令牌，可提高访问限额或读取私有仓库 |
 
 ## 主要功能
 
@@ -225,16 +202,15 @@ $env:LDXP_API_TARGET = 'http://127.0.0.1:<backend-port>'
 
 运行时数据库为 `backend/monitor.db`，首次启动会自动创建。它保存店铺、商品、快照、预购任务和本地配置；账号 JSON 只在导入请求期间处理，不写入该数据库。
 
-
 主要环境变量：
 
-| 变量 | 默认值 | 用途 |
-| --- | --- | --- |
-| `LDXP_HOST` | `127.0.0.1` | 后端监听地址 |
-| `LDXP_PORT` | `8000` | 后端监听端口 |
-| `LDXP_FRONTEND_URL` | `http://127.0.0.1:5173/` | 后端根路径跳转地址 |
-| `LDXP_DB_PATH` | `backend/monitor.db` | SQLite 数据库路径 |
-| `LDXP_API_TARGET` | `http://127.0.0.1:8000` | Vite 开发代理目标 |
+| 变量                  | 默认值                      | 用途           |
+| ------------------- | ------------------------ | ------------ |
+| `LDXP_HOST`         | `127.0.0.1`              | 后端监听地址       |
+| `LDXP_PORT`         | `8000`                   | 后端监听端口       |
+| `LDXP_FRONTEND_URL` | `http://127.0.0.1:5173/` | 后端根路径跳转地址    |
+| `LDXP_DB_PATH`      | `backend/monitor.db`     | SQLite 数据库路径 |
+| `LDXP_API_TARGET`   | `http://127.0.0.1:8000`  | Vite 开发代理目标  |
 
 ## 开发验证
 
@@ -264,3 +240,4 @@ start.ps1             一键启动脚本
 PAYMENT.md            官方支付链路补充说明
 redeem_api_sdk.py     401 找回服务 SDK
 ```
+
