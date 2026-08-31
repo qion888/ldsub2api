@@ -119,11 +119,17 @@ function Wait-LdxpBackend([int]$Port, $Process) {
         }
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
+            $authStatus = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/auth/status" -TimeoutSec 2
+            $authMe = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/auth/me" -TimeoutSec 2
             if (
                 $health.ok `
                 -and $health.sub2api_accounts `
                 -and $health.sub2api_card_import_history_delete `
-                -and $health.order_complaint_submit
+                -and $health.order_complaint_submit `
+                -and $authStatus.ok `
+                -and ($authStatus.PSObject.Properties.Name -contains 'needs_setup') `
+                -and $authMe.ok `
+                -and ($authMe.PSObject.Properties.Name -contains 'authenticated')
             ) {
                 return
             }
@@ -131,7 +137,7 @@ function Wait-LdxpBackend([int]$Port, $Process) {
         catch {}
         Start-Sleep -Milliseconds 200
     }
-    throw 'Backend readiness check failed: required Sub2API or order complaint routes were not loaded'
+    throw 'Backend readiness check failed: required auth, Sub2API, or order complaint routes were not loaded'
 }
 
 if (-not (Test-Path -LiteralPath $viteCommand)) {
