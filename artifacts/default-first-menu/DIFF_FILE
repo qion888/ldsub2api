@@ -1,0 +1,41 @@
+﻿diff --git a/frontend/src/authModel.js b/frontend/src/authModel.js
+index 86e1057..aa87c5c 100644
+--- a/frontend/src/authModel.js
++++ b/frontend/src/authModel.js
+@@ -116,8 +116,8 @@ export function canAccessView(view, user, mode = AUTH_MODES.SELF_USE, permission
+ }
+ 
+ export function defaultViewFor(user, mode = AUTH_MODES.SELF_USE) {
+-  if (canAccessView('monitor', user, mode)) return 'monitor';
+-  return 'products';
++  if (canAccessView('products', user, mode)) return 'products';
++  return 'monitor';
+ }
+ 
+ export function roleLabel(user) {
+diff --git a/frontend/src/authModel.test.js b/frontend/src/authModel.test.js
+index 26b4661..1bdaf50 100644
+--- a/frontend/src/authModel.test.js
++++ b/frontend/src/authModel.test.js
+@@ -60,7 +60,7 @@ test('gates admin views while retaining public views for ordinary users', () =>
+   assert.equal(canAccessView('settings', user, AUTH_MODES.EXTERNAL), true);
+   assert.equal(canAccessView('settings', null, AUTH_MODES.EXTERNAL), false);
+   assert.equal(canAccessView('settings', null, AUTH_MODES.SELF_USE), true);
+-  assert.equal(defaultViewFor(user, AUTH_MODES.EXTERNAL), 'monitor');
++  assert.equal(defaultViewFor(user, AUTH_MODES.EXTERNAL), 'products');
+ });
+ 
+ test('matches monitor write access with the backend role boundary', () => {
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index d4dd7b2..7a1e475 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -987,7 +987,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+   const [paymentChannel, setPaymentChannel] = useState(1);
+   const [paymentChannels, setPaymentChannels] = useState([{id: 1, name: '支付宝'}]);
+   const paymentWindow = useRef(null);
+-  const [activeView, setActiveView] = useState('monitor');
++  const [activeView, setActiveView] = useState('products');
+   const [redeemConfig, setRedeemConfig] = useState({base_url: 'https://30d.team'});
+   const [cardCodes, setCardCodes] = useState('');
+   const [reclaimResult, setReclaimResult] = useState(null);

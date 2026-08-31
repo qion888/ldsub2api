@@ -987,7 +987,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [paymentChannel, setPaymentChannel] = useState(1);
   const [paymentChannels, setPaymentChannels] = useState([{id: 1, name: '支付宝'}]);
   const paymentWindow = useRef(null);
-  const [activeView, setActiveView] = useState('monitor');
+  const [activeView, setActiveView] = useState('products');
   const [redeemConfig, setRedeemConfig] = useState({base_url: 'https://30d.team'});
   const [cardCodes, setCardCodes] = useState('');
   const [reclaimResult, setReclaimResult] = useState(null);
