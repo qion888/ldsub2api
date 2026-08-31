@@ -116,6 +116,22 @@ class OrderQueryBusy(OrderQueryError):
         )
 
 
+class OrderQueryWafVerificationRequired(OrderQueryError):
+    """The upstream order API returned an Aliyun browser challenge.
+
+    The lookup session is created before the API call, so the response must
+    carry that session context back to the browser.  Without it the UI cannot
+    call the dedicated browser-verification endpoint and the button appears
+    inert.
+    """
+
+    def __init__(self, *, session_id: str, expires_in: int, request: dict[str, int], detail: str = "链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后重试") -> None:
+        super().__init__(detail, code="waf_verification_required", status=409, retryable=True)
+        self.session_id = session_id
+        self.expires_in = int(expires_in)
+        self.request = dict(request)
+
+
 class UpstreamOrderError(OrderQueryError):
     pass
 

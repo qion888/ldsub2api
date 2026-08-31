@@ -36,6 +36,7 @@ from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
 from monitor_core.workers import MonitorWorker as CoreMonitorWorker
 from order_query.complaint import build_complaint_preview
+from order_query.browser_verification import OrderQueryBrowserVerificationManager
 from order_query import routes as order_query_routes
 from order_query.service import OrderQueryService
 from sub2api import automation as sub2api_automation
@@ -1121,6 +1122,11 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
 
 BROWSER_VERIFICATION = BrowserVerificationManager()
 ORDER_QUERY_SERVICE = OrderQueryService()
+ORDER_QUERY_BROWSER_VERIFICATION = OrderQueryBrowserVerificationManager(
+    sessions=ORDER_QUERY_SERVICE.sessions,
+    waf_markers=WAF_MARKERS,
+    profile_path=Path(__file__).with_name("order-waf-browser-profile"),
+)
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -1182,7 +1188,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "sub2api_card_import_history": True,
                 "sub2api_card_import_history_delete": True,
                 "order_query": True,
+                "order_query_waf_verification": True,
                 "order_complaint_submit": True,
+                "order_complaint_history": True,
             })
         if path == "/api/watches":
             return self._send_json(list_watches())
@@ -1292,6 +1300,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             complaint_remove_upload=getattr(ORDER_QUERY_SERVICE, "complaint_remove_upload", None),
         ):
             return
+
+        if path in (order_query_routes.ORDER_WAF_START_PATH, order_query_routes.ORDER_WAF_COMPLETE_PATH):
+            try:
+                result = (
+                    ORDER_QUERY_BROWSER_VERIFICATION.start(data)
+                    if path == order_query_routes.ORDER_WAF_START_PATH
+                    else ORDER_QUERY_BROWSER_VERIFICATION.complete(data)
+                )
+                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+            except order_query_routes.OrderQueryError as exc:
+                return self._send_json({"detail": exc.detail, "code": exc.code, "retryable": exc.retryable}, exc.status)
+            except RuntimeError as exc:
+                return self._send_json({"detail": str(exc)}, 502)
 
         if path == "/api/preorders":
             try:
@@ -1859,6 +1880,7 @@ def run() -> None:
         WORKER.stop_event.set()
         AUTOMATION_WORKER.stop_event.set()
         BROWSER_VERIFICATION._close()
+        ORDER_QUERY_BROWSER_VERIFICATION._close()
         ORDER_QUERY_SERVICE.sessions.clear()
         server.server_close()
 

@@ -39,7 +39,16 @@ class CaptchaRecognizer:
             else:
                 import ddddocr
 
-                classifier = ddddocr.DdddOcr(show_ad=False)
+                # The shop captcha mixes the four dark glyphs with noisy
+                # pastel characters.  ddddocr's current model often returns
+                # a plausible but incorrect four-character value, while the
+                # legacy model remains tuned for this image format.
+                try:
+                    classifier = ddddocr.DdddOcr(show_ad=False, old=True)
+                except TypeError:
+                    # Keep compatibility with older ddddocr releases that do
+                    # not expose the ``old`` model switch.
+                    classifier = ddddocr.DdddOcr(show_ad=False)
         except Exception as exc:
             raise CaptchaRecognizerUnavailable("本地验证码识别组件未就绪") from exc
         self._classifier = classifier

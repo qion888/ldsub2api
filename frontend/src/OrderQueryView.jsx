@@ -104,7 +104,7 @@ function OrderImage({order}) {
   return <img className="order-product-image" src={order.goods_image} alt="" onError={() => setFailed(true)}/>;
 }
 
-function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaCode, onRefresh, onSubmit, expiresIn}) {
+function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaCode, onRefresh, onSubmit, expiresIn, waf, wafBusy, onStartWaf, onCompleteWaf}) {
   const manualRequired = verification?.status === 'manual_required';
   const attempts = Number(verification?.attempts || 0);
   const state = busy ? 'busy' : manualRequired ? 'manual' : verification?.status === 'verified' ? 'verified' : 'idle';
@@ -113,7 +113,9 @@ function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaC
     : verificationLabel(verification);
   const imageSource = captcha?.image_data_url || captcha?.image_url || '';
 
-  return <section className={`order-verification ${state}`} aria-live="polite">
+  const wafPending = waf?.status === 'awaiting_verification';
+  const wafRequired = waf?.status === 'required' || wafPending;
+  return <section className={`order-verification ${state} ${wafRequired ? 'waf-required' : ''}`} aria-live="polite">
     <div className="order-verification-head">
       <span className="order-verification-icon">{state === 'busy' ? <RefreshCw className="spin" size={18}/> : state === 'verified' ? <Check size={18}/> : state === 'manual' ? <TriangleAlert size={18}/> : <ShieldCheck size={18}/>}</span>
       <div><span>CAPTCHA SESSION</span><strong>{stateLabel}</strong></div>
@@ -133,6 +135,12 @@ function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaC
       <button className="button primary" type="submit" disabled={Boolean(busy) || !/^[A-Za-z0-9]{4}$/.test(captchaCode)}><ShieldCheck size={15}/>{busy === 'manual' ? '正在验证' : '验证并继续'}</button>
       <small>{expiresIn ? `当前验证会话约 ${Math.max(1, Math.ceil(Number(expiresIn) / 60))} 分钟内有效` : '自动识别未通过，请确认图片内容'}</small>
     </form>}
+    {wafRequired && <div className="order-waf-panel" role="status">
+      <div className="order-waf-copy"><span className="order-waf-icon"><ShieldCheck size={17}/></span><div><strong>需要完成阿里云 WAF 验证</strong><small>{wafPending ? 'Edge 浏览器已打开，请完成滑块后返回此处继续' : (waf?.detail || '订单接口暂时拦截了当前请求')}</small></div></div>
+      <div className="order-waf-actions">
+        {!wafPending ? <button className="button secondary" type="button" onClick={onStartWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ArrowUpRight size={14}/>{wafBusy === 'start' ? '正在打开浏览器' : '打开浏览器验证'}</button> : <button className="button primary" type="button" onClick={onCompleteWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ShieldCheck size={14}/>{wafBusy === 'complete' ? '正在同步订单' : '验证完成并继续查询'}</button>}
+      </div>
+    </div>}
   </section>;
 }
 
@@ -487,7 +495,7 @@ function ComplaintHistoryDialog({
       </form>}
 
       {showError && <div className="order-history-state error" data-history-phase-focus tabIndex={-1} role="alert">
-        <TriangleAlert size={21}/><strong>{sessionExpired ? '查询会话已失效' : '售后记录暂时不可用'}</strong><span>{error || '售后记录读取失败，请重试'}</span>
+        <TriangleAlert size={21}/><strong>{sessionExpired ? '查询会话已失效' : error?.includes('接口') ? '售后记录接口不可用' : '售后记录暂时不可用'}</strong><span>{error || '售后记录读取失败，请重试'}</span>
         <div className="order-history-actions">{sessionExpired ? <button className="button primary" type="button" onClick={onRequery}><RefreshCw size={15}/>关闭并重新查询</button> : <button className="button secondary" type="button" onClick={onRetry}><RotateCcw size={15}/>重试</button>}<button className="button secondary" type="button" onClick={onClose}>关闭</button></div>
       </div>}
 
@@ -561,6 +569,8 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const [expiresIn, setExpiresIn] = useState(0);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  const [wafVerification, setWafVerification] = useState(null);
+  const [wafBusy, setWafBusy] = useState('');
   const [hasQueried, setHasQueried] = useState(false);
   const [queriedAt, setQueriedAt] = useState(null);
   const [detailOrder, setDetailOrder] = useState(null);
@@ -615,6 +625,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const historyRequest = useRef(null);
   const historyGeneration = useRef(0);
   const runSearchRef = useRef(null);
+  const wafRequestRef = useRef(null);
   const imagePreviewDialog = useRef(null);
   const imagePreviewTrigger = useRef(null);
   complaintUploadsRef.current = complaintUploads;
@@ -1027,6 +1038,23 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const summary = useMemo(() => summarizeOrders(result.orders, result.pagination.total), [result]);
   const manualRequired = verification?.status === 'manual_required';
 
+  const commitSearchResponse = (response, {keywords: normalizedKeywords, status, page, pageSize, quiet = false} = {}) => {
+    const normalized = normalizeOrderResponse(response, {page, pageSize});
+    setSessionId(String(response.session_id || ''));
+    setExpiresIn(Number(response.expires_in || 0));
+    setVerification(response.verification || null);
+    setSubmittedKeywords(normalizedKeywords);
+    setResult(normalized);
+    resultContext.current = {keywords: normalizedKeywords, status: Number(status), pageSize: Number(pageSize)};
+    setCaptcha(null);
+    setCaptchaCode('');
+    setHasQueried(true);
+    setQueriedAt(new Date());
+    setWafVerification(null);
+    if (!quiet) notify({type: 'success', title: '订单查询完成', message: `已获取 ${normalized.pagination.total} 笔订单`, duration: 4200});
+    return normalized;
+  };
+
   const sendSearch = async (payload, allowExpiredRetry = true) => {
     try {
       return await request('/order-query/search', {
@@ -1086,8 +1114,16 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       setCaptchaCode('');
       setSessionId('');
       setExpiresIn(0);
+      setWafVerification(null);
+      wafRequestRef.current = null;
       setQueriedAt(null);
     }
+    wafRequestRef.current = {
+      keywords: normalizedKeywords,
+      status: Number(statusValue),
+      page: Number(pageValue),
+      page_size: Number(pageSizeValue),
+    };
     setBusy(refreshCaptcha ? 'refresh' : manualCode ? 'manual' : 'search');
     setError('');
     const payload = {
@@ -1121,18 +1157,33 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
         return false;
       }
 
-      const normalized = normalizeOrderResponse(response, {page: pageValue, pageSize: pageSizeValue});
-      setResult(normalized);
-      resultContext.current = nextContext;
-      setCaptcha(null);
-      setCaptchaCode('');
-      setHasQueried(true);
-      setQueriedAt(new Date());
-      if (!quiet) notify({type: 'success', title: '订单查询完成', message: `已获取 ${normalized.pagination.total} 笔订单`, duration: 4200});
+      const normalized = commitSearchResponse(response, {keywords: normalizedKeywords, status: statusValue, page: pageValue, pageSize: pageSizeValue, quiet});
       return true;
     } catch (requestError) {
       if (version !== requestVersion.current) return false;
       clearStaleResult();
+      if (requestError.code === 'waf_verification_required' || requestError.payload?.code === 'waf_verification_required') {
+        setError('');
+        // Preserve the session created before the upstream WAF response so
+        // the browser-verification button has a usable context.
+        const wafPayload = requestError.payload || {};
+        const responseSessionId = String(wafPayload.session_id || '');
+        const responseRequest = wafPayload.waf_request;
+        if (responseSessionId) setSessionId(responseSessionId);
+        if (Number.isFinite(Number(wafPayload.expires_in))) setExpiresIn(Number(wafPayload.expires_in));
+        if (responseSessionId && responseRequest && typeof responseRequest === 'object') {
+          wafRequestRef.current = {
+            keywords: normalizedKeywords,
+            status: Number(responseRequest.status ?? statusValue),
+            page: Number(responseRequest.page ?? pageValue),
+            page_size: Number(responseRequest.page_size ?? pageSizeValue),
+          };
+        }
+        setSubmittedKeywords(normalizedKeywords);
+        setWafVerification({status: 'required', detail: requestError.message || '订单接口触发阿里云 WAF 验证'});
+        notify({type: 'warning', title: '需要完成浏览器验证', message: '订单接口返回 403，打开 Edge 完成阿里云 WAF 滑块后继续', duration: 7000});
+        return false;
+      }
       setError(requestError.message || '订单查询失败');
       notify(requestError.message || '订单查询失败', 'error');
       return false;
@@ -1142,6 +1193,49 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   };
 
   runSearchRef.current = runSearch;
+
+  const runOrderWafVerification = async phase => {
+    const requestSpec = wafRequestRef.current;
+    if (!requestSpec || !sessionId || !submittedKeywords || wafBusy || busy) {
+      if (!wafBusy && !busy && (!requestSpec || !sessionId || !submittedKeywords)) {
+        notify('楠岃瘉浼氳瘽宸插け鏁堬紝璇峰厛閲嶆柊鏌ヨ', 'error');
+      }
+      return false;
+    }
+    setWafBusy(phase);
+    try {
+      const response = await request(`/order-query/waf-verification/${phase}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...requestSpec, session_id: sessionId, keywords: submittedKeywords}),
+      });
+      if (response.status === 'awaiting_verification') {
+        setWafVerification({status: 'awaiting_verification', detail: response.detail || '请在 Edge 窗口完成滑块验证'});
+        notify({type: 'info', title: 'Edge 验证已打开', message: '完成滑块后点击“验证完成并继续查询”', duration: 6000});
+        return false;
+      }
+      commitSearchResponse(response, {
+        keywords: requestSpec.keywords,
+        status: requestSpec.status,
+        page: requestSpec.page,
+        pageSize: requestSpec.page_size,
+      });
+      return true;
+    } catch (requestError) {
+      if (requestError.status === 410) {
+        setSessionId('');
+        setVerification(null);
+        setExpiresIn(0);
+        setWafVerification(null);
+      } else {
+        setWafVerification({status: 'required', detail: requestError.message || '浏览器验证未完成，请重试'});
+      }
+      notify(requestError.message || '浏览器验证未完成', 'error');
+      return false;
+    } finally {
+      setWafBusy('');
+    }
+  };
 
   const submitSearch = event => {
     event.preventDefault();
@@ -1623,6 +1717,10 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
         onRefresh={() => runSearch({refreshCaptcha: true, quiet: true})}
         onSubmit={submitManualCaptcha}
         expiresIn={expiresIn}
+        waf={wafVerification}
+        wafBusy={wafBusy}
+        onStartWaf={() => runOrderWafVerification('start')}
+        onCompleteWaf={() => runOrderWafVerification('complete')}
       />
     </section>
 

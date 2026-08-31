@@ -317,18 +317,28 @@ export function complaintHistoryErrorState(error = {}) {
   const sessionExpired = Number(error.status) === 410 || code === 'order_query_session_expired';
   const passwordRequired = code === 'order_query_password_required';
   const passwordInvalid = code === 'order_query_password_invalid';
+  const endpointUnavailable = code === 'complaint_history_endpoint_unavailable'
+    || code === 'order_complaint_history_unavailable'
+    || (Number(error.status) === 404 && normalizedText(error.message || error.payload?.detail) === '接口不存在');
   const fallback = sessionExpired
     ? '订单查询会话已失效，请重新查询订单后再查看记录'
     : passwordRequired
       ? '请输入订单安全密码'
       : passwordInvalid
         ? '订单安全密码错误，请重新输入'
-        : '售后记录读取失败，请重试';
+        : endpointUnavailable
+          ? '售后记录接口未启用，请重启后端服务'
+          : '售后记录读取失败，请重试';
+  const rawMessage = normalizedText(error.message || error.payload?.detail);
+  const message = endpointUnavailable && (rawMessage === '接口不存在' || rawMessage === 'Not Found')
+    ? fallback
+    : rawMessage || fallback;
   return {
     sessionExpired,
     passwordRequired,
     passwordInvalid,
-    message: normalizedText(error.message) || fallback,
+    endpointUnavailable,
+    message,
   };
 }
 
@@ -508,5 +518,6 @@ export function verificationLabel(verification = {}) {
   if (verification?.status !== 'verified') return '等待查询';
   if (verification?.mode === 'manual') return '手工验证通过';
   if (verification?.mode === 'session') return '会话验证有效';
+  if (verification?.mode === 'browser') return '浏览器验证通过';
   return '自动识别通过';
 }

@@ -13,6 +13,8 @@ from .errors import OrderQueryError
 SendJson = Callable[[Any, int], Any]
 ORDER_QUERY_PATH = "/api/order-query/search"
 ORDER_DETAIL_PATH = "/api/order-query/detail"
+ORDER_WAF_START_PATH = "/api/order-query/waf-verification/start"
+ORDER_WAF_COMPLETE_PATH = "/api/order-query/waf-verification/complete"
 ORDER_COMPLAINT_PREVIEW_PATH = "/api/order-query/complaints/preview"
 ORDER_COMPLAINT_CONTEXT_PATH = "/api/order-query/complaints/context"
 ORDER_COMPLAINT_HISTORY_PATH = "/api/order-query/complaints/history"
@@ -22,6 +24,8 @@ ORDER_COMPLAINT_REMOVE_UPLOAD_PATH = "/api/order-query/complaints/upload/remove"
 ORDER_QUERY_POST_PATHS = frozenset({
     ORDER_QUERY_PATH,
     ORDER_DETAIL_PATH,
+    ORDER_WAF_START_PATH,
+    ORDER_WAF_COMPLETE_PATH,
     ORDER_COMPLAINT_PREVIEW_PATH,
     ORDER_COMPLAINT_CONTEXT_PATH,
     ORDER_COMPLAINT_HISTORY_PATH,
@@ -127,6 +131,16 @@ def handle_post(
     else:
         return False
     if operation is None:
+        if path == ORDER_COMPLAINT_HISTORY_PATH:
+            send_json(
+                {
+                    "detail": "售后记录接口未启用，请重启后端服务",
+                    "code": "order_complaint_history_unavailable",
+                    "retryable": True,
+                },
+                503,
+            )
+            return True
         return False
     try:
         send_json(operation(data), 200)
@@ -136,6 +150,10 @@ def handle_post(
             "code": exc.code,
             "retryable": exc.retryable,
         }
+        if hasattr(exc, "session_id"):
+            payload["session_id"] = str(getattr(exc, "session_id"))
+            payload["expires_in"] = int(getattr(exc, "expires_in", 0))
+            payload["waf_request"] = dict(getattr(exc, "request", {}))
         if hasattr(exc, "seconds"):
             payload["cooldown_seconds"] = int(getattr(exc, "seconds"))
         send_json(payload, exc.status)

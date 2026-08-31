@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sys
 import threading
 import unittest
 from io import BytesIO
@@ -9,9 +10,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 from urllib.parse import parse_qs
+from urllib.error import HTTPError
 from urllib.request import Request
 
 import main
+from monitor_core.storefront import WafChallengeRequired
 from order_query import routes
 from order_query.captcha import CaptchaRecognizer, captcha_sign, normalize_captcha_code
 from order_query.client import CaptchaChallenge, OrderQueryClient
@@ -31,6 +34,7 @@ from order_query.errors import (
     OrderQueryPasswordRateLimited,
     OrderQueryPasswordRequired,
     OrderQuerySessionExpired,
+    OrderQueryWafVerificationRequired,
     OrderComplaintSubmissionUnknown,
     UpstreamOrderError,
 )
@@ -83,6 +87,7 @@ class FakeOrderClient:
         self.list_calls: list[dict[str, Any]] = []
         self.detail_calls: list[dict[str, Any]] = []
         self.detail_error: Exception | None = None
+        self.list_error: Exception | None = None
         self.expire_next_list = False
 
     def start_captcha(self, previous_code: str = "") -> CaptchaChallenge:
@@ -104,6 +109,8 @@ class FakeOrderClient:
         from order_query.errors import CaptchaVerificationExpired
 
         self.list_calls.append(kwargs)
+        if self.list_error is not None:
+            raise self.list_error
         if self.expire_next_list:
             self.expire_next_list = False
             raise CaptchaVerificationExpired()
@@ -158,6 +165,40 @@ class CaptchaTests(unittest.TestCase):
         self.assertEqual(recognizer.recognize(b"png"), "Z9x8")
         self.assertEqual(recognizer.recognize(b"png"), "Z9x8")
         self.assertEqual(loads, [True])
+
+    def test_default_recognizer_uses_legacy_shop_captcha_model(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class DdddOcr:
+            def __init__(self, **kwargs: Any) -> None:
+                calls.append(kwargs)
+
+            def classification(self, image: bytes) -> str:
+                return "AB12"
+
+        fake_module = SimpleNamespace(DdddOcr=DdddOcr)
+        with patch.dict(sys.modules, {"ddddocr": fake_module}):
+            recognizer = CaptchaRecognizer()
+            self.assertEqual(recognizer.recognize(b"png"), "AB12")
+        self.assertEqual(calls, [{"show_ad": False, "old": True}])
+
+    def test_default_recognizer_falls_back_when_old_model_switch_is_unavailable(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class DdddOcr:
+            def __init__(self, **kwargs: Any) -> None:
+                calls.append(kwargs)
+                if "old" in kwargs:
+                    raise TypeError("old is unsupported")
+
+            def classification(self, image: bytes) -> str:
+                return "CD34"
+
+        fake_module = SimpleNamespace(DdddOcr=DdddOcr)
+        with patch.dict(sys.modules, {"ddddocr": fake_module}):
+            recognizer = CaptchaRecognizer()
+            self.assertEqual(recognizer.recognize(b"png"), "CD34")
+        self.assertEqual(calls, [{"show_ad": False, "old": True}, {"show_ad": False}])
 
 
 class ClientTests(unittest.TestCase):
@@ -253,6 +294,26 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "地址无效"):
             OrderQueryClient(opener=opener).start_captcha()
 
+    def test_http_403_aliyun_challenge_is_exposed_as_browser_verification(self) -> None:
+        class WafOpener:
+            def open(self, request: Request, timeout: float) -> Any:
+                raise HTTPError(
+                    request.full_url,
+                    403,
+                    "forbidden",
+                    {"Content-Type": "text/html; charset=utf-8"},
+                    BytesIO(b"<html>aliyun captcha challenge</html>"),
+                )
+
+        with self.assertRaises(WafChallengeRequired):
+            OrderQueryClient(opener=WafOpener()).list_orders(
+                keywords="buyer@example.test",
+                ticket="ticket",
+                status=999,
+                page=1,
+                page_size=10,
+            )
+
     def test_empty_order_result_keeps_one_pagination_page(self) -> None:
         from order_query.client import normalize_order_list
 
@@ -330,6 +391,20 @@ class ClientTests(unittest.TestCase):
                         trade_no="ORDER-1",
                         query_password="",
                     )
+
+    def test_complaint_history_maps_missing_upstream_endpoint_to_distinct_error(self) -> None:
+        opener = FakeOpener([self._json_response({
+            "code": 0,
+            "msg": "接口不存在",
+            "data": None,
+        })])
+        with self.assertRaises(UpstreamOrderError) as context:
+            OrderQueryClient(opener=opener).get_complaint_history(
+                trade_no="ORDER-1",
+                query_password="123456",
+            )
+        self.assertEqual(context.exception.code, "complaint_history_endpoint_unavailable")
+        self.assertEqual(context.exception.status, 503)
 
     def test_complaint_password_check_maps_human_verification_failure_to_expired_session(self) -> None:
         opener = FakeOpener([self._json_response({
@@ -833,6 +908,19 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(client.list_calls, [])
         self.assertEqual(client.start_count, 3)
 
+    def test_waf_response_preserves_session_context_for_browser_verification(self) -> None:
+        client = FakeOrderClient()
+        client.list_error = WafChallengeRequired("waf challenge")
+        service = self.service(client, FakeRecognizer(["AB12"]))
+
+        with self.assertRaises(OrderQueryWafVerificationRequired) as raised:
+            service.search({"keywords": "buyer", "status": 1, "page": 2, "page_size": 20})
+
+        error = raised.exception
+        self.assertTrue(error.session_id)
+        self.assertGreater(error.expires_in, 0)
+        self.assertEqual(error.request, {"status": 1, "page": 2, "page_size": 20})
+
     def test_expired_ticket_is_reverified_within_three_attempt_budget(self) -> None:
         client = FakeOrderClient()
         client.expire_next_list = True
@@ -1070,6 +1158,51 @@ class RouteTests(unittest.TestCase):
             "detail": "bad query",
             "code": "invalid_order_query",
             "retryable": False,
+        })])
+
+    def test_route_preserves_waf_session_context_for_browser_button(self) -> None:
+        responses: list[tuple[int, Any]] = []
+
+        def fail(data: dict[str, Any]) -> dict[str, Any]:
+            raise OrderQueryWafVerificationRequired(
+                session_id="abcdefghijklmnop",
+                expires_in=240,
+                request={"status": 999, "page": 1, "page_size": 10},
+            )
+
+        handled = routes.handle_post(
+            "/api/order-query/search",
+            {},
+            send_json=lambda value, status=200: responses.append((status, value)),
+            search=fail,
+            detail=lambda data: {},
+            complaint_preview=lambda data: {},
+        )
+        self.assertTrue(handled)
+        self.assertEqual(responses, [(409, {
+            "detail": "链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后重试",
+            "code": "waf_verification_required",
+            "retryable": True,
+            "session_id": "abcdefghijklmnop",
+            "expires_in": 240,
+            "waf_request": {"status": 999, "page": 1, "page_size": 10},
+        })])
+
+    def test_missing_history_operation_returns_distinct_service_error(self) -> None:
+        responses: list[tuple[int, Any]] = []
+        handled = routes.handle_post(
+            routes.ORDER_COMPLAINT_HISTORY_PATH,
+            {},
+            send_json=lambda value, status=200: responses.append((status, value)),
+            search=lambda data: {},
+            detail=lambda data: {},
+            complaint_preview=lambda data: {},
+        )
+        self.assertTrue(handled)
+        self.assertEqual(responses, [(503, {
+            "detail": "售后记录接口未启用，请重启后端服务",
+            "code": "order_complaint_history_unavailable",
+            "retryable": True,
         })])
 
     def test_detail_route_returns_a_specific_password_error(self) -> None:
