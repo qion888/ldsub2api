@@ -1,8 +1,14 @@
 import React, {useEffect, useMemo, useState} from 'react';
 import {
+  AlertTriangle,
   Check,
+  CheckCircle2,
+  CloudDownload,
+  ExternalLink,
+  GitBranch,
   KeyRound,
   LockKeyhole,
+  PackageCheck,
   RefreshCw,
   Save,
   SlidersHorizontal,
@@ -16,6 +22,7 @@ import {
 } from 'lucide-react';
 
 import {AUTH_MODES, isAdmin, normalizeMode, normalizeUser, roleLabel} from './authModel.js';
+import {normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
 
 const EMPTY_BASIC = {site_name: '', announcement: '', contact_email: '', timezone: 'Asia/Shanghai', base_url: ''};
 const EMPTY_SYSTEM = {
@@ -59,6 +66,9 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
   const [resetBusy, setResetBusy] = useState(false);
   const [passwordForm, setPasswordForm] = useState({current_password: '', password: '', confirm_password: ''});
   const [passwordBusy, setPasswordBusy] = useState(false);
+  const [versionInfo, setVersionInfo] = useState(null);
+  const [versionBusy, setVersionBusy] = useState('');
+  const [versionError, setVersionError] = useState('');
 
   const loadUsers = async () => {
     if (!admin) return;
@@ -70,6 +80,19 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
       setError(requestError.message || '用户列表加载失败');
     } finally {
       setUsersBusy(false);
+    }
+  };
+
+  const loadVersion = async () => {
+    if (!admin) return;
+    setVersionBusy('load');
+    setVersionError('');
+    try {
+      setVersionInfo(normalizeVersionInfo(await request('/version')));
+    } catch (requestError) {
+      setVersionError(requestError.message || '版本信息加载失败');
+    } finally {
+      setVersionBusy('');
     }
   };
 
@@ -96,7 +119,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
       setSystem(settingsPart(payload, 'system', EMPTY_SYSTEM));
       setSettingsMode(normalizeMode(payload?.mode || mode));
       setAllowRegistration(Boolean(payload?.allow_registration));
-      if (admin) await loadUsers();
+      if (admin) await Promise.all([loadUsers(), loadVersion()]);
     } catch (requestError) {
       setError(requestError.message || '设置加载失败');
     } finally {
@@ -275,18 +298,49 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
     }
   };
 
+  const checkVersionUpdates = async () => {
+    setVersionBusy('check');
+    setVersionError('');
+    try {
+      const result = normalizeVersionInfo(await request('/version/check', {method: 'POST'}));
+      setVersionInfo(result);
+      notify?.(result.message || (result.update_available ? '发现可用更新' : '当前已是最新版本'));
+    } catch (requestError) {
+      setVersionError(requestError.message || '检查更新失败');
+    } finally {
+      setVersionBusy('');
+    }
+  };
+
+  const installVersionUpdate = async () => {
+    if (!versionInfo?.update_ready) return;
+    if (!window.confirm(`将从 GitHub 更新到 ${versionInfo.latest_version || versionInfo.latest_short_commit}，是否继续？`)) return;
+    setVersionBusy('update');
+    setVersionError('');
+    try {
+      const result = normalizeVersionInfo(await request('/version/update', {method: 'POST'}));
+      setVersionInfo(result);
+      notify?.(result.message || '版本更新完成');
+    } catch (requestError) {
+      setVersionError(requestError.message || '版本更新失败');
+    } finally {
+      setVersionBusy('');
+    }
+  };
+
   const userCountLabel = useMemo(() => `${users.length} 个用户`, [users.length]);
 
   return <section className="settings-view">
     <div className="settings-head">
-      <div><span className="detail-kicker">SYSTEM CONTROL</span><h2>设置</h2><p>基础配置、系统模式与账号管理</p></div>
-      <button className="icon-button" type="button" aria-label="刷新设置" title="刷新设置" onClick={loadSettings} disabled={loading || saving || usersBusy}><RefreshCw size={16} className={loading ? 'spin' : ''}/></button>
+      <div><span className="detail-kicker">SYSTEM CONTROL</span><h2>设置</h2><p>基础配置、系统模式、版本与账号管理</p></div>
+      <button className="icon-button" type="button" aria-label="刷新设置" title="刷新设置" onClick={loadSettings} disabled={loading || saving || usersBusy || Boolean(versionBusy)}><RefreshCw size={16} className={loading ? 'spin' : ''}/></button>
     </div>
     <div className="settings-layout">
       <nav className="settings-tabs" aria-label="设置分类">
         {admin && <button type="button" className={tab === 'basic' ? 'active' : ''} onClick={() => setTab('basic')}><SlidersHorizontal size={16}/>基础设置</button>}
         <button type="button" className={tab === 'profile' ? 'active' : ''} onClick={() => setTab('profile')}><UserCircle size={16}/>我的账号</button>
         {admin && <button type="button" className={tab === 'system' ? 'active' : ''} onClick={() => setTab('system')}><Settings2 size={16}/>系统设置</button>}
+        {admin && <button type="button" className={tab === 'version' ? 'active' : ''} onClick={() => setTab('version')}><GitBranch size={16}/>版本与更新</button>}
         {admin && <button type="button" className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}><Users size={16}/>用户管理</button>}
       </nav>
       <div className="settings-content">
@@ -328,13 +382,37 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
           </div>
           <div className="settings-mode-callout"><ShieldCheck size={16}/><span>{settingsMode === AUTH_MODES.EXTERNAL ? '对外模式：登录后按角色显示功能。' : '自用模式：保留本机工作流，可选择登录管理。'}</span></div>
           <div className="settings-actions"><button className="button primary" type="button" onClick={saveSystem} disabled={saving}><Save size={15}/>{saving ? '保存中' : '保存系统设置'}</button></div>
-        </section> : <section className="settings-section users-section">
+        </section> : tab === 'users' ? <section className="settings-section users-section">
           <div className="settings-section-head"><div><span className="detail-kicker">USERS</span><h3>用户管理</h3></div><span className="settings-count">{userCountLabel}</span></div>
           <form className="user-create-form" onSubmit={createUser}>
             <div className="settings-form-grid"><label><span>账号</span><input value={newUser.username} onChange={event => setNewUser({...newUser, username: event.target.value})} autoComplete="off" placeholder="新用户账号"/></label><label><span>临时密码</span><input type="password" value={newUser.password} onChange={event => setNewUser({...newUser, password: event.target.value})} autoComplete="new-password" placeholder="初始密码"/></label><label><span>显示名称</span><input value={newUser.display_name} onChange={event => setNewUser({...newUser, display_name: event.target.value})} placeholder="可选"/></label><label><span>角色</span><select value={newUser.role} onChange={event => setNewUser({...newUser, role: event.target.value})}><option value="user">普通用户</option><option value="admin">管理员</option></select></label></div>
             <button className="button primary" type="submit" disabled={creatingUser}><UserPlus size={15}/>{creatingUser ? '创建中' : '创建用户'}</button>
           </form>
           <div className="user-table" role="table" aria-label="用户列表"><div className="user-row user-row-head" role="row"><span>账号</span><span>角色</span><span>状态</span><span>操作</span></div>{users.map(entry => <div className="user-row" role="row" key={entry.id}><span><strong>{entry.display_name}</strong><small>{entry.username}</small></span><span><select value={entry.role} onChange={event => updateUser(entry, {role: event.target.value})} disabled={usersBusy || entry.id === user?.id}><option value="user">普通用户</option><option value="admin">管理员</option></select></span><span><em className={`settings-user-status ${entry.enabled === false ? 'disabled' : ''}`}>{entry.enabled === false ? '已停用' : '正常'}</em></span><span className="user-row-actions"><button className="icon-button" type="button" title="重置密码" aria-label={`重置 ${entry.username} 的密码`} onClick={() => { setResetId(entry.id); setResetPassword(''); }} disabled={usersBusy}><KeyRound size={15}/></button><button className="icon-button danger-icon" type="button" title="删除用户" aria-label={`删除用户 ${entry.username}`} onClick={() => removeUser(entry)} disabled={usersBusy || entry.id === user?.id}><Trash2 size={15}/></button></span></div>)}{!users.length && <div className="settings-state">暂无其他用户</div>}</div>
+        </section> : <section className="settings-section version-section">
+          <div className="settings-section-head"><div><span className="detail-kicker">VERSION CONTROL</span><h3>版本与更新</h3></div><PackageCheck size={19}/></div>
+          {versionError && <div className="settings-error version-error" role="alert">{versionError}</div>}
+          {versionInfo ? <>
+            <div className="version-overview">
+              <div className="version-identity"><span className="version-mark"><PackageCheck size={21}/></span><div><small>当前版本</small><strong>v{versionInfo.current_version.replace(/^v/i, '')}</strong><code>{versionInfo.current_short_commit || 'unknown'}</code></div></div>
+              <span className={`version-status version-status-${versionInfo.status}`}>{versionInfo.needs_restart ? <AlertTriangle size={14}/> : versionInfo.status === 'up_to_date' ? <CheckCircle2 size={14}/> : <GitBranch size={14}/>} {versionStatusLabel(versionInfo)}</span>
+            </div>
+            <div className="version-meta-grid">
+              <div><small>运行分支</small><strong>{versionInfo.branch || 'detached HEAD'}</strong><span>目标 {versionInfo.target_branch}</span></div>
+              <div><small>GitHub 最新</small><strong>{versionInfo.latest_version ? `v${versionInfo.latest_version.replace(/^v/i, '')}` : '尚未检查'}</strong><span>{versionInfo.latest_short_commit || '点击检查更新'}</span></div>
+              <div><small>工作树</small><strong>{versionInfo.worktree_clean ? '干净' : `${versionInfo.dirty_file_count} 项改动`}</strong><span>{versionInfo.repository_matches ? '更新源已核对' : '更新源不一致'}</span></div>
+              <div><small>更新方式</small><strong>GitHub 快进更新</strong><span>仅允许 fast-forward</span></div>
+            </div>
+            {(versionInfo.message || versionBlockReason(versionInfo) || versionInfo.needs_restart) && <div className={`version-callout ${versionInfo.needs_restart || versionBlockReason(versionInfo) ? 'warning' : 'success'}`}>
+              {versionInfo.needs_restart || versionBlockReason(versionInfo) ? <AlertTriangle size={16}/> : <CheckCircle2 size={16}/>}<span>{versionInfo.needs_restart ? '新版本已安装，请重启后端与前端服务。' : versionBlockReason(versionInfo) || versionInfo.message}</span>
+            </div>}
+            {versionInfo.checked_at && <div className="version-checked">最近检查：{new Date(versionInfo.checked_at).toLocaleString('zh-CN', {hour12: false})}</div>}
+          </> : <div className="settings-state" role="status"><RefreshCw size={18} className={versionBusy ? 'spin' : ''}/>{versionBusy ? '正在读取版本信息' : '暂无版本信息'}</div>}
+          <div className="settings-actions version-actions">
+            {versionInfo?.repository_url && <a className="button secondary" href={versionInfo.repository_url} target="_blank" rel="noreferrer"><ExternalLink size={15}/>查看 GitHub</a>}
+            <button className="button secondary" type="button" onClick={checkVersionUpdates} disabled={Boolean(versionBusy)}><RefreshCw size={15} className={versionBusy === 'check' ? 'spin' : ''}/>{versionBusy === 'check' ? '检查中' : '检查更新'}</button>
+            {versionInfo?.update_available && <button className="button primary" type="button" onClick={installVersionUpdate} disabled={Boolean(versionBusy) || !versionInfo.update_ready}><CloudDownload size={15}/>{versionBusy === 'update' ? '更新中' : '立即更新'}</button>}
+          </div>
         </section>}
       </div>
     </div>

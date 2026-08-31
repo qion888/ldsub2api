@@ -61,6 +61,8 @@ from sub2api.constants import CODEX_FINGERPRINT_MODES, DEFAULT_AUTOMATION, DEFAU
 from user import auth as user_auth
 from user import routes as user_routes
 from user.errors import UserServiceError
+from version_control import RepositoryConfig, VersionControlService
+from version_control import routes as version_control_routes
 
 HOST = os.environ.get("LDXP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LDXP_PORT", "8000"))
@@ -96,6 +98,7 @@ def database() -> sqlite3.Connection:
 # Resolve ``database`` lazily so the existing isolated-database test seams and
 # embedding callers can replace the factory without rebuilding this service.
 USER_SERVICE = user_auth.AuthService(lambda: database(), now=utc_now)
+VERSION_SERVICE = VersionControlService(RepositoryConfig.from_environment(PROJECT_ROOT))
 
 
 def init_database() -> None:
@@ -1346,6 +1349,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             query_values=parse_qs(parsed.query),
         ):
             return
+        if version_control_routes.handle_get(
+            path,
+            send_json=self._send_json,
+            principal=_principal,
+            version_info=VERSION_SERVICE.version_info,
+        ):
+            return
         if path == "/":
             return self._send_redirect(FRONTEND_URL)
         if path == "/api/health":
@@ -1477,6 +1487,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             headers=getattr(self, "headers", None),
             user_agent=str(getattr(self, "headers", {}).get("User-Agent", ""))[:240],
             ip_address=self._request_ip(),
+        ):
+            return
+
+        if version_control_routes.handle_post(
+            path,
+            data,
+            send_json=self._send_json,
+            principal=_principal,
+            check_updates=VERSION_SERVICE.check_updates,
+            install_update=VERSION_SERVICE.install_update,
         ):
             return
 
