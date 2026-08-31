@@ -22,6 +22,8 @@ import {
   Link2,
   ListChecks,
   LoaderCircle,
+  LogIn,
+  LogOut,
   Moon,
   Minus,
   Package,
@@ -32,12 +34,15 @@ import {
   Save,
   Search,
   SlidersHorizontal,
+  Settings2,
   KeyRound,
   Sun,
   Tag,
   TimerReset,
   TriangleAlert,
   Upload,
+  UserCircle,
+  Wrench,
   ShieldCheck,
   ShoppingBag,
   Store,
@@ -57,9 +62,29 @@ import {
   normalizeSub2ApiRecoveryResult,
   recoveryResultForProgress,
 } from './sub2apiRecoveryModel.js';
+import {InstallWizard, LoginView} from './AuthGate.jsx';
+import SettingsView from './SettingsView.jsx';
+import {
+  AUTH_MODES,
+  canManageWorkspace,
+  canAccessView,
+  defaultViewFor,
+  isAdmin,
+  normalizeInstallStatus,
+  normalizeMode,
+  normalizeSession,
+  requiresLogin,
+  roleLabel,
+} from './authModel.js';
 
 const API = '/api';
 const CHECKOUT_PROFILE_KEY = 'ldxp-checkout-profile-v1';
+const AUTH_TOKEN_KEY = 'ldxp-auth-token-v1';
+let apiAuthToken = '';
+
+function setApiAuthToken(value) {
+  apiAuthToken = String(value || '').trim();
+}
 const PriceHistoryChart = React.lazy(() => import('./PriceHistoryChart.jsx'));
 const ProductDetailPriceChart = React.lazy(() => import('./PriceHistoryChart.jsx').then(module => ({default: module.ProductDetailPriceChart})));
 const loadOrderQueryView = () => import('./OrderQueryView.jsx');
@@ -104,8 +129,11 @@ function needsBrowserVerification(shop) {
   return /WAF|无法解析|HTML 页面|HTML页面/.test(shop.last_attempt?.error || '');
 }
 
-async function request(path, options) {
-  const response = await fetch(`${API}${path}`, options);
+async function request(path, options = {}, {auth = true} = {}) {
+  const headers = new Headers(options.headers || {});
+  if (auth && apiAuthToken && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${apiAuthToken}`);
+  const requestOptions = {...options, headers, credentials: options.credentials || 'include'};
+  const response = await fetch(`${API}${path}`, requestOptions);
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(payload.detail || '请求失败');
@@ -113,6 +141,9 @@ async function request(path, options) {
     error.payload = payload;
     error.code = payload.code || '';
     error.retryable = payload.retryable === true;
+    if (auth && response.status === 401 && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('ldxp-auth-expired', {detail: payload}));
+    }
     throw error;
   }
   return payload;
@@ -474,7 +505,7 @@ function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, 
                 <div><RadarStockPill item={item}/></div>
                 <div className="overview-time-cell"><strong>{compactTime(item.last_attempt?.fetched_at)}</strong><small>{itemIsUnlisted(item) ? '未上架' : item.last_attempt?.status === 'error' ? '抓取异常' : intervalLabel(item.interval_seconds)}</small></div>
                 <div className="overview-row-actions">
-                  <IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>
+                  {onRefresh && <IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>}
                   <IconButton label="直达商品页" onClick={() => onDirect(item)}><ArrowUpRight size={15}/></IconButton>
                   <button className="overview-buy-button" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15}/>{busy[`buy-${item.id}`] ? '准备中' : '购买'}</button>
                   <IconButton label="加入购买清单" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/></IconButton>
@@ -595,7 +626,7 @@ function ProductOverviewDrawer({id, open, items, shops, stableOrder, busy = {}, 
                 <div className="radar-copy"><strong title={item.latest?.title || item.name}>{item.latest?.title || item.name || '等待商品数据'}</strong><span>{itemShopName(item)} · {itemCategory(item)}</span><RadarStockPill item={item}/></div>
                 <div className="radar-quote"><strong>{money(price)}</strong><small>{floor !== undefined ? `最低 ${money(floor)}` : '暂无最低价'}</small>{item.price_changed && <em>变价</em>}</div>
               </button>
-              <div className="radar-actions"><IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={14} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton><IconButton label="直达商品页" onClick={() => onDirect(item)}><ArrowUpRight size={14}/></IconButton><IconButton label="一键购买" tone="buy" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={14} className={busy[`buy-${item.id}`] ? 'spin' : ''}/></IconButton><IconButton label="加入购买清单" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={14}/></IconButton></div>
+              <div className="radar-actions">{onRefresh && <IconButton label="刷新商品" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={14} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>}<IconButton label="直达商品页" onClick={() => onDirect(item)}><ArrowUpRight size={14}/></IconButton><IconButton label="一键购买" tone="buy" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={14} className={busy[`buy-${item.id}`] ? 'spin' : ''}/></IconButton><IconButton label="加入购买清单" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={14}/></IconButton></div>
             </article>;
           })}
         </div>
@@ -737,7 +768,7 @@ function ProductDetailDrawer({open, item, history, trend, historyTotal, priceDel
 
         <div className="detail-action-bar">
           <div><span>当前商品</span><strong>{itemShopName(item)}</strong></div>
-          <button className="button secondary" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/>刷新</button>
+          {onRefresh && <button className="button secondary" onClick={() => onRefresh(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/>刷新</button>}
           <button className="button secondary" onClick={() => onDirect(item)}><ArrowUpRight size={15}/>商品页</button>
           <button className="button secondary" onClick={() => onAdd(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/>加入清单</button>
           <button className="button primary" onClick={() => onBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15}/>{busy[`buy-${item.id}`] ? '正在准备' : '立即购买'}</button>
@@ -905,7 +936,10 @@ function HistoryView({
   </section>;
 }
 
-function App() {
+function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, onLogout, onLogin, onModeChange}) {
+  const admin = isAdmin(sessionUser);
+  const canManageMonitor = canManageWorkspace(sessionUser, authMode);
+  const readOnly = !canManageMonitor;
   const [items, setItems] = useState([]);
   const [shops, setShops] = useState([]);
   const [preorders, setPreorders] = useState([]);
@@ -1013,6 +1047,12 @@ function App() {
   const monitorLastLoadedAt = useRef(0);
   const redeemConfigLoaded = useRef(false);
   const stableItemOrder = useStableItemOrder(items);
+
+  useEffect(() => {
+    if (!canAccessView(activeView, sessionUser, authMode)) {
+      setActiveView(defaultViewFor(sessionUser, authMode));
+    }
+  }, [activeView, authMode, sessionUser]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1152,10 +1192,13 @@ function App() {
 
   const loadItems = async ({quiet = false} = {}) => {
     try {
+      // Ordinary users can browse public monitor data, but only administrators
+      // need the preorder management feed. Keep the read-only workspace from
+      // depending on an admin-only endpoint when an older backend is used.
       const [data, shopData, preorderData] = await Promise.all([
         request('/watches'),
         request('/shops'),
-        request('/preorders'),
+        canManageMonitor ? request('/preorders') : Promise.resolve([]),
       ]);
       setItems(data);
       setShops(shopData);
@@ -1254,7 +1297,7 @@ function App() {
       if (!cancelled) setFeatureStatus('monitor', result.ok ? 'ready' : 'error', result.error || '');
     });
     return () => { cancelled = true; };
-  }, [featureLoadAttempt.monitor]);
+  }, [canManageMonitor, featureLoadAttempt.monitor]);
 
   useEffect(() => {
     const feature = activeView === 'reclaim' || activeView === 'sub2api' ? activeView : null;
@@ -2971,6 +3014,10 @@ function App() {
   };
   const openDirectProduct = item => window.open(item.latest?.source_url || item.url, '_blank', 'noopener,noreferrer');
   const switchView = view => {
+    if (!canAccessView(view, sessionUser, authMode)) {
+      if (!sessionUser && onLogin) onLogin();
+      return;
+    }
     FEATURE_MODULE_LOADERS[view]?.();
     setOverviewOpen(false);
     setDetailOpen(false);
@@ -2983,6 +3030,7 @@ function App() {
     orders: {title: '订单查询', description: '自动完成链动小铺验证并查看购买订单'},
     reclaim: {title: '卡密 401 找回', description: '检测并找回 30d.team 卡密关联的 401 账号'},
     sub2api: {title: 'Sub2API 账号导入', description: '使用管理员密钥将账号 JSON 导入 Sub2API'},
+    settings: {title: '系统设置', description: '管理基础配置、运行模式与用户账号'},
   }[activeView];
   const resetHistoryFilters = () => setHistoryFilters({query: '', startDate: '', endDate: '', status: 'all', stock: 'all'});
   const changeHistoryPageSize = value => {
@@ -2999,10 +3047,13 @@ function App() {
           <button className={activeView === 'monitor' ? 'active' : ''} onClick={() => switchView('monitor')}><ListChecks size={18}/>监控面板</button>
           <button className={activeView === 'history' ? 'active' : ''} onClick={() => switchView('history')}><History size={18}/>价格记录</button>
           <button className={activeView === 'orders' ? 'active' : ''} onClick={() => switchView('orders')}><ReceiptText size={18}/>订单查询</button>
-          <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>
-          <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>
+          {admin && <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>}
+          {admin && <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>}
+          {canAccessView('settings', sessionUser, authMode) && <button className={activeView === 'settings' ? 'active' : ''} onClick={() => switchView('settings')}><Settings2 size={18}/>系统设置</button>}
         </nav>
         <div className="sidebar-foot">
+          <div className="sidebar-account"><span className="sidebar-account-icon"><UserCircle size={17}/></span><span><strong>{sessionUser?.display_name || sessionUser?.username || '本机用户'}</strong><small>{sessionUser ? roleLabel(sessionUser) : '自用模式访客'}</small></span></div>
+          {sessionUser ? <button className="sidebar-auth-button" type="button" onClick={onLogout}><LogOut size={14}/>退出登录</button> : onLogin && <button className="sidebar-auth-button" type="button" onClick={onLogin}><LogIn size={14}/>登录管理</button>}
           <div className={`service-light ${serviceOnline ? 'online' : ''}`}><span/>{serviceOnline ? '本地服务在线' : '本地服务离线'}</div>
           <small>数据存储于本机 SQLite</small>
         </div>
@@ -3014,7 +3065,7 @@ function App() {
           <div className="topbar-actions">
             {['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary overview-button" onClick={() => { setDetailOpen(false); setOverviewOpen(true); }} aria-expanded={overviewOpen} aria-controls="product-overview-drawer" disabled={featureLoadState.monitor.status !== 'ready'}><PanelRight size={16}/>商品总览</button>}
             <IconButton label={theme === 'dark' ? '切换日间模式' : '切换夜间模式'} onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={16}/> : <Moon size={16}/>}</IconButton>
-            {['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary refresh-all-button" onClick={fetchAll} disabled={busy.fetchAll || (!items.length && !shops.length)}>
+            {canManageMonitor && ['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary refresh-all-button" onClick={fetchAll} disabled={busy.fetchAll || (!items.length && !shops.length)}>
               <RefreshCw size={16} className={busy.fetchAll ? 'spin' : ''}/>全部刷新
             </button>}
           </div>
@@ -3030,10 +3081,10 @@ function App() {
         {['products', 'monitor', 'history'].includes(activeView) && featureLoadState.monitor.status !== 'ready' ? (
           <FeatureLoadingState feature="监控数据" state={featureLoadState.monitor} onRetry={() => retryFeature('monitor')}/>
         ) : activeView === 'products' ? (
-          <ProductOverviewView items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={fetchOne}/>
+          <ProductOverviewView items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor ? fetchOne : null}/>
         ) : activeView === 'monitor' ? (
           <>
-            <form className="watch-composer" onSubmit={addWatch}>
+            {canManageMonitor && <form className="watch-composer" onSubmit={addWatch}>
               <div className="composer-title"><div className="section-icon">{sourceMode === 'shop' ? <Store size={17}/> : <BellRing size={17}/>}</div><div><h2>添加监控</h2><div className="source-segment"><button type="button" className={sourceMode === 'shop' ? 'active' : ''} onClick={() => changeSourceMode('shop')}><Store size={13}/>整店</button><button type="button" className={sourceMode === 'item' ? 'active' : ''} onClick={() => changeSourceMode('item')}><Package size={13}/>单商品</button></div></div></div>
               <div className={`composer-fields ${sourceMode === 'shop' ? 'shop-mode' : ''}`}>
                 <label className="url-field"><span>{sourceMode === 'shop' ? '店铺链接' : '商品链接'}</span><div><Link2 size={16}/><input value={url} onChange={event => changeSourceUrl(event.target.value)} placeholder={sourceMode === 'shop' ? '粘贴店铺链接' : '粘贴商品链接'} required spellCheck="false"/></div></label>
@@ -3043,7 +3094,7 @@ function App() {
                 <label><span>监控频率</span><select value={intervalSeconds} onChange={event => setIntervalSeconds(Number(event.target.value))}>{MONITOR_INTERVAL_OPTIONS.map(seconds => <option value={seconds} key={seconds}>{intervalOptionLabel(seconds)}</option>)}</select></label>
                 <button className="button primary" disabled={busy.add}><Plus size={16}/>{busy.add ? '正在同步' : sourceMode === 'shop' ? '同步店铺' : '开始监控'}</button>
               </div>
-            </form>
+            </form>}
 
             {!!shops.length && <section className="shop-overview">
               <div className="section-heading"><div><h2>店铺汇总</h2><p>店铺接口按设定频率分页同步</p></div>{shopFilter && <button className="clear-filter" onClick={() => { setShopFilter(null); setCheckedIds([]); }}><X size={13}/>显示全部商品</button>}</div>
@@ -3053,12 +3104,12 @@ function App() {
                 <span className="monitor-result-count">{filteredShops.length} / {shops.length}</span>
                 {(shopQuery || shopStatusFilter !== 'all') && <IconButton label="清除店铺筛选" onClick={() => { setShopQuery(''); setShopStatusFilter('all'); }}><X size={14}/></IconButton>}
               </div>
-              <div className="shop-batch-toolbar">
+              {canManageMonitor && <div className="shop-batch-toolbar">
                 <label className="shop-select-all"><input className="select-checkbox" type="checkbox" checked={allVisibleShopsChecked} onChange={toggleAllVisibleShops} disabled={!filteredShops.length} aria-label="全选当前店铺"/><span>全选当前结果</span></label>
                 <div><span>{validCheckedShopIds.length ? `已选 ${validCheckedShopIds.length} 个店铺` : '尚未选择店铺'}</span>{validCheckedShopIds.length > 0 && <IconButton label="取消选择店铺" onClick={() => setCheckedShopIds([])}><X size={14}/></IconButton>}<button className="button danger-button" onClick={removeCheckedShops} disabled={!validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button></div>
-              </div>
+              </div>}
               <div className="shop-list">{!filteredShops.length ? <div className="monitor-filter-empty"><Store size={20}/><span>没有符合条件的店铺</span></div> : filteredShops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''} ${checkedShopIds.includes(shop.id) ? 'checked' : ''}`} key={shop.id}>
-                <label className="check-wrap shop-select-cell" title={`选择店铺：${shop.name || shop.token}`} onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedShopIds.includes(shop.id)} onChange={() => toggleShopChecked(shop.id)} aria-label={`选择店铺：${shop.name || shop.token}`}/></label>
+                {canManageMonitor && <label className="check-wrap shop-select-cell" title={`选择店铺：${shop.name || shop.token}`} onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedShopIds.includes(shop.id)} onChange={() => toggleShopChecked(shop.id)} aria-label={`选择店铺：${shop.name || shop.token}`}/></label>}
                 <button className="shop-main" onClick={() => { setShopFilter(current => current === shop.id ? null : shop.id); setCheckedIds([]); }}>
                   <span className="shop-icon"><Store size={18}/></span><span><strong>{shop.name || shop.token}</strong><small>{shop.token} · {shopGoodsTypeLabel(shop.goods_type)} · {shopCategoryLabel(shop)}</small></span>
                 </button>
@@ -3066,9 +3117,9 @@ function App() {
                 <div className="shop-stat"><span>在售</span><strong className="positive">{shop.on_sale_count}</strong></div>
                 <div className="shop-stat"><span>已知库存</span><strong>{shop.total_stock ?? '--'}</strong><small>{shop.known_stock_count}/{shop.product_count} 项公开</small></div>
                 <div className="shop-time" title={shop.last_attempt?.error || ''}><span className={`pill ${shop.last_attempt?.status === 'error' ? 'error' : 'live'}`}>{needsBrowserVerification(shop) ? '需要验证' : shop.last_attempt?.status === 'error' ? '同步异常' : '已同步'}</span><small>{compactTime(shop.last_attempt?.fetched_at)}</small></div>
-                <MonitorIntervalSelect value={shop.interval_seconds} label={`修改${shop.name || shop.token}监控频率`} caption="监控频率" disabled={busy[`shop-save-${shop.id}`]} onChange={value => updateShop(shop, {interval_seconds: value})}/>
+                {canManageMonitor && <><MonitorIntervalSelect value={shop.interval_seconds} label={`修改${shop.name || shop.token}监控频率`} caption="监控频率" disabled={busy[`shop-save-${shop.id}`]} onChange={value => updateShop(shop, {interval_seconds: value})}/>
                 <button className={`switch ${shop.enabled ? 'on' : ''}`} role="switch" aria-checked={shop.enabled} title={shop.enabled ? '暂停店铺监控' : '开启店铺监控'} disabled={busy[`shop-save-${shop.id}`]} onClick={() => updateShop(shop, {enabled: !shop.enabled})}><span/></button>
-                <div className="row-actions">{needsBrowserVerification(shop) && (verificationShopId === shop.id ? <IconButton label="验证完成并同步" tone="verify" onClick={() => completeBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ShieldCheck size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton> : <IconButton label="打开浏览器验证" tone="verify" onClick={() => startBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ArrowUpRight size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton>)}<IconButton label="同步店铺" onClick={() => fetchShop(shop.id)} disabled={busy[`shop-${shop.id}`]}><RefreshCw size={15} className={busy[`shop-${shop.id}`] ? 'spin' : ''}/></IconButton><IconButton label="删除店铺监控" tone="danger" onClick={() => removeShop(shop)}><Trash2 size={15}/></IconButton></div>
+                <div className="row-actions">{needsBrowserVerification(shop) && (verificationShopId === shop.id ? <IconButton label="验证完成并同步" tone="verify" onClick={() => completeBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ShieldCheck size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton> : <IconButton label="打开浏览器验证" tone="verify" onClick={() => startBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ArrowUpRight size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton>)}<IconButton label="同步店铺" onClick={() => fetchShop(shop.id)} disabled={busy[`shop-${shop.id}`]}><RefreshCw size={15} className={busy[`shop-${shop.id}`] ? 'spin' : ''}/></IconButton><IconButton label="删除店铺监控" tone="danger" onClick={() => removeShop(shop)}><Trash2 size={15}/></IconButton></div></>}
               </div>)}</div>
             </section>}
 
@@ -3081,23 +3132,23 @@ function App() {
                   <span className="monitor-result-count">{visibleItems.length} / {shopScopedItems.length}</span>
                   {(productQuery || productStatusFilter !== 'all') && <IconButton label="清除商品筛选" onClick={() => { setProductQuery(''); setProductStatusFilter('all'); }}><X size={14}/></IconButton>}
                 </div>
-                {visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
+                {canManageMonitor && visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
                 {!!displayedPreorders.length && <div className="preorder-list" aria-label="自动预购任务">{displayedPreorders.map(preorder => <div className={`preorder-row ${preorder.status}`} key={preorder.id}><span className="preorder-icon"><Clock3 size={15}/></span><div className="preorder-copy"><strong>{preorder.title}</strong><small>目标 {preorder.quantity} 件 · 每 {preorder.interval_seconds} 秒检查 · 当前库存 {preorder.stock_label}</small>{preorder.last_error && <small className="negative">{preorder.last_error}</small>}</div><span className={`pill ${preorder.status === 'triggered' ? 'live' : preorder.status === 'error' ? 'error' : 'neutral'}`}>{preorder.status === 'watching' ? '预购监控中' : preorder.status === 'processing' ? '正在创建订单' : preorder.status === 'triggered' ? '支付链接已创建' : '预购失败'}</span>{preorder.payment_url ? <a className="button official preorder-pay-link" href={preorder.payment_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>打开支付链接</a> : preorder.status === 'watching' || preorder.status === 'error' ? <IconButton label="停止自动预购" tone="danger" onClick={() => cancelPreorder(preorder)}><X size={15}/></IconButton> : <span/>}</div>)}</div>}
-                <div className="table-head"><label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label><span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控频率</span><span>操作</span></div>
+                <div className="table-head">{canManageMonitor ? <label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label> : <span/>}<span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控频率</span><span>操作</span></div>
                 <div className="product-list">
                   {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>{shopScopedItems.length ? '没有匹配的商品' : '暂无商品数据'}</strong><span>{shopScopedItems.length ? '调整搜索词或状态筛选后重试' : '在上方添加店铺或商品链接'}</span></div> : visibleItems.map(item => (
                     <div className={`product-row ${selectedId === item.id ? 'selected' : ''} ${checkedIds.includes(item.id) ? 'checked' : ''}`} key={item.id} onClick={() => openProductDetail(item.id)}>
-                      <label className="check-wrap checkbox-cell" title="选择商品" onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedIds.includes(item.id)} onChange={() => toggleChecked(item.id)}/></label>
+                      {canManageMonitor ? <label className="check-wrap checkbox-cell" title="选择商品" onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedIds.includes(item.id)} onChange={() => toggleChecked(item.id)}/></label> : <span className="checkbox-cell" aria-hidden="true"/>}
                       <div className="product-cell"><ProductImage item={item}/><div className="product-copy"><strong>{item.latest?.title || item.name || '等待首次抓取'}</strong><span>{item.shops?.length ? `${item.shops[0].name || item.shops[0].token} · ${item.url}` : item.name && item.latest ? item.name : item.url}</span><small>{compactTime(item.last_attempt?.fetched_at)}</small></div></div>
                       <div className="price-cell"><strong>{money(item.latest?.price)}</strong>{item.price_changed && <span className="change-flag">有变化</span>}</div>
                       <div className="state-cell"><StatusPill item={item}/><small>{itemStockLabel(item)}</small>{preorderByWatch.get(item.id)?.status === 'watching' && <small className="preorder-state">自动预购 {preorderByWatch.get(item.id).quantity} 件</small>}</div>
-                      <div className="monitor-cell" onClick={event => event.stopPropagation()}><button className={`switch ${itemMonitoringEnabled(item) ? 'on' : ''}`} role="switch" aria-checked={itemMonitoringEnabled(item)} title={item.shops?.length ? '由所属店铺统一控制' : item.enabled ? '暂停自动监控' : '开启自动监控'} disabled={busy[`watch-save-${item.id}`] || !!item.shops?.length} onClick={() => updateWatch(item, {enabled: !item.enabled})}><span/></button><MonitorIntervalSelect value={item.interval_seconds} label={`修改${item.latest?.title || item.name || '商品'}监控频率`} disabled={busy[`watch-save-${item.id}`] || !!item.shops?.length} onChange={value => updateWatch(item, {interval_seconds: value})}/><small>{item.shops?.length ? '跟随店铺' : '独立设置'}</small></div>
+                      <div className="monitor-cell" onClick={event => event.stopPropagation()}>{canManageMonitor ? <><button className={`switch ${itemMonitoringEnabled(item) ? 'on' : ''}`} role="switch" aria-checked={itemMonitoringEnabled(item)} title={item.shops?.length ? '由所属店铺统一控制' : item.enabled ? '暂停自动监控' : '开启自动监控'} disabled={busy[`watch-save-${item.id}`] || !!item.shops?.length} onClick={() => updateWatch(item, {enabled: !item.enabled})}><span/></button><MonitorIntervalSelect value={item.interval_seconds} label={`修改${item.latest?.title || item.name || '商品'}监控频率`} disabled={busy[`watch-save-${item.id}`] || !!item.shops?.length} onChange={value => updateWatch(item, {interval_seconds: value})}/><small>{item.shops?.length ? '跟随店铺' : '独立设置'}</small></> : <small>只读</small>}</div>
                       <div className="row-actions" onClick={event => event.stopPropagation()}>
-                        <IconButton label={item.shops?.length ? '同步所属店铺库存' : '立即抓取'} onClick={() => fetchOne(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>
+                        {canManageMonitor && <IconButton label={item.shops?.length ? '同步所属店铺库存' : '立即抓取'} onClick={() => fetchOne(item.id)} disabled={busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>}
                         <IconButton label="复制商品链接" onClick={() => copyLinks([item])}><Clipboard size={15}/></IconButton>
                         <IconButton label="加入购买清单" onClick={() => addToCart(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/></IconButton>
                         <IconButton label="使用已保存配置一键购买" tone="buy" onClick={() => oneClickBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15} className={busy[`buy-${item.id}`] ? 'spin' : ''}/></IconButton>
-                        <IconButton label="删除监控" tone="danger" onClick={() => removeWatch(item)}><Trash2 size={15}/></IconButton>
+                        {canManageMonitor && <IconButton label="删除监控" tone="danger" onClick={() => removeWatch(item)}><Trash2 size={15}/></IconButton>}
                       </div>
                     </div>
                   ))}
@@ -3129,6 +3180,8 @@ function App() {
           <React.Suspense fallback={<FeatureLoadingState feature="订单查询界面" state={{status: 'loading'}}/>}>
             <OrderQueryView request={request} notify={notify} initialKeywords={savedCheckout.contact} checkoutProfile={savedCheckout} onSaveCheckout={async profile => { try { const saved = await persistCheckout(profile); notify(saved.storage_mode === 'browser' ? '购买配置已保存到浏览器缓存' : '购买配置已保存到本机'); } catch (error) { notify(error.message, 'error'); throw error; } }}/>
           </React.Suspense>
+        ) : activeView === 'settings' ? (
+          <SettingsView request={request} user={sessionUser} mode={authMode} notify={notify} onModeChange={onModeChange}/>
         ) : activeView === 'reclaim' ? featureLoadState.reclaim.status !== 'ready' ? (
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
         ) : (
@@ -3165,8 +3218,8 @@ function App() {
         )}
       </main>
 
-      <ProductOverviewDrawer id="product-overview-drawer" open={overviewOpen} items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} shopFilter={shopFilter} onClose={() => setOverviewOpen(false)} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={fetchOne} onShopFilter={value => { setShopFilter(value); setCheckedIds([]); }}/>
-      <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={fetchOne} onDirect={openDirectProduct}/>
+      <ProductOverviewDrawer id="product-overview-drawer" open={overviewOpen} items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} shopFilter={shopFilter} onClose={() => setOverviewOpen(false)} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor ? fetchOne : null} onShopFilter={value => { setShopFilter(value); setCheckedIds([]); }}/>
+      <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={canManageMonitor ? fetchOne : null} onDirect={openDirectProduct}/>
 
       {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
       {checkoutPrompt && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setCheckoutPrompt(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="完善购买配置"><div className="modal-head"><div><span>CHECKOUT PROFILE</span><h2>完善购买配置</h2></div><IconButton label="关闭" onClick={() => setCheckoutPrompt(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>购买前需要联系方式{checkoutPrompt.requiresPassword ? '和安全密码' : ''}，支付渠道与优惠券可按商品支持情况使用。</p></div><div className="purchase-form"><label><span>联系方式</span><input value={contact.contact} onChange={event => setContact({...contact, contact: event.target.value})} placeholder="邮箱、手机号或其他联系方式" autoComplete="email"/></label>{checkoutPrompt.requiresPassword && <label><span>安全密码</span><input type={passwordVisible ? 'text' : 'password'} value={queryPassword} onChange={event => setQueryPassword(event.target.value)} placeholder="用于查询订单详情" autoComplete="off"/></label>}<label><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><label><span>优惠券 <small>可选</small></span><input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="输入优惠券码" autoComplete="off"/></label><label><span>配置保存位置</span><select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select></label></div><div className="modal-foot"><span><ShieldCheck size={14}/>保存后会用于后续购买和订单查询</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setCheckoutPrompt(null)}>取消</button><button className="button official" onClick={submitCheckoutPrompt}><Save size={15}/>保存并继续</button></div></div></div></div>}
@@ -3270,6 +3323,151 @@ function PurchasePanel({items, cart, setCart, totalCart, estimatedTotal, setQuan
       <p className="local-note"><ShieldCheck size={14}/>联系方式与安全密码会按所选位置保存，商品不要求密码时不会提交密码</p>
     </aside>
   );
+}
+
+function App() {
+  const [installStatus, setInstallStatus] = useState(null);
+  const [auth, setAuth] = useState({status: 'loading', mode: AUTH_MODES.SELF_USE, user: null, token: ''});
+  const [bootError, setBootError] = useState('');
+  const [loginOpen, setLoginOpen] = useState(false);
+
+  const clearSession = useMemo(() => () => {
+    setApiAuthToken('');
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    setAuth(current => ({
+      status: requiresLogin(current.mode) ? 'anonymous' : 'guest',
+      mode: current.mode,
+      user: null,
+      token: '',
+    }));
+  }, []);
+
+  const applySession = payload => {
+    const token = String(payload?.token || '').trim();
+    const normalized = normalizeSession({
+      ...payload,
+      authenticated: payload?.authenticated !== undefined ? payload.authenticated : Boolean(token || payload?.user),
+    });
+    if (!normalized.user) {
+      clearSession();
+      return;
+    }
+    const effectiveToken = token || String(window.localStorage.getItem(AUTH_TOKEN_KEY) || '').trim();
+    setApiAuthToken(effectiveToken);
+    if (effectiveToken) window.localStorage.setItem(AUTH_TOKEN_KEY, effectiveToken);
+    const nextMode = normalizeMode(payload?.mode || installStatus?.mode || auth.mode);
+    setAuth({status: 'authenticated', mode: nextMode, user: normalized.user, token: effectiveToken});
+    const registration = payload?.allow_registration ?? payload?.installation?.allow_registration;
+    setInstallStatus(current => current ? {
+      ...current,
+      configured: true,
+      needs_setup: false,
+      mode: nextMode,
+      ...(registration !== undefined ? {allow_registration: Boolean(registration)} : {}),
+    } : current);
+    setLoginOpen(false);
+  };
+
+  useEffect(() => {
+    const handleExpired = () => {
+      clearSession();
+      setLoginOpen(requiresLogin(auth.mode));
+    };
+    window.addEventListener('ldxp-auth-expired', handleExpired);
+    return () => window.removeEventListener('ldxp-auth-expired', handleExpired);
+  }, [auth.mode, clearSession]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const bootstrap = async () => {
+      setBootError('');
+      let status;
+      try {
+        status = normalizeInstallStatus(await request('/install/status', {}, {auth: false}));
+      } catch (error) {
+        // Keep existing self-use installations usable while an older backend is running.
+        if (error.status === 404) {
+          status = normalizeInstallStatus({configured: true, mode: AUTH_MODES.SELF_USE, needs_setup: false});
+        } else {
+          if (!cancelled) {
+            setBootError(error.message || '无法读取安装状态');
+            setAuth(current => ({...current, status: 'error'}));
+          }
+          return;
+        }
+      }
+      if (cancelled) return;
+      setInstallStatus(status);
+      if (status.needs_setup || !status.configured) {
+        setAuth({status: 'setup', mode: status.mode, user: null, token: ''});
+        return;
+      }
+
+      const storedToken = String(window.localStorage.getItem(AUTH_TOKEN_KEY) || '').trim();
+      if (storedToken) {
+        setApiAuthToken(storedToken);
+        try {
+          const me = await request('/auth/me');
+          if (!cancelled && me?.authenticated && me?.user) {
+            applySession({...me, token: storedToken, mode: me.mode || status.mode});
+            return;
+          }
+        } catch {
+          // Expired tokens fall through to the login gate.
+        }
+        setApiAuthToken('');
+        window.localStorage.removeItem(AUTH_TOKEN_KEY);
+      }
+      if (!cancelled) setAuth({status: requiresLogin(status.mode) ? 'anonymous' : 'guest', mode: status.mode, user: null, token: ''});
+    };
+    bootstrap();
+    return () => { cancelled = true; };
+    // Bootstrap intentionally runs once; session changes use applySession/clearSession.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const completeInstall = result => {
+    const nextMode = normalizeMode(result?.mode || installStatus?.mode);
+    const registration = result?.allow_registration ?? result?.installation?.allow_registration;
+    setInstallStatus(current => ({
+      ...(current || {}),
+      configured: true,
+      needs_setup: false,
+      mode: nextMode,
+      allow_registration: Boolean(registration),
+    }));
+    if (result?.token || result?.user) applySession({...result, mode: nextMode});
+    else setAuth({status: requiresLogin(nextMode) ? 'anonymous' : 'guest', mode: nextMode, user: null, token: ''});
+  };
+
+  const logout = async () => {
+    try {
+      await request('/auth/logout', {method: 'POST'});
+    } catch {
+      // Local session cleanup remains authoritative if the server is unavailable.
+    }
+    clearSession();
+  };
+
+  const handleModeChange = nextMode => {
+    const normalizedMode = normalizeMode(nextMode);
+    setInstallStatus(current => current ? {...current, mode: normalizedMode, auth_required: requiresLogin(normalizedMode)} : current);
+    setAuth(current => ({
+      ...current,
+      mode: normalizedMode,
+      status: current.user || !requiresLogin(normalizedMode) ? (current.user ? 'authenticated' : 'guest') : 'anonymous',
+    }));
+  };
+
+  if (auth.status === 'loading') return <div className="auth-boot-state" role="status"><Wrench size={20} className="spin"/><span>正在检查安装状态</span></div>;
+  if (auth.status === 'error') return <div className="auth-boot-state error" role="alert"><strong>无法连接服务</strong><span>{bootError || '请确认后端服务正在运行'}</span><button className="button secondary" type="button" onClick={() => window.location.reload()}><RefreshCw size={15}/>重新加载</button></div>;
+  if (auth.status === 'setup') return <InstallWizard request={request} onComplete={completeInstall}/>;
+  if (auth.status === 'anonymous') return <LoginView request={request} mode={auth.mode} allowRegistration={Boolean(installStatus?.allow_registration)} onAuthenticated={applySession} onGuest={auth.mode === AUTH_MODES.SELF_USE ? () => setAuth(current => ({...current, status: 'guest'})) : undefined}/>;
+
+  return <>
+    <WorkspaceApp sessionUser={auth.user} authMode={auth.mode} onLogout={logout} onLogin={() => setLoginOpen(true)} onModeChange={handleModeChange}/>
+    {loginOpen && <div className="auth-modal-host"><LoginView request={request} mode={auth.mode} allowRegistration={Boolean(installStatus?.allow_registration)} onAuthenticated={applySession} onBack={() => setLoginOpen(false)} onGuest={() => setLoginOpen(false)}/></div>}
+  </>;
 }
 
 const rootElement = document.getElementById('root');

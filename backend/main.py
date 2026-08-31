@@ -16,6 +16,16 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+
+# Support both ``python backend/main.py`` and ``python -m backend.main``.
+# Local modules historically used top-level imports, so expose both the
+# repository and backend roots before importing those modules.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BACKEND_ROOT = Path(__file__).resolve().parent
+for _module_root in (PROJECT_ROOT, BACKEND_ROOT):
+    if str(_module_root) not in sys.path:
+        sys.path.insert(0, str(_module_root))
+
 from monitor_settings import (
     DEFAULT_INTERVAL,
     DEFAULT_SHOP_INTERVAL,
@@ -48,11 +58,9 @@ from sub2api import routes as sub2api_routes
 from sub2api import settings as sub2api_config
 from sub2api import worker as sub2api_worker
 from sub2api.constants import CODEX_FINGERPRINT_MODES, DEFAULT_AUTOMATION, DEFAULT_URL
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+from user import auth as user_auth
+from user import routes as user_routes
+from user.errors import UserServiceError
 
 HOST = os.environ.get("LDXP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LDXP_PORT", "8000"))
@@ -85,6 +93,11 @@ def database() -> sqlite3.Connection:
     return monitor_database.create_database(DB_PATH)
 
 
+# Resolve ``database`` lazily so the existing isolated-database test seams and
+# embedding callers can replace the factory without rebuilding this service.
+USER_SERVICE = user_auth.AuthService(lambda: database(), now=utc_now)
+
+
 def init_database() -> None:
     monitor_database.initialize_database(
         database,
@@ -95,6 +108,7 @@ def init_database() -> None:
         default_automation=DEFAULT_SUB2API_AUTOMATION,
     )
     sub2api_card_history.initialize(database)
+    USER_SERVICE.initialize()
 
 
 DescriptionParser = storefront.DescriptionParser
@@ -321,7 +335,81 @@ def list_watches() -> list[dict[str, Any]]:
 
 
 
-def checkout_settings() -> dict[str, Any]:
+_CHECKOUT_DEFAULTS: dict[str, Any] = {
+    "contact": "",
+    "note": "",
+    "query_password": "",
+    "channel_id": 1,
+    "coupon_code": "",
+    "storage_mode": "local",
+}
+_CONTACT_DEFAULTS: dict[str, Any] = {"contact": "", "note": ""}
+
+
+def _non_admin_user_id(principal: dict[str, Any] | None) -> int | None:
+    """Return a valid user id for settings that must be isolated per user."""
+    if not isinstance(principal, dict) or str(principal.get("role") or "").lower() == "admin":
+        return None
+    try:
+        user_id = int(principal.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return user_id if user_id > 0 else None
+
+
+def _user_setting_key(name: str, user_id: int) -> str:
+    return f"user:{int(user_id)}:{name}"
+
+
+def _read_user_setting(name: str, user_id: int, fallback: dict[str, Any]) -> dict[str, Any]:
+    """Read a user-scoped JSON setting, tolerating pre-migration databases."""
+    try:
+        with database() as connection:
+            row = connection.execute(
+                "SELECT value FROM app_settings WHERE key = ?",
+                (_user_setting_key(name, user_id),),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return dict(fallback)
+    if row is None:
+        return dict(fallback)
+    try:
+        value = json.loads(str(row["value"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return dict(fallback)
+    return dict(value) if isinstance(value, dict) else dict(fallback)
+
+
+def _store_user_setting(name: str, user_id: int, value: dict[str, Any]) -> None:
+    with database() as connection:
+        stamp = utc_now()
+        connection.execute(
+            """
+            INSERT INTO app_settings(key, value, updated_at) VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (_user_setting_key(name, user_id), json.dumps(value, ensure_ascii=False), stamp),
+        )
+
+
+def contact_settings(*, principal: dict[str, Any] | None = None) -> dict[str, Any]:
+    user_id = _non_admin_user_id(principal)
+    if user_id is not None:
+        value = _read_user_setting("contact", user_id, _CONTACT_DEFAULTS)
+        return {**_CONTACT_DEFAULTS, **value}
+    try:
+        with database() as connection:
+            row = connection.execute("SELECT value FROM settings WHERE key = 'contact'").fetchone()
+        return {**_CONTACT_DEFAULTS, **_json_value(row["value"] if row else None, _CONTACT_DEFAULTS)}
+    except sqlite3.OperationalError:
+        return dict(_CONTACT_DEFAULTS)
+
+
+def checkout_settings(*, principal: dict[str, Any] | None = None) -> dict[str, Any]:
+    user_id = _non_admin_user_id(principal)
+    if user_id is not None:
+        value = _read_user_setting("checkout", user_id, _CHECKOUT_DEFAULTS)
+        return {**_CHECKOUT_DEFAULTS, **value}
     return monitor_setting_store.read_checkout(database)
 
 
@@ -1135,7 +1223,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def log_message(self, format_string: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format_string % args}")
 
-    def _send_json(self, data: Any, status: int = 200) -> None:
+    def _send_json(self, data: Any, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1144,10 +1232,80 @@ class ApiHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "")
         if re.fullmatch(r"http://(?:127\.0\.0\.1|localhost):\d{2,5}", origin):
             self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Token")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(str(name), str(value))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_json_compat(
+        self,
+        data: Any,
+        status: int = 200,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        """Keep the lightweight two-argument test handlers compatible."""
+        if not extra_headers:
+            self._send_json(data, status)
+            return
+        try:
+            self._send_json(data, status, extra_headers)
+        except TypeError:
+            if hasattr(self, "wfile"):
+                raise
+            self._send_json(data, status)
+
+    def _request_ip(self) -> str:
+        address = getattr(self, "client_address", None)
+        if isinstance(address, tuple) and address:
+            return str(address[0])[:80]
+        return ""
+
+    def _authorize_request(self, method: str, path: str) -> tuple[dict[str, Any] | None, bool]:
+        """Apply installation-mode and role policy before legacy handlers."""
+        if not path.startswith("/api/"):
+            return None, True
+        try:
+            installation = USER_SERVICE.installation_status()
+            principal = USER_SERVICE.authenticate(getattr(self, "headers", None))
+            user_routes.authorization(
+                method,
+                path,
+                installation=installation,
+                principal=principal,
+            )
+            return principal, True
+        except UserServiceError as exc:
+            headers = {"WWW-Authenticate": "Bearer"} if exc.status == 401 else None
+            self._send_json_compat(exc.payload(), exc.status, headers)
+            return None, False
+        except Exception:
+            self._send_json({"detail": "用户服务暂时不可用", "code": "user_service_error"}, 500)
+            return None, False
+
+    def _user_send_json(self, path: str, data: Any, status: int = 200) -> None:
+        """Attach an HttpOnly session cookie while retaining body-token clients."""
+        headers: dict[str, str] = {}
+        if status < 400 and isinstance(data, dict) and data.get("token"):
+            max_age = 86400
+            expires_at = data.get("expires_at")
+            if expires_at:
+                try:
+                    expiry = datetime.fromisoformat(str(expires_at))
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    max_age = max(1, int((expiry - datetime.now(timezone.utc)).total_seconds()))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            headers["Set-Cookie"] = (
+                f"ldxp_session={data['token']}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
+            )
+        elif path == user_routes.AUTH_LOGOUT_PATH and status < 500:
+            headers["Set-Cookie"] = "ldxp_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        self._send_json_compat(data, status, headers)
 
     def _send_redirect(self, location: str) -> None:
         self.send_response(302)
@@ -1176,9 +1334,22 @@ class ApiHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        _principal, allowed = self._authorize_request("GET", path)
+        if not allowed:
+            return
+        if user_routes.handle_get(
+            path,
+            send_json=self._send_json,
+            service=USER_SERVICE,
+            headers=getattr(self, "headers", None),
+            principal=_principal,
+            query_values=parse_qs(parsed.query),
+        ):
+            return
         if path == "/":
             return self._send_redirect(FRONTEND_URL)
         if path == "/api/health":
+            installation = USER_SERVICE.installation_status()
             return self._send_json({
                 "ok": True,
                 "time": utc_now(),
@@ -1191,12 +1362,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "order_query_waf_verification": True,
                 "order_complaint_submit": True,
                 "order_complaint_history": True,
+                "auth_enabled": bool(installation.get("auth_required")),
+                "install_required": bool(installation.get("needs_setup")),
+                "mode": installation.get("mode", "self_use"),
             })
         if path == "/api/watches":
             return self._send_json(list_watches())
         if path == "/api/shops":
             return self._send_json(list_shops())
         if path == "/api/preorders":
+            # Preorder records are a shared management queue.  Self-use guests
+            # and administrators may inspect it; external ordinary users get
+            # an empty, non-sensitive view instead of another user's tasks.
+            installation = USER_SERVICE.installation_status()
+            if _principal and _principal.get("role") != "admin":
+                return self._send_json([])
+            if installation.get("mode") == "external" and _principal is None:
+                return self._send_json([])
             return self._send_json(list_preorders())
         shop_products_match = re.fullmatch(r"/api/shops/(\d+)/products", path)
         if shop_products_match:
@@ -1234,11 +1416,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             except KeyError as exc:
                 return self._send_json({"detail": str(exc.args[0])}, 404)
         if path == "/api/settings/contact":
-            with database() as connection:
-                row = connection.execute("SELECT value FROM settings WHERE key = 'contact'").fetchone()
-            return self._send_json(_json_value(row["value"] if row else None, {"contact": "", "note": ""}))
+            return self._send_json(contact_settings(principal=_principal))
         if path == "/api/settings/checkout":
-            return self._send_json(checkout_settings())
+            return self._send_json(checkout_settings(principal=_principal))
         if path == "/api/redeem/config":
             return self._send_json(redeem_settings())
         if sub2api_routes.handle_get(
@@ -1281,10 +1461,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         if rejection is not None:
             status, payload = rejection
             return self._send_json(payload, status)
+        _principal, allowed = self._authorize_request("POST", path)
+        if not allowed:
+            return
         try:
             data = self._read_json()
         except ValueError as exc:
             return self._send_json({"detail": str(exc)}, 400)
+
+        if user_routes.handle_post(
+            path,
+            data,
+            send_json=lambda payload, status=200: self._user_send_json(path, payload, status),
+            service=USER_SERVICE,
+            headers=getattr(self, "headers", None),
+            user_agent=str(getattr(self, "headers", {}).get("User-Agent", ""))[:240],
+            ip_address=self._request_ip(),
+        ):
+            return
 
         if order_query_routes.handle_post(
             path,
@@ -1736,10 +1930,22 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         path = urlparse(self.path).path.rstrip("/")
+        _principal, allowed = self._authorize_request("PUT", path)
+        if not allowed:
+            return
         try:
             data = self._read_json()
         except ValueError as exc:
             return self._send_json({"detail": str(exc)}, 400)
+
+        if user_routes.handle_put(
+            path,
+            data,
+            send_json=self._send_json,
+            service=USER_SERVICE,
+            headers=getattr(self, "headers", None),
+        ):
+            return
 
         match = re.fullmatch(r"/api/watches/(\d+)", path)
         if match:
@@ -1769,11 +1975,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             contact = str(data.get("contact") or "").strip()[:160]
             note = str(data.get("note") or "").strip()[:160]
             value = {"contact": contact, "note": note}
-            with database() as connection:
-                connection.execute(
-                    "INSERT INTO settings(key, value) VALUES('contact', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (json.dumps(value, ensure_ascii=False),),
-                )
+            user_id = _non_admin_user_id(_principal)
+            if user_id is not None:
+                _store_user_setting("contact", user_id, value)
+            else:
+                with database() as connection:
+                    connection.execute(
+                        "INSERT INTO settings(key, value) VALUES('contact', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (json.dumps(value, ensure_ascii=False),),
+                    )
             return self._send_json(value)
 
         if path == "/api/settings/checkout":
@@ -1798,11 +2008,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "coupon_code": coupon_code,
                 "storage_mode": storage_mode,
             }
-            with database() as connection:
-                connection.execute(
-                    "INSERT INTO settings(key, value) VALUES('checkout', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (json.dumps(value, ensure_ascii=False),),
-                )
+            user_id = _non_admin_user_id(_principal)
+            if user_id is not None:
+                _store_user_setting("checkout", user_id, value)
+            else:
+                with database() as connection:
+                    connection.execute(
+                        "INSERT INTO settings(key, value) VALUES('checkout', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (json.dumps(value, ensure_ascii=False),),
+                    )
             return self._send_json(value)
 
         if path == "/api/redeem/config":
@@ -1830,6 +2044,16 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path.rstrip("/")
+        _principal, allowed = self._authorize_request("DELETE", path)
+        if not allowed:
+            return
+        if user_routes.handle_delete(
+            path,
+            send_json=self._send_json,
+            service=USER_SERVICE,
+            headers=getattr(self, "headers", None),
+        ):
+            return
         if sub2api_routes.handle_delete(
             path,
             send_json=self._send_json,
