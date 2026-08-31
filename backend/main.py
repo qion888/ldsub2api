@@ -423,6 +423,41 @@ def _sub2api_reclaim_attempt_context() -> tuple[dict[str, int], int, list[str]]:
     return normalized, maximum, limited
 
 
+def _sub2api_reclaim_call_context(
+    *,
+    attempt_counts: dict[str, int] | None,
+    max_reclaim_attempts: int | None,
+    exclude_card_codes: list[str] | None,
+) -> tuple[dict[str, int], int, list[str]]:
+    persisted_attempts, persisted_maximum, persisted_limited = _sub2api_reclaim_attempt_context()
+    if isinstance(attempt_counts, dict):
+        normalized_attempts = {
+            str(code).strip(): max(0, int(count))
+            for code, count in attempt_counts.items()
+            if str(code).strip()
+            and str(count).strip().lstrip("-").isdigit()
+        }
+    else:
+        normalized_attempts = persisted_attempts
+    if max_reclaim_attempts is None:
+        maximum = persisted_maximum
+    else:
+        try:
+            maximum = min(max(int(max_reclaim_attempts), 1), 20)
+        except (TypeError, ValueError):
+            maximum = persisted_maximum
+    if isinstance(exclude_card_codes, list):
+        limited = list(dict.fromkeys(
+            str(code).strip() for code in exclude_card_codes if str(code).strip()
+        ))
+    else:
+        limited = persisted_limited
+    limited = list(dict.fromkeys(
+        limited + [code for code, count in normalized_attempts.items() if count >= maximum]
+    ))
+    return normalized_attempts, maximum, limited
+
+
 def _persist_sub2api_reclaim_attempts(result: dict[str, Any]) -> None:
     if not isinstance(result, dict) or not isinstance(result.get("attempt_counts"), dict):
         return
@@ -655,11 +690,18 @@ def _download_reclaim_payloads(
 
 
 def reclaim_sub2api_401_accounts(
-    *, include_downloads: bool = True, exclude_order_nos: list[str] | None = None
+    *, include_downloads: bool = True, exclude_order_nos: list[str] | None = None,
+    attempt_counts: dict[str, int] | None = None,
+    max_reclaim_attempts: int | None = None,
+    exclude_card_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     if exclude_order_nos is None:
         exclude_order_nos = _sub2api_imported_order_nos()
-    attempts, maximum, limited = _sub2api_reclaim_attempt_context()
+    attempts, maximum, limited = _sub2api_reclaim_call_context(
+        attempt_counts=attempt_counts,
+        max_reclaim_attempts=max_reclaim_attempts,
+        exclude_card_codes=exclude_card_codes,
+    )
     result = sub2api_reclaim.reclaim_401_accounts(
         config=sub2api_settings(reveal=True),
         accounts_loader=_sub2api_fetch_accounts,
@@ -783,11 +825,17 @@ def refresh_sub2api_reclaim(
 
 def retry_sub2api_401_accounts(
     card_codes: list[str], *, exclude_order_nos: list[str] | None = None,
-    include_downloads: bool = True,
+    include_downloads: bool = True, attempt_counts: dict[str, int] | None = None,
+    max_reclaim_attempts: int | None = None,
+    exclude_card_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     if exclude_order_nos is None:
         exclude_order_nos = _sub2api_imported_order_nos()
-    attempts, maximum, limited = _sub2api_reclaim_attempt_context()
+    attempts, maximum, limited = _sub2api_reclaim_call_context(
+        attempt_counts=attempt_counts,
+        max_reclaim_attempts=max_reclaim_attempts,
+        exclude_card_codes=exclude_card_codes,
+    )
     result = sub2api_reclaim.retry_reclaim(
         card_codes,
         redeem_client_factory=_redeem_client,
