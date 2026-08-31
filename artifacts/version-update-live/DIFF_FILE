@@ -1,7 +1,0 @@
-﻿diff --git "a/E:\\soft\\java\\ldxp\\artifacts\\version-update-live\\ROLLBACK_BASELINE" "b/E:\\soft\\java\\ldxp\\artifacts\\version-update-live\\MODIFIED_FILE"
-index 7ec1d6d..3e3c2f1 100644
---- "a/E:\\soft\\java\\ldxp\\artifacts\\version-update-live\\ROLLBACK_BASELINE"
-+++ "b/E:\\soft\\java\\ldxp\\artifacts\\version-update-live\\MODIFIED_FILE"
-@@ -1 +1 @@
--2.1.0
-+2.1.1
