@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 from user import routes as user_routes
 from user.errors import AuthenticationRequired, Forbidden
 from version_control.errors import VersionControlError
-from version_control.routes import handle_get, handle_post
+from version_control.routes import handle_delete, handle_get, handle_post
 from version_control.service import RepositoryConfig, VersionControlService
 
 
@@ -219,6 +219,28 @@ class VersionControlServiceTests(unittest.TestCase):
         self.assertTrue(result["safety_backup_id"])
         self.assertTrue(result["needs_restart"])
 
+    def test_delete_backup_removes_verified_files(self):
+        service = VersionControlService(self.config, runner=GitStateRunner())
+        created = service.create_backup()["backup"]
+
+        result = service.delete_backup(created["id"])
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(result["deleted_backup_id"], created["id"])
+        self.assertEqual(result["backups"]["total"], 0)
+        self.assertFalse(Path(created["path"]).exists())
+
+    def test_delete_backup_protects_last_update_rollback_backup(self):
+        service = VersionControlService(self.config, runner=GitStateRunner())
+        created = service.create_backup()["backup"]
+        service._write_last_update({"backup_id": created["id"], "can_rollback": True})
+
+        with self.assertRaises(VersionControlError) as raised:
+            service.delete_backup(created["id"])
+
+        self.assertEqual(raised.exception.code, "backup_in_use")
+        self.assertTrue(Path(created["path"]).exists())
+
 
 class VersionControlRouteTests(unittest.TestCase):
     def request_get(self, principal):
@@ -285,6 +307,29 @@ class VersionControlRouteTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(calls[-1], ("rollback", "backup-1", True))
 
+    def test_delete_route_dispatches_backup_deletion_and_requires_admin(self):
+        responses = []
+        calls = []
+        handled = handle_delete(
+            "/api/version/backups/backup-1234",
+            send_json=lambda payload, status=200: responses.append((status, payload)),
+            principal={"role": "admin"},
+            delete_backup=lambda backup_id: calls.append(backup_id) or {"deleted": True},
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(calls, ["backup-1234"])
+        self.assertEqual(responses[-1], (200, {"deleted": True}))
+
+        responses.clear()
+        self.assertTrue(handle_delete(
+            "/api/version/backups/backup-1234",
+            send_json=lambda payload, status=200: responses.append((status, payload)),
+            principal={"role": "user"},
+            delete_backup=lambda _backup_id: {"deleted": True},
+        ))
+        self.assertEqual(responses[-1][0], 403)
+
     def test_global_policy_keeps_version_operations_admin_only(self):
         installation = {"initialized": True, "needs_setup": False, "mode": "self_use"}
         with self.assertRaises(AuthenticationRequired):
@@ -299,6 +344,26 @@ class VersionControlRouteTests(unittest.TestCase):
         user_routes.authorization(
             "POST",
             "/api/version/update",
+            installation=installation,
+            principal={"role": "admin"},
+        )
+        with self.assertRaises(AuthenticationRequired):
+            user_routes.authorization(
+                "DELETE",
+                "/api/version/backups/backup-1234",
+                installation=installation,
+                principal=None,
+            )
+        with self.assertRaises(Forbidden):
+            user_routes.authorization(
+                "DELETE",
+                "/api/version/backups/backup-1234",
+                installation=installation,
+                principal={"role": "user"},
+            )
+        user_routes.authorization(
+            "DELETE",
+            "/api/version/backups/backup-1234",
             installation=installation,
             principal={"role": "admin"},
         )

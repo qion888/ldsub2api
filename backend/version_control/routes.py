@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from .errors import VersionControlError
@@ -14,6 +15,7 @@ VERSION_BACKUP_PATH = "/api/version/backup"
 VERSION_BACKUPS_PATH = "/api/version/backups"
 VERSION_RESTORE_PATH = "/api/version/restore"
 VERSION_ROLLBACK_PATH = "/api/version/rollback"
+VERSION_BACKUP_DELETE_PATTERN = re.compile(r"^/api/version/backups/([A-Za-z0-9_-]{8,100})$")
 VERSION_PATHS = frozenset({
     VERSION_PATH,
     VERSION_CHECK_PATH,
@@ -108,3 +110,20 @@ def handle_post(
             restore_data=bool(data.get("restore_data")),
         )
     return _run(send_json, operation)
+
+
+def handle_delete(
+    path: str,
+    *,
+    send_json: SendJson,
+    principal: dict[str, Any] | None,
+    delete_backup: Callable[[str], dict[str, Any]] | None = None,
+) -> bool:
+    match = VERSION_BACKUP_DELETE_PATTERN.fullmatch(path)
+    if not match:
+        return False
+    if not _require_admin(principal, send_json):
+        return True
+    if delete_backup is None:
+        return False
+    return _run(send_json, lambda: delete_backup(match.group(1)))

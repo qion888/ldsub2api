@@ -2088,6 +2088,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             card_import_history_deleter=delete_sub2api_card_import_record,
         ):
             return
+        if version_control_routes.handle_delete(
+            path,
+            send_json=self._send_json,
+            principal=_principal,
+            delete_backup=VERSION_SERVICE.delete_backup,
+        ):
+            return
         preorder_match = re.fullmatch(r"/api/preorders/(\d+)", path)
         if preorder_match:
             with database() as connection:

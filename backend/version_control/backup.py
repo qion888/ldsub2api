@@ -172,6 +172,7 @@ class BackupManager:
             "reason": str(reason or "manual")[:80],
             "database_path": str(self.database_path),
             "file_name": database_file.name,
+            "path": str(database_file),
             "size_bytes": database_file.stat().st_size,
             "sha256": _sha256(database_file),
             "schema_version": integrity["schema_version"],
@@ -213,6 +214,24 @@ class BackupManager:
                 status=409,
             )
         return {**metadata, "path": str(database_file)}
+
+    def delete_backup(self, backup_id: Any) -> dict[str, Any]:
+        """Delete one verified backup file and its metadata record."""
+        normalized = self._validate_id(backup_id)
+        backup = self.get_backup(normalized)
+        database_file = self._database_file(normalized)
+        metadata_file = self._metadata_file(normalized)
+        try:
+            database_file.unlink()
+            metadata_file.unlink()
+        except OSError as exc:
+            raise VersionControlError(
+                "备份文件删除失败，请稍后重试",
+                code="backup_delete_failed",
+                status=409,
+                retryable=True,
+            ) from exc
+        return backup
 
     def list_backups(self) -> dict[str, Any]:
         self.backup_dir.mkdir(parents=True, exist_ok=True)

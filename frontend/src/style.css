@@ -2854,19 +2854,22 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .version-data-grid { margin-top: 13px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--ui-border-soft); }
 .version-data-grid > div { min-width: 0; padding: 11px; border-right: 1px solid var(--ui-border-soft); }
 .version-data-grid > div:last-child { border-right: 0; }
-.version-data-grid small, .version-data-grid strong, .version-data-grid span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.version-data-grid small, .version-data-grid strong, .version-data-grid span, .version-data-grid code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .version-data-grid small { color: var(--ui-text-faint); font-size: 10px; }
 .version-data-grid strong { margin-top: 5px; color: var(--ui-text); font-size: 12px; }
 .version-data-grid span { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; }
+.version-data-grid code { margin-top: 4px; color: var(--ui-text-faint); font-size: 9px; }
 .version-panel-actions { margin-top: 11px; display: flex; flex-wrap: wrap; gap: 8px; }
 .version-backup-list { margin-top: 11px; border: 1px solid var(--ui-border-soft); }
-.version-backup-row { min-height: 54px; padding: 8px 10px; display: grid; grid-template-columns: minmax(0, 1fr) 110px 30px; gap: 10px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
+.version-backup-row { min-height: 54px; padding: 8px 10px; display: grid; grid-template-columns: minmax(0, 1fr) 110px 68px; gap: 10px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
 .version-backup-row:last-child { border-bottom: 0; }
 .version-backup-main { min-width: 0; }
 .version-backup-main strong, .version-backup-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .version-backup-main strong { color: var(--ui-text); font-size: 11px; }
 .version-backup-main small { margin-top: 3px; color: var(--ui-text-muted); font-size: 10px; }
+.version-backup-main code { display: block; margin-top: 3px; overflow: hidden; color: var(--ui-text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .version-backup-row code { overflow: hidden; color: var(--ui-text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.version-backup-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .version-backup-row .icon-button { width: 30px; height: 30px; }
 .version-backup-empty { min-height: 72px; border: 1px solid var(--ui-border-soft); }
 .users-section { overflow: hidden; }
@@ -2915,7 +2918,7 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .version-meta-grid > div:last-child { border-bottom: 0; }
   .version-actions .button { flex: 1 1 145px; }
   .version-panel-head { align-items: flex-start; flex-direction: column; }
-  .version-backup-row { grid-template-columns: minmax(0, 1fr) 30px; }
+  .version-backup-row { grid-template-columns: minmax(0, 1fr) 58px; }
   .version-backup-row code { display: none; }
   .user-create-form .settings-form-grid { grid-template-columns: 1fr; }
   .auth-modal-host { padding: 10px; }

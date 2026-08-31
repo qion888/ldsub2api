@@ -54,6 +54,7 @@ test('preserves restart status after a completed update', () => {
 test('normalizes database compatibility, backup history, and rollback metadata', () => {
   const info = normalizeVersionInfo({
     database: {
+      path: 'C:/ldxp/backend/monitor.db',
       integrity: true,
       compatibility: 'sqlite-preserved',
       size_bytes: '2048',
@@ -63,15 +64,17 @@ test('normalizes database compatibility, backup history, and rollback metadata',
     backups: {
       ok: true,
       total: 1,
-      items: [{id: 'backup-1', reason: 'manual', sha256: 'a'.repeat(64), schema_version: 2}],
+      items: [{id: 'backup-1', reason: 'manual', path: 'C:/ldxp/.runtime/version-backups/backup-1.sqlite3', sha256: 'a'.repeat(64), schema_version: 2}],
     },
     last_update: {backup_id: 'backup-1', previous_commit: 'a'.repeat(40), can_rollback: true},
   });
 
   assert.equal(info.database.compatibility, 'sqlite-preserved');
+  assert.equal(info.database.path, 'C:/ldxp/backend/monitor.db');
   assert.equal(info.database.size_bytes, 2048);
   assert.equal(info.backups.total, 1);
   assert.equal(info.backups.items[0].id, 'backup-1');
+  assert.equal(info.backups.items[0].path, 'C:/ldxp/.runtime/version-backups/backup-1.sqlite3');
   assert.equal(info.last_update.can_rollback, true);
   assert.equal(normalizeBackupList({items: [{id: 'x'}]}).latest.id, 'x');
 });

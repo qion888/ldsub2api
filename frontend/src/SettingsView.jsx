@@ -354,13 +354,43 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
   };
 
   const installVersionUpdate = async () => {
-    if (!versionInfo?.update_ready) return;
-    if (!window.confirm(`将从 GitHub 更新到 ${versionInfo.latest_version || versionInfo.latest_short_commit}，是否继续？`)) return;
     setVersionBusy('update');
     setVersionError('');
     try {
+      let current = versionInfo;
+      if (!current?.update_ready) {
+        current = normalizeVersionInfo(await request('/version/check', {method: 'POST'}));
+        setVersionInfo(current);
+      }
+      if (!current.update_available || !current.update_ready) {
+        notify?.(current.message || versionBlockReason(current) || '当前已是最新版本');
+        return;
+      }
+      if (!window.confirm(`将从 GitHub 更新到 ${current.latest_version || current.latest_short_commit}，是否继续？`)) return;
       const result = normalizeVersionInfo(await request('/version/update', {method: 'POST'}));
-      setVersionInfo(result);
+      setVersionInfo(previous => {
+        const previousInfo = normalizeVersionInfo(previous || {});
+        const candidates = [
+          ...(result.backup ? [result.backup] : []),
+          ...(result.backups?.items || []),
+          ...previousInfo.backups.items,
+        ];
+        const items = candidates.filter((item, index, list) => (
+          item?.id && list.findIndex(candidate => candidate?.id === item.id) === index
+        ));
+        return normalizeVersionInfo({
+          ...previousInfo,
+          ...result,
+          backups: {
+            ...previousInfo.backups,
+            ...result.backups,
+            ok: true,
+            items,
+            total: items.length,
+            latest: items[0] || null,
+          },
+        });
+      });
       notify?.(result.message || '版本更新完成');
     } catch (requestError) {
       setVersionError(requestError.message || '版本更新失败');
@@ -392,6 +422,22 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
       notify?.('数据备份已完成');
     } catch (requestError) {
       setVersionError(requestError.message || '数据备份失败');
+    } finally {
+      setBackupBusy('');
+    }
+  };
+
+  const deleteVersionBackup = async backup => {
+    if (!backup?.id) return;
+    if (!window.confirm(`删除 ${formatVersionDate(backup.created_at)} 的数据备份？删除后无法恢复。`)) return;
+    setBackupBusy(`delete:${backup.id}`);
+    setVersionError('');
+    try {
+      const result = await request(`/version/backups/${encodeURIComponent(backup.id)}`, {method: 'DELETE'});
+      setVersionInfo(current => normalizeVersionInfo({...current, ...result, backups: result?.backups || current?.backups}));
+      notify?.(result.message || '数据备份已删除');
+    } catch (requestError) {
+      setVersionError(requestError.message || '数据备份删除失败');
     } finally {
       setBackupBusy('');
     }
@@ -523,7 +569,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
                 <span className={`version-integrity ${versionInfo.database.integrity ? 'ok' : 'error'}`}><ShieldCheck size={14}/>{versionInfo.database.integrity ? 'SQLite 完整性正常' : '需要检查数据库'}</span>
               </div>
               <div className="version-data-grid">
-                <div><small>数据库</small><strong>{versionInfo.database.file_name || 'monitor.db'}</strong><span>{formatBackupSize(versionInfo.database.size_bytes)} · schema {versionInfo.database.schema_version ?? 0}</span></div>
+                <div><small>数据库</small><strong>{versionInfo.database.file_name || 'monitor.db'}</strong><span>{formatBackupSize(versionInfo.database.size_bytes)} · schema {versionInfo.database.schema_version ?? 0}</span>{versionInfo.database.path && <code className="version-path" title={versionInfo.database.path}>{versionInfo.database.path}</code>}</div>
                 <div><small>数据兼容</small><strong>{versionInfo.database.compatibility === 'sqlite-preserved' ? '原库保留' : versionInfo.database.compatibility}</strong><span>{versionInfo.database.integrity_message || '升级不修改 SQLite 结构'}</span></div>
                 <div><small>备份记录</small><strong>{versionInfo.backups.total || versionInfo.database.backup_count} 份</strong><span>{versionInfo.backups.latest ? `最近 ${formatVersionDate(versionInfo.backups.latest.created_at)}` : '尚无备份'}</span></div>
               </div>
@@ -539,9 +585,9 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
               </div>
               {versionInfo.backups.items.length ? <div className="version-backup-list">
                 {versionInfo.backups.items.map(backup => <div className="version-backup-row" key={backup.id}>
-                  <div className="version-backup-main"><strong>{backupReasonLabel(backup.reason)}</strong><small>{formatVersionDate(backup.created_at)} · {formatBackupSize(backup.size_bytes)} · schema {backup.schema_version ?? 0}</small></div>
+                  <div className="version-backup-main"><strong>{backupReasonLabel(backup.reason)}</strong><small>{formatVersionDate(backup.created_at)} · {formatBackupSize(backup.size_bytes)} · schema {backup.schema_version ?? 0}</small>{backup.path && <code className="version-backup-path" title={backup.path}>{backup.path}</code>}</div>
                   <code title={backup.sha256}>{backup.sha256 ? `${backup.sha256.slice(0, 12)}…` : '无校验摘要'}</code>
-                  <button className="icon-button" type="button" title="恢复此备份" aria-label={`恢复 ${formatVersionDate(backup.created_at)} 的备份`} onClick={() => restoreVersionBackup(backup)} disabled={Boolean(versionBusy) || Boolean(backupBusy)}><RefreshCw size={15} className={backupBusy === `restore:${backup.id}` ? 'spin' : ''}/></button>
+                  <div className="version-backup-actions"><button className="icon-button" type="button" title="恢复此备份" aria-label={`恢复 ${formatVersionDate(backup.created_at)} 的备份`} onClick={() => restoreVersionBackup(backup)} disabled={Boolean(versionBusy) || Boolean(backupBusy)}><RefreshCw size={15} className={backupBusy === `restore:${backup.id}` ? 'spin' : ''}/></button><button className="icon-button danger-icon" type="button" title="删除此备份" aria-label={`删除 ${formatVersionDate(backup.created_at)} 的备份`} onClick={() => deleteVersionBackup(backup)} disabled={Boolean(versionBusy) || Boolean(backupBusy)}><Trash2 size={15} className={backupBusy === `delete:${backup.id}` ? 'spin' : ''}/></button></div>
                 </div>)}
               </div> : <div className="settings-state version-backup-empty">暂无数据备份，升级前会自动创建安全备份</div>}
             </div>
@@ -549,7 +595,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
           <div className="settings-actions version-actions">
             {versionInfo?.repository_url && <a className="button secondary" href={versionInfo.repository_url} target="_blank" rel="noreferrer"><ExternalLink size={15}/>查看 GitHub</a>}
             <button className="button secondary" type="button" onClick={checkVersionUpdates} disabled={Boolean(versionBusy)}><RefreshCw size={15} className={versionBusy === 'check' ? 'spin' : ''}/>{versionBusy === 'check' ? '检查中' : '检查更新'}</button>
-            {versionInfo?.update_available && <button className="button primary" type="button" onClick={installVersionUpdate} disabled={Boolean(versionBusy) || !versionInfo.update_ready}><CloudDownload size={15}/>{versionBusy === 'update' ? '更新中' : '立即更新'}</button>}
+            {versionInfo && <button className="button primary" type="button" onClick={installVersionUpdate} disabled={Boolean(versionBusy) || (versionInfo.update_available && !versionInfo.update_ready)}><CloudDownload size={15}/>{versionBusy === 'update' ? '更新中' : '立即更新'}</button>}
           </div>
         </section>}
       </div>

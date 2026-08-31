@@ -536,6 +536,25 @@ class VersionControlService:
     def list_backups(self) -> dict[str, Any]:
         return self._backups.list_backups()
 
+    def delete_backup(self, backup_id: Any) -> dict[str, Any]:
+        selected_id = str(backup_id or "").strip()
+        last_update = self._read_last_update() or {}
+        if selected_id and selected_id == str(last_update.get("backup_id") or "").strip():
+            raise VersionControlError(
+                "最近一次升级备份用于版本回退，暂不能删除",
+                code="backup_in_use",
+                status=409,
+            )
+        deleted = self._backups.delete_backup(backup_id)
+        return {
+            "ok": True,
+            "status": "deleted",
+            "deleted_backup_id": deleted["id"],
+            "backups": self._backups.list_backups(),
+            "database": self._backups.database_status(),
+            "message": "数据备份已删除",
+        }
+
     def restore_backup(self, backup_id: Any) -> dict[str, Any]:
         state = self._repository_state()
         return self._backups.restore_backup(

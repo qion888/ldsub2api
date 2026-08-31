@@ -26,6 +26,8 @@ function normalizeBackup(value) {
     created_at: source.created_at || null,
     reason: String(source.reason || 'manual').trim(),
     file_name: String(source.file_name || '').trim(),
+    path: String(source.path || '').trim(),
+    database_path: String(source.database_path || '').trim(),
     size_bytes: nonNegativeInteger(source.size_bytes),
     sha256: String(source.sha256 || '').trim(),
     schema_version: source.schema_version == null ? null : nonNegativeInteger(source.schema_version),
