@@ -113,11 +113,15 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
     setVersionError('');
     try {
       const info = await request('/version');
+      // The aggregate endpoint already includes backup metadata. Only use the
+      // dedicated endpoint when talking to an older backend without that field.
       let backups = info?.backups;
-      try {
-        backups = await request('/version/backups');
-      } catch (requestError) {
-        if (requestError.status !== 404) throw requestError;
+      if (!backups) {
+        try {
+          backups = await request('/version/backups');
+        } catch (requestError) {
+          if (requestError.status !== 404) throw requestError;
+        }
       }
       setVersionInfo(normalizeVersionInfo({...info, backups: normalizeBackupList(backups)}));
     } catch (requestError) {
@@ -150,7 +154,13 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
       setSystem(settingsPart(payload, 'system', EMPTY_SYSTEM));
       setSettingsMode(normalizeMode(payload?.mode || mode));
       setAllowRegistration(Boolean(payload?.allow_registration));
-      if (admin) await Promise.all([loadUsers(), loadVersion()]);
+      // The settings form is independent from the heavier admin panels. Paint
+      // it as soon as its own payload is ready, then hydrate secondary data.
+      setLoading(false);
+      if (admin) {
+        void loadUsers();
+        void loadVersion();
+      }
     } catch (requestError) {
       setError(requestError.message || '设置加载失败');
     } finally {
