@@ -171,3 +171,23 @@ def initialize_database(
             "UPDATE watches SET created_at = COALESCE(created_at, ?) WHERE created_at IS NULL",
             (now(),),
         )
+
+    # User tables live in the same SQLite file but are maintained by their
+    # focused package.  Keeping this additive hook here means every existing
+    # startup path (including tests that initialize the monitor schema
+    # directly) also gets a usable installation state.
+    try:
+        from user import store as user_store
+    except ModuleNotFoundError as exc:
+        if exc.name != "user":
+            raise
+        try:
+            from backend.user import store as user_store
+        except ModuleNotFoundError as nested:
+            # ``monitor_core`` can still be imported as a standalone library
+            # outside this repository; only a missing package is optional.
+            if nested.name not in {"backend", "backend.user"}:
+                raise
+            user_store = None
+    if user_store is not None:
+        user_store.initialize_schema(database_factory, now=now)
