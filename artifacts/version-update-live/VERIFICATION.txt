@@ -17,6 +17,11 @@ Literal output/result: HEAD=193e336c7271a0573b33ae238342fd965bc8dc90; VERSION=2.
 Exit status: 0
 
 MODIFIED
+Command: python - <live-test-repo> (VersionControlService.check_updates)
+Input: same clean user copy reset to 193e336; real GitHub origin; no release API stub
+Literal output/result: {"current_commit":"193e336c7271a0573b33ae238342fd965bc8dc90","current_version":"2.1.0","latest_commit":"84f0466b9fd11219a19970e98eab3e836fd8283a","latest_version":"2.1.1","remote_ahead_by":1,"status":"update_available","update_available":true,"update_ready":true}
+Exit status: 0
+
 Command: python - <live-test-repo> (VersionControlService.install_update)
 Input: RepositoryConfig(repository_url=https://github.com/qion888/ldsub2api.git, branch=main, remote=origin)
 Literal output/result: {"backup_id":"20260831T112246Z-4aae4106","database_value":"before-update","latest_commit":"84f0466b9fd11219a19970e98eab3e836fd8283a","needs_restart":true,"previous_commit":"193e336c7271a0573b33ae238342fd965bc8dc90","previous_version":"2.1.0","status":"updated","updated":true,"updated_version":"2.1.1"}
