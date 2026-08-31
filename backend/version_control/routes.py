@@ -10,7 +10,19 @@ from .errors import VersionControlError
 VERSION_PATH = "/api/version"
 VERSION_CHECK_PATH = "/api/version/check"
 VERSION_UPDATE_PATH = "/api/version/update"
-VERSION_PATHS = frozenset({VERSION_PATH, VERSION_CHECK_PATH, VERSION_UPDATE_PATH})
+VERSION_BACKUP_PATH = "/api/version/backup"
+VERSION_BACKUPS_PATH = "/api/version/backups"
+VERSION_RESTORE_PATH = "/api/version/restore"
+VERSION_ROLLBACK_PATH = "/api/version/rollback"
+VERSION_PATHS = frozenset({
+    VERSION_PATH,
+    VERSION_CHECK_PATH,
+    VERSION_UPDATE_PATH,
+    VERSION_BACKUP_PATH,
+    VERSION_BACKUPS_PATH,
+    VERSION_RESTORE_PATH,
+    VERSION_ROLLBACK_PATH,
+})
 SendJson = Callable[[Any, int], Any]
 
 
@@ -47,12 +59,16 @@ def handle_get(
     send_json: SendJson,
     principal: dict[str, Any] | None,
     version_info: Callable[[], dict[str, Any]],
+    backups_loader: Callable[[], dict[str, Any]] | None = None,
 ) -> bool:
-    if path != VERSION_PATH:
+    if path not in {VERSION_PATH, VERSION_BACKUPS_PATH}:
         return False
     if not _require_admin(principal, send_json):
         return True
-    return _run(send_json, version_info)
+    operation = version_info if path == VERSION_PATH else backups_loader
+    if operation is None:
+        return False
+    return _run(send_json, operation)
 
 
 def handle_post(
@@ -63,11 +79,32 @@ def handle_post(
     principal: dict[str, Any] | None,
     check_updates: Callable[[], dict[str, Any]],
     install_update: Callable[[], dict[str, Any]],
+    create_backup: Callable[[str], dict[str, Any]] | None = None,
+    restore_backup: Callable[[Any], dict[str, Any]] | None = None,
+    rollback_update: Callable[..., dict[str, Any]] | None = None,
 ) -> bool:
-    del data
     if path not in {VERSION_CHECK_PATH, VERSION_UPDATE_PATH}:
-        return False
+        if path not in {VERSION_BACKUP_PATH, VERSION_RESTORE_PATH, VERSION_ROLLBACK_PATH}:
+            return False
     if not _require_admin(principal, send_json):
         return True
-    operation = check_updates if path == VERSION_CHECK_PATH else install_update
+    if path == VERSION_CHECK_PATH:
+        operation = check_updates
+    elif path == VERSION_UPDATE_PATH:
+        operation = install_update
+    elif path == VERSION_BACKUP_PATH:
+        if create_backup is None:
+            return False
+        operation = lambda: create_backup(str(data.get("reason") or "manual"))
+    elif path == VERSION_RESTORE_PATH:
+        if restore_backup is None:
+            return False
+        operation = lambda: restore_backup(data.get("backup_id"))
+    else:
+        if rollback_update is None:
+            return False
+        operation = lambda: rollback_update(
+            data.get("backup_id"),
+            restore_data=bool(data.get("restore_data")),
+        )
     return _run(send_json, operation)

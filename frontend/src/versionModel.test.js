@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
+import {normalizeBackupList, normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
 
 
 test('normalizes update metadata and safe GitHub links', () => {
@@ -47,4 +47,29 @@ test('preserves restart status after a completed update', () => {
   assert.equal(info.updated, true);
   assert.equal(info.needs_restart, true);
   assert.equal(versionStatusLabel(info), '等待重启');
+});
+
+test('normalizes database compatibility, backup history, and rollback metadata', () => {
+  const info = normalizeVersionInfo({
+    database: {
+      integrity: true,
+      compatibility: 'sqlite-preserved',
+      size_bytes: '2048',
+      backup_count: '1',
+      latest_backup: {id: 'latest-1', reason: 'before-update', size_bytes: 100},
+    },
+    backups: {
+      ok: true,
+      total: 1,
+      items: [{id: 'backup-1', reason: 'manual', sha256: 'a'.repeat(64), schema_version: 2}],
+    },
+    last_update: {backup_id: 'backup-1', previous_commit: 'a'.repeat(40), can_rollback: true},
+  });
+
+  assert.equal(info.database.compatibility, 'sqlite-preserved');
+  assert.equal(info.database.size_bytes, 2048);
+  assert.equal(info.backups.total, 1);
+  assert.equal(info.backups.items[0].id, 'backup-1');
+  assert.equal(info.last_update.can_rollback, true);
+  assert.equal(normalizeBackupList({items: [{id: 'x'}]}).latest.id, 'x');
 });

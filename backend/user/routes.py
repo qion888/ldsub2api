@@ -34,6 +34,10 @@ _VERSION_PATHS = frozenset({
     "/api/version",
     "/api/version/check",
     "/api/version/update",
+    "/api/version/backup",
+    "/api/version/backups",
+    "/api/version/restore",
+    "/api/version/rollback",
 })
 
 AUTH_BOOTSTRAP_GET = frozenset({
