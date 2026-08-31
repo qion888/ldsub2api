@@ -26,6 +26,12 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "session_ttl_hours": 24,
     "maintenance_mode": False,
     "log_level": "info",
+    # External installations can expose a read-only homepage without forcing
+    # an authentication gate. Feature switches are deliberately separate so
+    # ordinary users never inherit management access implicitly.
+    "force_login": True,
+    "allow_user_reclaim": False,
+    "allow_user_sub2api_import": False,
 }
 
 

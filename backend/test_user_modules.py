@@ -140,6 +140,39 @@ class UserServiceTests(unittest.TestCase):
 
 
 class UserRoutePolicyTests(unittest.TestCase):
+    def test_external_force_login_controls_anonymous_public_access(self):
+        public_installation = {
+            "mode": "external",
+            "initialized": True,
+            "needs_setup": False,
+            "force_login": False,
+        }
+        routes.authorization("GET", "/api/watches", installation=public_installation, principal=None)
+        routes.authorization("GET", "/api/install/status", installation=public_installation, principal=None)
+
+        protected_installation = {**public_installation, "force_login": True}
+        with self.assertRaises(AuthenticationRequired):
+            routes.authorization("GET", "/api/watches", installation=protected_installation, principal=None)
+
+    def test_external_user_feature_flags_are_independent(self):
+        base = {"mode": "external", "initialized": True, "needs_setup": False, "force_login": True}
+        user = {"role": "user"}
+
+        with self.assertRaises(Forbidden):
+            routes.authorization("POST", "/api/sub2api/reclaim-401", installation=base, principal=user)
+        with self.assertRaises(Forbidden):
+            routes.authorization("POST", "/api/sub2api/import", installation=base, principal=user)
+
+        reclaim_only = {**base, "allow_user_reclaim": True}
+        routes.authorization("POST", "/api/sub2api/reclaim-401", installation=reclaim_only, principal=user)
+        with self.assertRaises(Forbidden):
+            routes.authorization("POST", "/api/sub2api/import", installation=reclaim_only, principal=user)
+
+        import_only = {**base, "allow_user_sub2api_import": True}
+        routes.authorization("POST", "/api/sub2api/import", installation=import_only, principal=user)
+        with self.assertRaises(Forbidden):
+            routes.authorization("POST", "/api/sub2api/reclaim-401", installation=import_only, principal=user)
+
     def test_external_policy_distinguishes_public_user_and_admin(self):
         installation = {"mode": "external", "needs_setup": False}
         routes.authorization("GET", "/api/watches", installation=installation, principal=None)
@@ -229,6 +262,45 @@ class MainUserRouteTests(unittest.TestCase):
             )
             self.assertEqual(allowed_status, 200)
             self.assertEqual(allowed["total"], 1)
+
+    def test_external_public_homepage_and_feature_flags_round_trip(self):
+        with patch.object(main, "database", side_effect=lambda: isolated_database(self.path)):
+            main.init_database()
+            setup_status, setup = self.request_api(
+                "POST",
+                "/api/install/setup",
+                {
+                    "username": "admin",
+                    "password": "password123",
+                    "mode": "external",
+                    "force_login": False,
+                    "allow_user_reclaim": True,
+                    "allow_user_sub2api_import": False,
+                },
+            )
+            self.assertEqual(setup_status, 200)
+            self.assertFalse(setup["auth_required"])
+
+            public_status, _ = self.request_api("GET", "/api/watches")
+            self.assertEqual(public_status, 200)
+            reclaim_status, _ = self.request_api("POST", "/api/sub2api/reclaim-401")
+            self.assertEqual(reclaim_status, 401)
+
+            admin_headers = {"Authorization": f"Bearer {setup['token']}"}
+            settings_status, settings = self.request_api(
+                "PUT",
+                "/api/settings/system",
+                {"force_login": True, "allow_user_reclaim": False, "allow_user_sub2api_import": True},
+                headers=admin_headers,
+            )
+            self.assertEqual(settings_status, 200)
+            self.assertTrue(settings["force_login"])
+            self.assertFalse(settings["allow_user_reclaim"])
+            self.assertTrue(settings["allow_user_sub2api_import"])
+
+            protected_status, protected = self.request_api("GET", "/api/watches")
+            self.assertEqual(protected_status, 401)
+            self.assertEqual(protected["code"], "auth_required")
 
     def test_auth_setup_alias_preorders_view_and_user_scoped_checkout(self):
         with patch.object(main, "database", side_effect=lambda: isolated_database(self.path)):

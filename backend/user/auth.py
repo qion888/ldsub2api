@@ -159,6 +159,7 @@ class AuthService:
         allow_registration = bool(state.get("allow_registration"))
         if "allow_registration" in system:
             allow_registration = bool(state.get("allow_registration"))
+        force_login = bool(system.get("force_login", True)) if mode == "external" else False
         return {
             "ok": True,
             "configured": not needs_setup,
@@ -167,7 +168,10 @@ class AuthService:
             "mode": mode,
             "mode_label": "对外模式" if mode == "external" else "自用模式",
             "allow_registration": allow_registration,
-            "auth_required": mode == "external" and initialized,
+            "auth_required": mode == "external" and initialized and force_login,
+            "force_login": force_login,
+            "allow_user_reclaim": bool(system.get("allow_user_reclaim", False)),
+            "allow_user_sub2api_import": bool(system.get("allow_user_sub2api_import", False)),
             "user_count": user_count,
             "admin_count": admin_count,
             "initialized_at": state.get("initialized_at"),
@@ -184,6 +188,9 @@ class AuthService:
             "mode_label": "自用模式",
             "allow_registration": False,
             "auth_required": False,
+            "force_login": False,
+            "allow_user_reclaim": False,
+            "allow_user_sub2api_import": False,
             "user_count": 0,
             "admin_count": 0,
             "initialized_at": None,
@@ -235,9 +242,15 @@ class AuthService:
         display_name = normalize_display_name(payload.get("display_name"), username)
         mode = normalize_mode(payload.get("mode"), "self_use")
         allow_registration = _bool_value(payload.get("allow_registration"), default=False)
+        force_login = _bool_value(payload.get("force_login"), default=mode == "external")
+        allow_user_reclaim = _bool_value(payload.get("allow_user_reclaim"), default=False)
+        allow_user_sub2api_import = _bool_value(payload.get("allow_user_sub2api_import"), default=False)
         if mode == "self_use":
             # Registration has no purpose in a trusted local installation.
             allow_registration = False
+            force_login = False
+            allow_user_reclaim = True
+            allow_user_sub2api_import = True
         site_name = str(payload.get("site_name") or "").strip()[:120]
         timezone_name = str(payload.get("timezone") or "Asia/Shanghai").strip()[:64]
 
@@ -271,6 +284,9 @@ class AuthService:
                 store.put_json_setting(connection, "basic", basic, now=stamp)
             system = self._system_settings(connection)
             system["allow_registration"] = allow_registration
+            system["force_login"] = force_login
+            system["allow_user_reclaim"] = allow_user_reclaim
+            system["allow_user_sub2api_import"] = allow_user_sub2api_import
             store.put_json_setting(connection, "system", system, now=stamp)
             store.set_installation(
                 connection,
@@ -295,6 +311,10 @@ class AuthService:
             "user": store.user_from_row(user_row),
             "mode": mode,
             "allow_registration": allow_registration,
+            "auth_required": mode == "external" and force_login,
+            "force_login": force_login,
+            "allow_user_reclaim": allow_user_reclaim,
+            "allow_user_sub2api_import": allow_user_sub2api_import,
             "installation": self.installation_status(),
         }
 
@@ -533,7 +553,10 @@ class AuthService:
             "mode": status["mode"],
             "mode_label": "对外模式" if status["mode"] == "external" else "自用模式",
             "allow_registration": bool(status["allow_registration"]),
-            "auth_required": status["mode"] == "external" and status["initialized"],
+            "auth_required": status["mode"] == "external" and status["initialized"] and bool(status["system"].get("force_login", True)),
+            "force_login": bool(status["system"].get("force_login", True)) if status["mode"] == "external" else False,
+            "allow_user_reclaim": bool(status["system"].get("allow_user_reclaim", False)),
+            "allow_user_sub2api_import": bool(status["system"].get("allow_user_sub2api_import", False)),
             "basic": basic,
             "system": system,
         }
@@ -590,6 +613,12 @@ class AuthService:
                         if level not in {"debug", "info", "warning", "error"}:
                             raise UserServiceError("日志级别无效", code="invalid_setting")
                         system["log_level"] = level
+                    if "force_login" in incoming:
+                        system["force_login"] = _bool_value(incoming["force_login"], default=True)
+                    if "allow_user_reclaim" in incoming:
+                        system["allow_user_reclaim"] = _bool_value(incoming["allow_user_reclaim"])
+                    if "allow_user_sub2api_import" in incoming:
+                        system["allow_user_sub2api_import"] = _bool_value(incoming["allow_user_sub2api_import"])
                     raw_mode = incoming.get("mode", payload.get("mode"))
                     mode = normalize_mode(raw_mode, status["mode"]) if raw_mode is not None else status["mode"]
                     allow_registration = _bool_value(
@@ -598,6 +627,12 @@ class AuthService:
                     )
                     if mode == "self_use":
                         allow_registration = False
+                        system["force_login"] = False
+                        # Self-use guests are intentionally allowed to use the
+                        # local recovery/import workflow, regardless of the
+                        # external ordinary-user switches.
+                        system["allow_user_reclaim"] = True
+                        system["allow_user_sub2api_import"] = True
                     system["allow_registration"] = allow_registration
                     store.put_json_setting(connection, "system", system, now=stamp)
                     store.set_installation(

@@ -42,17 +42,27 @@ export function normalizeUser(value) {
 
 export function normalizeInstallStatus(value) {
   const source = value && typeof value === 'object' ? value : {};
+  const mode = normalizeMode(source.mode);
   const configured = source.configured !== undefined
     ? Boolean(source.configured)
     : !Boolean(source.needs_setup);
   const needsSetup = source.needs_setup !== undefined
     ? Boolean(source.needs_setup)
     : !configured;
+  const forceLogin = source.force_login !== undefined
+    ? Boolean(source.force_login)
+    : source.auth_required !== undefined ? Boolean(source.auth_required) : mode === AUTH_MODES.EXTERNAL;
   return {
     configured,
     needs_setup: needsSetup,
-    mode: normalizeMode(source.mode),
+    mode,
     allow_registration: Boolean(source.allow_registration),
+    force_login: forceLogin,
+    auth_required: source.auth_required !== undefined
+      ? Boolean(source.auth_required)
+      : mode === AUTH_MODES.EXTERNAL && forceLogin,
+    allow_user_reclaim: Boolean(source.allow_user_reclaim),
+    allow_user_sub2api_import: Boolean(source.allow_user_sub2api_import),
   };
 }
 
@@ -68,8 +78,16 @@ export function normalizeSession(value) {
   };
 }
 
-export function requiresLogin(mode) {
-  return normalizeMode(mode) === AUTH_MODES.EXTERNAL;
+export function requiresLogin(modeOrStatus) {
+  if (modeOrStatus && typeof modeOrStatus === 'object') {
+    const source = modeOrStatus;
+    const mode = normalizeMode(source.mode);
+    if (mode !== AUTH_MODES.EXTERNAL) return false;
+    if (source.auth_required !== undefined) return Boolean(source.auth_required);
+    if (source.force_login !== undefined) return Boolean(source.force_login);
+    return true;
+  }
+  return normalizeMode(modeOrStatus) === AUTH_MODES.EXTERNAL;
 }
 
 export function isAdmin(user) {
@@ -82,9 +100,16 @@ export function canManageWorkspace(user, mode = AUTH_MODES.SELF_USE) {
   return isAdmin(user) || (!user && normalizeMode(mode) === AUTH_MODES.SELF_USE);
 }
 
-export function canAccessView(view, user, mode = AUTH_MODES.SELF_USE) {
+export function canAccessView(view, user, mode = AUTH_MODES.SELF_USE, permissions = {}) {
   const normalizedMode = normalizeMode(mode);
-  if (ADMIN_VIEWS.includes(view)) return isAdmin(user);
+  if (ADMIN_VIEWS.includes(view)) {
+    if (isAdmin(user)) return true;
+    if (normalizedMode === AUTH_MODES.SELF_USE && !user) return true;
+    if (normalizedMode === AUTH_MODES.EXTERNAL && user?.role === ROLES.USER) {
+      return view === 'reclaim' ? Boolean(permissions.allow_user_reclaim) : Boolean(permissions.allow_user_sub2api_import);
+    }
+    return false;
+  }
   if (view === 'settings') return Boolean(user) || normalizedMode === AUTH_MODES.SELF_USE;
   if (view === 'users') return isAdmin(user);
   return PUBLIC_VIEWS.includes(view);

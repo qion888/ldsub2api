@@ -31,6 +31,10 @@ test('normalizes install mode and setup state', () => {
     needs_setup: true,
     mode: AUTH_MODES.EXTERNAL,
     allow_registration: true,
+    force_login: true,
+    auth_required: true,
+    allow_user_reclaim: false,
+    allow_user_sub2api_import: false,
   });
   assert.equal(normalizeInstallStatus({needs_setup: false, mode: 'local'}).mode, AUTH_MODES.SELF_USE);
 });
@@ -38,6 +42,8 @@ test('normalizes install mode and setup state', () => {
 test('requires login only for external mode', () => {
   assert.equal(requiresLogin(AUTH_MODES.EXTERNAL), true);
   assert.equal(requiresLogin(AUTH_MODES.SELF_USE), false);
+  assert.equal(requiresLogin({mode: AUTH_MODES.EXTERNAL, force_login: false}), false);
+  assert.equal(requiresLogin({mode: AUTH_MODES.EXTERNAL, auth_required: true}), true);
 });
 
 test('gates admin views while retaining public views for ordinary users', () => {
@@ -46,6 +52,10 @@ test('gates admin views while retaining public views for ordinary users', () => 
 
   assert.equal(canAccessView('sub2api', admin, AUTH_MODES.EXTERNAL), true);
   assert.equal(canAccessView('sub2api', user, AUTH_MODES.EXTERNAL), false);
+  assert.equal(canAccessView('reclaim', null, AUTH_MODES.SELF_USE), true);
+  assert.equal(canAccessView('sub2api', null, AUTH_MODES.SELF_USE), true);
+  assert.equal(canAccessView('reclaim', user, AUTH_MODES.EXTERNAL, {allow_user_reclaim: true}), true);
+  assert.equal(canAccessView('sub2api', user, AUTH_MODES.EXTERNAL, {allow_user_sub2api_import: true}), true);
   assert.equal(canAccessView('orders', user, AUTH_MODES.EXTERNAL), true);
   assert.equal(canAccessView('settings', user, AUTH_MODES.EXTERNAL), true);
   assert.equal(canAccessView('settings', null, AUTH_MODES.EXTERNAL), false);

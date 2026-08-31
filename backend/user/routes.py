@@ -29,6 +29,40 @@ _USER_ID = r"/api/users/(\d+)"
 _USER_PASSWORD = r"/api/users/(\d+)/password"
 _WATCH_HISTORY = re.compile(r"/api/watches/\d+/history$")
 _SHOP_PRODUCTS = re.compile(r"/api/shops/\d+/products$")
+_CARD_IMPORT_RECORD = re.compile(r"/api/sub2api/card-import-records(?:/\d+)?(?:/retry)?$")
+
+AUTH_BOOTSTRAP_GET = frozenset({
+    "/api/health",
+    INSTALL_STATUS_PATH,
+    AUTH_STATUS_PATH,
+    AUTH_ME_PATH,
+})
+AUTH_BOOTSTRAP_POST = frozenset({
+    INSTALL_SETUP_PATH,
+    AUTH_SETUP_PATH,
+    AUTH_LOGIN_PATH,
+    AUTH_REGISTER_PATH,
+})
+
+USER_RECLAIM_EXACT = frozenset({
+    "/api/sub2api/reclaim-401",
+    "/api/sub2api/reclaim401",
+    "/api/sub2api/reclaim-401/retry",
+    "/api/sub2api/reclaim401/retry",
+    "/api/sub2api/reclaim-progress",
+    "/api/redeem/health-check",
+    "/api/redeem/reclaim",
+    "/api/redeem/progress",
+    "/api/redeem/download",
+    "/api/redeem/config",
+})
+USER_IMPORT_EXACT = frozenset({
+    "/api/sub2api/import",
+    "/api/sub2api/options",
+    "/api/sub2api/test",
+    "/api/sub2api/config",
+    "/api/sub2api/automation",
+})
 
 
 def _self_use_guest_legacy(method: str, path: str) -> bool:
@@ -110,6 +144,19 @@ def _is_user_allowed(method: str, path: str) -> bool:
     return False
 
 
+def _user_feature_allowed(method: str, path: str, installation: dict[str, Any]) -> bool:
+    """Allow explicitly enabled external-user recovery/import operations."""
+    method = method.upper()
+    if bool(installation.get("allow_user_reclaim")) and path in USER_RECLAIM_EXACT:
+        return method in {"GET", "POST"}
+    if bool(installation.get("allow_user_sub2api_import")):
+        if path in USER_IMPORT_EXACT and method in {"GET", "POST"}:
+            return True
+        if _CARD_IMPORT_RECORD.fullmatch(path) and method in {"GET", "POST"}:
+            return True
+    return False
+
+
 def authorization(
     method: str,
     path: str,
@@ -143,11 +190,23 @@ def authorization(
     # enforces authentication for account CRUD, password, and system settings.
     if mode == "self_use" and principal is None and _self_use_guest_legacy(method, path):
         return
+    # External mode can expose the public homepage while still protecting
+    # every other API route behind login. Authentication bootstrap endpoints
+    # remain public so the login/install screens can render.
+    if initialized and mode == "external" and bool(installation.get("force_login", installation.get("auth_required", True))) and principal is None:
+        method_upper = method.upper()
+        if not (
+            (method_upper == "GET" and path in AUTH_BOOTSTRAP_GET)
+            or (method_upper == "POST" and path in AUTH_BOOTSTRAP_POST)
+        ):
+            raise AuthenticationRequired("璇峰厛鐧诲綍")
     if _is_public(method, path):
         return
     if principal is None:
         raise AuthenticationRequired("请先登录")
     if principal.get("role") == "admin":
+        return
+    if _user_feature_allowed(method, path, installation):
         return
     if _is_user_allowed(method, path):
         return
