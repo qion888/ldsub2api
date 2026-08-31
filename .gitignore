@@ -7,6 +7,8 @@ backend/order_query/waf-browser-profile/
 backend/server.*.log
 frontend/server.*.log
 .runtime/
+artifacts/
+
 
 # Reproducible dependencies and build output
 frontend/node_modules/
@@ -16,5 +18,11 @@ frontend/dist/
 
 # Local captures, archives, and verification output
 artifacts/
+/DIFF_FILE
+/VERIFICATION.txt
+/MODIFIED_FILE
+/ROLLBACK_BASELINE
+/ROLLBACK.sh
+/acceptance-account-fix.db
 *.zip
 grab_*.txt

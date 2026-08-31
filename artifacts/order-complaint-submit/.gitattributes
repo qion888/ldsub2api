@@ -1,7 +1,0 @@
-MODIFIED_FILE binary
-ROLLBACK_BASELINE binary
-DIFF_FILE text eol=lf whitespace=-trailing-space
-ROLLBACK.sh text eol=lf
-VERIFICATION.txt text eol=lf
-acceptance-result.json text eol=lf
-*.png binary
