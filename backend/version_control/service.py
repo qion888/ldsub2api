@@ -16,6 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from .backup import BackupManager
 from .errors import VersionControlError
 
 
@@ -103,12 +104,18 @@ class VersionControlService:
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         opener: Callable[..., Any] = urlopen,
         now: Callable[[], datetime] | None = None,
+        database_path: Path | None = None,
     ) -> None:
         self.config = config
         self._runner = runner
         self._opener = opener
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._update_lock = threading.Lock()
+        self._backups = BackupManager(
+            config.root,
+            database_path or (config.root / "backend" / "monitor.db"),
+            now=self._now,
+        )
 
     def _run_git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         command = ["git", "-C", str(self.config.root), *arguments]
@@ -147,6 +154,49 @@ class VersionControlService:
 
     def _git_text(self, *arguments: str) -> str:
         return str(self._run_git(*arguments).stdout or "").strip()
+
+    @property
+    def _remote_ref(self) -> str:
+        return f"refs/remotes/{self.config.remote}/{self.config.branch}"
+
+    def _fetch_remote(self) -> None:
+        fetch_spec = f"+refs/heads/{self.config.branch}:{self._remote_ref}"
+        self._run_git("fetch", "--prune", self.config.remote, fetch_spec)
+
+    def _remote_commit(self) -> str:
+        return self._git_text("rev-parse", self._remote_ref)
+
+    def _commit_distance(self, current_commit: str, remote_commit: str) -> tuple[int, int]:
+        result = self._run_git(
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"{current_commit}...{remote_commit}",
+        )
+        values = str(result.stdout or "").strip().split()
+        if len(values) != 2:
+            raise VersionControlError(
+                "Git 未返回有效的版本关系",
+                code="git_comparison_failed",
+                status=409,
+                retryable=True,
+            )
+        try:
+            local_ahead, remote_ahead = (max(0, int(value)) for value in values)
+        except ValueError as exc:
+            raise VersionControlError(
+                "Git 未返回有效的版本关系",
+                code="git_comparison_failed",
+                status=409,
+                retryable=True,
+            ) from exc
+        return local_ahead, remote_ahead
+
+    def _remote_version_file(self) -> str:
+        result = self._run_git("show", f"{self._remote_ref}:VERSION", check=False)
+        if result.returncode != 0:
+            return ""
+        return str(result.stdout or "").strip()[:80]
 
     def _read_current_version(self) -> str:
         try:
@@ -192,11 +242,32 @@ class VersionControlService:
 
     def version_info(self) -> dict[str, Any]:
         state = self._repository_state()
+        backups = self._backups.list_backups()
         return {
             "ok": True,
             **state,
             "status": "ready" if state["can_update"] else "blocked",
+            "database": self._backups.database_status(),
+            "backups": backups,
+            "last_update": self._read_last_update(),
         }
+
+    @property
+    def _last_update_path(self) -> Path:
+        return self._backups.backup_dir / "last-update.json"
+
+    def _read_last_update(self) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(self._last_update_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _write_last_update(self, payload: dict[str, Any]) -> None:
+        self._backups.backup_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self._last_update_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, self._last_update_path)
 
     def _github_json(self, path: str, *, allow_not_found: bool = False) -> Any:
         url = f"https://api.github.com/repos/{self.config.github_slug}/{path.lstrip('/')}"
@@ -259,16 +330,28 @@ class VersionControlService:
     def check_updates(self) -> dict[str, Any]:
         state = self._repository_state()
         branch = quote(self.config.branch, safe="")
-        latest = self._github_json(f"commits/{branch}")
-        if not isinstance(latest, dict) or not re.fullmatch(r"[0-9a-fA-F]{40}", str(latest.get("sha") or "")):
+        self._fetch_remote()
+        remote_commit = self._remote_commit().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", remote_commit):
             raise VersionControlError(
-                "GitHub 未返回有效的最新提交",
-                code="github_invalid_commit",
+                "GitHub 远端引用不是有效提交",
+                code="git_invalid_remote_commit",
                 status=502,
                 retryable=True,
             )
-        latest_commit = str(latest["sha"]).lower()
-        release = self._github_json("releases/latest", allow_not_found=True)
+        latest_commit = remote_commit
+        github_commit = ""
+        try:
+            latest = self._github_json(f"commits/{branch}")
+            if isinstance(latest, dict) and re.fullmatch(r"[0-9a-fA-F]{40}", str(latest.get("sha") or "")):
+                github_commit = str(latest["sha"]).lower()
+        except VersionControlError:
+            latest = None
+        try:
+            release = self._github_json("releases/latest", allow_not_found=True)
+        except VersionControlError:
+            # Git refs are authoritative for update safety; release metadata is optional.
+            release = None
         release_info = None
         latest_version = ""
         if isinstance(release, dict):
@@ -280,30 +363,27 @@ class VersionControlService:
                 "url": str(release.get("html_url") or "").strip(),
             }
         if not latest_version:
-            latest_version = self._latest_version_file() or state["current_version"]
+            latest_version = self._remote_version_file()
+        if not latest_version:
+            try:
+                latest_version = self._latest_version_file()
+            except VersionControlError:
+                latest_version = ""
+        latest_version = latest_version or state["current_version"]
 
-        ahead_by = 0
-        behind_by = 0
-        if state["current_commit"].lower() != latest_commit:
-            current = quote(state["current_commit"], safe="")
-            comparison = self._github_json(f"compare/{current}...{branch}", allow_not_found=True)
-            if isinstance(comparison, dict):
-                try:
-                    ahead_by = max(0, int(comparison.get("ahead_by") or 0))
-                    behind_by = max(0, int(comparison.get("behind_by") or 0))
-                except (TypeError, ValueError):
-                    ahead_by = behind_by = 0
-
-        if state["current_commit"].lower() == latest_commit:
+        local_ahead_by, remote_ahead_by = self._commit_distance(
+            state["current_commit"].lower(), remote_commit
+        )
+        if state["current_commit"].lower() == remote_commit:
             check_status = "up_to_date"
             message = "当前已是 GitHub 最新版本"
-        elif ahead_by > 0 and behind_by == 0:
+        elif remote_ahead_by > 0 and local_ahead_by == 0:
             check_status = "update_available"
-            message = f"发现 {ahead_by} 个可用更新提交"
-        elif behind_by > 0 and ahead_by == 0:
+            message = f"发现 {remote_ahead_by} 个可用更新提交，升级前将自动备份数据"
+        elif local_ahead_by > 0 and remote_ahead_by == 0:
             check_status = "local_ahead"
             message = "本地版本领先于 GitHub 主分支"
-        elif ahead_by > 0 and behind_by > 0:
+        elif local_ahead_by > 0 and remote_ahead_by > 0:
             check_status = "diverged"
             message = "本地分支与 GitHub 主分支已分叉，无法自动更新"
         else:
@@ -321,10 +401,16 @@ class VersionControlService:
             "latest_version": latest_version,
             "latest_commit": latest_commit,
             "latest_short_commit": latest_commit[:8],
-            "ahead_by": ahead_by,
-            "behind_by": behind_by,
+            "ahead_by": remote_ahead_by,
+            "behind_by": local_ahead_by,
+            "remote_ahead_by": remote_ahead_by,
+            "local_ahead_by": local_ahead_by,
+            "comparison_source": "git-fetch",
+            "github_commit": github_commit or None,
             "release": release_info,
             "checked_at": self._now().isoformat(timespec="seconds"),
+            "database": self._backups.database_status(),
+            "last_update": self._read_last_update(),
         }
 
     def _require_update_ready(self, state: dict[str, Any]) -> None:
@@ -358,14 +444,12 @@ class VersionControlService:
         try:
             before = self._repository_state()
             self._require_update_ready(before)
-            remote_ref = f"refs/remotes/{self.config.remote}/{self.config.branch}"
-            fetch_spec = f"refs/heads/{self.config.branch}:{remote_ref}"
-            self._run_git("fetch", "--prune", self.config.remote, fetch_spec)
+            self._fetch_remote()
 
             # Fetch can take time, so verify the mutable state again before merging.
             current = self._repository_state()
             self._require_update_ready(current)
-            remote_commit = self._git_text("rev-parse", remote_ref)
+            remote_commit = self._remote_commit()
             if current["current_commit"] == remote_commit:
                 return {
                     "ok": True,
@@ -397,7 +481,12 @@ class VersionControlService:
                     status=409,
                 )
 
-            self._run_git("merge", "--ff-only", remote_ref)
+            backup = self._backups.create_backup(
+                reason="before-update",
+                code_commit=before["current_commit"],
+                code_version=before["current_version"],
+            )
+            self._run_git("merge", "--ff-only", self._remote_ref)
             after = self._repository_state()
             if after["current_commit"] != remote_commit:
                 raise VersionControlError(
@@ -405,6 +494,15 @@ class VersionControlService:
                     code="update_verification_failed",
                     status=500,
                 )
+            last_update = {
+                "backup_id": backup["id"],
+                "previous_commit": before["current_commit"],
+                "updated_commit": remote_commit,
+                "previous_version": before["current_version"],
+                "updated_version": after["current_version"],
+                "updated_at": self._now().astimezone(timezone.utc).isoformat(timespec="seconds"),
+            }
+            self._write_last_update(last_update)
             return {
                 "ok": True,
                 **after,
@@ -415,6 +513,101 @@ class VersionControlService:
                 "latest_commit": remote_commit,
                 "latest_short_commit": remote_commit[:8],
                 "message": "版本已更新，请重启服务以加载新代码",
+                "backup": backup,
+                "last_update": {**last_update, "can_rollback": True},
+                "database": self._backups.database_status(),
+            }
+        finally:
+            self._update_lock.release()
+
+    def create_backup(self, reason: str = "manual") -> dict[str, Any]:
+        state = self._repository_state()
+        return {
+            "ok": True,
+            "backup": self._backups.create_backup(
+                reason=reason,
+                code_commit=state["current_commit"],
+                code_version=state["current_version"],
+            ),
+            "database": self._backups.database_status(),
+            "message": "数据备份已完成",
+        }
+
+    def list_backups(self) -> dict[str, Any]:
+        return self._backups.list_backups()
+
+    def restore_backup(self, backup_id: Any) -> dict[str, Any]:
+        state = self._repository_state()
+        return self._backups.restore_backup(
+            backup_id,
+            create_safety_backup=True,
+            code_commit=state["current_commit"],
+            code_version=state["current_version"],
+        )
+
+    def rollback_update(self, backup_id: Any = None, *, restore_data: bool = False) -> dict[str, Any]:
+        if not self._update_lock.acquire(blocking=False):
+            raise VersionControlError(
+                "已有版本操作正在执行",
+                code="update_in_progress",
+                status=409,
+                retryable=True,
+            )
+        try:
+            state = self._repository_state()
+            self._require_update_ready(state)
+            last_update = self._read_last_update()
+            selected_id = str(backup_id or (last_update or {}).get("backup_id") or "").strip()
+            if not last_update or not selected_id:
+                raise VersionControlError(
+                    "没有可回退的版本更新记录",
+                    code="rollback_not_available",
+                    status=409,
+                )
+            if selected_id != str(last_update.get("backup_id")):
+                raise VersionControlError(
+                    "指定备份不是最近一次版本更新的备份",
+                    code="rollback_backup_mismatch",
+                    status=409,
+                )
+            if state["current_commit"] != str(last_update.get("updated_commit")):
+                raise VersionControlError(
+                    "当前提交已发生变化，不能直接回退该版本",
+                    code="rollback_commit_mismatch",
+                    status=409,
+                )
+            safety_backup = self._backups.create_backup(
+                reason="before-rollback",
+                code_commit=state["current_commit"],
+                code_version=state["current_version"],
+            )
+            previous_commit = str(last_update.get("previous_commit") or "")
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", previous_commit):
+                raise VersionControlError(
+                    "回退记录中的提交无效",
+                    code="rollback_commit_invalid",
+                    status=409,
+                )
+            self._run_git("reset", "--hard", previous_commit)
+            restored = None
+            if restore_data:
+                restored = self._backups.restore_backup(
+                    selected_id,
+                    create_safety_backup=False,
+                    code_commit=previous_commit,
+                    code_version=str(last_update.get("previous_version") or ""),
+                )
+            after = self._repository_state()
+            return {
+                "ok": True,
+                "status": "rolled_back",
+                "previous_commit": after["current_commit"],
+                "safety_backup_id": safety_backup["id"],
+                "restored_backup_id": selected_id if restored else None,
+                "data_restored": bool(restored),
+                "needs_restart": True,
+                "database": self._backups.database_status(),
+                "message": "代码已回退，请重启服务；数据按选择处理",
             }
         finally:
             self._update_lock.release()

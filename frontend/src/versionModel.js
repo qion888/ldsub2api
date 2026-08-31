@@ -19,6 +19,61 @@ function nonNegativeInteger(value) {
   return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
 }
 
+function normalizeBackup(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    id: String(source.id || '').trim(),
+    created_at: source.created_at || null,
+    reason: String(source.reason || 'manual').trim(),
+    file_name: String(source.file_name || '').trim(),
+    size_bytes: nonNegativeInteger(source.size_bytes),
+    sha256: String(source.sha256 || '').trim(),
+    schema_version: source.schema_version == null ? null : nonNegativeInteger(source.schema_version),
+    code_commit: String(source.code_commit || '').trim(),
+    code_version: String(source.code_version || '').trim(),
+  };
+}
+
+function normalizeDatabase(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const latest = source.latest_backup ? normalizeBackup(source.latest_backup) : null;
+  return {
+    path: String(source.path || '').trim(),
+    file_name: String(source.file_name || '').trim(),
+    size_bytes: nonNegativeInteger(source.size_bytes),
+    integrity: source.integrity !== false,
+    integrity_message: String(source.integrity_message || '').trim(),
+    schema_version: source.schema_version == null ? null : nonNegativeInteger(source.schema_version),
+    compatibility: String(source.compatibility || 'sqlite-preserved').trim(),
+    backup_count: nonNegativeInteger(source.backup_count),
+    latest_backup: latest,
+  };
+}
+
+function normalizeLastUpdate(value) {
+  if (!value || typeof value !== 'object') return null;
+  return {
+    backup_id: String(value.backup_id || '').trim(),
+    previous_commit: String(value.previous_commit || '').trim(),
+    updated_commit: String(value.updated_commit || '').trim(),
+    previous_version: String(value.previous_version || '').trim(),
+    updated_version: String(value.updated_version || '').trim(),
+    updated_at: value.updated_at || null,
+    can_rollback: value.can_rollback !== false,
+  };
+}
+
+export function normalizeBackupList(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const items = Array.isArray(source.items) ? source.items.map(normalizeBackup).filter(item => item.id) : [];
+  return {
+    ok: Boolean(source.ok),
+    items,
+    total: nonNegativeInteger(source.total ?? items.length),
+    latest: source.latest ? normalizeBackup(source.latest) : items[0] || null,
+  };
+}
+
 export function normalizeVersionInfo(value) {
   const source = value && typeof value === 'object' ? value : {};
   const currentCommit = String(source.current_commit || '').trim();
@@ -52,6 +107,13 @@ export function normalizeVersionInfo(value) {
     ahead_by: nonNegativeInteger(source.ahead_by),
     behind_by: nonNegativeInteger(source.behind_by),
     checked_at: source.checked_at || null,
+    database: normalizeDatabase(source.database),
+    backups: normalizeBackupList(source.backups),
+    last_update: normalizeLastUpdate(source.last_update),
+    backup: source.backup ? normalizeBackup(source.backup) : null,
+    restored_backup_id: String(source.restored_backup_id || '').trim(),
+    safety_backup_id: String(source.safety_backup_id || '').trim(),
+    restored_data: Boolean(source.data_restored),
     release: release ? {
       tag: String(release.tag || '').trim(),
       name: String(release.name || '').trim(),

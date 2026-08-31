@@ -2845,6 +2845,30 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .version-checked { margin-top: 9px; color: var(--ui-text-faint); font-size: 10px; text-align: right; }
 .version-actions { flex-wrap: wrap; }
 .version-actions .button { text-decoration: none; }
+.version-data-panel, .version-backups-panel { margin-top: 18px; padding-top: 17px; border-top: 1px solid var(--ui-border-soft); }
+.version-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.version-panel-head h4 { margin: 3px 0 0; color: var(--ui-text); font-size: 13px; }
+.version-integrity { min-height: 26px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-muted); background: var(--ui-control); border: 1px solid var(--ui-border); border-radius: 3px; font-size: 10px; white-space: nowrap; }
+.version-integrity.ok { color: var(--ui-success); border-color: color-mix(in srgb, var(--ui-success) 35%, var(--ui-border)); }
+.version-integrity.error { color: var(--ui-danger); border-color: color-mix(in srgb, var(--ui-danger) 35%, var(--ui-border)); }
+.version-data-grid { margin-top: 13px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--ui-border-soft); }
+.version-data-grid > div { min-width: 0; padding: 11px; border-right: 1px solid var(--ui-border-soft); }
+.version-data-grid > div:last-child { border-right: 0; }
+.version-data-grid small, .version-data-grid strong, .version-data-grid span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.version-data-grid small { color: var(--ui-text-faint); font-size: 10px; }
+.version-data-grid strong { margin-top: 5px; color: var(--ui-text); font-size: 12px; }
+.version-data-grid span { margin-top: 4px; color: var(--ui-text-muted); font-size: 10px; }
+.version-panel-actions { margin-top: 11px; display: flex; flex-wrap: wrap; gap: 8px; }
+.version-backup-list { margin-top: 11px; border: 1px solid var(--ui-border-soft); }
+.version-backup-row { min-height: 54px; padding: 8px 10px; display: grid; grid-template-columns: minmax(0, 1fr) 110px 30px; gap: 10px; align-items: center; border-bottom: 1px solid var(--ui-border-soft); }
+.version-backup-row:last-child { border-bottom: 0; }
+.version-backup-main { min-width: 0; }
+.version-backup-main strong, .version-backup-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.version-backup-main strong { color: var(--ui-text); font-size: 11px; }
+.version-backup-main small { margin-top: 3px; color: var(--ui-text-muted); font-size: 10px; }
+.version-backup-row code { overflow: hidden; color: var(--ui-text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.version-backup-row .icon-button { width: 30px; height: 30px; }
+.version-backup-empty { min-height: 72px; border: 1px solid var(--ui-border-soft); }
 .users-section { overflow: hidden; }
 .user-create-form { margin-top: 15px; padding-bottom: 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 11px; align-items: end; border-bottom: 1px solid var(--ui-border-soft); }
 .user-create-form .settings-form-grid { margin-top: 0; grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -2872,6 +2896,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .user-create-form .settings-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .version-meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .version-meta-grid > div:nth-child(2) { border-right: 0; }
+  .version-data-grid { grid-template-columns: 1fr; }
+  .version-data-grid > div { border-right: 0; border-bottom: 1px solid var(--ui-border-soft); }
+  .version-data-grid > div:last-child { border-bottom: 0; }
 }
 
 @media (max-width: 620px) {
@@ -2887,6 +2914,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .version-meta-grid > div { padding: 12px 0; border-right: 0; border-bottom: 1px solid var(--ui-border-soft); }
   .version-meta-grid > div:last-child { border-bottom: 0; }
   .version-actions .button { flex: 1 1 145px; }
+  .version-panel-head { align-items: flex-start; flex-direction: column; }
+  .version-backup-row { grid-template-columns: minmax(0, 1fr) 30px; }
+  .version-backup-row code { display: none; }
   .user-create-form .settings-form-grid { grid-template-columns: 1fr; }
   .auth-modal-host { padding: 10px; }
   .auth-modal-host .auth-frame { min-height: calc(100vh - 20px); }

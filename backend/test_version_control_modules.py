@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -44,14 +45,23 @@ class GitStateRunner:
             stdout = f"{REPOSITORY_URL}\n"
         elif arguments == ("status", "--porcelain=v1", "--untracked-files=all"):
             stdout = self.dirty
-        elif arguments == ("fetch", "--prune", "origin", "refs/heads/main:refs/remotes/origin/main"):
+        elif arguments in {
+            ("fetch", "--prune", "origin", "refs/heads/main:refs/remotes/origin/main"),
+            ("fetch", "--prune", "origin", "+refs/heads/main:refs/remotes/origin/main"),
+        }:
             pass
         elif arguments == ("rev-parse", "refs/remotes/origin/main"):
             stdout = f"{self.remote_commit}\n"
+        elif arguments == ("rev-list", "--left-right", "--count", f"{self.current_commit}...{self.remote_commit}"):
+            stdout = "0 3\n"
+        elif arguments == ("show", "refs/remotes/origin/main:VERSION"):
+            stdout = "2.2.0\n"
         elif arguments == ("merge-base", "--is-ancestor", self.current_commit, self.remote_commit):
             returncode = 0
         elif arguments == ("merge", "--ff-only", "refs/remotes/origin/main"):
             self.current_commit = self.remote_commit
+        elif arguments == ("reset", "--hard", CURRENT_COMMIT):
+            self.current_commit = CURRENT_COMMIT
         else:
             raise AssertionError(f"Unexpected git command: {arguments}")
         return subprocess.CompletedProcess(command, returncode, stdout, stderr)
@@ -95,6 +105,12 @@ class VersionControlServiceTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         (self.root / "VERSION").write_text("2.1.0\n", encoding="utf-8")
+        (self.root / "backend").mkdir()
+        connection = sqlite3.connect(self.root / "backend" / "monitor.db")
+        connection.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO settings(value) VALUES ('fixture')")
+        connection.commit()
+        connection.close()
         self.config = RepositoryConfig(root=self.root, repository_url=REPOSITORY_URL)
 
     def tearDown(self):
@@ -147,7 +163,7 @@ class VersionControlServiceTests(unittest.TestCase):
         self.assertEqual(result["current_commit"], LATEST_COMMIT)
         commands = [command[3:] for command in runner.commands]
         self.assertIn(
-            ["fetch", "--prune", "origin", "refs/heads/main:refs/remotes/origin/main"],
+            ["fetch", "--prune", "origin", "+refs/heads/main:refs/remotes/origin/main"],
             commands,
         )
         self.assertIn(["merge", "--ff-only", "refs/remotes/origin/main"], commands)
@@ -161,6 +177,47 @@ class VersionControlServiceTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "dirty_worktree")
         self.assertFalse(any(command[3:4] == ["fetch"] for command in runner.commands))
+
+    def test_manual_backup_restore_and_safety_backup_preserve_sqlite_data(self):
+        runner = GitStateRunner()
+        service = VersionControlService(self.config, runner=runner)
+        created = service.create_backup()
+        backup_id = created["backup"]["id"]
+        database_path = self.root / "backend" / "monitor.db"
+        connection = sqlite3.connect(database_path)
+        connection.execute("UPDATE settings SET value = 'changed'")
+        connection.commit()
+        connection.close()
+
+        restored = service.restore_backup(backup_id)
+
+        self.assertEqual(restored["status"], "restored")
+        self.assertTrue(restored["safety_backup_id"])
+        connection = sqlite3.connect(database_path)
+        self.assertEqual(connection.execute("SELECT value FROM settings").fetchone()[0], "fixture")
+        connection.close()
+        self.assertEqual(service.list_backups()["total"], 2)
+
+    def test_rollback_update_resets_code_without_restoring_data_by_default(self):
+        runner = GitStateRunner()
+        runner.current_commit = LATEST_COMMIT
+        service = VersionControlService(self.config, runner=runner)
+        backup = service.create_backup()["backup"]
+        service._write_last_update({
+            "backup_id": backup["id"],
+            "previous_commit": CURRENT_COMMIT,
+            "updated_commit": LATEST_COMMIT,
+            "previous_version": "2.1.0",
+            "updated_version": "2.2.0",
+        })
+
+        result = service.rollback_update()
+
+        self.assertEqual(result["status"], "rolled_back")
+        self.assertEqual(result["previous_commit"], CURRENT_COMMIT)
+        self.assertFalse(result["data_restored"])
+        self.assertTrue(result["safety_backup_id"])
+        self.assertTrue(result["needs_restart"])
 
 
 class VersionControlRouteTests(unittest.TestCase):
@@ -199,6 +256,34 @@ class VersionControlRouteTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(calls, ["update"])
         self.assertEqual(responses[-1], (200, {"updated": True}))
+
+    def test_post_routes_dispatch_backup_restore_and_rollback_payloads(self):
+        responses = []
+        calls = []
+        handled = handle_post(
+            "/api/version/restore",
+            {"backup_id": "backup-1"},
+            send_json=lambda payload, status=200: responses.append((status, payload)),
+            principal={"role": "admin"},
+            check_updates=lambda: {},
+            install_update=lambda: {},
+            restore_backup=lambda backup_id: calls.append(("restore", backup_id)) or {"restored": True},
+        )
+        self.assertTrue(handled)
+        self.assertEqual(calls, [("restore", "backup-1")])
+        self.assertEqual(responses[-1], (200, {"restored": True}))
+
+        handled = handle_post(
+            "/api/version/rollback",
+            {"backup_id": "backup-1", "restore_data": True},
+            send_json=lambda payload, status=200: responses.append((status, payload)),
+            principal={"role": "admin"},
+            check_updates=lambda: {},
+            install_update=lambda: {},
+            rollback_update=lambda backup_id, restore_data=False: calls.append(("rollback", backup_id, restore_data)) or {"rolled_back": True},
+        )
+        self.assertTrue(handled)
+        self.assertEqual(calls[-1], ("rollback", "backup-1", True))
 
     def test_global_policy_keeps_version_operations_admin_only(self):
         installation = {"initialized": True, "needs_setup": False, "mode": "self_use"}

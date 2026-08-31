@@ -98,7 +98,10 @@ def database() -> sqlite3.Connection:
 # Resolve ``database`` lazily so the existing isolated-database test seams and
 # embedding callers can replace the factory without rebuilding this service.
 USER_SERVICE = user_auth.AuthService(lambda: database(), now=utc_now)
-VERSION_SERVICE = VersionControlService(RepositoryConfig.from_environment(PROJECT_ROOT))
+VERSION_SERVICE = VersionControlService(
+    RepositoryConfig.from_environment(PROJECT_ROOT),
+    database_path=DB_PATH,
+)
 
 
 def init_database() -> None:
@@ -1354,6 +1357,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             send_json=self._send_json,
             principal=_principal,
             version_info=VERSION_SERVICE.version_info,
+            backups_loader=VERSION_SERVICE.list_backups,
         ):
             return
         if path == "/":
@@ -1497,6 +1501,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             principal=_principal,
             check_updates=VERSION_SERVICE.check_updates,
             install_update=VERSION_SERVICE.install_update,
+            create_backup=VERSION_SERVICE.create_backup,
+            restore_backup=VERSION_SERVICE.restore_backup,
+            rollback_update=VERSION_SERVICE.rollback_update,
         ):
             return
 
