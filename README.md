@@ -60,6 +60,21 @@ Sub2API 导入：
 .\start.ps1 -SkipInstall
 ```
 
+### Downloaded Windows copy
+
+To avoid PowerShell blocking a downloaded `start.ps1`, double-click `start.cmd` in the project root or run:
+
+```powershell
+.\start.cmd
+```
+
+The launcher uses a process-only execution-policy bypass and sets `LDXP_AUTO_INSTALL=1`, so missing Python, Node.js, npm, and project dependencies are installed through `winget` when available. Extra arguments are forwarded, for example:
+
+```powershell
+.\start.cmd -BootstrapOnly
+.\start.cmd -SkipInstall
+```
+
 脚本会自动：
 
 - 安装缺失的前端依赖；
