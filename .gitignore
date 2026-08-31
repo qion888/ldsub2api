@@ -7,6 +7,8 @@ backend/order_query/waf-browser-profile/
 backend/server.*.log
 frontend/server.*.log
 .runtime/
+artifacts/
+
 
 # Reproducible dependencies and build output
 frontend/node_modules/
