@@ -256,6 +256,34 @@ class GoodsParserTests(unittest.TestCase):
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
 
+                    connection.execute(
+                        "INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen) VALUES(?, 'single-shop-delete', ?, 1, ?)",
+                        (shop_ids[2], watch_id, main.utc_now()),
+                    )
+                    connection.execute(
+                        "INSERT INTO shop_exclusions(shop_id, goods_key, removed_at) VALUES(?, 'single-shop-delete', ?)",
+                        (shop_ids[2], main.utc_now()),
+                    )
+                    connection.execute(
+                        "INSERT INTO shop_runs(shop_id, fetched_at, status) VALUES(?, ?, 'success')",
+                        (shop_ids[2], main.utc_now()),
+                    )
+
+                single_status, single_result = self.request_api(
+                    "DELETE", f"/api/shops/{shop_ids[2]}", {}
+                )
+                self.assertEqual(single_status, 200)
+                self.assertEqual(single_result, {"ok": True})
+                with main.database() as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_exclusions").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_runs").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
+
+                missing_status, _ = self.request_api("DELETE", f"/api/shops/{shop_ids[2]}", {})
+                self.assertEqual(missing_status, 404)
+
                 invalid_status, _ = self.request_api("POST", "/api/shops/batch-delete", {"ids": []})
                 self.assertEqual(invalid_status, 400)
 

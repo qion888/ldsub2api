@@ -600,6 +600,21 @@ class InventoryService:
             return 0
         placeholders = ",".join("?" for _ in shop_ids)
         with self.database() as connection:
+            # Existing installations may have created these child tables
+            # before their ON DELETE CASCADE clauses were introduced. Delete
+            # the known dependants explicitly so both schemas behave alike.
+            connection.execute(
+                f"DELETE FROM shop_exclusions WHERE shop_id IN ({placeholders})",
+                shop_ids,
+            )
+            connection.execute(
+                f"DELETE FROM shop_products WHERE shop_id IN ({placeholders})",
+                shop_ids,
+            )
+            connection.execute(
+                f"DELETE FROM shop_runs WHERE shop_id IN ({placeholders})",
+                shop_ids,
+            )
             cursor = connection.execute(
                 f"DELETE FROM shops WHERE id IN ({placeholders})",
                 shop_ids,

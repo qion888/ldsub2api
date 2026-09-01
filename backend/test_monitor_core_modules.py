@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 from pathlib import Path
 
@@ -255,6 +257,90 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertEqual(product["sale_status"], "off_sale")
         self.assertIsNone(product["stock"])
+
+    def test_delete_shops_cleans_children_before_parent_for_legacy_schema(self) -> None:
+        legacy_path = Path(self.directory.name) / "legacy-shop-delete.db"
+
+        @contextmanager
+        def legacy_database() -> sqlite3.Connection:
+            connection = sqlite3.connect(legacy_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            try:
+                yield connection
+                connection.commit()
+            finally:
+                connection.close()
+
+        with legacy_database() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE watches (id INTEGER PRIMARY KEY, url TEXT NOT NULL);
+                CREATE TABLE shops (id INTEGER PRIMARY KEY, url TEXT NOT NULL, token TEXT NOT NULL);
+                CREATE TABLE shop_products (
+                    shop_id INTEGER NOT NULL,
+                    goods_key TEXT NOT NULL,
+                    watch_id INTEGER NOT NULL,
+                    listed INTEGER NOT NULL DEFAULT 1,
+                    last_seen TEXT NOT NULL,
+                    PRIMARY KEY (shop_id, goods_key),
+                    FOREIGN KEY (shop_id) REFERENCES shops(id),
+                    FOREIGN KEY (watch_id) REFERENCES watches(id)
+                );
+                CREATE TABLE shop_exclusions (
+                    shop_id INTEGER NOT NULL,
+                    goods_key TEXT NOT NULL,
+                    removed_at TEXT NOT NULL,
+                    PRIMARY KEY (shop_id, goods_key),
+                    FOREIGN KEY (shop_id) REFERENCES shops(id)
+                );
+                CREATE TABLE shop_runs (
+                    id INTEGER PRIMARY KEY,
+                    shop_id INTEGER NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    FOREIGN KEY (shop_id) REFERENCES shops(id)
+                );
+                """
+            )
+            watch_id = connection.execute(
+                "INSERT INTO watches(url) VALUES(?)",
+                ("https://pay.ldxp.cn/item/legacy-shop-product",),
+            ).lastrowid
+            shop_id = connection.execute(
+                "INSERT INTO shops(url, token) VALUES(?, ?)",
+                ("https://pay.ldxp.cn/shop/LEGACYDELETE", "LEGACYDELETE"),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO shop_products(shop_id, goods_key, watch_id, last_seen) VALUES(?, ?, ?, ?)",
+                (shop_id, "legacy-product", watch_id, "2026-08-30T08:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO shop_exclusions(shop_id, goods_key, removed_at) VALUES(?, ?, ?)",
+                (shop_id, "legacy-product", "2026-08-30T08:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO shop_runs(shop_id, fetched_at, status) VALUES(?, ?, 'success')",
+                (shop_id, "2026-08-30T08:00:00+00:00"),
+            )
+
+        service = InventoryService(
+            database=legacy_database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: {},
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+        )
+        self.assertEqual(service.delete_shops([shop_id]), 1)
+
+        with legacy_database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_exclusions").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_runs").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches").fetchone()[0], 1)
 
     def test_inventory_links_single_product_to_discovered_shop_and_reuses_it(self) -> None:
         product = {
