@@ -66,6 +66,7 @@ import {
 } from './sub2apiRecoveryModel.js';
 import {InstallWizard, LoginView} from './AuthGate.jsx';
 import SettingsView from './SettingsView.jsx';
+import VersionMenu from './VersionMenu.jsx';
 import {
   AUTH_MODES,
   canManageWorkspace,
@@ -990,6 +991,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [paymentChannels, setPaymentChannels] = useState([{id: 1, name: '支付宝'}]);
   const paymentWindow = useRef(null);
   const [activeView, setActiveView] = useState('products');
+  const [settingsTab, setSettingsTab] = useState('basic');
   const [sub2apiSection, setSub2apiSection] = useState(DEFAULT_SUB2API_SECTION);
   const [redeemConfig, setRedeemConfig] = useState({base_url: 'https://30d.team'});
   const [cardCodes, setCardCodes] = useState('');
@@ -3177,6 +3179,10 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     setDetailOpen(false);
     setActiveView(view);
   };
+  const openVersionSettings = () => {
+    setSettingsTab('version');
+    switchView('settings');
+  };
   const switchSub2ApiSection = section => {
     const nextSection = normalizeSub2ApiSection(section);
     setSub2apiSection(nextSection);
@@ -3201,7 +3207,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark"><Activity size={18}/></div><div><strong>链动监控台</strong><span>LOCAL WATCH</span></div></div>
+        <div className="brand"><div className="brand-mark"><Activity size={18}/></div><div className="brand-copy"><strong>链动监控台</strong><span>LOCAL WATCH</span><VersionMenu request={request} user={sessionUser} onOpenSettings={openVersionSettings} notify={notify}/></div></div>
         <nav className="nav-list" aria-label="页面导航">
           <button className={activeView === 'products' ? 'active' : ''} onClick={() => switchView('products')}><CircleDollarSign size={18}/>商品总览</button>
           <button className={activeView === 'monitor' ? 'active' : ''} onClick={() => switchView('monitor')}><ListChecks size={18}/>监控面板</button>
