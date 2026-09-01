@@ -904,6 +904,22 @@ body.drawer-open { overflow: hidden; }
 .brand strong { font-size: 16px; font-weight: 740; }
 .nav-list { gap: 5px; }
 .nav-list button { min-height: 40px; padding: 0 12px; font-size: 13px; }
+.nav-group { min-width: 0; display: grid; gap: 2px; }
+.nav-group > .nav-parent { width: 100%; }
+.nav-parent > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-parent-chevron { margin-left: auto; color: var(--ui-text-faint); transition: transform .16s ease; }
+.nav-group.expanded .nav-parent-chevron { transform: rotate(90deg); }
+.nav-sublist { margin: 1px 0 5px 29px; padding: 3px 0 3px 8px; display: grid; gap: 2px; border-left: 1px solid var(--ui-border); }
+.nav-list .nav-sublist button { width: 100%; min-height: 30px; padding: 0 8px; color: var(--ui-text-faint); background: transparent; border-radius: 3px; box-shadow: none; font-size: 11px; font-weight: 560; }
+.nav-list .nav-sublist button:hover { color: var(--ui-text); background: var(--ui-surface-muted); }
+.nav-list .nav-sublist button.active { color: var(--ui-text); background: var(--ui-surface-muted); box-shadow: none; }
+.nav-list .nav-sublist button.active::before { width: 4px; height: 4px; flex: 0 0 auto; content: ''; background: var(--ui-success); border-radius: 50%; }
+.sub2api-mobile-tabs { display: none; }
+.sub2api-automation-reclaim-result { display: grid; gap: 8px; }
+.sub2api-section-empty { min-height: 220px; padding: 36px 24px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--ui-text-muted); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; text-align: center; }
+.sub2api-section-empty svg { color: var(--ui-text-faint); }
+.sub2api-section-empty strong { color: var(--ui-text); font-size: 15px; }
+.sub2api-section-empty span { max-width: 420px; color: var(--ui-text-faint); font-size: 11px; }
 .workspace { width: calc(100% - 224px); margin-left: 224px; padding: 24px 28px 38px; }
 .topbar { min-height: 48px; gap: 18px; }
 .topbar h1 { font-size: 24px; font-weight: 760; }
@@ -1393,6 +1409,15 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .shop-row { grid-template-columns: minmax(170px, 1fr) 55px 80px 38px 70px; }
   .shop-row .shop-stat:nth-of-type(2) { display: none; }
   .shop-main { min-width: 0; max-width: 100%; }
+  .nav-sublist { display: none; }
+  .nav-parent-chevron { display: none; }
+  .sub2api-mobile-tabs { padding: 4px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; }
+  .sub2api-mobile-tabs button { min-width: 0; min-height: 52px; padding: 7px 9px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 4px; color: var(--ui-text-muted); background: transparent; border: 1px solid transparent; border-radius: 3px; text-align: left; }
+  .sub2api-mobile-tabs button:hover { color: var(--ui-text); background: var(--ui-surface-muted); }
+  .sub2api-mobile-tabs button.active { color: var(--ui-text); background: var(--ui-surface-muted); border-color: var(--ui-border); }
+  .sub2api-mobile-tabs span, .sub2api-mobile-tabs small { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sub2api-mobile-tabs span { font-size: 12px; font-weight: 700; }
+  .sub2api-mobile-tabs small { color: var(--ui-text-faint); font-size: 9px; }
 }
 
 @media (max-width: 900px) and (min-width: 681px) {
@@ -1416,6 +1441,10 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .nav-list { justify-content: flex-start; gap: 3px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
   .nav-list::-webkit-scrollbar { display: none; }
   .nav-list button { width: 64px; min-width: 0; flex: 0 0 64px; flex-direction: column; justify-content: center; gap: 3px; min-height: 50px; padding-inline: 2px; font-size: 10px; scroll-snap-align: center; white-space: nowrap; }
+  .nav-group { width: 64px; min-width: 64px; flex: 0 0 64px; }
+  .nav-group > .nav-parent { width: 64px; }
+  .sub2api-mobile-tabs button { min-height: 44px; align-items: center; padding: 6px; text-align: center; }
+  .sub2api-mobile-tabs small { display: none; }
   .workspace { width: 100%; margin: 0; padding: 17px 12px 87px; }
   .topbar { min-height: 44px; align-items: flex-start; }
   .topbar h1 { font-size: 19px; }

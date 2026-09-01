@@ -52,6 +52,7 @@ import {
 } from 'lucide-react';
 import './style.css';
 import {buildSub2ApiAutomationSaveNotice, buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+import {DEFAULT_SUB2API_SECTION, SUB2API_SECTIONS, normalizeSub2ApiSection} from './sub2apiNavigation.js';
 import {
   CARD_RECLAIM_POLL_TIMEOUT_MS,
   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
@@ -988,6 +989,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [paymentChannels, setPaymentChannels] = useState([{id: 1, name: '支付宝'}]);
   const paymentWindow = useRef(null);
   const [activeView, setActiveView] = useState('products');
+  const [sub2apiSection, setSub2apiSection] = useState(DEFAULT_SUB2API_SECTION);
   const [redeemConfig, setRedeemConfig] = useState({base_url: 'https://30d.team'});
   const [cardCodes, setCardCodes] = useState('');
   const [reclaimResult, setReclaimResult] = useState(null);
@@ -1364,36 +1366,36 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     sub2apiCardHistoryFilterRef.current = sub2apiCardHistoryFilter;
     sub2apiCardHistoryPageRef.current = sub2apiCardHistoryPage;
     sub2apiCardHistoryPageSizeRef.current = sub2apiCardHistoryPageSize;
-    if (activeView === 'sub2api' && featureLoadState.sub2api.status === 'ready') {
+    if (activeView === 'sub2api' && sub2apiSection === 'cards' && featureLoadState.sub2api.status === 'ready') {
       loadSub2ApiCardHistory({
         status: sub2apiCardHistoryFilter,
         page: sub2apiCardHistoryPage,
         pageSize: sub2apiCardHistoryPageSize,
       });
     }
-  }, [activeView, featureLoadState.sub2api.status, sub2apiCardHistoryFilter, sub2apiCardHistoryPage, sub2apiCardHistoryPageSize]);
+  }, [activeView, sub2apiSection, featureLoadState.sub2api.status, sub2apiCardHistoryFilter, sub2apiCardHistoryPage, sub2apiCardHistoryPageSize]);
 
   useEffect(() => {
     if (activeView !== 'sub2api' || featureLoadState.sub2api.status !== 'ready') return undefined;
     if (sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
-    const stateTimer = canManageMonitor ? window.setInterval(() => loadSub2ApiAutomation(), 5000) : null;
+    const stateTimer = canManageMonitor && sub2apiSection === 'automation' ? window.setInterval(() => loadSub2ApiAutomation(), 5000) : null;
     const monitorTimer = window.setInterval(() => {
       if (canManageMonitor && sub2apiConfig.admin_key_set) {
         loadSub2ApiOptions({quiet: true});
-        loadSub2ApiAccounts({quiet: true});
+        if (sub2apiSection === 'accounts') loadSub2ApiAccounts({quiet: true});
       }
     }, 60000);
     return () => {
       if (stateTimer) window.clearInterval(stateTimer);
       window.clearInterval(monitorTimer);
     };
-  }, [activeView, featureLoadState.sub2api.status, sub2apiConfig.base_url, sub2apiConfig.admin_key_set, canManageMonitor]);
+  }, [activeView, sub2apiSection, featureLoadState.sub2api.status, sub2apiConfig.base_url, sub2apiConfig.admin_key_set, canManageMonitor]);
 
   useEffect(() => {
-    if (canManageMonitor && activeView === 'sub2api' && featureLoadState.sub2api.status === 'ready' && sub2apiConfig.admin_key_set) {
+    if (canManageMonitor && activeView === 'sub2api' && sub2apiSection === 'accounts' && featureLoadState.sub2api.status === 'ready' && sub2apiConfig.admin_key_set) {
       loadSub2ApiAccounts({page: 1, quiet: true});
     }
-  }, [canManageMonitor, activeView, featureLoadState.sub2api.status, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
+  }, [canManageMonitor, activeView, sub2apiSection, featureLoadState.sub2api.status, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
 
   const fastestInterval = [...items, ...shops, ...preorders.filter(entry => entry.enabled)]
     .filter(item => item.enabled)
@@ -3130,13 +3132,19 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     setDetailOpen(false);
     setActiveView(view);
   };
+  const switchSub2ApiSection = section => {
+    const nextSection = normalizeSub2ApiSection(section);
+    setSub2apiSection(nextSection);
+    if (activeView !== 'sub2api') switchView('sub2api');
+  };
+  const sub2apiSectionMeta = SUB2API_SECTIONS.find(section => section.value === sub2apiSection) || SUB2API_SECTIONS[0];
   const viewMeta = {
     products: {title: '商品总览', description: '聚合监控店铺报价，快速比较最低价、库存与销售状态'},
     monitor: {title: '店铺与商品监控', description: '汇总店铺商品，追踪库存、价格与在售状态'},
     history: {title: '价格记录', description: '查看选中商品的抓取结果与价格变化'},
     orders: {title: '订单查询', description: '自动完成链动小铺验证并查看购买订单'},
     reclaim: {title: '卡密 401 找回', description: '检测并找回 30d.team 卡密关联的 401 账号'},
-    sub2api: {title: 'Sub2API 账号导入', description: '使用管理员密钥将账号 JSON 导入 Sub2API'},
+    sub2api: {title: `Sub2API · ${sub2apiSectionMeta.label}`, description: sub2apiSectionMeta.description},
     settings: {title: '系统设置', description: '管理基础配置、运行模式与用户账号'},
   }[activeView];
   const resetHistoryFilters = () => setHistoryFilters({query: '', startDate: '', endDate: '', status: 'all', stock: 'all'});
@@ -3155,7 +3163,12 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
           <button className={activeView === 'history' ? 'active' : ''} onClick={() => switchView('history')}><History size={18}/>价格记录</button>
           <button className={activeView === 'orders' ? 'active' : ''} onClick={() => switchView('orders')}><ReceiptText size={18}/>订单查询</button>
           {canUseReclaim && <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>}
-          {canUseSub2Api && <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>}
+          {canUseSub2Api && <div className={`nav-group ${activeView === 'sub2api' ? 'expanded' : ''}`}>
+            <button className={`nav-parent ${activeView === 'sub2api' ? 'active' : ''}`} onClick={() => { setSub2apiSection(DEFAULT_SUB2API_SECTION); switchView('sub2api'); }} aria-expanded={activeView === 'sub2api'}><Upload size={18}/><span>Sub2API 导入</span><ChevronRight size={14} className="nav-parent-chevron"/></button>
+            {activeView === 'sub2api' && <nav className="nav-sublist" aria-label="Sub2API 子菜单">
+              {SUB2API_SECTIONS.map(section => <button className={sub2apiSection === section.value ? 'active' : ''} key={section.value} onClick={() => switchSub2ApiSection(section.value)}>{section.value === 'cards' ? <KeyRound size={14}/> : section.value === 'automation' ? <TimerReset size={14}/> : <Database size={14}/>}<span>{section.shortLabel}</span></button>)}
+            </nav>}
+          </div>}
           {canAccessView('settings', sessionUser, authMode, accessPolicy) && <button className={activeView === 'settings' ? 'active' : ''} onClick={() => switchView('settings')}><Settings2 size={18}/>系统设置</button>}
         </nav>
         <div className="sidebar-foot">
@@ -3302,14 +3315,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
         ) : (
           <React.Suspense fallback={<FeatureLoadingState feature="401 找回界面" state={{status: 'loading'}}/>}>
-            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onRetry={retryLegacyReclaim} onDownload={downloadReclaimed} canConfigure={canManageMonitor} canImport={canUseSub2Api} onImport={() => { switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
+            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onRetry={retryLegacyReclaim} onDownload={downloadReclaimed} canConfigure={canManageMonitor} canImport={canUseSub2Api} onImport={() => { setSub2apiSection(DEFAULT_SUB2API_SECTION); switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
           </React.Suspense>
         ) : featureLoadState.sub2api.status !== 'ready' ? (
           <FeatureLoadingState feature="Sub2API" state={featureLoadState.sub2api} onRetry={() => retryFeature('sub2api')}/>
         ) : (
           <React.Suspense fallback={<FeatureLoadingState feature="Sub2API 界面" state={{status: 'loading'}}/>}>
-            <Sub2ApiView
-            canUseReclaim={canUseReclaim} canUseImport={canUseSub2Api} canConfigure={canManageMonitor}
+             <Sub2ApiView
+             canUseReclaim={canUseReclaim} canUseImport={canUseSub2Api} canConfigure={canManageMonitor}
+             section={sub2apiSection} onSectionChange={switchSub2ApiSection}
             config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey}
             redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={saveRedeemConfig}
             cardCodes={sub2apiCardCodes} onCardCodes={setSub2apiCardCodes} cardMode={sub2apiCardMode} onCardMode={setSub2apiCardMode}
