@@ -10,6 +10,7 @@ from unittest.mock import patch
 import main
 from user import routes, security
 from user.auth import AuthService
+from user.auth import _sqlite_retry
 from user.errors import AlreadyInitialized, AuthenticationRequired, Forbidden, InvalidCredentials, UserServiceError
 from user import store
 
@@ -45,6 +46,18 @@ class UserServiceTests(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_sqlite_contention_retries_then_recovers(self):
+        calls = []
+
+        def operation():
+            calls.append(True)
+            if len(calls) < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return {"ok": True}
+
+        self.assertEqual(_sqlite_retry(operation), {"ok": True})
+        self.assertEqual(len(calls), 3)
 
     def test_password_hash_is_salted_and_verifies(self):
         first = security.hash_password("correct horse")
@@ -232,6 +245,60 @@ class MainUserRouteTests(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_auth_outage_keeps_self_use_business_routes_available(self):
+        service = main.USER_SERVICE
+        previous_cache = service._last_installation_status
+        cached = {
+            "mode": "self_use",
+            "initialized": True,
+            "needs_setup": False,
+            "auth_required": False,
+            "force_login": False,
+        }
+        service._last_installation_status = cached
+        handler = object.__new__(main.ApiHandler)
+        handler.path = "/api/watches"
+        handler.headers = {}
+        responses = []
+        handler._send_json = lambda data, status=200, *_args: responses.append((status, data))
+        try:
+            with patch.object(service, "installation_status", side_effect=RuntimeError("database is locked")), patch.object(
+                service, "authenticate", side_effect=RuntimeError("database is locked")
+            ), patch.object(main, "list_watches", return_value=[]):
+                principal, allowed = handler._authorize_request("GET", "/api/watches")
+                self.assertIsNone(principal)
+                self.assertTrue(allowed)
+        finally:
+            service._last_installation_status = previous_cache
+
+    def test_auth_outage_returns_retryable_status_for_management_routes(self):
+        service = main.USER_SERVICE
+        previous_cache = service._last_installation_status
+        service._last_installation_status = {
+            "mode": "self_use",
+            "initialized": True,
+            "needs_setup": False,
+            "auth_required": False,
+            "force_login": False,
+        }
+        handler = object.__new__(main.ApiHandler)
+        handler.path = "/api/settings/system"
+        handler.headers = {}
+        responses = []
+        handler._send_json = lambda data, status=200, *_args: responses.append((status, data))
+        try:
+            with patch.object(service, "installation_status", side_effect=RuntimeError("database is locked")), patch.object(
+                service, "authenticate", side_effect=RuntimeError("database is locked")
+            ):
+                principal, allowed = handler._authorize_request("GET", "/api/settings/system")
+            self.assertIsNone(principal)
+            self.assertFalse(allowed)
+            self.assertEqual(responses[0][0], 503)
+            self.assertEqual(responses[0][1]["code"], "user_service_unavailable")
+            self.assertTrue(responses[0][1]["retryable"])
+        finally:
+            service._last_installation_status = previous_cache
 
     def request_api(self, method, path, payload=None, headers=None):
         body = json.dumps(payload or {}).encode("utf-8")
