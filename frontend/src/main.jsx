@@ -208,12 +208,14 @@ function cardImportVerificationPatch(result) {
 
 function intervalLabel(value) {
   const seconds = Number(value || 0);
-  return `${Math.max(1, Math.ceil(seconds / 60))}分钟`;
+  const normalizedSeconds = Number.isFinite(seconds) ? seconds : 60;
+  return `${Math.max(1, Math.ceil(normalizedSeconds / 60))}分钟`;
 }
 
 function intervalOptionLabel(value) {
   const seconds = Number(value || 0);
-  return `每 ${Math.max(1, Math.ceil(seconds / 60))} 分钟`;
+  const normalizedSeconds = Number.isFinite(seconds) ? seconds : 60;
+  return `每 ${Math.max(1, Math.ceil(normalizedSeconds / 60))} 分钟`;
 }
 
 function MonitorIntervalSelect({value, onChange, label, disabled = false, caption = ''}) {
