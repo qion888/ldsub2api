@@ -25,6 +25,7 @@ import {AUTH_MODES, isAdmin, normalizeMode, normalizeUser, roleLabel} from './au
 import {normalizeBackupList, normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
 
 const EMPTY_BASIC = {site_name: '', announcement: '', contact_email: '', timezone: 'Asia/Shanghai', base_url: ''};
+const GITHUB_REPOSITORY_URL = 'https://github.com/qion888/ldsub2api';
 const EMPTY_SYSTEM = {
   session_ttl_hours: 24,
   maintenance_mode: false,
@@ -70,9 +71,9 @@ function ErrorNotice({message}) {
   return message ? <div className="settings-error" role="alert">{message}</div> : null;
 }
 
-export default function SettingsView({request, user, mode, notify, onUserUpdated, onModeChange, onPasswordChanged}) {
+export default function SettingsView({request, user, mode, notify, onUserUpdated, onModeChange, onPasswordChanged, initialTab = null}) {
   const admin = isAdmin(user);
-  const [tab, setTab] = useState(admin ? 'basic' : 'profile');
+  const [tab, setTab] = useState(initialTab || (admin ? 'basic' : 'profile'));
   const [basic, setBasic] = useState(EMPTY_BASIC);
   const [system, setSystem] = useState(EMPTY_SYSTEM);
   const [settingsMode, setSettingsMode] = useState(normalizeMode(mode));
@@ -169,11 +170,11 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
   };
 
   useEffect(() => {
-    setTab(admin ? 'basic' : 'profile');
+    setTab(initialTab || (admin ? 'basic' : 'profile'));
     loadSettings();
     // The settings endpoint is scoped by the authenticated session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [admin, user?.id]);
+  }, [admin, initialTab, user?.id]);
 
   const saveBasic = async () => {
     setSaving(true);
@@ -593,7 +594,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
             </div>
           </> : <div className="settings-state" role="status"><RefreshCw size={18} className={versionBusy ? 'spin' : ''}/>{versionBusy ? '正在读取版本信息' : '暂无版本信息'}</div>}
           <div className="settings-actions version-actions">
-            {versionInfo?.repository_url && <a className="button secondary" href={versionInfo.repository_url} target="_blank" rel="noreferrer"><ExternalLink size={15}/>查看 GitHub</a>}
+            <a className="button secondary" href={versionInfo?.repository_url || GITHUB_REPOSITORY_URL} target="_blank" rel="noreferrer"><ExternalLink size={15}/>查看 GitHub</a>
             <button className="button secondary" type="button" onClick={checkVersionUpdates} disabled={Boolean(versionBusy)}><RefreshCw size={15} className={versionBusy === 'check' ? 'spin' : ''}/>{versionBusy === 'check' ? '检查中' : '检查更新'}</button>
             {versionInfo && <button className="button primary" type="button" onClick={installVersionUpdate} disabled={Boolean(versionBusy) || (versionInfo.update_available && !versionInfo.update_ready)}><CloudDownload size={15}/>{versionBusy === 'update' ? '更新中' : '立即更新'}</button>}
           </div>
