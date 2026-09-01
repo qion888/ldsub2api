@@ -18,11 +18,13 @@ class InventoryService:
         commerce_tags: Callable[[dict[str, Any]], list[dict[str, str]]],
         is_unlisted_error: Callable[[Any], bool],
         sync_intervals: Callable[[Any, int, int], int],
+        discover_shop: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> None:
         self.database = database
         self.now = now
         self.fetch_goods = fetch_goods
         self.fetch_shop_catalog = fetch_shop_catalog
+        self.discover_shop = discover_shop
         self.commerce_tags = commerce_tags
         self.is_unlisted_error = is_unlisted_error
         self.sync_intervals = sync_intervals
@@ -489,6 +491,7 @@ class InventoryService:
 
 
     def list_watches(self) -> list[dict[str, Any]]:
+        stamp = self.now()
         with self.database() as connection:
             result: list[dict[str, Any]] = []
             for row in connection.execute("SELECT * FROM watches ORDER BY id DESC"):
@@ -508,6 +511,30 @@ class InventoryService:
                 watch["enabled"] = bool(watch["enabled"])
                 watch["latest"] = self.effective_watch_product(connection, row["id"], latest, attempt)
                 watch["last_attempt"] = dict(attempt) if attempt else None
+                existing_link = connection.execute(
+                    "SELECT 1 FROM shop_products WHERE watch_id = ? LIMIT 1", (row["id"],)
+                ).fetchone()
+                if existing_link is None and self.discover_shop and latest is not None:
+                    raw_data = self._json_value(latest["raw_data"], {})
+                    if isinstance(raw_data, dict):
+                        goods_key = str(
+                            latest["goods_key"]
+                            or raw_data.get("goods_key")
+                            or str(row["url"]).rstrip("/").rsplit("/", 1)[-1]
+                        ).strip()
+                        try:
+                            shop_info = self.discover_shop(raw_data)
+                            if goods_key and shop_info:
+                                self._link_discovered_shop(
+                                    connection,
+                                    row["id"],
+                                    {"goods_key": goods_key, "shop": shop_info},
+                                    stamp,
+                                )
+                        except Exception:
+                            # A stale or malformed upstream snapshot must not
+                            # make the monitor list unavailable.
+                            pass
                 shop_links = connection.execute(
                     """
                     SELECT s.id, s.name, s.token FROM shop_products sp
