@@ -3145,6 +3145,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     setSub2apiCardAssignment(current => ({...current, codex_fingerprint_mode: mode}));
   };
 
+  const changeSub2ApiCardGroups = value => {
+    const groupId = Number(value);
+    setSub2apiCardAssignment(current => ({
+      ...current,
+      proxy_choice: Number.isInteger(groupId) && groupId > 0 && current.proxy_choice === 'json' ? 'none' : current.proxy_choice,
+      group_ids: Number.isInteger(groupId) && groupId > 0 ? [groupId] : [],
+    }));
+  };
+
   const toggleSub2ApiCardGroup = groupId => {
     setSub2apiCardAssignment(current => ({
       ...current,
@@ -3388,7 +3397,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
              optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
              codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
              cardProxyChoice={sub2apiCardAssignment.proxy_choice} cardGroupIds={sub2apiCardAssignment.group_ids} cardCodexFingerprintMode={sub2apiCardAssignment.codex_fingerprint_mode}
-             onCardProxyChoice={changeSub2ApiCardProxy} onCardCodexFingerprintMode={changeSub2ApiCardFingerprint} onCardToggleGroup={toggleSub2ApiCardGroup}
+             onCardProxyChoice={changeSub2ApiCardProxy} onCardCodexFingerprintMode={changeSub2ApiCardFingerprint} onCardGroupsChange={changeSub2ApiCardGroups} onCardToggleGroup={toggleSub2ApiCardGroup}
              reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} onRetry401={retrySub2Api401} retryBusy={sub2apiRetryBusy}
              automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationRetryResult={sub2apiAutomationRetryResult} automationBusy={sub2apiAutomationBusy}
              onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onRetryAutomation={retrySub2ApiAutomation}

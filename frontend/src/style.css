@@ -2038,12 +2038,11 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .sub2api-file-drop { min-height: 96px; margin-top: 12px !important; padding: 12px 18px; grid-template-columns: 28px minmax(0, 1fr); grid-template-rows: auto auto; column-gap: 10px; justify-items: start; text-align: left; }
 .sub2api-file-drop > svg { grid-row: 1 / 3; align-self: center; }
 .sub2api-file-drop strong, .sub2api-file-drop small { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.import-strategy-summary { margin-top: 10px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--ui-border-soft); }
-.import-strategy-summary > div { min-width: 0; min-height: 48px; padding: 8px 9px; display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 7px; align-items: center; color: var(--ui-text-muted); border-right: 1px solid var(--ui-border-soft); }
-.import-strategy-summary > div:last-child { border-right: 0; }
-.import-strategy-summary span, .import-strategy-summary strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.import-strategy-summary span { font-size: 9px; }
-.import-strategy-summary strong { margin-top: 4px; color: var(--ui-text); font-size: 10px; }
+.import-strategy-controls { margin-top: 10px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.import-strategy-controls label { min-width: 0; margin: 0; }
+.import-strategy-controls label > span { min-width: 0; margin-bottom: 5px; display: flex; align-items: center; gap: 5px; color: var(--ui-text-muted); font-size: 9px; }
+.import-strategy-controls label > span svg { flex: 0 0 auto; }
+.import-strategy-controls select { width: 100%; min-width: 0; height: 34px; padding-inline: 8px; color: var(--ui-text); background: var(--ui-surface); border-color: var(--ui-border); font-size: 9px; }
 .sub2api-import-panel .import-button { min-height: 34px; margin-top: 10px; }
 
 .card-import-console { min-width: 0; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; overflow: hidden; }
@@ -2366,10 +2365,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .sub2api-file-drop { min-height: 102px; margin-top: 12px !important; padding: 13px 17px; grid-template-columns: 29px minmax(0, 1fr); column-gap: 10px; }
 .sub2api-file-drop strong { font-size: 14px; }
 .sub2api-file-drop small { font-size: 11px; }
-.import-strategy-summary { margin-top: 10px; }
-.import-strategy-summary > div { min-height: 52px; padding: 8px 9px; grid-template-columns: 19px minmax(0, 1fr); gap: 7px; }
-.import-strategy-summary span { font-size: 11px; }
-.import-strategy-summary strong { margin-top: 3px; font-size: 12px; }
+.import-strategy-controls { margin-top: 10px; gap: 9px; }
+.import-strategy-controls label > span { margin-bottom: 5px; font-size: 11px; }
+.import-strategy-controls select { height: 38px; padding-inline: 9px; font-size: 11px; }
 .sub2api-import-panel .import-button { margin-top: 10px; }
 .sub2api-view .connection-result { font-size: 12px; }
 
@@ -2752,12 +2750,10 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .card-import-actions .button { width: 100%; }
   .sub2api-service-strip > div:nth-child(4), .sub2api-service-strip > div:nth-child(5) { display: none; }
   .sub2api-service-strip .sub2api-service-state { padding-inline: 9px; grid-template-columns: 24px minmax(0, 1fr); }
-  .sub2api-config-fields, .import-strategy-summary { grid-template-columns: 1fr; }
+  .sub2api-config-fields, .import-strategy-controls { grid-template-columns: 1fr; }
   .sub2api-capability-grid { grid-template-columns: 1fr 1fr; }
   .sub2api-capability-grid > div:nth-child(2) { border-right: 0; }
   .sub2api-capability-grid > div:nth-child(-n+2) { border-bottom: 1px solid var(--ui-border-soft); }
-  .import-strategy-summary > div { border-right: 0; border-bottom: 1px solid var(--ui-border-soft); }
-  .import-strategy-summary > div:last-child { border-bottom: 0; }
   .automation-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .automation-metrics > div:nth-child(3n) { border-right: 1px solid var(--ui-border-soft); }
   .automation-metrics > div:nth-child(even) { border-right: 0; }
