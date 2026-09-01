@@ -1510,9 +1510,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       setUrl('');
       await loadItems({quiet: true});
       if (!isShop) setSelectedId(result.id);
+      const shopDiscovery = result.shop_discovery || result.snapshot?.shop_discovery;
+      const discoveredShop = shopDiscovery?.shop;
       notify(isShop
         ? (result.summary?.status === 'success' ? `店铺已同步，导入 ${result.summary.product_count} 个商品` : '店铺已加入，首次同步暂未成功')
-        : (result.snapshot?.status === 'success' ? '商品已加入并完成首次抓取' : '商品已加入，首次抓取暂未成功'));
+        : (result.snapshot?.status === 'success'
+          ? (discoveredShop
+            ? `商品已添加并关联店铺：${discoveredShop.name || discoveredShop.token}`
+            : '商品已添加，暂未识别所属店铺')
+          : '商品已加入，首次抓取暂未成功'));
     } catch (error) {
       notify(error.message, 'error');
     } finally {

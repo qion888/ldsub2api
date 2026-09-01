@@ -360,7 +360,7 @@ class GoodsParserTests(unittest.TestCase):
                 "contact_format": "any",
                 "coupon_status": 1,
                 "category": {"name": "测试分类"},
-                "user": {"nickname": "测试店铺"},
+                "user": {"nickname": "测试店铺", "token": "TESTSHOP", "link": "https://pay.ldxp.cn/shop/TESTSHOP"},
                 "multipleoffers": {
                     "available": 1,
                     "discount_type": 1,
@@ -390,6 +390,36 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(tags["minimum"]["label"], "2件起购")
         self.assertIn("coupon", tags)
         self.assertIn("query_password", tags)
+        self.assertEqual(item["shop"]["token"], "TESTSHOP")
+        self.assertEqual(item["shop"]["name"], "测试店铺")
+
+    def test_normalizes_goods_without_shop_identity_as_unavailable(self):
+        item = main.normalize_goods_payload(
+            {"code": 1, "data": {"name": "独立商品", "status": 1, "user": {"nickname": "仅昵称"}}},
+            "standalone",
+        )
+        self.assertIsNone(item["shop"])
+
+    def test_add_watch_response_exposes_shop_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            with patch.object(main, "database", side_effect=lambda: isolated_database(database_path)), \
+                    patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                    patch.object(main.WORKER, "fetch", return_value={
+                        "status": "success",
+                        "shop_discovery": {
+                            "status": "linked",
+                            "shop": {"id": 7, "name": "测试店铺", "token": "TESTSHOP"},
+                        },
+                    }):
+                main.init_database()
+                status, result = self.request_api(
+                    "POST",
+                    "/api/watches",
+                    {"url": "https://pay.ldxp.cn/item/add-route-test", "name": "商品"},
+                )
+        self.assertEqual(status, 201)
+        self.assertEqual(result["shop_discovery"]["shop"]["token"], "TESTSHOP")
 
     def test_accepts_shop_urls_and_rejects_foreign_hosts(self):
         token, url = main.parse_shop_url("https://pay.ldxp.cn/shop/SHOPTEST")

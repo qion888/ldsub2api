@@ -81,6 +81,69 @@ def parse_shop_url(value: str) -> tuple[str, str]:
     return token, f"https://{ALLOWED_HOST}/shop/{token}"
 
 
+def discover_goods_shop(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the canonical shop identity exposed by a goods detail payload."""
+    seller = item.get("user") if isinstance(item.get("user"), dict) else {}
+    nested_shop = item.get("shop") if isinstance(item.get("shop"), dict) else {}
+    token_candidates = (
+        seller.get("token"),
+        seller.get("shop_token"),
+        nested_shop.get("token"),
+        item.get("shop_token"),
+        item.get("shopToken"),
+    )
+    link_candidates = (
+        seller.get("link"),
+        seller.get("url"),
+        nested_shop.get("link"),
+        nested_shop.get("url"),
+        item.get("shop_link"),
+        item.get("shop_url"),
+    )
+
+    token = ""
+    canonical_url = ""
+    for candidate in token_candidates:
+        value = str(candidate or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{3,80}", value):
+            token = value
+            canonical_url = f"https://{ALLOWED_HOST}/shop/{token}"
+            break
+    if not token:
+        for candidate in link_candidates:
+            try:
+                token, canonical_url = parse_shop_url(str(candidate or ""))
+            except ValueError:
+                continue
+            break
+    if not token:
+        return None
+
+    name = str(
+        seller.get("nickname")
+        or seller.get("name")
+        or nested_shop.get("name")
+        or token
+    ).strip()[:100]
+    category = item.get("category") if isinstance(item.get("category"), dict) else {}
+    category_id = category.get("id")
+    try:
+        category_id = int(category_id) if category_id not in (None, "") else None
+    except (TypeError, ValueError):
+        category_id = None
+    goods_type = str(item.get("goods_type") or "card").strip()[:30]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,30}", goods_type):
+        goods_type = "card"
+    return {
+        "token": token,
+        "url": canonical_url,
+        "name": name or token,
+        "category_id": category_id,
+        "category_name": str(category.get("name") or "").strip()[:100],
+        "goods_type": goods_type or "card",
+    }
+
+
 def _first_value(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
     for key in keys:
         if item.get(key) not in (None, ""):
@@ -247,6 +310,7 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
     extend = item.get("extend") if isinstance(item.get("extend"), dict) else {}
     category = item.get("category") if isinstance(item.get("category"), dict) else {}
     seller = item.get("user") if isinstance(item.get("user"), dict) else {}
+    shop = discover_goods_shop(item)
     limit_count = extend.get("limit_count")
     sale_status = "on_sale" if item.get("status") == 1 else "off_sale"
     stock_value = _stock_value(item) if sale_status == "on_sale" else None
@@ -277,6 +341,7 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "query_password_required": _upstream_enabled(extend.get("query_password_status")),
         "commerce_tags": commerce_tags_from_goods(item),
         "source_url": str(item.get("link") or f"https://{ALLOWED_HOST}/item/{goods_key}"),
+        "shop": shop,
         "raw_data": item,
     }
 

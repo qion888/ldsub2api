@@ -1677,7 +1677,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 snapshot = WORKER.fetch(watch_id)
             except RuntimeError as exc:
                 snapshot = {"status": "error", "error": str(exc)}
-            return self._send_json({"id": watch_id, "snapshot": snapshot}, 201)
+            return self._send_json(
+                {
+                    "id": watch_id,
+                    "snapshot": snapshot,
+                    "shop_discovery": snapshot.get("shop_discovery") if isinstance(snapshot, dict) else None,
+                },
+                201,
+            )
 
         if path == "/api/shops":
             try:
