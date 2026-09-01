@@ -163,6 +163,33 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
         self.assertFalse(manager._is_waf_html("<main>products</main>"))
 
+    def test_browser_challenge_keeps_first_party_page_context(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+
+        class FakeDriver:
+            page_source = "<div id='aliyunCaptcha'></div>"
+
+            def execute_script(self, *_args):
+                raise AssertionError("challenge HTML must not be injected into the page")
+
+        driver = FakeDriver()
+        manager.batch_active = True
+        manager.batch_total = 1
+        manager.batch_current_shop_id = 1
+        result = manager._render_challenge(driver, "<html>challenge</html>")
+
+        self.assertEqual(result["status"], "awaiting_verification")
+
     def test_browser_request_uses_storefront_visitor_id_and_detects_status_only_waf(self) -> None:
         manager = BrowserVerificationManager(
             database=self.database,

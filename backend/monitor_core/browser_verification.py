@@ -227,12 +227,22 @@ class BrowserVerificationManager:
         return list(products.values())
 
     def _render_challenge(self, driver: Any, html_text: str) -> dict[str, Any]:
+        # Keep the challenge in the first-party page context.  Replacing the
+        # document with HTML fetched through XHR strips the browser's original
+        # navigation state and can make Aliyun reject a perfectly valid slider.
         try:
-            driver.execute_script("document.open(); document.write(arguments[0]); document.close();", html_text)
-        except Exception as exc:
-            self._close()
-            self._reset_batch()
-            raise RuntimeError("Unable to display the WAF challenge in the browser") from exc
+            page_source = str(driver.page_source or "")
+        except Exception:
+            page_source = ""
+        if not self._is_waf_html(page_source) and self.batch_current_shop_id is not None and hasattr(driver, "get"):
+            try:
+                shop = self._shop(self.batch_current_shop_id)
+                self._request_waiter()
+                driver.get(shop["url"])
+            except Exception as exc:
+                self._close()
+                self._reset_batch()
+                raise RuntimeError("Unable to display the WAF challenge in the browser") from exc
         return self._status("Complete the WAF challenge in the open browser, then continue the batch")
 
     def _status(self, detail: str = "", status: str | None = None) -> dict[str, Any]:
