@@ -106,6 +106,34 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
         self.assertFalse(manager._is_waf_html("<main>products</main>"))
 
+    def test_browser_request_uses_storefront_visitor_id_and_detects_status_only_waf(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+
+        class FakeDriver:
+            script = ""
+
+            def set_script_timeout(self, _seconds):
+                return None
+
+            def execute_async_script(self, script, _payload):
+                self.script = script
+                return {"status": 403, "content_type": "text/html", "text": "<html>challenge</html>"}
+
+        driver = FakeDriver()
+        with self.assertRaises(RuntimeError):
+            manager._browser_request(driver, {"token": "SHOP", "current": 1})
+        self.assertIn("Visitorid", driver.script)
+
     def test_browser_verification_batches_shops_after_one_challenge(self) -> None:
         with self.database() as connection:
             for token in ("BATCHONE", "BATCHTWO"):
@@ -150,7 +178,9 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertEqual(first["status"], "awaiting_verification")
         self.assertEqual(first["pending_shop_ids"], shop_ids)
         self.assertEqual(first["current_shop_id"], shop_ids[0])
-        driver.page_source = "<main>verified</main>"
+        # A solved Aliyun page can retain the challenge marker in its source;
+        # completion must trust a fresh catalog request instead.
+        driver.page_source = "<div id='aliyunCaptcha'></div><main>verified</main>"
         completed = manager.complete_all()
         self.assertEqual(completed["status"], "success")
         self.assertEqual(completed["completed"], 2)

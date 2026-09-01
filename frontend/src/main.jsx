@@ -132,6 +132,21 @@ function needsBrowserVerification(shop) {
   return /WAF|无法解析|HTML 页面|HTML页面/.test(shop.last_attempt?.error || '');
 }
 
+function browserSyncSummary(result) {
+  if (result?.summary && typeof result.summary === 'object') return result.summary;
+  const successfulEntry = Array.isArray(result?.results)
+    ? result.results.find(entry => entry?.ok && entry.data && typeof entry.data === 'object')
+    : null;
+  return successfulEntry?.data || null;
+}
+
+function browserSyncFailure(result) {
+  const failedEntry = Array.isArray(result?.results)
+    ? result.results.find(entry => entry && entry.ok === false)
+    : null;
+  return failedEntry?.error || result?.detail || '浏览器会话同步失败';
+}
+
 async function request(path, options = {}, {auth = true} = {}) {
   const headers = new Headers(options.headers || {});
   if (auth && apiAuthToken && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${apiAuthToken}`);
@@ -1965,6 +1980,14 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     try {
       const result = await request(`/shops/${shop.id}/browser-verification/start`, {method: 'POST'});
       if (result.status === 'success') {
+        const summary = browserSyncSummary(result);
+        if (!summary) {
+          setVerificationShopId(null);
+          applyVerificationBatchState({...result, status: 'idle'});
+          notify(result.failed ? browserSyncFailure(result) : '浏览器会话同步完成', result.failed ? 'error' : 'info');
+          return;
+        }
+        if (!result.summary) result.summary = summary;
         setVerificationShopId(null);
         applyVerificationBatchState({...result, status: 'idle'});
         await loadItems({quiet: true});
@@ -1990,6 +2013,13 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         return notify(result.detail, 'error');
       }
       setVerificationShopId(null);
+      const summary = browserSyncSummary(result);
+      if (!summary) {
+        applyVerificationBatchState({...result, status: 'idle'});
+        notify(result.failed ? browserSyncFailure(result) : '验证通过并完成同步', result.failed ? 'error' : 'info');
+        return;
+      }
+      if (!result.summary) result.summary = summary;
       applyVerificationBatchState({...result, status: 'idle'});
       await loadItems({quiet: true});
       notify(`验证通过并同步完成，共 ${result.summary.product_count} 个商品`);

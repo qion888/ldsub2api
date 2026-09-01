@@ -9,6 +9,8 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from .storefront import is_waf_response
+
 
 class BrowserVerificationManager:
     """Coordinate one persistent browser session across one or many shops.
@@ -152,10 +154,22 @@ class BrowserVerificationManager:
             """
             const payload = arguments[0];
             const done = arguments[arguments.length - 1];
+            let visitorId = '';
+            try {
+              visitorId = window.localStorage.getItem('visitorId') || '';
+              if (!visitorId) {
+                visitorId = Math.random().toString(36).slice(2, 11);
+                window.localStorage.setItem('visitorId', visitorId);
+              }
+            } catch (_) {}
             fetch('/shopApi/Shop/goodsList', {
               method: 'POST',
               credentials: 'include',
-              headers: {'Accept': 'application/json, text/plain, */*', 'Content-Type': 'application/json'},
+              headers: {
+                'Accept': 'application/json, text/plain, */*',
+                'Content-Type': 'application/json',
+                ...(visitorId ? {'Visitorid': visitorId} : {}),
+              },
               body: JSON.stringify(payload)
             }).then(async response => done({
               status: response.status,
@@ -168,7 +182,14 @@ class BrowserVerificationManager:
         if not isinstance(result, dict) or result.get("error"):
             raise RuntimeError(str((result or {}).get("error") or "browser request failed")[:200])
         text = str(result.get("text") or "")
-        if self._is_waf_html(text):
+        try:
+            status = int(result.get("status") or 0)
+        except (TypeError, ValueError):
+            status = None
+        content_type = str(result.get("content_type") or "")
+        if self._is_waf_html(text) or is_waf_response(
+            text.encode("utf-8", "ignore"), content_type=content_type, status=status
+        ):
             raise self._waf_error(text)
         try:
             payload = json.loads(text)
@@ -302,8 +323,8 @@ class BrowserVerificationManager:
         with self.lock:
             if not self.batch_active or self.batch_total != 1 or self.batch_current_shop_id != shop_id or self.driver is None:
                 raise RuntimeError("no pending browser verification session for this shop")
-            if self._is_waf_html(str(self.driver.page_source or "")):
-                return self._status("The WAF challenge is still pending")
+            # Re-run the catalog request as the source of truth. Challenge pages
+            # can retain WAF markers after the slider has already issued a cookie.
             return self._advance_batch_locked()
 
     def start_all(self, shop_ids: list[int]) -> dict[str, Any]:
@@ -314,8 +335,8 @@ class BrowserVerificationManager:
         with self.lock:
             if not self.batch_active or self.driver is None:
                 raise RuntimeError("no pending batch browser verification session")
-            if self._is_waf_html(str(self.driver.page_source or "")):
-                return self._status("The WAF challenge is still pending")
+            # Re-run the catalog request as the source of truth. Challenge pages
+            # can retain WAF markers after the slider has already issued a cookie.
             return self._advance_batch_locked()
 
     def status(self) -> dict[str, Any]:
