@@ -61,6 +61,8 @@ from sub2api.constants import CODEX_FINGERPRINT_MODES, DEFAULT_AUTOMATION, DEFAU
 from user import auth as user_auth
 from user import routes as user_routes
 from user.errors import UserServiceError
+from version_control import RepositoryConfig, VersionControlService
+from version_control import routes as version_control_routes
 
 HOST = os.environ.get("LDXP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LDXP_PORT", "8000"))
@@ -96,6 +98,10 @@ def database() -> sqlite3.Connection:
 # Resolve ``database`` lazily so the existing isolated-database test seams and
 # embedding callers can replace the factory without rebuilding this service.
 USER_SERVICE = user_auth.AuthService(lambda: database(), now=utc_now)
+VERSION_SERVICE = VersionControlService(
+    RepositoryConfig.from_environment(PROJECT_ROOT),
+    database_path=DB_PATH,
+)
 
 
 def init_database() -> None:
@@ -327,6 +333,12 @@ def record_inventory_fetch(
 
 def list_shops() -> list[dict[str, Any]]:
     return INVENTORY.list_shops()
+
+
+def is_waf_error(value: Any) -> bool:
+    """Return true when a persisted shop error represents an interactive WAF."""
+    text = str(value or "").lower()
+    return "waf" in text or "aliyun" in text or "滑块" in text or "人机验证" in text
 
 
 def list_watches() -> list[dict[str, Any]]:
@@ -1346,6 +1358,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             query_values=parse_qs(parsed.query),
         ):
             return
+        if version_control_routes.handle_get(
+            path,
+            send_json=self._send_json,
+            principal=_principal,
+            version_info=VERSION_SERVICE.version_info,
+            backups_loader=VERSION_SERVICE.list_backups,
+        ):
+            return
         if path == "/":
             return self._send_redirect(FRONTEND_URL)
         if path == "/api/health":
@@ -1360,6 +1380,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "sub2api_card_import_history_delete": True,
                 "order_query": True,
                 "order_query_waf_verification": True,
+                "shop_batch_waf_verification": True,
                 "order_complaint_submit": True,
                 "order_complaint_history": True,
                 "auth_enabled": bool(installation.get("auth_required")),
@@ -1477,6 +1498,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             headers=getattr(self, "headers", None),
             user_agent=str(getattr(self, "headers", {}).get("User-Agent", ""))[:240],
             ip_address=self._request_ip(),
+        ):
+            return
+
+        if version_control_routes.handle_post(
+            path,
+            data,
+            send_json=self._send_json,
+            principal=_principal,
+            check_updates=VERSION_SERVICE.check_updates,
+            install_update=VERSION_SERVICE.install_update,
+            create_backup=VERSION_SERVICE.create_backup,
+            restore_backup=VERSION_SERVICE.restore_backup,
+            rollback_update=VERSION_SERVICE.rollback_update,
         ):
             return
 
@@ -1643,7 +1677,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 snapshot = WORKER.fetch(watch_id)
             except RuntimeError as exc:
                 snapshot = {"status": "error", "error": str(exc)}
-            return self._send_json({"id": watch_id, "snapshot": snapshot}, 201)
+            return self._send_json(
+                {
+                    "id": watch_id,
+                    "snapshot": snapshot,
+                    "shop_discovery": snapshot.get("shop_discovery") if isinstance(snapshot, dict) else None,
+                },
+                201,
+            )
 
         if path == "/api/shops":
             try:
@@ -1722,6 +1763,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
 
+        if path == "/api/shops/browser-verification/start-all":
+            raw_ids = data.get("shop_ids")
+            if raw_ids in (None, ""):
+                raw_ids = [shop["id"] for shop in list_shops() if shop.get("enabled") and is_waf_error((shop.get("last_attempt") or {}).get("error"))]
+            if not isinstance(raw_ids, list) or len(raw_ids) > 100:
+                return self._send_json({"detail": "shop_ids must contain between 1 and 100 shop ids"}, 400)
+            try:
+                shop_ids = list(dict.fromkeys(int(value) for value in raw_ids))
+            except (TypeError, ValueError):
+                return self._send_json({"detail": "shop_ids contains an invalid id"}, 400)
+            if any(value < 1 for value in shop_ids):
+                return self._send_json({"detail": "shop_ids contains an invalid id"}, 400)
+            try:
+                result = BROWSER_VERIFICATION.start_all(shop_ids)
+                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+            except KeyError as exc:
+                return self._send_json({"detail": str(exc.args[0])}, 404)
+            except RuntimeError as exc:
+                return self._send_json({"detail": str(exc)}, 502)
+
+        if path == "/api/shops/browser-verification/complete-all":
+            try:
+                result = BROWSER_VERIFICATION.complete_all()
+                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+            except RuntimeError as exc:
+                return self._send_json({"detail": str(exc)}, 409)
+
         browser_complete_match = re.fullmatch(r"/api/shops/(\d+)/browser-verification/complete", path)
         if browser_complete_match:
             try:
@@ -1734,14 +1802,19 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         if path == "/api/shops/fetch-all":
             results = []
+            waf_shop_ids = []
             for shop in list_shops():
                 if not shop["enabled"]:
                     continue
                 try:
                     results.append({"id": shop["id"], "ok": True, "data": WORKER.fetch_shop(shop["id"])})
                 except Exception as exc:
-                    results.append({"id": shop["id"], "ok": False, "error": str(exc)})
-            return self._send_json({"results": results})
+                    error = str(exc)
+                    if is_waf_error(error):
+                        waf_shop_ids.append(shop["id"])
+                    results.append({"id": shop["id"], "ok": False, "error": error, "waf": is_waf_error(error)})
+            verification = BROWSER_VERIFICATION.status()
+            return self._send_json({"results": results, "waf_shop_ids": waf_shop_ids, "verification": verification})
 
         if path == "/api/watches/inventory-refresh":
             raw_ids = data.get("ids")
@@ -2059,6 +2132,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             send_json=self._send_json,
             delete_account=delete_sub2api_account,
             card_import_history_deleter=delete_sub2api_card_import_record,
+        ):
+            return
+        if version_control_routes.handle_delete(
+            path,
+            send_json=self._send_json,
+            principal=_principal,
+            delete_backup=VERSION_SERVICE.delete_backup,
         ):
             return
         preorder_match = re.fullmatch(r"/api/preorders/(\d+)", path)

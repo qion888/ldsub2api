@@ -1,3 +1,10 @@
+﻿[CmdletBinding()]
+param(
+    [switch]$AutoInstall,
+    [switch]$SkipInstall,
+    [switch]$BootstrapOnly
+)
+
 $ErrorActionPreference = 'Stop'
 
 $backendDirectory = Join-Path $PSScriptRoot 'backend'
@@ -7,10 +14,88 @@ $viteCommand = Join-Path $nodeModules '.bin\vite.cmd'
 $requirements = Join-Path $backendDirectory 'requirements.txt'
 $runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
 $backendPidFile = Join-Path $runtimeDirectory 'backend.pid'
+$packageLock = Join-Path $frontendDirectory 'package-lock.json'
+
+if ($AutoInstall -and $SkipInstall) {
+    throw '-AutoInstall and -SkipInstall cannot be used together.'
+}
+
+function Write-LdxpStep([string]$Message) {
+    Write-Host "`n==> $Message" -ForegroundColor Cyan
+}
+
+function Update-LdxpPath {
+    $paths = @(
+        $env:Path,
+        [Environment]::GetEnvironmentVariable('Path', 'User'),
+        [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    ) -join ';'
+    $seen = @{}
+    $env:Path = (($paths -split ';') | Where-Object {
+        $value = [string]$_
+        if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+        $key = $value.Trim().TrimEnd('\').ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { return $false }
+        $seen[$key] = $true
+        return $true
+    }) -join ';'
+}
+
+function Confirm-LdxpInstall([string]$DisplayName) {
+    if ($SkipInstall) { return $false }
+    if ($AutoInstall -or $env:LDXP_AUTO_INSTALL -eq '1') { return $true }
+    if ($env:LDXP_AUTO_INSTALL -eq '0') { return $false }
+    if ([Console]::IsInputRedirected) {
+        throw "Missing $DisplayName. Run .\start.ps1 -AutoInstall to install it automatically."
+    }
+    Write-Host ''
+    Write-Host "未检测到可用的 $DisplayName。" -ForegroundColor Yellow
+    $answer = Read-Host '是否使用 Windows 程序包管理器自动安装？[Y/n]'
+    return [string]::IsNullOrWhiteSpace($answer) -or $answer.Trim() -match '^(?i:y|yes|是)$'
+}
+
+function Install-LdxpRuntime(
+    [string]$DisplayName,
+    [string]$PackageId,
+    [string]$ManualUrl
+) {
+    if (-not (Confirm-LdxpInstall $DisplayName)) {
+        throw "缺少 $DisplayName。请安装后重新运行脚本：$ManualUrl"
+    }
+    $winget = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        throw "未找到 winget，无法自动安装 $DisplayName。请先从 Microsoft Store 安装应用安装程序，或访问 $ManualUrl"
+    }
+    Write-LdxpStep "正在安装 $DisplayName"
+    & $winget.Source install `
+        --id $PackageId `
+        --exact `
+        --source winget `
+        --scope user `
+        --silent `
+        --accept-package-agreements `
+        --accept-source-agreements `
+        --disable-interactivity
+    if ($LASTEXITCODE -ne 0) {
+        throw "$DisplayName 自动安装失败（winget 退出码 $LASTEXITCODE）。请访问 $ManualUrl 手动安装后重试。"
+    }
+    Update-LdxpPath
+}
+
+function Test-LdxpPythonVersion([string]$Executable) {
+    if ([string]::IsNullOrWhiteSpace($Executable)) { return $false }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Executable -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)" *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch { return $false }
+    finally { $ErrorActionPreference = $previousPreference }
+}
 
 function Resolve-LdxpPython {
     $candidates = @()
-    $fallback = $null
     if (-not [string]::IsNullOrWhiteSpace($env:LDXP_PYTHON)) {
         $candidates += $env:LDXP_PYTHON
     }
@@ -19,6 +104,11 @@ function Resolve-LdxpPython {
         (Join-Path $runtimeDirectory 'python\python.exe'),
         (Join-Path $runtimeDirectory 'python.exe')
     )
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $candidates += Get-ChildItem `
+            -Path (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python*\python.exe') `
+            -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+    }
     $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
     if ($launcher) {
         & $launcher.Source -0p 2>$null | ForEach-Object {
@@ -45,25 +135,127 @@ function Resolve-LdxpPython {
             }
         }
         if ($resolved) {
-            if (-not $fallback) {
-                $fallback = $resolved
-            }
-            & $resolved -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)" *> $null
-            if ($LASTEXITCODE -eq 0) {
+            if (Test-LdxpPythonVersion $resolved) {
                 return $resolved
             }
         }
     }
-    if ($fallback) {
-        Write-Warning 'Python 3.10-3.13 was not found. The app will start with the available interpreter and use manual captcha entry if OCR cannot load.'
-        return $fallback
+    return $null
+}
+
+function Ensure-LdxpPython {
+    $pythonExecutable = Resolve-LdxpPython
+    if ($pythonExecutable) { return $pythonExecutable }
+    Install-LdxpRuntime `
+        -DisplayName 'Python 3.12' `
+        -PackageId 'Python.Python.3.12' `
+        -ManualUrl 'https://www.python.org/downloads/windows/'
+    $pythonExecutable = Resolve-LdxpPython
+    if (-not $pythonExecutable) {
+        throw 'Python 安装完成，但当前窗口仍未找到 Python 3.10-3.13。请关闭此窗口后重新运行 start.ps1。'
     }
-    throw 'Python interpreter not found. Set LDXP_PYTHON or install Python.'
+    return $pythonExecutable
+}
+
+function Test-LdxpNodeVersion([string]$Executable) {
+    if ([string]::IsNullOrWhiteSpace($Executable)) { return $false }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $rawVersion = [string](& $Executable --version 2>$null)
+    }
+    catch { return $false }
+    finally { $ErrorActionPreference = $previousPreference }
+    if ($LASTEXITCODE -ne 0 -or $rawVersion -notmatch '^v(\d+)\.(\d+)\.') { return $false }
+    $major = [int]$Matches[1]
+    $minor = [int]$Matches[2]
+    return ($major -eq 20 -and $minor -ge 19) -or ($major -ge 22)
+}
+
+function Resolve-LdxpNodeRuntime {
+    $nodeCandidates = @()
+    $nodeCommand = Get-Command 'node.exe' -ErrorAction SilentlyContinue
+    if ($nodeCommand) { $nodeCandidates += $nodeCommand.Source }
+    if ($env:ProgramFiles) { $nodeCandidates += Join-Path $env:ProgramFiles 'nodejs\node.exe' }
+    if (${env:ProgramFiles(x86)}) { $nodeCandidates += Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe' }
+    if ($env:LOCALAPPDATA) { $nodeCandidates += Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe' }
+    $nodeExecutable = $nodeCandidates | Where-Object {
+        $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) -and (Test-LdxpNodeVersion $_)
+    } | Select-Object -First 1
+    if (-not $nodeExecutable) { return $null }
+
+    $npmCandidates = @(
+        (Join-Path (Split-Path -Parent $nodeExecutable) 'npm.cmd'),
+        (Join-Path (Split-Path -Parent $nodeExecutable) 'npm.ps1')
+    )
+    $npmCommand = Get-Command 'npm.cmd' -ErrorAction SilentlyContinue
+    if ($npmCommand) { $npmCandidates += $npmCommand.Source }
+    $npmCommand = Get-Command 'npm' -ErrorAction SilentlyContinue
+    if ($npmCommand) { $npmCandidates += $npmCommand.Source }
+    $npmExecutable = $npmCandidates | Where-Object {
+        $_ -and (Test-Path -LiteralPath $_ -PathType Leaf)
+    } | Select-Object -First 1
+    if (-not $npmExecutable) { return $null }
+    return @{ Node = $nodeExecutable; Npm = $npmExecutable }
+}
+
+function Ensure-LdxpNodeRuntime {
+    $runtime = Resolve-LdxpNodeRuntime
+    if ($runtime) { return $runtime }
+    Install-LdxpRuntime `
+        -DisplayName 'Node.js LTS（含 npm）' `
+        -PackageId 'OpenJS.NodeJS.LTS' `
+        -ManualUrl 'https://nodejs.org/en/download'
+    $runtime = Resolve-LdxpNodeRuntime
+    if (-not $runtime) {
+        throw 'Node.js 安装完成，但当前窗口仍未找到兼容的 Node.js/npm。请关闭此窗口后重新运行 start.ps1。'
+    }
+    return $runtime
 }
 
 function Test-LdxpBackendDependencies([string]$PythonExecutable) {
-    & $PythonExecutable -c "import selenium, ddddocr, numpy, onnxruntime" *> $null
-    return $LASTEXITCODE -eq 0
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $PythonExecutable -c "import selenium, ddddocr, numpy, onnxruntime" *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch { return $false }
+    finally { $ErrorActionPreference = $previousPreference }
+}
+
+function Ensure-LdxpPip([string]$PythonExecutable) {
+    $pipReady = $false
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $PythonExecutable -m pip --version *> $null
+        $pipReady = $LASTEXITCODE -eq 0
+    }
+    catch { $pipReady = $false }
+    finally { $ErrorActionPreference = $previousPreference }
+    if ($pipReady) { return }
+    if ($SkipInstall) {
+        throw '当前 Python 没有 pip。请安装带 pip 的 Python，或去掉 -SkipInstall 让脚本自动修复。'
+    }
+    Write-LdxpStep '正在为 Python 安装 pip'
+    & $PythonExecutable -m ensurepip --upgrade
+    if ($LASTEXITCODE -ne 0) {
+        throw 'pip 安装失败，请修复 Python 安装后重试。'
+    }
+}
+
+function Ensure-LdxpFrontendDependencies([string]$NpmExecutable) {
+    if (Test-Path -LiteralPath $viteCommand -PathType Leaf) { return }
+    $installCommand = if (Test-Path -LiteralPath $packageLock -PathType Leaf) { 'ci' } else { 'install' }
+    if ($SkipInstall) {
+        throw "缺少前端依赖。请运行：npm --prefix `"$frontendDirectory`" $installCommand"
+    }
+    Write-LdxpStep '正在安装前端依赖（首次运行可能需要几分钟）'
+    & $NpmExecutable --prefix $frontendDirectory $installCommand
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $viteCommand -PathType Leaf)) {
+        throw "前端依赖安装失败。请检查网络后运行：npm --prefix `"$frontendDirectory`" $installCommand"
+    }
 }
 
 function Stop-RecordedLdxpBackend {
@@ -126,6 +318,7 @@ function Wait-LdxpBackend([int]$Port, $Process) {
                 -and $health.sub2api_accounts `
                 -and $health.sub2api_card_import_history_delete `
                 -and $health.order_complaint_submit `
+                -and $health.order_complaint_history `
                 -and $authStatus.ok `
                 -and ($authStatus.PSObject.Properties.Name -contains 'needs_setup') `
                 -and $authMe.ok `
@@ -140,43 +333,50 @@ function Wait-LdxpBackend([int]$Port, $Process) {
     throw 'Backend readiness check failed: required auth, Sub2API, or order complaint routes were not loaded'
 }
 
-if (-not (Test-Path -LiteralPath $viteCommand)) {
-    Write-Host 'Installing frontend dependencies...'
-    npm --prefix $frontendDirectory install
-}
-
 New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
-$pythonExecutable = Resolve-LdxpPython
+$pythonExecutable = Ensure-LdxpPython
+$nodeRuntime = Ensure-LdxpNodeRuntime
+$npmExecutable = $nodeRuntime.Npm
+Ensure-LdxpFrontendDependencies $npmExecutable
 Stop-RecordedLdxpBackend
 Stop-StaleLdxpProcesses
 
 if (Test-Path $requirements) {
     $backendDependenciesReady = Test-LdxpBackendDependencies $pythonExecutable
     if (-not $backendDependenciesReady) {
-        Write-Host 'Installing backend browser verification and OCR dependencies...'
-        & $pythonExecutable -m pip install -r $requirements
-        $backendDependenciesReady = $LASTEXITCODE -eq 0 -and (Test-LdxpBackendDependencies $pythonExecutable)
-        if (-not $backendDependenciesReady) {
+        if ($SkipInstall) {
+            Write-Warning '缺少可选的 OCR 依赖；已按 -SkipInstall 跳过安装，订单查询将使用手动验证码。'
+        }
+        else {
             $runtimeEnvironment = Join-Path $runtimeDirectory 'python'
             $runtimePython = Join-Path $runtimeEnvironment 'Scripts\python.exe'
             $selectedPython = [IO.Path]::GetFullPath($pythonExecutable)
             $runtimePythonPath = [IO.Path]::GetFullPath($runtimePython)
             if (-not $selectedPython.Equals($runtimePythonPath, [StringComparison]::OrdinalIgnoreCase)) {
-                Write-Host 'Creating an isolated backend Python runtime...'
+                Write-LdxpStep '正在创建项目专用的 Python 环境'
                 & $pythonExecutable -m venv $runtimeEnvironment
-                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
-                    & $runtimePython -m pip install -r $requirements
-                    $backendDependenciesReady = $LASTEXITCODE -eq 0 -and (Test-LdxpBackendDependencies $runtimePython)
-                    if ($backendDependenciesReady) {
-                        $pythonExecutable = $runtimePython
-                    }
+                if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
+                    throw '项目专用 Python 环境创建失败。请修复 Python 安装后重试。'
                 }
+                $pythonExecutable = $runtimePython
             }
+            Ensure-LdxpPip $pythonExecutable
+            Write-LdxpStep '正在安装后端浏览器验证和 OCR 依赖'
+            & $pythonExecutable -m pip install -r $requirements
+            $backendDependenciesReady = $LASTEXITCODE -eq 0 -and (Test-LdxpBackendDependencies $pythonExecutable)
         }
         if (-not $backendDependenciesReady) {
-            Write-Warning 'Some optional backend dependencies could not be installed. Order lookup will offer manual captcha entry when OCR is unavailable.'
+            Write-Warning '部分 OCR 依赖安装失败，订单查询仍可使用手动验证码。需要完整功能时，请检查网络后重新运行 start.ps1。'
         }
     }
+}
+
+Write-Host "Python: $pythonExecutable" -ForegroundColor DarkGray
+Write-Host "Node.js: $($nodeRuntime.Node)" -ForegroundColor DarkGray
+Write-Host "npm: $npmExecutable" -ForegroundColor DarkGray
+if ($BootstrapOnly) {
+    Write-Host '依赖检查完成，可以运行 .\start.ps1 启动服务。' -ForegroundColor Green
+    return
 }
 
 $backendPort = Get-FreeLocalPort 8000
@@ -206,7 +406,7 @@ try {
     Write-Host "Ports:         frontend=$frontendPort  backend=$backendPort" -ForegroundColor Yellow
     Write-Host 'Press Ctrl+C to stop both services.' -ForegroundColor DarkGray
     Write-Host '========================================' -ForegroundColor DarkGray
-    npm --prefix $frontendDirectory run dev -- --host 127.0.0.1 --port $frontendPort --strictPort
+    & $npmExecutable --prefix $frontendDirectory run dev -- --host 127.0.0.1 --port $frontendPort --strictPort
 }
 finally {
     if (-not $backendProcess.HasExited) {

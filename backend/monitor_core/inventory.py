@@ -104,6 +104,98 @@ class InventoryService:
             product["stock_label"] = "未上架"
         return product
 
+    def _link_discovered_shop(
+        self,
+        connection: sqlite3.Connection,
+        watch_id: int,
+        product: dict[str, Any],
+        stamp: str,
+    ) -> dict[str, Any]:
+        """Persist a shop exposed by a single-product detail response."""
+        shop_info = product.get("shop")
+        if not isinstance(shop_info, dict) or not shop_info.get("token"):
+            return {"status": "unavailable", "shop": None}
+
+        token = str(shop_info["token"]).strip()
+        url = str(shop_info.get("url") or f"https://pay.ldxp.cn/shop/{token}").strip()
+        name = str(shop_info.get("name") or token).strip()[:100] or token
+        category_id = shop_info.get("category_id")
+        category_name = str(shop_info.get("category_name") or "").strip()[:100]
+        goods_type = str(shop_info.get("goods_type") or "card").strip()[:30] or "card"
+
+        shop = connection.execute(
+            "SELECT id, name, category_id, category_name, goods_type FROM shops WHERE token = ? OR url = ?",
+            (token, url),
+        ).fetchone()
+        if shop is None:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO shops(
+                    url, token, name, keywords, category_id, category_name, goods_type,
+                    enabled, interval_seconds, created_at
+                ) VALUES(?, ?, ?, '', ?, ?, ?, 1, 300, ?)
+                """,
+                (url, token, name, category_id, category_name, goods_type, stamp),
+            )
+            shop = connection.execute(
+                "SELECT id, name, category_id, category_name, goods_type FROM shops WHERE token = ? OR url = ?",
+                (token, url),
+            ).fetchone()
+            if shop is None:
+                return {"status": "unavailable", "shop": None}
+            shop_id = int(shop["id"])
+            shop_name = str(shop["name"] or "").strip() or name
+        else:
+            shop_id = int(shop["id"])
+            shop_name = str(shop["name"] or "").strip() or name
+            # Fill metadata discovered from the product without replacing a
+            # name/category that an operator has already configured.
+            connection.execute(
+                """
+                UPDATE shops SET
+                    category_id = COALESCE(category_id, ?),
+                    category_name = CASE WHEN category_name IS NULL OR category_name = '' THEN ? ELSE category_name END,
+                    goods_type = CASE WHEN goods_type IS NULL OR goods_type = '' THEN ? ELSE goods_type END
+                WHERE id = ?
+                """,
+                (category_id, category_name, goods_type, shop_id),
+            )
+
+        connection.execute(
+            "UPDATE shops SET name = ? WHERE id = ? AND (name IS NULL OR name = '' OR name = token)",
+            (name, shop_id),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen)
+            VALUES(?, ?, ?, 1, ?)
+            ON CONFLICT(shop_id, goods_key) DO UPDATE SET
+                watch_id = excluded.watch_id,
+                listed = 1,
+                last_seen = excluded.last_seen
+            """,
+            (shop_id, product["goods_key"], watch_id, stamp),
+        )
+        connection.execute(
+            "DELETE FROM shop_exclusions WHERE shop_id = ? AND goods_key = ?",
+            (shop_id, product["goods_key"]),
+        )
+        shop_interval = connection.execute(
+            "SELECT interval_seconds FROM shops WHERE id = ?", (shop_id,)
+        ).fetchone()
+        if shop_interval is not None:
+            self.sync_intervals(connection, shop_id, int(shop_interval["interval_seconds"] or 300))
+        shop_row = connection.execute(
+            "SELECT id, name, token FROM shops WHERE id = ?", (shop_id,)
+        ).fetchone()
+        linked_shop = dict(shop_row) if shop_row else {
+            "id": shop_id,
+            "name": shop_name,
+            "token": token,
+        }
+        return {"status": "linked", "shop": linked_shop}
+
 
     def record_fetch(self, watch_id: int) -> dict[str, Any]:
         stamp = self.now()
@@ -140,11 +232,13 @@ class InventoryService:
                         stamp,
                     ),
                 )
+                discovery = self._link_discovered_shop(connection, watch_id, data, stamp)
                 connection.execute("UPDATE watches SET last_run = ? WHERE id = ?", (stamp, watch_id))
             old_price = previous["price"] if previous else None
             data["previous_price"] = old_price
             data["price_changed"] = old_price not in (None, "") and old_price != data["price"]
             data.update({"fetched_at": stamp, "status": "success"})
+            data["shop_discovery"] = discovery
             data.pop("raw_data", None)
             return data
         except Exception as exc:

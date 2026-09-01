@@ -116,8 +116,8 @@ export function canAccessView(view, user, mode = AUTH_MODES.SELF_USE, permission
 }
 
 export function defaultViewFor(user, mode = AUTH_MODES.SELF_USE) {
-  if (canAccessView('monitor', user, mode)) return 'monitor';
-  return 'products';
+  if (canAccessView('products', user, mode)) return 'products';
+  return 'monitor';
 }
 
 export function roleLabel(user) {

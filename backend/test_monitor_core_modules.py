@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from monitor_core import database as database_module
@@ -105,6 +106,74 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
         self.assertFalse(manager._is_waf_html("<main>products</main>"))
 
+    def test_browser_verification_batches_shops_after_one_challenge(self) -> None:
+        with self.database() as connection:
+            for token in ("BATCHONE", "BATCHTWO"):
+                connection.execute(
+                    "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
+                    (f"https://pay.ldxp.cn/shop/{token}", token, token, "2026-08-30T08:00:00+00:00"),
+                )
+            shop_ids = [row[0] for row in connection.execute("SELECT id FROM shops ORDER BY id")]
+
+        class FakeDriver:
+            page_source = "<div id='challenge'></div>"
+
+            def execute_script(self, *_args):
+                return None
+
+            def quit(self):
+                return None
+
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+        driver = FakeDriver()
+        manager._create_driver = lambda: (driver, "chrome")
+        attempts = {shop_ids[0]: 0}
+
+        def sync(_driver, shop_id):
+            if shop_id == shop_ids[0] and attempts[shop_id] == 0:
+                attempts[shop_id] += 1
+                raise RuntimeError("WAF challenge")
+            return {"product_count": 1}
+
+        manager._sync_shop = sync
+        first = manager.start_all(shop_ids)
+        self.assertEqual(first["status"], "awaiting_verification")
+        self.assertEqual(first["pending_shop_ids"], shop_ids)
+        self.assertEqual(first["current_shop_id"], shop_ids[0])
+        driver.page_source = "<main>verified</main>"
+        completed = manager.complete_all()
+        self.assertEqual(completed["status"], "success")
+        self.assertEqual(completed["completed"], 2)
+        self.assertEqual([entry["id"] for entry in completed["results"]], shop_ids)
+        self.assertEqual(completed["browser"], "chrome")
+
+    def test_browser_order_supports_linux_and_explicit_selection(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+        with patch("monitor_core.browser_verification.sys.platform", "linux"), patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(manager._browser_order(), ["chrome", "chromium", "edge", "firefox"])
+        with patch.dict("os.environ", {"LDXP_WAF_BROWSER": "firefox"}):
+            self.assertEqual(manager._browser_order(), ["firefox"])
+
     def test_storefront_normalizes_catalog_without_application_globals(self) -> None:
         product = storefront.normalize_goods_list_item(
             {
@@ -156,6 +225,94 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertEqual(product["sale_status"], "off_sale")
         self.assertIsNone(product["stock"])
+
+    def test_inventory_links_single_product_to_discovered_shop_and_reuses_it(self) -> None:
+        product = {
+            "goods_key": "single-product",
+            "title": "单商品",
+            "price": "3.00",
+            "market_price": "",
+            "stock": 4,
+            "description": "",
+            "specs": {"店铺": "发现店铺"},
+            "image": "",
+            "sale_status": "on_sale",
+            "raw_data": {"name": "单商品"},
+            "shop": {
+                "token": "DISCOVERED",
+                "url": "https://pay.ldxp.cn/shop/DISCOVERED",
+                "name": "发现店铺",
+                "category_id": 114049,
+                "category_name": "分类",
+                "goods_type": "card",
+            },
+        }
+        service = InventoryService(
+            database=self.database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: {
+                **product,
+                "goods_key": "single-product-2" if str(url).endswith("single-product-2") else product["goods_key"],
+            },
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+        )
+        with self.database() as connection:
+            first = connection.execute(
+                "INSERT INTO watches(url, name, created_at) VALUES(?, ?, ?)",
+                ("https://pay.ldxp.cn/item/single-product", "单商品", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            second = connection.execute(
+                "INSERT INTO watches(url, name, created_at) VALUES(?, ?, ?)",
+                ("https://pay.ldxp.cn/item/single-product-2", "单商品2", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+
+        first_result = service.record_fetch(first)
+        second_result = service.record_fetch(second)
+
+        self.assertEqual(first_result["shop_discovery"]["status"], "linked")
+        self.assertEqual(second_result["shop_discovery"]["shop"]["id"], first_result["shop_discovery"]["shop"]["id"])
+        with self.database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 2)
+
+    def test_inventory_does_not_fabricate_shop_without_identity(self) -> None:
+        product = {
+            "goods_key": "standalone-product",
+            "title": "独立商品",
+            "price": "3.00",
+            "market_price": "",
+            "stock": None,
+            "description": "",
+            "specs": {},
+            "image": "",
+            "sale_status": "on_sale",
+            "raw_data": {},
+            "shop": None,
+        }
+        service = InventoryService(
+            database=self.database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: dict(product),
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+        )
+        with self.database() as connection:
+            watch_id = connection.execute(
+                "INSERT INTO watches(url, name, created_at) VALUES(?, ?, ?)",
+                ("https://pay.ldxp.cn/item/standalone-product", "独立商品", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+
+        result = service.record_fetch(watch_id)
+
+        self.assertEqual(result["shop_discovery"], {"status": "unavailable", "shop": None})
+        with self.database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
 
     def test_preorder_module_rejects_disabled_request_before_storage(self) -> None:
         with self.assertRaisesRegex(ValueError, "启用自动预购"):

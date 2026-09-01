@@ -52,6 +52,7 @@ import {
 } from 'lucide-react';
 import './style.css';
 import {buildSub2ApiAutomationSaveNotice, buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+import {DEFAULT_SUB2API_SECTION, SUB2API_SECTIONS, normalizeSub2ApiSection} from './sub2apiNavigation.js';
 import {
   CARD_RECLAIM_POLL_TIMEOUT_MS,
   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
@@ -987,7 +988,8 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [paymentChannel, setPaymentChannel] = useState(1);
   const [paymentChannels, setPaymentChannels] = useState([{id: 1, name: '支付宝'}]);
   const paymentWindow = useRef(null);
-  const [activeView, setActiveView] = useState('monitor');
+  const [activeView, setActiveView] = useState('products');
+  const [sub2apiSection, setSub2apiSection] = useState(DEFAULT_SUB2API_SECTION);
   const [redeemConfig, setRedeemConfig] = useState({base_url: 'https://30d.team'});
   const [cardCodes, setCardCodes] = useState('');
   const [reclaimResult, setReclaimResult] = useState(null);
@@ -1035,6 +1037,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [sub2apiAutomationBusy, setSub2apiAutomationBusy] = useState(false);
   const [busy, setBusy] = useState({});
   const [verificationShopId, setVerificationShopId] = useState(null);
+  const [verificationBatch, setVerificationBatch] = useState({
+    status: 'idle',
+    browser: null,
+    completed: 0,
+    total: 0,
+    current_shop_id: null,
+    pending_shop_ids: [],
+    results: [],
+  });
   const [serviceOnline, setServiceOnline] = useState(false);
   const [featureLoadState, setFeatureLoadState] = useState({
     monitor: {status: 'loading', error: ''},
@@ -1355,36 +1366,36 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     sub2apiCardHistoryFilterRef.current = sub2apiCardHistoryFilter;
     sub2apiCardHistoryPageRef.current = sub2apiCardHistoryPage;
     sub2apiCardHistoryPageSizeRef.current = sub2apiCardHistoryPageSize;
-    if (activeView === 'sub2api' && featureLoadState.sub2api.status === 'ready') {
+    if (activeView === 'sub2api' && sub2apiSection === 'cards' && featureLoadState.sub2api.status === 'ready') {
       loadSub2ApiCardHistory({
         status: sub2apiCardHistoryFilter,
         page: sub2apiCardHistoryPage,
         pageSize: sub2apiCardHistoryPageSize,
       });
     }
-  }, [activeView, featureLoadState.sub2api.status, sub2apiCardHistoryFilter, sub2apiCardHistoryPage, sub2apiCardHistoryPageSize]);
+  }, [activeView, sub2apiSection, featureLoadState.sub2api.status, sub2apiCardHistoryFilter, sub2apiCardHistoryPage, sub2apiCardHistoryPageSize]);
 
   useEffect(() => {
     if (activeView !== 'sub2api' || featureLoadState.sub2api.status !== 'ready') return undefined;
     if (sub2apiConfig.admin_key_set) loadSub2ApiOptions({quiet: true});
-    const stateTimer = canManageMonitor ? window.setInterval(() => loadSub2ApiAutomation(), 5000) : null;
+    const stateTimer = canManageMonitor && sub2apiSection === 'automation' ? window.setInterval(() => loadSub2ApiAutomation(), 5000) : null;
     const monitorTimer = window.setInterval(() => {
       if (canManageMonitor && sub2apiConfig.admin_key_set) {
         loadSub2ApiOptions({quiet: true});
-        loadSub2ApiAccounts({quiet: true});
+        if (sub2apiSection === 'accounts') loadSub2ApiAccounts({quiet: true});
       }
     }, 60000);
     return () => {
       if (stateTimer) window.clearInterval(stateTimer);
       window.clearInterval(monitorTimer);
     };
-  }, [activeView, featureLoadState.sub2api.status, sub2apiConfig.base_url, sub2apiConfig.admin_key_set, canManageMonitor]);
+  }, [activeView, sub2apiSection, featureLoadState.sub2api.status, sub2apiConfig.base_url, sub2apiConfig.admin_key_set, canManageMonitor]);
 
   useEffect(() => {
-    if (canManageMonitor && activeView === 'sub2api' && featureLoadState.sub2api.status === 'ready' && sub2apiConfig.admin_key_set) {
+    if (canManageMonitor && activeView === 'sub2api' && sub2apiSection === 'accounts' && featureLoadState.sub2api.status === 'ready' && sub2apiConfig.admin_key_set) {
       loadSub2ApiAccounts({page: 1, quiet: true});
     }
-  }, [canManageMonitor, activeView, featureLoadState.sub2api.status, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
+  }, [canManageMonitor, activeView, sub2apiSection, featureLoadState.sub2api.status, sub2apiConfig.admin_key_set, sub2apiAccountFilters.search, sub2apiAccountFilters.status, sub2apiAccountFilters.platform]);
 
   const fastestInterval = [...items, ...shops, ...preorders.filter(entry => entry.enabled)]
     .filter(item => item.enabled)
@@ -1466,6 +1477,8 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const validCheckedShopIds = shops.filter(shop => checkedShopIds.includes(shop.id)).map(shop => shop.id);
   const visibleCheckedShopIds = filteredShops.filter(shop => checkedShopIds.includes(shop.id)).map(shop => shop.id);
   const allVisibleShopsChecked = filteredShops.length > 0 && visibleCheckedShopIds.length === filteredShops.length;
+  const wafShopIds = shops.filter(shop => shop.enabled && needsBrowserVerification(shop)).map(shop => shop.id);
+  const batchVerificationPending = verificationBatch.status === 'awaiting_verification';
   const preorderByWatch = new Map(preorders.map(entry => [entry.watch_id, entry]));
   const displayedPreorders = preorders.filter(entry => entry.status !== 'cancelled');
 
@@ -1497,9 +1510,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       setUrl('');
       await loadItems({quiet: true});
       if (!isShop) setSelectedId(result.id);
+      const shopDiscovery = result.shop_discovery || result.snapshot?.shop_discovery;
+      const discoveredShop = shopDiscovery?.shop;
       notify(isShop
         ? (result.summary?.status === 'success' ? `店铺已同步，导入 ${result.summary.product_count} 个商品` : '店铺已加入，首次同步暂未成功')
-        : (result.snapshot?.status === 'success' ? '商品已加入并完成首次抓取' : '商品已加入，首次抓取暂未成功'));
+        : (result.snapshot?.status === 'success'
+          ? (discoveredShop
+            ? `商品已添加并关联店铺：${discoveredShop.name || discoveredShop.token}`
+            : '商品已添加，暂未识别所属店铺')
+          : '商品已加入，首次抓取暂未成功'));
     } catch (error) {
       notify(error.message, 'error');
     } finally {
@@ -1647,12 +1666,38 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         request('/shops/fetch-all', {method: 'POST'}),
       ]);
       await loadItems({quiet: true});
-      const failed = [...watchResult.results, ...shopResult.results].filter(entry => !entry.ok).length;
-      notify(failed ? `刷新完成，${failed} 项抓取失败` : '店铺与商品已全部刷新', failed ? 'error' : 'info');
+      const wafIds = Array.isArray(shopResult.waf_shop_ids) ? shopResult.waf_shop_ids : [];
+      const failed = [...watchResult.results, ...shopResult.results].filter(entry => !entry.ok && !entry.waf).length;
+      if (wafIds.length) {
+        await startBrowserVerificationBatch(wafIds);
+        if (failed) notify(`刷新完成，${failed} 项抓取失败，${wafIds.length} 个店铺等待 WAF 验证`, 'error');
+      } else {
+        notify(failed ? `刷新完成，${failed} 项抓取失败` : '店铺与商品已全部刷新', failed ? 'error' : 'info');
+      }
     } catch (error) {
       notify(error.message, 'error');
     } finally {
       setBusy(value => ({...value, fetchAll: false}));
+    }
+  };
+
+  const syncAllShops = async () => {
+    setBusy(value => ({...value, shopBatchSync: true}));
+    try {
+      const result = await request('/shops/fetch-all', {method: 'POST'});
+      await loadItems({quiet: true});
+      const wafIds = Array.isArray(result.waf_shop_ids) ? result.waf_shop_ids : [];
+      const failed = (result.results || []).filter(entry => !entry.ok && !entry.waf).length;
+      if (wafIds.length) {
+        await startBrowserVerificationBatch(wafIds);
+        if (failed) notify(`店铺同步完成，${failed} 项失败，${wafIds.length} 个店铺等待 WAF 验证`, 'error');
+      } else {
+        notify(failed ? `店铺同步完成，${failed} 项失败` : '全部店铺同步完成', failed ? 'error' : 'info');
+      }
+    } catch (error) {
+      notify(error.message, 'error');
+    } finally {
+      setBusy(value => ({...value, shopBatchSync: false}));
     }
   };
 
@@ -1848,16 +1893,73 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       : entry));
   };
 
+  const applyVerificationBatchState = result => {
+    setVerificationBatch(current => ({
+      ...current,
+      ...result,
+      pending_shop_ids: Array.isArray(result?.pending_shop_ids) ? result.pending_shop_ids : current.pending_shop_ids,
+      results: Array.isArray(result?.results) ? result.results : current.results,
+    }));
+  };
+
+  const startBrowserVerificationBatch = async (shopIds = wafShopIds) => {
+    const ids = [...new Set((shopIds || []).map(Number).filter(Number.isInteger).filter(id => id > 0))];
+    if (!ids.length) return notify('当前没有需要验证的 WAF 店铺');
+    setBusy(value => ({...value, verificationBatch: true}));
+    try {
+      const result = await request('/shops/browser-verification/start-all', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({shop_ids: ids}),
+      });
+      applyVerificationBatchState(result);
+      if (result.status === 'awaiting_verification') {
+        notify(`批量同步已暂停，${result.completed || 0}/${result.total || ids.length} 个店铺完成${result.browser ? `，浏览器：${result.browser}` : ''}`);
+      } else {
+        await loadItems({quiet: true});
+        notify(`批量同步完成，共 ${result.completed || ids.length} 个店铺`);
+      }
+      return result;
+    } catch (error) {
+      notify(error.message, 'error');
+      return null;
+    } finally {
+      setBusy(value => ({...value, verificationBatch: false}));
+    }
+  };
+
+  const completeBrowserVerificationBatch = async () => {
+    setBusy(value => ({...value, verificationBatch: true}));
+    try {
+      const result = await request('/shops/browser-verification/complete-all', {method: 'POST'});
+      applyVerificationBatchState(result);
+      if (result.status === 'awaiting_verification') {
+        notify(result.detail || 'WAF 验证尚未完成', 'error');
+      } else {
+        await loadItems({quiet: true});
+        notify(`批量验证完成，共 ${result.completed || 0} 个店铺`);
+      }
+      return result;
+    } catch (error) {
+      notify(error.message, 'error');
+      return null;
+    } finally {
+      setBusy(value => ({...value, verificationBatch: false}));
+    }
+  };
+
   const startBrowserVerification = async shop => {
     setBusy(value => ({...value, [`verify-${shop.id}`]: true}));
     try {
       const result = await request(`/shops/${shop.id}/browser-verification/start`, {method: 'POST'});
       if (result.status === 'success') {
         setVerificationShopId(null);
+        applyVerificationBatchState({...result, status: 'idle'});
         await loadItems({quiet: true});
         notify(`浏览器会话同步完成，共 ${result.summary.product_count} 个商品`);
       } else {
         setVerificationShopId(shop.id);
+        applyVerificationBatchState(result);
         notify(result.detail);
       }
     } catch (error) {
@@ -1872,9 +1974,11 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     try {
       const result = await request(`/shops/${shop.id}/browser-verification/complete`, {method: 'POST'});
       if (result.status === 'awaiting_verification') {
+        applyVerificationBatchState(result);
         return notify(result.detail, 'error');
       }
       setVerificationShopId(null);
+      applyVerificationBatchState({...result, status: 'idle'});
       await loadItems({quiet: true});
       notify(`验证通过并同步完成，共 ${result.summary.product_count} 个商品`);
     } catch (error) {
@@ -3034,13 +3138,19 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     setDetailOpen(false);
     setActiveView(view);
   };
+  const switchSub2ApiSection = section => {
+    const nextSection = normalizeSub2ApiSection(section);
+    setSub2apiSection(nextSection);
+    if (activeView !== 'sub2api') switchView('sub2api');
+  };
+  const sub2apiSectionMeta = SUB2API_SECTIONS.find(section => section.value === sub2apiSection) || SUB2API_SECTIONS[0];
   const viewMeta = {
     products: {title: '商品总览', description: '聚合监控店铺报价，快速比较最低价、库存与销售状态'},
     monitor: {title: '店铺与商品监控', description: '汇总店铺商品，追踪库存、价格与在售状态'},
     history: {title: '价格记录', description: '查看选中商品的抓取结果与价格变化'},
     orders: {title: '订单查询', description: '自动完成链动小铺验证并查看购买订单'},
     reclaim: {title: '卡密 401 找回', description: '检测并找回 30d.team 卡密关联的 401 账号'},
-    sub2api: {title: 'Sub2API 账号导入', description: '使用管理员密钥将账号 JSON 导入 Sub2API'},
+    sub2api: {title: `Sub2API · ${sub2apiSectionMeta.label}`, description: sub2apiSectionMeta.description},
     settings: {title: '系统设置', description: '管理基础配置、运行模式与用户账号'},
   }[activeView];
   const resetHistoryFilters = () => setHistoryFilters({query: '', startDate: '', endDate: '', status: 'all', stock: 'all'});
@@ -3059,7 +3169,12 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
           <button className={activeView === 'history' ? 'active' : ''} onClick={() => switchView('history')}><History size={18}/>价格记录</button>
           <button className={activeView === 'orders' ? 'active' : ''} onClick={() => switchView('orders')}><ReceiptText size={18}/>订单查询</button>
           {canUseReclaim && <button className={activeView === 'reclaim' ? 'active' : ''} onClick={() => switchView('reclaim')}><KeyRound size={18}/>401 找回</button>}
-          {canUseSub2Api && <button className={activeView === 'sub2api' ? 'active' : ''} onClick={() => switchView('sub2api')}><Upload size={18}/>Sub2API 导入</button>}
+          {canUseSub2Api && <div className={`nav-group ${activeView === 'sub2api' ? 'expanded' : ''}`}>
+            <button className={`nav-parent ${activeView === 'sub2api' ? 'active' : ''}`} onClick={() => { setSub2apiSection(DEFAULT_SUB2API_SECTION); switchView('sub2api'); }} aria-expanded={activeView === 'sub2api'}><Upload size={18}/><span>Sub2API 导入</span><ChevronRight size={14} className="nav-parent-chevron"/></button>
+            {activeView === 'sub2api' && <nav className="nav-sublist" aria-label="Sub2API 子菜单">
+              {SUB2API_SECTIONS.map(section => <button className={sub2apiSection === section.value ? 'active' : ''} key={section.value} onClick={() => switchSub2ApiSection(section.value)}>{section.value === 'cards' ? <KeyRound size={14}/> : section.value === 'automation' ? <TimerReset size={14}/> : <Database size={14}/>}<span>{section.shortLabel}</span></button>)}
+            </nav>}
+          </div>}
           {canAccessView('settings', sessionUser, authMode, accessPolicy) && <button className={activeView === 'settings' ? 'active' : ''} onClick={() => switchView('settings')}><Settings2 size={18}/>系统设置</button>}
         </nav>
         <div className="sidebar-foot">
@@ -3117,8 +3232,17 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
               </div>
               {canManageMonitor && <div className="shop-batch-toolbar">
                 <label className="shop-select-all"><input className="select-checkbox" type="checkbox" checked={allVisibleShopsChecked} onChange={toggleAllVisibleShops} disabled={!filteredShops.length} aria-label="全选当前店铺"/><span>全选当前结果</span></label>
-                <div><span>{validCheckedShopIds.length ? `已选 ${validCheckedShopIds.length} 个店铺` : '尚未选择店铺'}</span>{validCheckedShopIds.length > 0 && <IconButton label="取消选择店铺" onClick={() => setCheckedShopIds([])}><X size={14}/></IconButton>}<button className="button danger-button" onClick={removeCheckedShops} disabled={!validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button></div>
+                <div className="shop-batch-actions">
+                  <span>{validCheckedShopIds.length ? `已选 ${validCheckedShopIds.length} 个店铺` : '尚未选择店铺'}</span>
+                  {validCheckedShopIds.length > 0 && <IconButton label="取消选择店铺" onClick={() => setCheckedShopIds([])}><X size={14}/></IconButton>}
+                  <button className="button secondary" onClick={syncAllShops} disabled={busy.shopBatchSync || busy.fetchAll || !shops.length}><RefreshCw size={14} className={busy.shopBatchSync ? 'spin' : ''}/>{busy.shopBatchSync ? '正在同步' : '同步全部店铺'}</button>
+                  <button className="button secondary" onClick={() => batchVerificationPending ? completeBrowserVerificationBatch() : startBrowserVerificationBatch()} disabled={busy.verificationBatch || (!batchVerificationPending && !wafShopIds.length)} title={batchVerificationPending ? '完成浏览器验证后继续同步' : '使用共享浏览器会话验证所有 WAF 店铺'}>
+                    <ShieldCheck size={14} className={busy.verificationBatch ? 'spin' : ''}/>{batchVerificationPending ? `继续验证 ${verificationBatch.completed}/${verificationBatch.total}` : `验证全部 WAF${wafShopIds.length ? ` (${wafShopIds.length})` : ''}`}
+                  </button>
+                  <button className="button danger-button" onClick={removeCheckedShops} disabled={!validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button>
+                </div>
               </div>}
+              {canManageMonitor && batchVerificationPending && <div className="shop-verification-banner"><ShieldCheck size={15}/><span>浏览器：{verificationBatch.browser || '自动选择'}，当前店铺 {verificationBatch.current_shop_id || '--'}，剩余 {verificationBatch.pending_shop_ids?.length || 0} 个</span><button className="button primary" onClick={completeBrowserVerificationBatch} disabled={busy.verificationBatch}><Check size={14}/>验证完成并继续</button></div>}
               <div className="shop-list">{!filteredShops.length ? <div className="monitor-filter-empty"><Store size={20}/><span>没有符合条件的店铺</span></div> : filteredShops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''} ${checkedShopIds.includes(shop.id) ? 'checked' : ''}`} key={shop.id}>
                 {canManageMonitor && <label className="check-wrap shop-select-cell" title={`选择店铺：${shop.name || shop.token}`} onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedShopIds.includes(shop.id)} onChange={() => toggleShopChecked(shop.id)} aria-label={`选择店铺：${shop.name || shop.token}`}/></label>}
                 <button className="shop-main" onClick={() => { setShopFilter(current => current === shop.id ? null : shop.id); setCheckedIds([]); }}>
@@ -3197,14 +3321,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
           <FeatureLoadingState feature="401 找回" state={featureLoadState.reclaim} onRetry={() => retryFeature('reclaim')}/>
         ) : (
           <React.Suspense fallback={<FeatureLoadingState feature="401 找回界面" state={{status: 'loading'}}/>}>
-            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onRetry={retryLegacyReclaim} onDownload={downloadReclaimed} canConfigure={canManageMonitor} canImport={canUseSub2Api} onImport={() => { switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
+            <ReclaimView config={redeemConfig} setConfig={setRedeemConfig} cardCodes={cardCodes} setCardCodes={setCardCodes} result={reclaimResult} busy={reclaimBusy} onSave={saveRedeemConfig} onRun={runReclaim} onRetry={retryLegacyReclaim} onDownload={downloadReclaimed} canConfigure={canManageMonitor} canImport={canUseSub2Api} onImport={() => { setSub2apiSection(DEFAULT_SUB2API_SECTION); switchView('sub2api'); if (reclaimPayload) { setSub2apiPayload(reclaimPayload); setSub2apiFileName('找回结果.json'); } }}/>
           </React.Suspense>
         ) : featureLoadState.sub2api.status !== 'ready' ? (
           <FeatureLoadingState feature="Sub2API" state={featureLoadState.sub2api} onRetry={() => retryFeature('sub2api')}/>
         ) : (
           <React.Suspense fallback={<FeatureLoadingState feature="Sub2API 界面" state={{status: 'loading'}}/>}>
-            <Sub2ApiView
-            canUseReclaim={canUseReclaim} canUseImport={canUseSub2Api} canConfigure={canManageMonitor}
+             <Sub2ApiView
+             canUseReclaim={canUseReclaim} canUseImport={canUseSub2Api} canConfigure={canManageMonitor}
+             section={sub2apiSection} onSectionChange={switchSub2ApiSection}
             config={sub2apiConfig} setConfig={setSub2apiConfig} adminKey={sub2apiAdminKey} setAdminKey={setSub2apiAdminKey}
             redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={saveRedeemConfig}
             cardCodes={sub2apiCardCodes} onCardCodes={setSub2apiCardCodes} cardMode={sub2apiCardMode} onCardMode={setSub2apiCardMode}

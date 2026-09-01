@@ -60,7 +60,7 @@ test('gates admin views while retaining public views for ordinary users', () => 
   assert.equal(canAccessView('settings', user, AUTH_MODES.EXTERNAL), true);
   assert.equal(canAccessView('settings', null, AUTH_MODES.EXTERNAL), false);
   assert.equal(canAccessView('settings', null, AUTH_MODES.SELF_USE), true);
-  assert.equal(defaultViewFor(user, AUTH_MODES.EXTERNAL), 'monitor');
+  assert.equal(defaultViewFor(user, AUTH_MODES.EXTERNAL), 'products');
 });
 
 test('matches monitor write access with the backend role boundary', () => {

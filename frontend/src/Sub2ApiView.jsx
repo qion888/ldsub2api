@@ -33,6 +33,7 @@ import {
   X,
 } from 'lucide-react';
 import {normalizeSub2ApiRecoveryResult} from './sub2apiRecoveryModel.js';
+import {SUB2API_SECTIONS, normalizeSub2ApiSection} from './sub2apiNavigation.js';
 
 function compactTime(value) {
   if (!value) return '尚未抓取';
@@ -556,7 +557,8 @@ function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false, 
   );
 }
 
-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName, onManualReclaim, canUseReclaim = true, canUseImport = true, canConfigure = true}) {
+export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName, onManualReclaim, section = 'cards', onSectionChange, canUseReclaim = true, canUseImport = true, canConfigure = true}) {
+  const activeSection = normalizeSub2ApiSection(section);
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
   const jsonProxyCount = Array.isArray(payload?.proxies) ? payload.proxies.length : 0;
@@ -611,6 +613,11 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
         <button className="icon-button" title="刷新 Sub2API 状态" aria-label="刷新 Sub2API 状态" onClick={onLoadOptions} disabled={optionsBusy || !config.admin_key_set}><RefreshCw size={16} className={optionsBusy ? 'spin' : ''}/></button>
       </div>
 
+      <nav className="sub2api-mobile-tabs" aria-label="Sub2API 子菜单">
+        {SUB2API_SECTIONS.map(item => <button type="button" className={activeSection === item.value ? 'active' : ''} onClick={() => onSectionChange?.(item.value)} key={item.value}><span>{item.shortLabel}</span><small>{item.description}</small></button>)}
+      </nav>
+
+      {activeSection === 'cards' && <>
       <div className="tool-grid sub2api-primary-grid">
         {canConfigure && <div className="tool-panel sub2api-config-panel">
           <div className="section-heading"><div><span className="detail-kicker">SUB2API ADMIN</span><h2>连接配置</h2><p>x-api-key · 后端代理</p></div><Settings2 size={21}/></div>
@@ -618,12 +625,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
             <label><span>服务地址</span><input value={config.base_url} onChange={event => setConfig({...config, base_url: event.target.value})} placeholder="http://127.0.0.1:8080"/></label>
             <label><span>管理员密钥 {config.admin_key_set && <small>{config.admin_key_mask}</small>}</span><input type="password" value={adminKey} onChange={event => setAdminKey(event.target.value)} placeholder={config.admin_key_set ? '留空保留现有密钥' : '输入管理员密钥'} autoComplete="off"/></label>
           </div>
-          <div className="tool-actions compact-actions"><button className="button primary" onClick={onSave}><Save size={15}/>保存</button><button className="button secondary" onClick={onTest} disabled={busy || retryBusy}><Activity size={15}/>测试</button><button className="button secondary" onClick={onReclaim401} disabled={reclaimBusy || retryBusy || busy}><KeyRound size={15}/>{reclaimBusy ? '扫描中' : retryBusy ? '重新找回中' : '扫描并找回 401'}</button></div>
+          <div className="tool-actions compact-actions"><button className="button primary" onClick={onSave}><Save size={15}/>保存</button><button className="button secondary" onClick={onTest} disabled={busy || retryBusy}><Activity size={15}/>测试</button></div>
           {result && !result.mode && <div className={`connection-result ${result.ok ? 'ok' : 'bad'}`}>{result.ok ? `连接成功${result.account_count == null ? '' : ` · ${result.account_count} 个账号`}` : (result.detail || `上游 HTTP ${result.upstream_status}`)}</div>}
-          {reclaimResult && <>
-            <div className={`connection-result ${reclaimResult.ok !== false ? 'ok' : 'bad'}`}>扫描 {reclaimResult.scanned_accounts ?? '--'} · 401 {reclaimResult.accounts_401 ?? '--'} · 提交 {reclaimResult.card_code_count ?? '--'} · 跳过 {reclaimResult.skipped_non_401 ?? 0}</div>
-            <Sub2ApiRecoveryResult result={reclaimResult} busy={reclaimBusy || retryBusy} onRetry={onRetry401}/>
-          </>}
           <div className="sub2api-capability-grid"><div><span className={config.admin_key_set ? 'ready' : ''}/><small>管理认证</small><strong>{config.admin_key_set ? '已保存' : '待配置'}</strong></div><div><span className={options.loaded ? 'ready' : ''}/><small>账号读取</small><strong>{options.loaded ? '正常' : '待同步'}</strong></div><div><span className={options.proxy_service_available ? 'ready' : ''}/><small>代理资源</small><strong>{options.proxy_service_available ? `${options.proxy_count} 个` : '待同步'}</strong></div><div><span className={automationState ? 'ready' : ''}/><small>自动化状态</small><strong>{automationState ? '已连接' : '待同步'}</strong></div></div>
         </div>}
         {importEnabled && <div className="tool-panel sub2api-import-panel">
@@ -645,13 +648,15 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           onRun={onRunCardImport} onPush={onPushCards}
           historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
           historyPage={cardHistoryPage} historyPageSize={cardHistoryPageSize} onHistoryPage={onCardHistoryPage} onHistoryPageSize={onCardHistoryPageSize}
-          historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onDeleteHistory={onDeleteCardHistory} onCopyCode={onCopyCardCode}
-        />}
+           historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onDeleteHistory={onDeleteCardHistory} onCopyCode={onCopyCardCode}
+         />}
+      </>}
 
-      {canConfigure && <div className="automation-console">
+      {activeSection === 'automation' && <>
+      {canConfigure ? <div className="automation-console">
         <div className="automation-head">
           <div><span className="detail-kicker">401 AUTOMATION CONTROL</span><h2>定时找回与自动导入</h2><p>账号健康、找回队列与导入策略</p></div>
-          <div className="automation-head-actions"><span className={`automation-readiness ${monitorReady ? 'ready' : ''}`}><ShieldCheck size={15}/>401 监控 {monitorReady ? '就绪' : '待配置'}</span><span className={`automation-readiness ${importReady ? 'ready' : ''}`}><Upload size={15}/>自动导入 {automation.auto_import ? (importReady ? '就绪' : `${importMissingCount} 项待配置`) : '已关闭'}</span><button className="button secondary" onClick={onRunAutomation} disabled={automationBusy || !automation.enabled}><RefreshCw size={15} className={automationBusy ? 'spin' : ''}/>立即检查</button><button className="button primary" onClick={onSaveAutomation} disabled={automationBusy}><Save size={15}/>{automationBusy ? '处理中' : '保存策略'}</button></div>
+          <div className="automation-head-actions"><span className={`automation-readiness ${monitorReady ? 'ready' : ''}`}><ShieldCheck size={15}/>401 监控 {monitorReady ? '就绪' : '待配置'}</span><span className={`automation-readiness ${importReady ? 'ready' : ''}`}><Upload size={15}/>自动导入 {automation.auto_import ? (importReady ? '就绪' : `${importMissingCount} 项待配置`) : '已关闭'}</span>{reclaimEnabled && <button className="button secondary" onClick={onReclaim401} disabled={reclaimBusy || retryBusy || busy}><KeyRound size={15}/>{reclaimBusy ? '扫描中' : retryBusy ? '重新找回中' : '扫描并找回 401'}</button>}<button className="button secondary" onClick={onRunAutomation} disabled={automationBusy || !automation.enabled}><RefreshCw size={15} className={automationBusy ? 'spin' : ''}/>立即检查</button><button className="button primary" onClick={onSaveAutomation} disabled={automationBusy}><Save size={15}/>{automationBusy ? '处理中' : '保存策略'}</button></div>
         </div>
 
         <div className="automation-metrics">
@@ -662,6 +667,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           <div><span>代理异常</span><strong className={monitor.unhealthy_proxies ? 'negative' : ''}>{monitor.unhealthy_proxies ?? '--'}</strong><small>{monitor.active_proxies ?? 0} 个活跃</small></div>
           <div><span>找回队列</span><strong>{automationState?.pending_card_codes?.length ?? 0}</strong><small>{automationRecovery.summary.downloaded ?? 0} 个最近下载</small></div>
         </div>
+
+        {reclaimResult && <div className="sub2api-automation-reclaim-result"><div className={`connection-result ${reclaimResult.ok !== false ? 'ok' : 'bad'}`}>扫描 {reclaimResult.scanned_accounts ?? '--'} · 401 {reclaimResult.accounts_401 ?? '--'} · 提交 {reclaimResult.card_code_count ?? '--'} · 跳过 {reclaimResult.skipped_non_401 ?? 0}</div><Sub2ApiRecoveryResult result={reclaimResult} busy={reclaimBusy || retryBusy} onRetry={onRetry401}/></div>}
 
         {automationDisplayResult && <Sub2ApiRecoveryResult result={automationDisplayResult} compact busy={automationBusy || retryBusy} onRetry={onRetryAutomation} testId="sub2api-automation-result"/>}
 
@@ -709,7 +716,10 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           </section>
         </div>
 
-        <Sub2ApiAccountsPanel
+      </div> : <div className="sub2api-section-empty"><ShieldCheck size={22}/><strong>自动化功能需要管理员权限</strong><span>请使用管理员账号配置 401 定时找回与自动导入。</span></div>}
+      </>}
+
+      {activeSection === 'accounts' && (canConfigure ? <Sub2ApiAccountsPanel
           data={accountsData}
           filters={accountFilters}
           onFiltersChange={patch => { onAccountFiltersChange({...accountFilters, ...patch}); }}
@@ -722,9 +732,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           onTest={onTestAccount}
           onDelete={onDeleteAccount}
           onCopyName={onCopyAccountName}
-          onPage={page => onLoadAccounts({page})}
-        />
-      </div>}
+           onPage={page => onLoadAccounts({page})}
+         /> : <div className="sub2api-section-empty"><Database size={22}/><strong>账号列表需要管理员权限</strong><span>当前账号只允许执行授权范围内的导入操作。</span></div>)}
     </section>
   );
 }

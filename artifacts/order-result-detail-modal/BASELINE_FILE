@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+﻿import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   AlertCircle,
   ArrowUpRight,
@@ -34,7 +34,6 @@ import {
 import {
   COMPLAINT_REASON_OPTIONS,
   ORDER_STATUS_OPTIONS,
-  canOpenOrderDetail,
   canOpenProtectedOrderDetail,
   complaintActionForOrder,
   complaintHistoryErrorState,
@@ -164,7 +163,6 @@ function OrderDetailDialog({
   busy,
   error,
   sessionExpired,
-  passwordRequired,
   dialogRef,
   passwordInputRef,
   onPassword,
@@ -175,8 +173,7 @@ function OrderDetailDialog({
   onRequery,
 }) {
   const showingDetail = Boolean(detail);
-  const dialogTitle = showingDetail || !passwordRequired ? '订单详情' : '安全密码验证';
-  const dialogKicker = showingDetail || !passwordRequired ? 'ORDER DETAIL' : 'SECURE ORDER';
+  const dialogTitle = showingDetail ? '订单详情' : '安全密码验证';
   const seller = detail?.seller || {};
   const sellerContacts = detail ? [
     {label: '卖家 QQ', value: seller.contact_qq},
@@ -199,20 +196,20 @@ function OrderDetailDialog({
 
   return <div className="modal-backdrop order-detail-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <div
-      className={`checkout-modal ${showingDetail || !passwordRequired ? 'order-detail-modal' : 'order-password-modal'}`}
+      className={`checkout-modal ${showingDetail ? 'order-detail-modal' : 'order-password-modal'}`}
       role="dialog"
       aria-modal="true"
       aria-labelledby="order-detail-dialog-title"
-      aria-describedby={!showingDetail && passwordRequired ? 'order-password-description' : undefined}
+      aria-describedby={showingDetail ? undefined : 'order-password-description'}
       ref={dialogRef}
       tabIndex={-1}
     >
       <div className="modal-head order-dialog-head">
-        <div><span>{dialogKicker}</span><h2 id="order-detail-dialog-title">{dialogTitle}</h2></div>
+        <div><span>{showingDetail ? 'ORDER DETAIL' : 'SECURE ORDER'}</span><h2 id="order-detail-dialog-title">{dialogTitle}</h2></div>
         <QueryIconButton label="关闭订单详情" onClick={onClose}><X size={17}/></QueryIconButton>
       </div>
 
-      {!showingDetail && passwordRequired ? <form className="order-password-form" onSubmit={onSubmit}>
+      {!showingDetail ? <form className="order-password-form" onSubmit={onSubmit}>
         <div className="order-password-context">
           <span className="order-password-context-icon"><KeyRound size={20}/></span>
           <div><strong>{order.goods_name}</strong><small>{order.trade_no}</small></div>
@@ -247,18 +244,7 @@ function OrderDetailDialog({
               : <button className="button primary" type="submit" disabled={busy || !password.length}><ShieldCheck size={15}/>{busy ? '正在验证' : '验证并查看'}</button>}
           </div>
         </div>
-      </form> : !showingDetail ? <div className="order-detail-loading-state" aria-live="polite">
-        <div className="order-detail-loading-icon">{busy ? <RefreshCw className="spin" size={22}/> : error ? <AlertCircle size={22}/> : <ReceiptText size={22}/>}</div>
-        <strong>{busy ? '正在读取订单详情' : error ? '订单详情读取失败' : '准备读取订单详情'}</strong>
-        <span>{error || '正在读取订单金额、状态和交付内容'}</span>
-        <div className="order-dialog-foot order-detail-loading-foot">
-          <span>{sessionExpired ? <TriangleAlert size={14}/> : <ShieldCheck size={14}/>} {sessionExpired ? '查询验证会话已失效' : '无需安全密码'}</span>
-          <div>
-            <button className="button secondary" type="button" onClick={onClose}>关闭</button>
-            {sessionExpired && <button className="button primary" type="button" onClick={onRequery}><RefreshCw size={15}/>关闭并重新查询</button>}
-          </div>
-        </div>
-      </div> : <>
+      </form> : <>
         <div className="order-detail-scroll">
           <section className="order-detail-identity">
             <OrderImage order={order}/>
@@ -561,7 +547,7 @@ function OrderRow({order, onCopy, onOpenProtectedDetail, onComplaint, onComplain
     <td data-label="操作"><div className="order-row-actions">
       {order.detail_url && <a className="icon-button" href={order.detail_url} target="_blank" rel="noreferrer" aria-label="打开官方订单详情" title="打开官方订单详情"><ExternalLink size={14}/></a>}
       {canOpenProtectedOrderDetail(order) && <button className="button secondary order-result-link order-password-button" type="button" onClick={event => onOpenProtectedDetail(order, event.currentTarget)}><KeyRound size={14}/>安全密码</button>}
-      {canOpenOrderDetail(order) && <button className="button secondary order-result-link order-detail-button" type="button" onClick={event => onOpenProtectedDetail(order, event.currentTarget)}><ReceiptText size={14}/>{order.goods_action_label}</button>}
+      {order.status === 1 && order.result_url && !order.need_query_password && <a className="button secondary order-result-link" href={order.result_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>{order.goods_action_label}</a>}
       {complaintAction.kind === 'apply' && <button className="button secondary order-complaint-button" type="button" onClick={event => onComplaint(order, event.currentTarget)}><MessageSquareWarning size={14}/>{complaintAction.label}</button>}
       {complaintAction.kind === 'history' && <button className={`button secondary order-complaint-button history ${complaintAction.status.tone}`} type="button" onClick={event => onComplaintHistory(order, event.currentTarget)}><MessagesSquare size={14}/>{complaintAction.label}</button>}
       {complaintAction.kind === 'history' && complaintAction.canReapply && <button className="button secondary order-complaint-button" type="button" onClick={event => onComplaint(order, event.currentTarget)}><MessageSquareWarning size={14}/>{complaintAction.reapplyLabel}</button>}
@@ -591,7 +577,6 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const [orderDetail, setOrderDetail] = useState(null);
   const [detailPassword, setDetailPassword] = useState('');
   const [detailPasswordVisible, setDetailPasswordVisible] = useState(false);
-  const [detailRequiresPassword, setDetailRequiresPassword] = useState(false);
   const [detailBusy, setDetailBusy] = useState(false);
   const [detailError, setDetailError] = useState('');
   const [detailSessionExpired, setDetailSessionExpired] = useState(false);
@@ -837,7 +822,6 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
     setOrderDetail(null);
     setDetailPassword('');
     setDetailPasswordVisible(false);
-    setDetailRequiresPassword(false);
     setDetailBusy(false);
     setDetailError('');
     setDetailSessionExpired(false);
@@ -883,7 +867,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     const focusFrame = window.requestAnimationFrame(() => {
-      if (orderDetail || !detailRequiresPassword) detailDialogRef.current?.focus();
+      if (orderDetail) detailDialogRef.current?.focus();
       else detailPasswordInputRef.current?.focus();
     });
     const handleKeyDown = event => {
@@ -917,7 +901,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       document.body.style.overflow = previousOverflow;
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [closeOrderDetail, detailOrder, orderDetail, detailRequiresPassword]);
+  }, [closeOrderDetail, detailOrder, orderDetail]);
 
   useEffect(() => {
     if (!complaintOpen) return undefined;
@@ -1279,14 +1263,12 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const openProtectedOrderDetail = (order, trigger) => {
     if (complaintOpen) return;
     const sessionAvailable = Boolean(sessionId && submittedKeywords);
-    const passwordRequired = canOpenProtectedOrderDetail(order);
     detailRequestVersion.current += 1;
     detailAbortController.current?.abort();
     detailAbortController.current = null;
     detailTriggerRef.current = trigger || document.activeElement;
     setDetailOrder(order);
     setOrderDetail(null);
-    setDetailRequiresPassword(passwordRequired);
     setDetailPassword(checkoutProfile?.query_password || '');
     setDetailPasswordVisible(false);
     setDetailBusy(false);
@@ -1295,8 +1277,8 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   };
 
   const submitOrderDetailPassword = async event => {
-    event?.preventDefault();
-    if (!detailOrder || detailBusy || detailSessionExpired || (detailRequiresPassword && !detailPassword.length)) return;
+    event.preventDefault();
+    if (!detailOrder || detailBusy || detailSessionExpired || !detailPassword.length) return;
     if (!sessionId || !submittedKeywords) {
       setSessionId('');
       setVerification(null);
@@ -1351,20 +1333,12 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       setDetailPasswordVisible(false);
       setDetailSessionExpired(errorState.sessionExpired);
       setDetailError(errorState.message);
-      if (!errorState.sessionExpired) window.requestAnimationFrame(() => {
-        if (detailRequiresPassword) detailPasswordInputRef.current?.focus();
-        else detailDialogRef.current?.focus();
-      });
+      if (!errorState.sessionExpired) window.requestAnimationFrame(() => detailPasswordInputRef.current?.focus());
     } finally {
       if (detailAbortController.current === controller) detailAbortController.current = null;
       if (version === detailRequestVersion.current) setDetailBusy(false);
     }
   };
-
-  useEffect(() => {
-    if (!detailOrder || detailRequiresPassword || orderDetail || detailBusy || detailSessionExpired || detailError || !sessionId || !submittedKeywords) return;
-    submitOrderDetailPassword();
-  }, [detailOrder, detailRequiresPassword, orderDetail, detailBusy, detailSessionExpired, detailError, sessionId, submittedKeywords]);
 
   const requeryAfterDetailExpiry = () => {
     const keyword = submittedKeywords;
@@ -1791,7 +1765,6 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       busy={detailBusy}
       error={detailError}
       sessionExpired={detailSessionExpired}
-      passwordRequired={detailRequiresPassword}
       dialogRef={detailDialogRef}
       passwordInputRef={detailPasswordInputRef}
       onPassword={value => {
