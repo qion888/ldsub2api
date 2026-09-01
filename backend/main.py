@@ -335,6 +335,12 @@ def list_shops() -> list[dict[str, Any]]:
     return INVENTORY.list_shops()
 
 
+def is_waf_error(value: Any) -> bool:
+    """Return true when a persisted shop error represents an interactive WAF."""
+    text = str(value or "").lower()
+    return "waf" in text or "aliyun" in text or "滑块" in text or "人机验证" in text
+
+
 def list_watches() -> list[dict[str, Any]]:
     return INVENTORY.list_watches()
 
@@ -1374,6 +1380,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "sub2api_card_import_history_delete": True,
                 "order_query": True,
                 "order_query_waf_verification": True,
+                "shop_batch_waf_verification": True,
                 "order_complaint_submit": True,
                 "order_complaint_history": True,
                 "auth_enabled": bool(installation.get("auth_required")),
@@ -1749,6 +1756,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
 
+        if path == "/api/shops/browser-verification/start-all":
+            raw_ids = data.get("shop_ids")
+            if raw_ids in (None, ""):
+                raw_ids = [shop["id"] for shop in list_shops() if shop.get("enabled") and is_waf_error((shop.get("last_attempt") or {}).get("error"))]
+            if not isinstance(raw_ids, list) or len(raw_ids) > 100:
+                return self._send_json({"detail": "shop_ids must contain between 1 and 100 shop ids"}, 400)
+            try:
+                shop_ids = list(dict.fromkeys(int(value) for value in raw_ids))
+            except (TypeError, ValueError):
+                return self._send_json({"detail": "shop_ids contains an invalid id"}, 400)
+            if any(value < 1 for value in shop_ids):
+                return self._send_json({"detail": "shop_ids contains an invalid id"}, 400)
+            try:
+                result = BROWSER_VERIFICATION.start_all(shop_ids)
+                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+            except KeyError as exc:
+                return self._send_json({"detail": str(exc.args[0])}, 404)
+            except RuntimeError as exc:
+                return self._send_json({"detail": str(exc)}, 502)
+
+        if path == "/api/shops/browser-verification/complete-all":
+            try:
+                result = BROWSER_VERIFICATION.complete_all()
+                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+            except RuntimeError as exc:
+                return self._send_json({"detail": str(exc)}, 409)
+
         browser_complete_match = re.fullmatch(r"/api/shops/(\d+)/browser-verification/complete", path)
         if browser_complete_match:
             try:
@@ -1761,14 +1795,19 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         if path == "/api/shops/fetch-all":
             results = []
+            waf_shop_ids = []
             for shop in list_shops():
                 if not shop["enabled"]:
                     continue
                 try:
                     results.append({"id": shop["id"], "ok": True, "data": WORKER.fetch_shop(shop["id"])})
                 except Exception as exc:
-                    results.append({"id": shop["id"], "ok": False, "error": str(exc)})
-            return self._send_json({"results": results})
+                    error = str(exc)
+                    if is_waf_error(error):
+                        waf_shop_ids.append(shop["id"])
+                    results.append({"id": shop["id"], "ok": False, "error": error, "waf": is_waf_error(error)})
+            verification = BROWSER_VERIFICATION.status()
+            return self._send_json({"results": results, "waf_shop_ids": waf_shop_ids, "verification": verification})
 
         if path == "/api/watches/inventory-refresh":
             raw_ids = data.get("ids")

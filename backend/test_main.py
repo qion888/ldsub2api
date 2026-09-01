@@ -259,6 +259,38 @@ class GoodsParserTests(unittest.TestCase):
                 invalid_status, _ = self.request_api("POST", "/api/shops/batch-delete", {"ids": []})
                 self.assertEqual(invalid_status, 400)
 
+    def test_shop_fetch_all_exposes_waf_ids_for_batch_verification(self):
+        shops = [
+            {"id": 11, "enabled": True},
+            {"id": 12, "enabled": True},
+            {"id": 13, "enabled": False},
+        ]
+        def fetch_shop(shop_id):
+            if shop_id == 11:
+                raise RuntimeError("WAF challenge required")
+            return {"status": "success", "product_count": 2}
+
+        with patch.object(main, "list_shops", return_value=shops), \
+                patch.object(main.WORKER, "fetch_shop", side_effect=fetch_shop), \
+                patch.object(main.BROWSER_VERIFICATION, "status", return_value={"status": "idle"}):
+            status, result = self.request_api("POST", "/api/shops/fetch-all", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["waf_shop_ids"], [11])
+        self.assertEqual(result["results"][0]["waf"], True)
+        self.assertEqual(result["results"][1]["ok"], True)
+
+    def test_shop_batch_verification_route_validates_ids_and_dispatches(self):
+        expected = {"status": "awaiting_verification", "completed": 0, "total": 2, "pending_shop_ids": [4, 5]}
+        with patch.object(main.BROWSER_VERIFICATION, "start_all", return_value=expected) as start_all:
+            status, result = self.request_api("POST", "/api/shops/browser-verification/start-all", {"shop_ids": [4, 5, 5]})
+        self.assertEqual(status, 202)
+        self.assertEqual(result, expected)
+        start_all.assert_called_once_with([4, 5])
+
+        status, result = self.request_api("POST", "/api/shops/browser-verification/start-all", {"shop_ids": ["bad"]})
+        self.assertEqual(status, 400)
+        self.assertIn("invalid id", result["detail"])
+
     def test_monitor_interval_supports_one_second_and_clamps_bounds(self):
         self.assertEqual(main.normalize_interval(1), 1)
         self.assertEqual(main.normalize_interval("3"), 3)

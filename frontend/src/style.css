@@ -3194,6 +3194,21 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .shop-batch-toolbar > div { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .shop-batch-toolbar .icon-button { width: 29px; height: 29px; }
 .shop-batch-toolbar .button { min-height: 30px; padding-inline: 9px; font-size: 9px; }
+.shop-batch-actions { flex-wrap: wrap; }
+.shop-verification-banner {
+  min-height: 38px;
+  padding: 7px 9px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ui-warning);
+  background: color-mix(in srgb, var(--ui-warning) 8%, var(--ui-surface));
+  border: 1px solid color-mix(in srgb, var(--ui-warning) 28%, var(--ui-border));
+  border-top: 0;
+  font-size: 10px;
+}
+.shop-verification-banner > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.shop-verification-banner .button { min-height: 28px; padding-inline: 9px; font-size: 9px; white-space: nowrap; }
 .product-filter-bar { margin-top: 10px; }
 .monitor-search,
 .monitor-filter-select { min-width: 0; margin: 0; position: relative; }
@@ -3348,6 +3363,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .shop-row > .row-actions { grid-column: 3; grid-row: 2; align-self: end; }
   .shop-batch-toolbar { align-items: flex-start; flex-direction: column; }
   .shop-batch-toolbar > div { width: 100%; justify-content: space-between; }
+  .shop-batch-actions { align-items: center; }
+  .shop-verification-banner { align-items: flex-start; flex-wrap: wrap; }
+  .shop-verification-banner .button { margin-left: 23px; }
   .product-row { grid-template-columns: 22px minmax(0, 1fr) auto; }
   .monitor-cell {
     position: static;

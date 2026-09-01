@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from monitor_core import database as database_module
@@ -104,6 +105,74 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
         self.assertFalse(manager._is_waf_html("<main>products</main>"))
+
+    def test_browser_verification_batches_shops_after_one_challenge(self) -> None:
+        with self.database() as connection:
+            for token in ("BATCHONE", "BATCHTWO"):
+                connection.execute(
+                    "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
+                    (f"https://pay.ldxp.cn/shop/{token}", token, token, "2026-08-30T08:00:00+00:00"),
+                )
+            shop_ids = [row[0] for row in connection.execute("SELECT id FROM shops ORDER BY id")]
+
+        class FakeDriver:
+            page_source = "<div id='challenge'></div>"
+
+            def execute_script(self, *_args):
+                return None
+
+            def quit(self):
+                return None
+
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+        driver = FakeDriver()
+        manager._create_driver = lambda: (driver, "chrome")
+        attempts = {shop_ids[0]: 0}
+
+        def sync(_driver, shop_id):
+            if shop_id == shop_ids[0] and attempts[shop_id] == 0:
+                attempts[shop_id] += 1
+                raise RuntimeError("WAF challenge")
+            return {"product_count": 1}
+
+        manager._sync_shop = sync
+        first = manager.start_all(shop_ids)
+        self.assertEqual(first["status"], "awaiting_verification")
+        self.assertEqual(first["pending_shop_ids"], shop_ids)
+        self.assertEqual(first["current_shop_id"], shop_ids[0])
+        driver.page_source = "<main>verified</main>"
+        completed = manager.complete_all()
+        self.assertEqual(completed["status"], "success")
+        self.assertEqual(completed["completed"], 2)
+        self.assertEqual([entry["id"] for entry in completed["results"]], shop_ids)
+        self.assertEqual(completed["browser"], "chrome")
+
+    def test_browser_order_supports_linux_and_explicit_selection(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+        with patch("monitor_core.browser_verification.sys.platform", "linux"), patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(manager._browser_order(), ["chrome", "chromium", "edge", "firefox"])
+        with patch.dict("os.environ", {"LDXP_WAF_BROWSER": "firefox"}):
+            self.assertEqual(manager._browser_order(), ["firefox"])
 
     def test_storefront_normalizes_catalog_without_application_globals(self) -> None:
         product = storefront.normalize_goods_list_item(
