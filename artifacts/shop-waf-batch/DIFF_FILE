@@ -80,7 +80,7 @@ index f2fab55..0e31c4f 100644
          if path == "/api/watches/inventory-refresh":
              raw_ids = data.get("ids")
 diff --git a/backend/monitor_core/browser_verification.py b/backend/monitor_core/browser_verification.py
-index d0e0da6..ed6baa8 100644
+index d0e0da6..d37150f 100644
 --- a/backend/monitor_core/browser_verification.py
 +++ b/backend/monitor_core/browser_verification.py
 @@ -1,14 +1,23 @@
@@ -233,7 +233,7 @@ index d0e0da6..ed6baa8 100644
          return payload
  
      def _catalog(self, driver: Any, shop: Any, first_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-@@ -119,73 +207,125 @@ class BrowserVerificationManager:
+@@ -119,73 +207,129 @@ class BrowserVerificationManager:
              driver.execute_script("document.open(); document.write(arguments[0]); document.close();", html_text)
          except Exception as exc:
              self._close()
@@ -254,6 +254,8 @@ index d0e0da6..ed6baa8 100644
 +            "browser": self.browser_name,
 +            "completed": self.batch_completed,
 +            "total": self.batch_total,
++            "succeeded": sum(1 for entry in self.batch_results if entry.get("ok")),
++            "failed": sum(1 for entry in self.batch_results if not entry.get("ok")),
 +            "current_shop_id": self.batch_current_shop_id,
 +            "pending_shop_ids": list(self.batch_queue),
 +            "results": list(self.batch_results),
@@ -415,6 +417,8 @@ index d0e0da6..ed6baa8 100644
 +                    "browser": self.browser_name,
 +                    "completed": self.batch_completed,
 +                    "total": self.batch_total,
++                    "succeeded": sum(1 for entry in self.batch_results if entry.get("ok")),
++                    "failed": sum(1 for entry in self.batch_results if not entry.get("ok")),
 +                    "current_shop_id": None,
 +                    "pending_shop_ids": list(self.batch_queue),
 +                    "results": list(self.batch_results),
@@ -553,7 +557,7 @@ index e3c4a8e..146872e 100644
          product = storefront.normalize_goods_list_item(
              {
 diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
-index 7a1e475..c0c9885 100644
+index 7a1e475..0efa913 100644
 --- a/frontend/src/main.jsx
 +++ b/frontend/src/main.jsx
 @@ -1035,6 +1035,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
@@ -653,7 +657,7 @@ index 7a1e475..c0c9885 100644
 +        notify(`批量同步已暂停，${result.completed || 0}/${result.total || ids.length} 个店铺完成${result.browser ? `，浏览器：${result.browser}` : ''}`);
 +      } else {
 +        await loadItems({quiet: true});
-+        notify(`批量同步完成，共 ${result.completed || ids.length} 个店铺`);
++        notify(`批量同步完成，成功 ${result.succeeded ?? result.completed ?? ids.length} 个，失败 ${result.failed || 0} 个`, result.failed ? 'error' : 'info');
 +      }
 +      return result;
 +    } catch (error) {
@@ -673,7 +677,7 @@ index 7a1e475..c0c9885 100644
 +        notify(result.detail || 'WAF 验证尚未完成', 'error');
 +      } else {
 +        await loadItems({quiet: true});
-+        notify(`批量验证完成，共 ${result.completed || 0} 个店铺`);
++        notify(`批量验证完成，成功 ${result.succeeded ?? result.completed ?? 0} 个，失败 ${result.failed || 0} 个`, result.failed ? 'error' : 'info');
 +      }
 +      return result;
 +    } catch (error) {
