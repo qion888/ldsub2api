@@ -270,7 +270,8 @@ class GoodsParserTests(unittest.TestCase):
                 raise RuntimeError("WAF challenge required")
             return {"status": "success", "product_count": 2}
 
-        with patch.object(main, "list_shops", return_value=shops), \
+        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                patch.object(main, "list_shops", return_value=shops), \
                 patch.object(main.WORKER, "fetch_shop", side_effect=fetch_shop), \
                 patch.object(main.BROWSER_VERIFICATION, "status", return_value={"status": "idle"}):
             status, result = self.request_api("POST", "/api/shops/fetch-all", {})
@@ -281,13 +282,14 @@ class GoodsParserTests(unittest.TestCase):
 
     def test_shop_batch_verification_route_validates_ids_and_dispatches(self):
         expected = {"status": "awaiting_verification", "completed": 0, "total": 2, "pending_shop_ids": [4, 5]}
-        with patch.object(main.BROWSER_VERIFICATION, "start_all", return_value=expected) as start_all:
+        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                patch.object(main.BROWSER_VERIFICATION, "start_all", return_value=expected) as start_all:
             status, result = self.request_api("POST", "/api/shops/browser-verification/start-all", {"shop_ids": [4, 5, 5]})
-        self.assertEqual(status, 202)
-        self.assertEqual(result, expected)
-        start_all.assert_called_once_with([4, 5])
+            self.assertEqual(status, 202)
+            self.assertEqual(result, expected)
+            start_all.assert_called_once_with([4, 5])
 
-        status, result = self.request_api("POST", "/api/shops/browser-verification/start-all", {"shop_ids": ["bad"]})
+            status, result = self.request_api("POST", "/api/shops/browser-verification/start-all", {"shop_ids": ["bad"]})
         self.assertEqual(status, 400)
         self.assertIn("invalid id", result["detail"])
 
