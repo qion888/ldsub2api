@@ -253,12 +253,16 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertEqual(delete_result["deleted_count"], 2)
                 with main.database() as connection:
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
-                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 0)
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
 
+                    single_watch_id = connection.execute(
+                        "INSERT INTO watches(url, name, enabled) VALUES(?, 'single shop product', 1)",
+                        ("https://pay.ldxp.cn/item/single-shop-delete",),
+                    ).lastrowid
                     connection.execute(
                         "INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen) VALUES(?, 'single-shop-delete', ?, 1, ?)",
-                        (shop_ids[2], watch_id, main.utc_now()),
+                        (shop_ids[2], single_watch_id, main.utc_now()),
                     )
                     connection.execute(
                         "INSERT INTO shop_exclusions(shop_id, goods_key, removed_at) VALUES(?, 'single-shop-delete', ?)",
@@ -279,7 +283,7 @@ class GoodsParserTests(unittest.TestCase):
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_exclusions").fetchone()[0], 0)
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_runs").fetchone()[0], 0)
-                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (single_watch_id,)).fetchone()[0], 0)
 
                 missing_status, _ = self.request_api("DELETE", f"/api/shops/{shop_ids[2]}", {})
                 self.assertEqual(missing_status, 404)

@@ -1624,13 +1624,13 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   };
 
   const removeShop = async shop => {
-    if (!window.confirm(`停止监控店铺“${shop.name || shop.token}”？已导入的商品记录会保留。`)) return;
+    if (!window.confirm(`删除店铺“${shop.name || shop.token}”？该店铺独占的商品和价格记录也会删除，共享商品会保留。`)) return;
     try {
       await request(`/shops/${shop.id}`, {method: 'DELETE'});
       if (shopFilter === shop.id) setShopFilter(null);
       setCheckedShopIds(current => current.filter(id => id !== shop.id));
       await loadItems({quiet: true});
-      notify('店铺监控已删除');
+      notify('店铺监控及其独占商品已删除');
     } catch (error) {
       notify(error.message, 'error');
     }
@@ -1649,7 +1649,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
 
   const removeCheckedShops = async () => {
     if (!validCheckedShopIds.length) return;
-    if (!window.confirm(`删除 ${validCheckedShopIds.length} 个店铺监控？已导入的商品和价格记录会保留。`)) return;
+    if (!window.confirm(`删除 ${validCheckedShopIds.length} 个店铺监控？独占商品和价格记录也会删除，共享商品会保留。`)) return;
     setBusy(value => ({...value, shopBatchDelete: true}));
     try {
       const result = await request('/shops/batch-delete', {
@@ -1660,7 +1660,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       if (validCheckedShopIds.includes(shopFilter)) setShopFilter(null);
       setCheckedShopIds([]);
       await loadItems({quiet: true});
-      notify(`已删除 ${result.deleted_count} 个店铺监控，商品记录已保留`);
+      notify(`已删除 ${result.deleted_count} 个店铺监控及其独占商品`);
     } catch (error) {
       notify(error.message, 'error');
     } finally {

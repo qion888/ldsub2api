@@ -276,6 +276,16 @@ class MonitorCoreModuleTests(unittest.TestCase):
             connection.executescript(
                 """
                 CREATE TABLE watches (id INTEGER PRIMARY KEY, url TEXT NOT NULL);
+                CREATE TABLE snapshots (
+                    id INTEGER PRIMARY KEY,
+                    watch_id INTEGER NOT NULL,
+                    FOREIGN KEY (watch_id) REFERENCES watches(id)
+                );
+                CREATE TABLE preorders (
+                    id INTEGER PRIMARY KEY,
+                    watch_id INTEGER NOT NULL,
+                    FOREIGN KEY (watch_id) REFERENCES watches(id)
+                );
                 CREATE TABLE shops (id INTEGER PRIMARY KEY, url TEXT NOT NULL, token TEXT NOT NULL);
                 CREATE TABLE shop_products (
                     shop_id INTEGER NOT NULL,
@@ -307,6 +317,8 @@ class MonitorCoreModuleTests(unittest.TestCase):
                 "INSERT INTO watches(url) VALUES(?)",
                 ("https://pay.ldxp.cn/item/legacy-shop-product",),
             ).lastrowid
+            connection.execute("INSERT INTO snapshots(watch_id) VALUES(?)", (watch_id,))
+            connection.execute("INSERT INTO preorders(watch_id) VALUES(?)", (watch_id,))
             shop_id = connection.execute(
                 "INSERT INTO shops(url, token) VALUES(?, ?)",
                 ("https://pay.ldxp.cn/shop/LEGACYDELETE", "LEGACYDELETE"),
@@ -340,7 +352,44 @@ class MonitorCoreModuleTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_exclusions").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_runs").fetchone()[0], 0)
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM preorders").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches").fetchone()[0], 0)
+
+    def test_delete_shops_keeps_product_shared_with_another_shop(self) -> None:
+        with self.database() as connection:
+            watch_id = connection.execute(
+                "INSERT INTO watches(url, created_at) VALUES(?, ?)",
+                ("https://pay.ldxp.cn/item/shared-shop-product", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            shop_ids = [
+                connection.execute(
+                    "INSERT INTO shops(url, token, created_at) VALUES(?, ?, ?)",
+                    (f"https://pay.ldxp.cn/shop/SHARED{index}", f"SHARED{index}", "2026-08-30T08:00:00+00:00"),
+                ).lastrowid
+                for index in (1, 2)
+            ]
+            for shop_id in shop_ids:
+                connection.execute(
+                    "INSERT INTO shop_products(shop_id, goods_key, watch_id, last_seen) VALUES(?, 'shared-product', ?, ?)",
+                    (shop_id, watch_id, "2026-08-30T08:00:00+00:00"),
+                )
+
+        service = InventoryService(
+            database=self.database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: {},
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+        )
+        self.assertEqual(service.delete_shops([shop_ids[0]]), 1)
+
+        with self.database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 1)
 
     def test_inventory_links_single_product_to_discovered_shop_and_reuses_it(self) -> None:
         product = {
