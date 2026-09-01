@@ -448,9 +448,52 @@ class InventoryService:
                 shop_refresh_cache[shop_id] = summary
         return self._latest_watch_product(watch_id, shop_id=shop_id, shop_summary=summary)
 
+    def _backfill_discovered_shops(self, connection: sqlite3.Connection, stamp: str) -> None:
+        """Restore shop links for snapshots created before shop discovery existed."""
+        if self.discover_shop is None:
+            return
+        rows = connection.execute(
+            """
+            SELECT w.id, w.url, s.goods_key, s.raw_data
+            FROM watches w
+            JOIN snapshots s ON s.watch_id = w.id AND s.status = 'success'
+            WHERE s.id = (
+                SELECT latest.id FROM snapshots latest
+                WHERE latest.watch_id = w.id AND latest.status = 'success'
+                ORDER BY latest.id DESC LIMIT 1
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM shop_products existing WHERE existing.watch_id = w.id
+            )
+            """
+        ).fetchall()
+        for row in rows:
+            raw_data = self._json_value(row["raw_data"], {})
+            if not isinstance(raw_data, dict):
+                continue
+            goods_key = str(
+                row["goods_key"]
+                or raw_data.get("goods_key")
+                or str(row["url"]).rstrip("/").rsplit("/", 1)[-1]
+            ).strip()
+            try:
+                shop_info = self.discover_shop(raw_data)
+                if goods_key and shop_info:
+                    self._link_discovered_shop(
+                        connection,
+                        row["id"],
+                        {"goods_key": goods_key, "shop": shop_info},
+                        stamp,
+                    )
+            except Exception:
+                # A stale or malformed upstream snapshot must not make either
+                # monitor list unavailable.
+                continue
 
     def list_shops(self) -> list[dict[str, Any]]:
+        stamp = self.now()
         with self.database() as connection:
+            self._backfill_discovered_shops(connection, stamp)
             result: list[dict[str, Any]] = []
             for row in connection.execute("SELECT * FROM shops ORDER BY id DESC"):
                 latest_run = connection.execute(
@@ -493,6 +536,7 @@ class InventoryService:
     def list_watches(self) -> list[dict[str, Any]]:
         stamp = self.now()
         with self.database() as connection:
+            self._backfill_discovered_shops(connection, stamp)
             result: list[dict[str, Any]] = []
             for row in connection.execute("SELECT * FROM watches ORDER BY id DESC"):
                 latest = connection.execute(
@@ -511,30 +555,6 @@ class InventoryService:
                 watch["enabled"] = bool(watch["enabled"])
                 watch["latest"] = self.effective_watch_product(connection, row["id"], latest, attempt)
                 watch["last_attempt"] = dict(attempt) if attempt else None
-                existing_link = connection.execute(
-                    "SELECT 1 FROM shop_products WHERE watch_id = ? LIMIT 1", (row["id"],)
-                ).fetchone()
-                if existing_link is None and self.discover_shop and latest is not None:
-                    raw_data = self._json_value(latest["raw_data"], {})
-                    if isinstance(raw_data, dict):
-                        goods_key = str(
-                            latest["goods_key"]
-                            or raw_data.get("goods_key")
-                            or str(row["url"]).rstrip("/").rsplit("/", 1)[-1]
-                        ).strip()
-                        try:
-                            shop_info = self.discover_shop(raw_data)
-                            if goods_key and shop_info:
-                                self._link_discovered_shop(
-                                    connection,
-                                    row["id"],
-                                    {"goods_key": goods_key, "shop": shop_info},
-                                    stamp,
-                                )
-                        except Exception:
-                            # A stale or malformed upstream snapshot must not
-                            # make the monitor list unavailable.
-                            pass
                 shop_links = connection.execute(
                     """
                     SELECT s.id, s.name, s.token FROM shop_products sp

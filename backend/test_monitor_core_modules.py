@@ -342,8 +342,10 @@ class MonitorCoreModuleTests(unittest.TestCase):
                 ),
             )
 
+        shops = service.list_shops()
         watches = service.list_watches()
 
+        self.assertEqual(shops[0]["token"], "LEGACYSHOP")
         self.assertEqual(watches[0]["shops"], [{"id": 1, "name": "旧店铺", "token": "LEGACYSHOP"}])
         with self.database() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
