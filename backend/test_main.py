@@ -325,11 +325,11 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("invalid id", result["detail"])
 
-    def test_monitor_interval_supports_one_second_and_clamps_bounds(self):
-        self.assertEqual(main.normalize_interval(1), 1)
-        self.assertEqual(main.normalize_interval("3"), 3)
+    def test_monitor_interval_uses_minute_floor_and_clamps_bounds(self):
+        self.assertEqual(main.normalize_interval(1), 60)
+        self.assertEqual(main.normalize_interval("3"), 60)
         self.assertEqual(main.normalize_interval(0), main.DEFAULT_INTERVAL)
-        self.assertEqual(main.normalize_interval(-10), 1)
+        self.assertEqual(main.normalize_interval(-10), 60)
         self.assertEqual(main.normalize_interval(999999), main.MAX_INTERVAL)
 
     def test_shop_monitor_route_syncs_linked_product_interval(self):
@@ -800,7 +800,7 @@ class GoodsParserTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 201)
                 self.assertEqual(result[0]["quantity"], 5)
-                self.assertEqual(result[0]["interval_seconds"], 3)
+                self.assertEqual(result[0]["interval_seconds"], 60)
                 with main.database() as connection:
                     row = connection.execute("SELECT * FROM preorders WHERE watch_id = ?", (watch_id,)).fetchone()
                 self.assertEqual(row["contact"], "buyer@example.com")

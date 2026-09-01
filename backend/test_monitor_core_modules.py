@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -44,6 +45,35 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertTrue({"watches", "snapshots", "shops", "preorders"}.issubset(tables))
         self.assertEqual(settings.read_json(self.database, "feature", {}), {"enabled": True})
         self.assertEqual(settings.normalize_service_url("https://example.test/", ""), "https://example.test")
+
+    def test_database_migration_clamps_legacy_second_intervals(self) -> None:
+        with self.database() as connection:
+            watch_id = connection.execute(
+                "INSERT INTO watches(url, name, interval_seconds, created_at) VALUES(?, ?, 1, ?)",
+                ("https://pay.ldxp.cn/item/legacy-interval", "Legacy", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            shop_id = connection.execute(
+                "INSERT INTO shops(url, token, name, interval_seconds, created_at) VALUES(?, ?, ?, 2, ?)",
+                ("https://pay.ldxp.cn/shop/legacy-interval", "legacy-interval", "Legacy", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO preorders(watch_id, quantity, interval_seconds, contact, created_at) VALUES(?, 1, 3, ?, ?)",
+                (watch_id, "buyer@example.com", "2026-08-30T08:00:00+00:00"),
+            )
+
+        database_module.initialize_database(
+            self.database,
+            now=lambda: "2026-08-30T08:01:00+00:00",
+            default_interval=300,
+            default_redeem_url="https://redeem.example",
+            default_sub2api_url="https://sub2api.example",
+            default_automation={"enabled": False},
+        )
+
+        with self.database() as connection:
+            self.assertEqual(connection.execute("SELECT interval_seconds FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 60)
+            self.assertEqual(connection.execute("SELECT interval_seconds FROM shops WHERE id = ?", (shop_id,)).fetchone()[0], 60)
+            self.assertEqual(connection.execute("SELECT interval_seconds FROM preorders WHERE watch_id = ?", (watch_id,)).fetchone()[0], 60)
 
     def test_history_calculates_price_and_stock_transitions(self) -> None:
         with self.database() as connection:
@@ -91,6 +121,31 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertEqual([item["ok"] for item in result], [True, False, True])
         self.assertEqual(result[1]["error"], "failed")
+
+    def test_worker_uses_minute_floor_for_legacy_rows(self) -> None:
+        worker = MonitorWorker(
+            database=self.database,
+            record_inventory_fetch=lambda watch_id, cache=None: {"watch_id": watch_id},
+            record_shop_fetch=lambda shop_id: {"shop_id": shop_id},
+            process_preorder=lambda preorder_id, product: None,
+            mark_preorder_check_error=lambda preorder_id, error: None,
+            default_interval=300,
+        )
+
+        self.assertEqual(worker._interval(1, 1), 60)
+        self.assertEqual(worker._interval("invalid", 300), 300)
+
+    def test_storefront_throttle_enforces_configured_gap(self) -> None:
+        with patch.dict(os.environ, {"LDXP_UPSTREAM_MIN_INTERVAL": "0.01"}), \
+             patch.object(storefront.time, "monotonic", side_effect=[0.0, 0.0]), \
+             patch.object(storefront.time, "sleep") as sleep:
+            storefront._UPSTREAM_NEXT_ALLOWED = 0.0
+            storefront.wait_for_upstream_request()
+            storefront.wait_for_upstream_request()
+
+        self.assertEqual(sleep.call_count, 1)
+        self.assertGreaterEqual(sleep.call_args.args[0], 0.01)
+        storefront._UPSTREAM_NEXT_ALLOWED = 0.0
 
     def test_browser_verification_detects_configured_waf_markers(self) -> None:
         manager = BrowserVerificationManager(

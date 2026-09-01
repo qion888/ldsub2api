@@ -112,6 +112,7 @@ def init_database() -> None:
         default_redeem_url=DEFAULT_REDEEM_URL,
         default_sub2api_url=DEFAULT_SUB2API_URL,
         default_automation=DEFAULT_SUB2API_AUTOMATION,
+        minimum_interval=MIN_INTERVAL,
     )
     sub2api_card_history.initialize(database)
     USER_SERVICE.initialize()
@@ -1208,6 +1209,7 @@ class MonitorWorker(CoreMonitorWorker):
             process_preorder=lambda preorder_id, product: process_preorder(preorder_id, product),
             mark_preorder_check_error=lambda preorder_id, error: mark_preorder_check_error(preorder_id, error),
             default_interval=DEFAULT_INTERVAL,
+            minimum_interval=MIN_INTERVAL,
         )
 
 
@@ -1240,6 +1242,7 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
             waf_error=WafChallengeRequired,
             waf_markers=WAF_MARKERS,
             profile_path=Path(__file__).with_name("waf-browser-profile"),
+            request_waiter=storefront.wait_for_upstream_request,
         )
 
 
@@ -1419,6 +1422,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "shop_batch_waf_verification": True,
                 "order_complaint_submit": True,
                 "order_complaint_history": True,
+                "monitor_min_interval_seconds": MIN_INTERVAL,
+                "upstream_min_interval_seconds": storefront.upstream_min_interval(),
                 "auth_enabled": bool(installation.get("auth_required")),
                 "install_required": bool(installation.get("needs_setup")),
                 "mode": installation.get("mode", "self_use"),

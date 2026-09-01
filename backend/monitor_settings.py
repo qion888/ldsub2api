@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 DEFAULT_INTERVAL = 60
 DEFAULT_SHOP_INTERVAL = 300
-MIN_INTERVAL = 1
+MIN_INTERVAL = 60
 MAX_INTERVAL = 86400
 
 
@@ -16,7 +16,16 @@ class MonitorNotFound(LookupError):
 
 
 def normalize_interval(value: Any, default: int = DEFAULT_INTERVAL) -> int:
-    return min(max(int(value or default), MIN_INTERVAL), MAX_INTERVAL)
+    try:
+        fallback = int(default or DEFAULT_INTERVAL)
+    except (TypeError, ValueError):
+        fallback = DEFAULT_INTERVAL
+    fallback = min(max(fallback, MIN_INTERVAL), MAX_INTERVAL)
+    try:
+        requested = int(value) if value not in (None, "", 0) else fallback
+    except (TypeError, ValueError):
+        requested = fallback
+    return min(max(requested, MIN_INTERVAL), MAX_INTERVAL)
 
 
 def sync_shop_product_intervals(
@@ -24,6 +33,7 @@ def sync_shop_product_intervals(
     shop_id: int,
     interval_seconds: int,
 ) -> int:
+    interval_seconds = normalize_interval(interval_seconds)
     cursor = connection.execute(
         """
         UPDATE watches SET interval_seconds = ? WHERE id IN (

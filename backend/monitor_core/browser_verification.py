@@ -32,6 +32,7 @@ class BrowserVerificationManager:
         waf_error: type[Exception],
         waf_markers: tuple[bytes, ...],
         profile_path: Path,
+        request_waiter: Callable[[], None] | None = None,
     ) -> None:
         self._database = database
         self._worker_lock = worker_lock
@@ -42,6 +43,7 @@ class BrowserVerificationManager:
         self._waf_error = waf_error
         self._waf_markers = waf_markers
         self._profile_path = profile_path
+        self._request_waiter = request_waiter or (lambda: None)
         self.lock = threading.RLock()
         self.driver: Any = None
         self.shop_id: int | None = None
@@ -149,6 +151,7 @@ class BrowserVerificationManager:
         raise RuntimeError(f"Unable to start a WAF browser ({detail})")
 
     def _browser_request(self, driver: Any, data: dict[str, Any]) -> dict[str, Any]:
+        self._request_waiter()
         driver.set_script_timeout(30)
         result = driver.execute_async_script(
             """
@@ -260,6 +263,7 @@ class BrowserVerificationManager:
 
     def _sync_shop(self, driver: Any, shop_id: int) -> dict[str, Any]:
         shop = self._shop(shop_id)
+        self._request_waiter()
         driver.get(shop["url"])
         first_payload = self._browser_request(driver, self._request_data(shop, 1))
         products = self._catalog(driver, shop, first_payload)
