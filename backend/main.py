@@ -115,6 +115,28 @@ def init_database() -> None:
     )
     sub2api_card_history.initialize(database)
     USER_SERVICE.initialize()
+    # Prime the policy cache so a transient SQLite lock cannot take down all
+    # legacy monitoring endpoints while the background workers are starting.
+    try:
+        USER_SERVICE.installation_status()
+    except Exception:
+        pass
+
+
+def _auth_service_fallback_allowed(method: str, path: str, installation: dict[str, Any]) -> bool:
+    """Return whether a cached policy can safely serve a transient auth outage."""
+    # User and installation management must never be served without a live
+    # user service. The rest of the API can continue in trusted self-use mode.
+    if path.startswith("/api/auth/") or path.startswith("/api/install/"):
+        return False
+    if path.startswith("/api/users") or path.startswith("/api/settings"):
+        return False
+    mode = str(installation.get("mode") or "self_use")
+    if mode == "self_use":
+        return user_routes._self_use_guest_legacy(method, path)
+    if not bool(installation.get("auth_required", installation.get("force_login", True))):
+        return user_routes._is_public(method, path)
+    return False
 
 
 DescriptionParser = storefront.DescriptionParser
@@ -1295,8 +1317,21 @@ class ApiHandler(BaseHTTPRequestHandler):
             headers = {"WWW-Authenticate": "Bearer"} if exc.status == 401 else None
             self._send_json_compat(exc.payload(), exc.status, headers)
             return None, False
-        except Exception:
-            self._send_json({"detail": "用户服务暂时不可用", "code": "user_service_error"}, 500)
+        except Exception as exc:
+            cached = USER_SERVICE.cached_installation_status()
+            if cached and _auth_service_fallback_allowed(method, path, cached):
+                # A busy user table should not make the local monitor blank.
+                # The next request retries the live policy automatically.
+                return None, True
+            print(f"[user-service] authorization unavailable: {type(exc).__name__}: {exc}")
+            self._send_json(
+                {
+                    "detail": "用户服务暂时不可用，请稍后重试",
+                    "code": "user_service_unavailable",
+                    "retryable": True,
+                },
+                503,
+            )
             return None, False
 
     def _user_send_json(self, path: str, data: Any, status: int = 200) -> None:

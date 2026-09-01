@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from http.cookies import CookieError, SimpleCookie
 from typing import Any, Callable
@@ -27,6 +29,21 @@ USERNAME_PATTERN = re.compile(r"^[\w.-]{3,64}$", re.UNICODE)
 MAX_TOKEN_LENGTH = 512
 DEFAULT_SESSION_TTL_HOURS = 24
 MAX_SESSION_TTL_HOURS = 720
+SQLITE_RETRY_ATTEMPTS = 3
+
+
+def _sqlite_retry(operation: Callable[[], Any]) -> Any:
+    """Retry short-lived SQLite contention without masking real failures."""
+    for attempt in range(SQLITE_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            retryable = "database is locked" in message or "database is busy" in message
+            if not retryable or attempt == SQLITE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(0.03 * (attempt + 1))
+    raise RuntimeError("unreachable")
 
 
 def _utc_datetime(value: Any) -> datetime | None:
@@ -120,35 +137,30 @@ class AuthService:
     def __init__(self, database: DatabaseFactory, *, now: NowFactory | None = None) -> None:
         self._database = database
         self._now = now or _now_iso
+        self._last_installation_status: dict[str, Any] | None = None
 
     def initialize(self) -> None:
+        self._last_installation_status = None
         store.initialize_schema(self._database, now=self._now)
 
     def _ensure_schema(self) -> None:
         # ``run()`` initializes eagerly, while this guard makes health checks
         # and direct unit calls safe before the first server start.
         try:
-            with self._database() as connection:
-                connection.execute("SELECT 1 FROM install_state LIMIT 1").fetchone()
+            _sqlite_retry(self._probe_schema)
         except Exception as exc:
             if getattr(exc, "sqlite_errorname", "") not in {"SQLITE_ERROR", "SQLITE_SCHEMA"} and "no such table" not in str(exc).lower():
                 raise
-            self.initialize()
+            _sqlite_retry(self.initialize)
+
+    def _probe_schema(self) -> None:
+        with self._database() as connection:
+            connection.execute("SELECT 1 FROM install_state LIMIT 1").fetchone()
 
     def installation_status(self) -> dict[str, Any]:
         self._ensure_schema()
         try:
-            with self._database() as connection:
-                state = store.installation(connection)
-                user_count = store.count_users(connection)
-                admin_count = store.count_admins(connection, enabled_only=True)
-                system = store.json_setting(connection, "system", store.DEFAULT_SYSTEM_SETTINGS)
-                state = self._migrate_legacy_installation(
-                    connection,
-                    state,
-                    user_count=user_count,
-                    admin_count=admin_count,
-                )
+            state, user_count, admin_count, system = _sqlite_retry(self._read_installation_state)
         except Exception as exc:
             if "no such table" not in str(exc).lower():
                 raise
@@ -160,7 +172,7 @@ class AuthService:
         if "allow_registration" in system:
             allow_registration = bool(state.get("allow_registration"))
         force_login = bool(system.get("force_login", True)) if mode == "external" else False
-        return {
+        result = {
             "ok": True,
             "configured": not needs_setup,
             "initialized": initialized,
@@ -176,6 +188,26 @@ class AuthService:
             "admin_count": admin_count,
             "initialized_at": state.get("initialized_at"),
         }
+        self._last_installation_status = dict(result)
+        return result
+
+    def _read_installation_state(self) -> tuple[dict[str, Any], int, int, dict[str, Any]]:
+        with self._database() as connection:
+            state = store.installation(connection)
+            user_count = store.count_users(connection)
+            admin_count = store.count_admins(connection, enabled_only=True)
+            system = store.json_setting(connection, "system", store.DEFAULT_SYSTEM_SETTINGS)
+            state = self._migrate_legacy_installation(
+                connection,
+                state,
+                user_count=user_count,
+                admin_count=admin_count,
+            )
+        return state, user_count, admin_count, system
+
+    def cached_installation_status(self) -> dict[str, Any] | None:
+        """Return the last known policy for transient database failures."""
+        return dict(self._last_installation_status) if self._last_installation_status else None
 
     @staticmethod
     def _fallback_installation() -> dict[str, Any]:
@@ -480,8 +512,7 @@ class AuthService:
         if not token:
             return None
         self._ensure_schema()
-        stamp = str(self._now())
-        current = _utc_datetime(stamp) or datetime.now(timezone.utc)
+        current = _utc_datetime(self._now()) or datetime.now(timezone.utc)
         with self._database() as connection:
             row = store.session_row(connection, security.token_digest(token))
             if row is None or not bool(row["enabled"]):
@@ -489,10 +520,10 @@ class AuthService:
             expires = _utc_datetime(row["expires_at"])
             if expires is None or expires <= current or row["revoked_at"]:
                 return None
-            connection.execute(
-                "UPDATE user_sessions SET last_seen_at = ? WHERE id = ?",
-                (stamp, int(row["id"])),
-            )
+            # Authentication is deliberately read-only. Updating a session on
+            # every request created a write lock that could block monitoring,
+            # imports, and recovery endpoints while the inventory worker was
+            # committing a large batch.
             role = str(row["role"] or "user").lower()
             role = role if role in store.VALID_ROLES else "user"
             return {

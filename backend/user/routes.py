@@ -248,8 +248,17 @@ def _run(send_json: SendJson, operation: Callable[[], Any]) -> bool:
     except UserServiceError as exc:
         _emit_error(send_json, exc)
     except Exception as exc:
-        # Do not expose SQL or password details to a remote caller.
-        send_json({"detail": "用户服务暂时不可用", "code": "user_service_error"}, 500)
+        # Keep infrastructure failures distinct from validation/auth errors so
+        # clients can retry instead of treating them as a bad request.
+        print(f"[user-service] route unavailable: {type(exc).__name__}: {exc}")
+        send_json(
+            {
+                "detail": "用户服务暂时不可用，请稍后重试",
+                "code": "user_service_unavailable",
+                "retryable": True,
+            },
+            503,
+        )
     return True
 
 
