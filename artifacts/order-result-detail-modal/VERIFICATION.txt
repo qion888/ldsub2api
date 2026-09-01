@@ -38,4 +38,7 @@ MODIFIED literal output/result: Vite build succeeded, exit 0
 MODIFIED backend command: $env:PYTHONPATH='backend'; python -m unittest discover -s backend -p 'test_*.py'
 MODIFIED literal output/result: 217 tests passed, exit 0
 
+BROWSER acceptance command: Playwright Chromium against http://127.0.0.1:5173 with intercepted order fixtures; click 订单查询, search fixture order, click 获取卡密, then click 安全密码 after toggling need_query_password.
+BROWSER literal output/result: 获取卡密 button count 1, href null; detail dialog contained 订单详情 and CARD-ACCEPTANCE-1 with no password input; secure flow contained password input and title 安全密码验证; exit 0.
+
 Restored behavior/status: rollback-test/OrderQueryView.jsx matches BASELINE_FILE after ROLLBACK.sh; MODIFIED_FILE remains the modified copy.
