@@ -1,0 +1,41 @@
+Order query delivery detail verification
+
+Changed branch/field:
+- Branch: codex/order-result-detail-modal
+- Order result action field: the paid, no-password action now opens the in-app Order detail dialog.
+- Password field: password-protected orders still open the Secure order password dialog.
+- Official link field: the external order-detail icon remains a separate official-link action.
+
+Artifacts:
+- MODIFIED_FILE: artifacts/order-result-detail-modal/MODIFIED_FILE
+- DIFF_FILE: artifacts/order-result-detail-modal/DIFF_FILE
+- VERIFICATION.txt: artifacts/order-result-detail-modal/VERIFICATION.txt
+- ROLLBACK.sh: artifacts/order-result-detail-modal/ROLLBACK.sh
+
+BASELINE command: git hash-object artifacts/order-result-detail-modal/BASELINE_FILE
+BASELINE input: baseline OrderQueryView.jsx from commit 15687639cd49c1d893d364d1ba35e72299284cc7
+BASELINE literal output/result: d6be50133eba66b132519bbb549bde4a03b9ee63, exit 0
+
+MODIFIED command: git hash-object artifacts/order-result-detail-modal/MODIFIED_FILE
+MODIFIED input: modified OrderQueryView.jsx after the dialog change
+MODIFIED literal output/result: 82cd3cb0bcd8bddf2e58a609094c466bab7a18fc, exit 0
+
+ROLLBACK command: E:\soft\Git\bin\bash.exe artifacts/order-result-detail-modal/ROLLBACK.sh artifacts/order-result-detail-modal/rollback-test/OrderQueryView.jsx
+ROLLBACK input: rollback-test/OrderQueryView.jsx initially contained MODIFIED_FILE
+ROLLBACK literal output/result: restored artifacts/order-result-detail-modal/rollback-test/OrderQueryView.jsx; hash d6be50133eba66b132519bbb549bde4a03b9ee63; exit 0
+
+BASELINE test command: npm test
+BASELINE literal output/result: 53 passed, exit 0
+BASELINE build command: npm run build
+BASELINE literal output/result: Vite build succeeded, exit 0
+BASELINE backend command: $env:PYTHONPATH='backend'; python -m unittest discover -s backend -p 'test_*.py'
+BASELINE literal output/result: 217 tests passed, exit 0
+
+MODIFIED test command: npm test
+MODIFIED literal output/result: 53 passed, exit 0
+MODIFIED build command: npm run build
+MODIFIED literal output/result: Vite build succeeded, exit 0
+MODIFIED backend command: $env:PYTHONPATH='backend'; python -m unittest discover -s backend -p 'test_*.py'
+MODIFIED literal output/result: 217 tests passed, exit 0
+
+Restored behavior/status: rollback-test/OrderQueryView.jsx matches BASELINE_FILE after ROLLBACK.sh; MODIFIED_FILE remains the modified copy.
