@@ -463,6 +463,12 @@ body.order-history-open { overflow: hidden; }
 
 .order-detail-modal { width: min(840px, 100%); max-height: calc(100dvh - 48px); padding: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
 .order-detail-modal > .order-dialog-head { min-height: 70px; padding: 16px 20px; border-bottom: 1px solid var(--ui-border); }
+.order-detail-loading-state { min-height: 300px; padding: 36px 28px 28px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--ui-text-muted); text-align: center; }
+.order-detail-loading-icon { width: 48px; height: 48px; margin-bottom: 4px; display: grid; place-items: center; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); border-radius: 50%; }
+.order-detail-loading-state strong { color: var(--ui-text); font-size: 14px; }
+.order-detail-loading-state > span { max-width: 430px; color: var(--ui-text-muted); font-size: 10px; line-height: 1.55; overflow-wrap: anywhere; }
+.order-detail-loading-foot { width: 100%; margin-top: 18px; padding-top: 14px; }
+.order-detail-button { border-color: color-mix(in srgb, var(--ui-accent, #0f6f54) 32%, var(--ui-border)); }
 .order-detail-scroll { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .order-detail-identity { min-width: 0; min-height: 76px; padding: 14px 20px; display: grid; grid-template-columns: 46px minmax(0, 1fr) auto; gap: 12px; align-items: center; background: var(--ui-surface-muted); border-bottom: 1px solid var(--ui-border); }
 .order-detail-identity .order-product-image { width: 46px; height: 46px; }
@@ -580,6 +586,7 @@ body.order-history-open { overflow: hidden; }
   .order-detail-backdrop { padding: 10px; }
   .order-password-modal { max-height: calc(100dvh - 20px); padding: 18px; overflow-y: auto; }
   .order-detail-modal { max-height: calc(100dvh - 20px); }
+  .order-detail-loading-state { min-height: 240px; padding: 28px 18px 20px; }
   .order-detail-modal > .order-dialog-head { min-height: 62px; padding: 13px 14px; }
   .order-detail-identity { min-height: 70px; padding: 12px 14px; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 9px; }
   .order-detail-identity .order-product-image { width: 42px; height: 42px; }

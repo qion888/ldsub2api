@@ -192,6 +192,11 @@ export function canOpenProtectedOrderDetail(order = {}) {
   return Number(order.status) === 1 && passwordRequired && Boolean(String(order.trade_no || '').trim());
 }
 
+export function canOpenOrderDetail(order = {}) {
+  const passwordRequired = order.need_query_password === true || Number(order.need_query_password) === 1;
+  return Number(order.status) === 1 && !passwordRequired && Boolean(String(order.trade_no || '').trim());
+}
+
 export function formatOrderMoney(value) {
   if (value === null || value === undefined || value === '') return '--';
   const number = Number(value);

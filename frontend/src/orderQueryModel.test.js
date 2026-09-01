@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  canOpenOrderDetail,
   canOpenProtectedOrderDetail,
   COMPLAINT_MAX_IMAGE_BYTES,
   COMPLAINT_REASON_OPTIONS,
@@ -57,6 +58,9 @@ test('normalizes upstream order fields and status labels', () => {
   assert.equal(canOpenProtectedOrderDetail(order), true);
   assert.equal(canOpenProtectedOrderDetail({...order, status: 0}), false);
   assert.equal(canOpenProtectedOrderDetail({...order, need_query_password: false}), false);
+  assert.equal(canOpenOrderDetail({...order, need_query_password: false}), true);
+  assert.equal(canOpenOrderDetail(order), false);
+  assert.equal(canOpenOrderDetail({...order, status: 0, need_query_password: false}), false);
 });
 
 test('distinguishes complaint actions and statuses conservatively', () => {
