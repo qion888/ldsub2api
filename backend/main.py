@@ -1570,13 +1570,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         ):
             return
 
-        if path in (order_query_routes.ORDER_WAF_START_PATH, order_query_routes.ORDER_WAF_COMPLETE_PATH):
+        if path in (
+            order_query_routes.ORDER_WAF_START_PATH,
+            order_query_routes.ORDER_WAF_COMPLETE_PATH,
+            order_query_routes.ORDER_WAF_STATUS_PATH,
+        ):
             try:
-                result = (
-                    ORDER_QUERY_BROWSER_VERIFICATION.start(data)
-                    if path == order_query_routes.ORDER_WAF_START_PATH
-                    else ORDER_QUERY_BROWSER_VERIFICATION.complete(data)
-                )
+                if path == order_query_routes.ORDER_WAF_START_PATH:
+                    result = ORDER_QUERY_BROWSER_VERIFICATION.start(data)
+                elif path == order_query_routes.ORDER_WAF_COMPLETE_PATH:
+                    result = ORDER_QUERY_BROWSER_VERIFICATION.complete(data)
+                else:
+                    result = ORDER_QUERY_BROWSER_VERIFICATION.status(data)
                 return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
             except order_query_routes.OrderQueryError as exc:
                 return self._send_json({"detail": exc.detail, "code": exc.code, "retryable": exc.retryable}, exc.status)

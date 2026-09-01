@@ -137,9 +137,9 @@ function VerificationPanel({busy, verification, captcha, captchaCode, onCaptchaC
       <small>{expiresIn ? `当前验证会话约 ${Math.max(1, Math.ceil(Number(expiresIn) / 60))} 分钟内有效` : '自动识别未通过，请确认图片内容'}</small>
     </form>}
     {wafRequired && <div className="order-waf-panel" role="status">
-      <div className="order-waf-copy"><span className="order-waf-icon"><ShieldCheck size={17}/></span><div><strong>需要完成阿里云 WAF 验证</strong><small>{wafPending ? 'Edge 浏览器已打开，请完成滑块后返回此处继续' : (waf?.detail || '订单接口暂时拦截了当前请求')}</small></div></div>
+      <div className="order-waf-copy"><span className="order-waf-icon"><ShieldCheck size={17}/></span><div><strong>需要完成阿里云 WAF 验证</strong><small>{wafPending ? '独立浏览器已打开，完成滑块后系统会自动检测并同步订单' : (waf?.detail || '订单接口暂时拦截了当前请求')}</small></div></div>
       <div className="order-waf-actions">
-        {!wafPending ? <button className="button secondary" type="button" onClick={onStartWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ArrowUpRight size={14}/>{wafBusy === 'start' ? '正在打开浏览器' : '打开浏览器验证'}</button> : <button className="button primary" type="button" onClick={onCompleteWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ShieldCheck size={14}/>{wafBusy === 'complete' ? '正在同步订单' : '验证完成并继续查询'}</button>}
+        {!wafPending ? <button className="button secondary" type="button" onClick={onStartWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ArrowUpRight size={14}/>{wafBusy === 'start' ? '正在打开浏览器' : '打开浏览器验证'}</button> : <button className="button primary" type="button" onClick={onCompleteWaf} disabled={Boolean(wafBusy) || Boolean(busy)}><ShieldCheck size={14}/>{wafBusy === 'complete' ? '正在同步订单' : '立即检查验证'}</button>}
       </div>
     </div>}
   </section>;
@@ -641,6 +641,8 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const historyGeneration = useRef(0);
   const runSearchRef = useRef(null);
   const wafRequestRef = useRef(null);
+  const wafAutoStartRef = useRef('');
+  const wafRecoveryRef = useRef('');
   const imagePreviewDialog = useRef(null);
   const imagePreviewTrigger = useRef(null);
   complaintUploadsRef.current = complaintUploads;
@@ -1067,6 +1069,8 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
     setHasQueried(true);
     setQueriedAt(new Date());
     setWafVerification(null);
+    wafAutoStartRef.current = '';
+    wafRecoveryRef.current = '';
     if (!quiet) notify({type: 'success', title: '订单查询完成', message: `已获取 ${normalized.pagination.total} 笔订单`, duration: 4200});
     return normalized;
   };
@@ -1197,7 +1201,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
         }
         setSubmittedKeywords(normalizedKeywords);
         setWafVerification({status: 'required', detail: requestError.message || '订单接口触发阿里云 WAF 验证'});
-        notify({type: 'warning', title: '需要完成浏览器验证', message: '订单接口返回 403，打开 Edge 完成阿里云 WAF 滑块后继续', duration: 7000});
+        notify({type: 'warning', title: '需要完成浏览器验证', message: '订单接口被阿里云 WAF 拦截，正在启动独立浏览器验证', duration: 7000});
         return false;
       }
       setError(requestError.message || '订单查询失败');
@@ -1226,8 +1230,10 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
         body: JSON.stringify({...requestSpec, session_id: sessionId, keywords: submittedKeywords}),
       });
       if (response.status === 'awaiting_verification') {
+        if (response.session_id) setSessionId(String(response.session_id));
+        if (Number.isFinite(Number(response.expires_in))) setExpiresIn(Number(response.expires_in));
         setWafVerification({status: 'awaiting_verification', detail: response.detail || '请在 Edge 窗口完成滑块验证'});
-        notify({type: 'info', title: 'Edge 验证已打开', message: '完成滑块后点击“验证完成并继续查询”', duration: 6000});
+        notify({type: 'info', title: '独立浏览器验证已打开', message: '完成滑块后页面会自动继续查询', duration: 6000});
         return false;
       }
       commitSearchResponse(response, {
@@ -1239,10 +1245,24 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       return true;
     } catch (requestError) {
       if (requestError.status === 410) {
+        const recoveryKey = `${requestSpec.session_id || sessionId}:${requestSpec.keywords}:${requestSpec.status}:${requestSpec.page}`;
+        const canRecover = wafRecoveryRef.current !== recoveryKey;
+        wafRecoveryRef.current = recoveryKey;
         setSessionId('');
         setVerification(null);
         setExpiresIn(0);
         setWafVerification(null);
+        if (canRecover) {
+          notify({type: 'info', title: '查询会话已刷新', message: '验证等待时间较长，正在创建新的查询会话', duration: 5000});
+          window.setTimeout(() => runSearchRef.current?.({
+            keywordValue: requestSpec.keywords,
+            statusValue: requestSpec.status,
+            pageValue: requestSpec.page,
+            pageSizeValue: requestSpec.page_size,
+            reuseSession: false,
+          }), 0);
+          return false;
+        }
       } else {
         setWafVerification({status: 'required', detail: requestError.message || '浏览器验证未完成，请重试'});
       }
@@ -1252,6 +1272,77 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       setWafBusy('');
     }
   };
+
+  // Start the isolated browser as soon as the upstream WAF response arrives.
+  useEffect(() => {
+    if (wafVerification?.status !== 'required' || busy || wafBusy || !sessionId || !submittedKeywords) return;
+    const requestSpec = wafRequestRef.current;
+    if (!requestSpec) return;
+    const key = `${sessionId}:${requestSpec.keywords}:${requestSpec.status}:${requestSpec.page}`;
+    if (wafAutoStartRef.current === key) return;
+    wafAutoStartRef.current = key;
+    runOrderWafVerification('start');
+  }, [busy, sessionId, submittedKeywords, wafBusy, wafVerification]);
+
+  // Poll only the local browser page. The protected order API is requested
+  // once, after the browser reports that the challenge document is gone.
+  useEffect(() => {
+    if (wafVerification?.status !== 'awaiting_verification') return undefined;
+    const requestSpec = wafRequestRef.current;
+    if (!requestSpec || !sessionId || !submittedKeywords) return undefined;
+    let cancelled = false;
+    let attempts = 0;
+    let timer = null;
+    const poll = async () => {
+      if (cancelled) return;
+      attempts += 1;
+      try {
+        const response = await request('/order-query/waf-verification/status', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({...requestSpec, session_id: sessionId, keywords: submittedKeywords}),
+        });
+        if (cancelled) return;
+        if (response.ready) {
+          await runOrderWafVerification('complete');
+          return;
+        }
+        if (attempts >= 90) {
+          setWafVerification({status: 'required', detail: '浏览器验证等待超时，请完成滑块后重试'});
+          notify('浏览器验证等待超时，请重试', 'error');
+          return;
+        }
+      } catch (requestError) {
+        if (cancelled) return;
+        if (requestError.status === 410) {
+          const recoveryKey = `${sessionId}:${requestSpec.keywords}:${requestSpec.status}:${requestSpec.page}`;
+          if (wafRecoveryRef.current !== recoveryKey) {
+            wafRecoveryRef.current = recoveryKey;
+            setSessionId('');
+            setWafVerification(null);
+            notify({type: 'info', title: '查询会话已刷新', message: '正在重新创建查询会话', duration: 5000});
+            window.setTimeout(() => runSearchRef.current?.({
+              keywordValue: requestSpec.keywords,
+              statusValue: requestSpec.status,
+              pageValue: requestSpec.page,
+              pageSizeValue: requestSpec.page_size,
+              reuseSession: false,
+            }), 0);
+          }
+          return;
+        }
+        setWafVerification({status: 'required', detail: requestError.message || '浏览器验证窗口已关闭，请重试'});
+        notify(requestError.message || '浏览器验证窗口已关闭，请重试', 'error');
+        return;
+      }
+      timer = window.setTimeout(poll, 3500);
+    };
+    timer = window.setTimeout(poll, 1000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [sessionId, submittedKeywords, wafVerification]);
 
   const submitSearch = event => {
     event.preventDefault();
