@@ -642,7 +642,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
   const runSearchRef = useRef(null);
   const wafRequestRef = useRef(null);
   const wafAutoStartRef = useRef('');
-  const wafRecoveryRef = useRef('');
+  const wafRecoveryAttemptsRef = useRef(0);
   const imagePreviewDialog = useRef(null);
   const imagePreviewTrigger = useRef(null);
   complaintUploadsRef.current = complaintUploads;
@@ -1070,7 +1070,7 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
     setQueriedAt(new Date());
     setWafVerification(null);
     wafAutoStartRef.current = '';
-    wafRecoveryRef.current = '';
+    wafRecoveryAttemptsRef.current = 0;
     if (!quiet) notify({type: 'success', title: '订单查询完成', message: `已获取 ${normalized.pagination.total} 笔订单`, duration: 4200});
     return normalized;
   };
@@ -1102,11 +1102,16 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
     refreshCaptcha = false,
     reuseSession = true,
     quiet = false,
+    autoRecovery = false,
   } = {}) => {
     const normalizedKeywords = keywordValue.trim();
     if (!normalizedKeywords) {
       notify('请输入预留联系方式或订单号', 'error');
       return false;
+    }
+    if (!autoRecovery) {
+      wafRecoveryAttemptsRef.current = 0;
+      wafAutoStartRef.current = '';
     }
 
     const version = requestVersion.current + 1;
@@ -1245,14 +1250,12 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       return true;
     } catch (requestError) {
       if (requestError.status === 410) {
-        const recoveryKey = `${requestSpec.session_id || sessionId}:${requestSpec.keywords}:${requestSpec.status}:${requestSpec.page}`;
-        const canRecover = wafRecoveryRef.current !== recoveryKey;
-        wafRecoveryRef.current = recoveryKey;
-        setSessionId('');
-        setVerification(null);
-        setExpiresIn(0);
-        setWafVerification(null);
-        if (canRecover) {
+        if (wafRecoveryAttemptsRef.current < 1) {
+          wafRecoveryAttemptsRef.current += 1;
+          setSessionId('');
+          setVerification(null);
+          setExpiresIn(0);
+          setWafVerification(null);
           notify({type: 'info', title: '查询会话已刷新', message: '验证等待时间较长，正在创建新的查询会话', duration: 5000});
           window.setTimeout(() => runSearchRef.current?.({
             keywordValue: requestSpec.keywords,
@@ -1260,9 +1263,13 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
             pageValue: requestSpec.page,
             pageSizeValue: requestSpec.page_size,
             reuseSession: false,
+            autoRecovery: true,
           }), 0);
           return false;
         }
+        setWafVerification({status: 'required', detail: '订单查询会话已过期，请重新点击查询'});
+        notify('订单查询会话已过期，请重新点击查询', 'error');
+        return false;
       } else {
         setWafVerification({status: 'required', detail: requestError.message || '浏览器验证未完成，请重试'});
       }
@@ -1315,10 +1322,11 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
       } catch (requestError) {
         if (cancelled) return;
         if (requestError.status === 410) {
-          const recoveryKey = `${sessionId}:${requestSpec.keywords}:${requestSpec.status}:${requestSpec.page}`;
-          if (wafRecoveryRef.current !== recoveryKey) {
-            wafRecoveryRef.current = recoveryKey;
+          if (wafRecoveryAttemptsRef.current < 1) {
+            wafRecoveryAttemptsRef.current += 1;
             setSessionId('');
+            setVerification(null);
+            setExpiresIn(0);
             setWafVerification(null);
             notify({type: 'info', title: '查询会话已刷新', message: '正在重新创建查询会话', duration: 5000});
             window.setTimeout(() => runSearchRef.current?.({
@@ -1327,7 +1335,11 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
               pageValue: requestSpec.page,
               pageSizeValue: requestSpec.page_size,
               reuseSession: false,
+              autoRecovery: true,
             }), 0);
+          } else {
+            setWafVerification({status: 'required', detail: '订单查询会话已过期，请重新点击查询'});
+            notify('订单查询会话已过期，请重新点击查询', 'error');
           }
           return;
         }
