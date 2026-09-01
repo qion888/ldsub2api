@@ -1,5 +1,5 @@
 TASK: Batch storefront WAF verification and cross-platform browser selection
-BRANCH: codex/start-bootstrap-dependencies (feature commit will be cherry-picked to main)
+BRANCH: main (implemented on codex/start-bootstrap-dependencies, then cherry-picked as 20c1ad3, 18fa391, and 9a3c884)
 CHANGED_FIELDS: backend/monitor_core/browser_verification.py (shared browser queue, browser candidates, batch state); backend/main.py (batch routes and WAF ids); frontend/src/main.jsx (one-click shop sync and batch verification controls); frontend/src/style.css (batch verification banner); tests
 
 ARTIFACTS
