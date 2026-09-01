@@ -53,6 +53,7 @@ import {
 import './style.css';
 import {buildSub2ApiAutomationSaveNotice, buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
 import {DEFAULT_SUB2API_SECTION, SUB2API_SECTIONS, normalizeSub2ApiSection} from './sub2apiNavigation.js';
+import {readSub2ApiCardAssignment, SUB2API_CARD_ASSIGNMENT_KEY} from './sub2apiAssignment.js';
 import {
   CARD_RECLAIM_POLL_TIMEOUT_MS,
   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
@@ -1006,6 +1007,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [sub2apiProxyChoice, setSub2apiProxyChoice] = useState('json');
   const [sub2apiGroupIds, setSub2apiGroupIds] = useState([]);
   const [sub2apiCodexFingerprintMode, setSub2apiCodexFingerprintMode] = useState('off');
+  const [sub2apiCardAssignment, setSub2apiCardAssignment] = useState(readSub2ApiCardAssignment);
   const [sub2apiReclaimBusy, setSub2apiReclaimBusy] = useState(false);
   const [sub2apiReclaimResult, setSub2apiReclaimResult] = useState(null);
   const [sub2apiRetryBusy, setSub2apiRetryBusy] = useState(false);
@@ -1071,6 +1073,14 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('ldxp-theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SUB2API_CARD_ASSIGNMENT_KEY, JSON.stringify(sub2apiCardAssignment));
+    } catch {
+      // Browser storage can be disabled; the in-memory settings still apply.
+    }
+  }, [sub2apiCardAssignment]);
 
   useEffect(() => {
     let parsed;
@@ -2359,11 +2369,18 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     try {
       const options = await request('/sub2api/options');
       setSub2apiOptions({...options, loaded: true});
-      setSub2apiGroupIds(current => current.filter(id => options.groups.some(group => group.id === id)));
-      setSub2apiProxyChoice(current => {
+      const validGroup = groupId => options.groups.some(group => group.id === groupId);
+      const normalizeProxyChoice = current => {
         if (current === 'json' || current === 'none') return current;
         return options.proxies.some(proxy => `proxy:${proxy.id}` === current) ? current : 'none';
-      });
+      };
+      setSub2apiGroupIds(current => current.filter(validGroup));
+      setSub2apiProxyChoice(normalizeProxyChoice);
+      setSub2apiCardAssignment(current => ({
+        ...current,
+        proxy_choice: normalizeProxyChoice(current.proxy_choice),
+        group_ids: current.group_ids.filter(validGroup),
+      }));
       if (!quiet) notify(`已加载 ${options.proxy_count} 个代理、${options.group_count} 个分组`);
       return options;
     } catch (error) {
@@ -2658,6 +2675,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
           const imported = await importSub2Api(staged.payload, {
             reclaimOrderNos: staged.orderNos,
             throwOnError: true,
+            assignment: 'automation',
           });
           const verification = imported?.import_verification;
           completed = {
@@ -2770,24 +2788,28 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     }
   };
 
-  const buildSub2ApiImportBody = (payloadOverride, reclaimOrderNos = sub2apiReclaimOrderNos) => {
+  const buildSub2ApiImportBody = (payloadOverride, reclaimOrderNos = sub2apiReclaimOrderNos, assignment = 'card') => {
     const payload = payloadOverride || sub2apiPayload || reclaimPayload;
     if (!payload) return null;
-    const assignExisting = sub2apiProxyChoice !== 'json' || sub2apiGroupIds.length > 0;
-    const proxyId = sub2apiProxyChoice.startsWith('proxy:') ? Number(sub2apiProxyChoice.slice(6)) : null;
+    const cardAssignment = sub2apiCardAssignment;
+    const proxyChoice = assignment === 'automation' ? sub2apiProxyChoice : cardAssignment.proxy_choice;
+    const groupIds = assignment === 'automation' ? sub2apiGroupIds : cardAssignment.group_ids;
+    const fingerprintMode = assignment === 'automation' ? sub2apiCodexFingerprintMode : cardAssignment.codex_fingerprint_mode;
+    const assignExisting = proxyChoice !== 'json' || groupIds.length > 0;
+    const proxyId = proxyChoice.startsWith('proxy:') ? Number(proxyChoice.slice(6)) : null;
     return {
       data: payload,
       assign_existing: assignExisting,
       reclaim_order_nos: reclaimOrderNos,
       proxy_id: proxyId,
-      group_ids: sub2apiGroupIds,
-      codex_fingerprint_mode: sub2apiCodexFingerprintMode,
+      group_ids: groupIds,
+      codex_fingerprint_mode: fingerprintMode,
       endpoint: '/api/v1/admin/accounts/data',
     };
   };
 
-  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos, throwOnError = false, bodyOverride = null} = {}) => {
-    const importBody = bodyOverride || buildSub2ApiImportBody(payloadOverride, reclaimOrderNos);
+  const importSub2Api = async (payloadOverride, {reclaimOrderNos = sub2apiReclaimOrderNos, throwOnError = false, bodyOverride = null, assignment = 'card'} = {}) => {
+    const importBody = bodyOverride || buildSub2ApiImportBody(payloadOverride, reclaimOrderNos, assignment);
     if (!importBody) {
       notify('请先选择账号 JSON 文件或下载找回结果', 'error');
       return null;
@@ -3112,6 +3134,23 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     if (sub2apiProxyChoice === 'json') setSub2apiProxyChoice('none');
   };
 
+  const changeSub2ApiCardProxy = value => {
+    setSub2apiCardAssignment(current => ({...current, proxy_choice: value, group_ids: value === 'json' ? [] : current.group_ids}));
+  };
+
+  const changeSub2ApiCardFingerprint = mode => {
+    if (!['off', 'device', 'session', 'full'].includes(mode)) return;
+    setSub2apiCardAssignment(current => ({...current, codex_fingerprint_mode: mode}));
+  };
+
+  const toggleSub2ApiCardGroup = groupId => {
+    setSub2apiCardAssignment(current => ({
+      ...current,
+      proxy_choice: current.proxy_choice === 'json' ? 'none' : current.proxy_choice,
+      group_ids: current.group_ids.includes(groupId) ? current.group_ids.filter(id => id !== groupId) : [...current.group_ids, groupId],
+    }));
+  };
+
   const selectedPriceDelta = useMemo(() => {
     const prices = historyTrend.filter(point => point.status === 'success' && point.price !== '' && Number.isFinite(Number(point.price))).map(point => Number(point.price));
     if (prices.length < 2) return null;
@@ -3340,8 +3379,10 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
             cardHistoryBusy={sub2apiCardHistoryBusy} cardHistoryActions={sub2apiCardHistoryActions} onRefreshCardHistory={() => loadSub2ApiCardHistory()}
             onRetryCardHistory={retrySub2ApiCardHistory} onDeleteCardHistory={deleteSub2ApiCardHistory} onCopyCardCode={copySub2ApiCardCode}
             fileName={sub2apiFileName} payload={sub2apiPayload} result={sub2apiResult} busy={sub2apiBusy}
-            optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
-            codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
+             optionsBusy={sub2apiOptionsBusy} options={sub2apiOptions} proxyChoice={sub2apiProxyChoice} groupIds={sub2apiGroupIds}
+             codexFingerprintMode={sub2apiCodexFingerprintMode} onCodexFingerprintMode={setSub2apiCodexFingerprintMode}
+             cardProxyChoice={sub2apiCardAssignment.proxy_choice} cardGroupIds={sub2apiCardAssignment.group_ids} cardCodexFingerprintMode={sub2apiCardAssignment.codex_fingerprint_mode}
+             onCardProxyChoice={changeSub2ApiCardProxy} onCardCodexFingerprintMode={changeSub2ApiCardFingerprint} onCardToggleGroup={toggleSub2ApiCardGroup}
              reclaimBusy={sub2apiReclaimBusy} reclaimResult={sub2apiReclaimResult} onReclaim401={reclaimSub2Api401} onRetry401={retrySub2Api401} retryBusy={sub2apiRetryBusy}
              automation={sub2apiAutomation} automationState={sub2apiAutomationState} automationRetryResult={sub2apiAutomationRetryResult} automationBusy={sub2apiAutomationBusy}
              onAutomationChange={setSub2apiAutomation} onSaveAutomation={saveSub2ApiAutomation} onRunAutomation={runSub2ApiAutomation} onRetryAutomation={retrySub2ApiAutomation}

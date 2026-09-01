@@ -2067,6 +2067,28 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .card-import-inputs textarea { width: 100%; min-height: 104px; max-height: 210px; padding: 10px 11px; resize: vertical; color: var(--ui-text); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 3px; font: inherit; font-size: 11px; line-height: 1.55; }
 .card-import-inputs textarea:focus { outline: 0; border-color: var(--ui-text-muted); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-text) 8%, transparent); }
 .card-import-control { display: flex; flex-direction: column; }
+.card-import-assignment { padding: 14px 16px 15px; border-top: 1px solid var(--ui-border); border-bottom: 1px solid var(--ui-border); background: var(--ui-surface-muted); }
+.card-import-assignment-head { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.card-import-assignment-head > div { min-width: 0; }
+.card-import-assignment-head h3 { margin: 3px 0 0; color: var(--ui-text); font-size: 13px; }
+.card-import-assignment-head p { margin: 4px 0 0; color: var(--ui-text-muted); font-size: 9px; }
+.card-import-assignment-head .icon-button { width: 30px; height: 30px; flex: 0 0 auto; }
+.card-import-assignment-grid { margin-top: 11px; display: grid; grid-template-columns: minmax(220px, .85fr) minmax(220px, .85fr) minmax(300px, 1.3fr); gap: 13px; }
+.card-import-assignment-grid > label, .card-import-assignment-grid > .fingerprint-field { min-width: 0; margin-top: 0; }
+.card-import-assignment-grid > label > span, .card-import-assignment-grid .fingerprint-field > span { display: block; margin-bottom: 5px; color: var(--ui-text-muted); font-size: 9px; font-weight: 600; }
+.card-import-assignment-grid select { width: 100%; height: 34px; }
+.card-assignment-meta { display: block; margin-top: 5px; overflow: hidden; color: var(--ui-text-muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.card-group-picker { margin-top: 0; }
+.card-group-picker > .group-picker-head { max-height: none; min-height: 25px; overflow: visible; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 0; }
+.card-group-picker > div:last-child { max-height: 112px; overflow-y: auto; border-block: 1px solid var(--ui-border-soft); }
+.card-group-picker label { min-height: 36px; padding: 5px 3px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--ui-border-soft); cursor: pointer; }
+.card-group-picker label:last-child { border-bottom: 0; }
+.card-group-picker label.inactive { opacity: .58; }
+.card-group-picker input { width: 15px; height: 15px; margin: 0; flex: 0 0 auto; accent-color: var(--ui-black); }
+.card-group-picker label > span, .card-group-picker label strong, .card-group-picker label small { display: block; min-width: 0; }
+.card-group-picker label strong, .card-group-picker label small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-group-picker label strong { color: var(--ui-text); font-size: 9px; }
+.card-group-picker label small { margin-top: 2px; color: var(--ui-text-muted); font-size: 8px; }
 .card-mode-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .card-mode-head > span { margin: 0; white-space: nowrap; }
 .card-mode-segment { width: min(100%, 310px); height: 35px; padding: 2px; display: grid; grid-template-columns: 1fr 1fr; background: var(--ui-surface-muted); border: 1px solid var(--ui-border); }
@@ -2360,6 +2382,15 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .card-service-field { grid-template-columns: minmax(0, 1fr) 38px; }
 .card-service-field .icon-button { width: 38px; height: 38px; }
 .card-import-inputs textarea { min-height: 112px; padding: 10px 11px; font-size: 13px; }
+.card-import-assignment { padding: 14px 16px 15px; }
+.card-import-assignment-head h3 { font-size: 14px; }
+.card-import-assignment-head p { font-size: 10px; }
+.card-import-assignment-grid > label > span, .card-import-assignment-grid .fingerprint-field > span { font-size: 11px; }
+.card-import-assignment-grid select { height: 38px; }
+.card-assignment-meta { font-size: 9px; }
+.card-group-picker label { min-height: 42px; padding: 6px 4px; }
+.card-group-picker label strong { font-size: 11px; }
+.card-group-picker label small { font-size: 10px; }
 .card-mode-segment { height: 38px; }
 .card-mode-segment button { font-size: 12px; }
 .card-flow-steps { margin-top: 12px; }
@@ -2665,6 +2696,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 @media (max-width: 1200px) {
   .sub2api-primary-grid { grid-template-columns: 1fr; }
   .card-import-body { grid-template-columns: minmax(300px, .8fr) minmax(420px, 1.2fr); }
+  .card-import-assignment-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .card-group-picker { grid-column: 1 / -1; }
   .automation-workspace { grid-template-columns: 1fr 1.25fr; }
   .automation-workspace .assignment-card { border-right: 0; }
   .automation-workspace .runtime-card { grid-column: 1 / -1; border-top: 1px solid var(--ui-border); }
@@ -2677,6 +2710,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .sub2api-service-strip { grid-template-columns: minmax(220px, 1fr) repeat(3, 70px) 38px; }
   .card-import-body { grid-template-columns: 1fr; }
   .card-import-inputs { border-right: 0; border-bottom: 1px solid var(--ui-border); }
+  .card-import-assignment-grid { grid-template-columns: 1fr; }
+  .card-group-picker { grid-column: auto; }
   .card-history-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .card-history-summary > div:nth-child(2) { border-right: 0; }
   .card-history-summary > div:nth-child(-n+2) { border-bottom: 1px solid var(--ui-border-soft); }

@@ -440,7 +440,7 @@ function CardImportHistoryPanel({data, filter, onFilter, page, pageSize, onPage,
   );
 }
 
-function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyPage, historyPageSize, onHistoryPage, onHistoryPageSize, historyBusy, historyActions, onRefreshHistory, onRetryHistory, onDeleteHistory, onCopyCode}) {
+function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, codes, onCodes, mode, onMode, busy, importing, flow, payload, canAutoPush, options = {proxies: [], groups: [], loaded: false}, optionsBusy, onLoadOptions, proxyChoice = 'json', groupIds = [], codexFingerprintMode = 'off', onProxyChoice, onCodexFingerprintMode, onToggleGroup, onRun, onPush, historyData, historyFilter, onHistoryFilter, historyPage, historyPageSize, onHistoryPage, onHistoryPageSize, historyBusy, historyActions, onRefreshHistory, onRetryHistory, onDeleteHistory, onCopyCode}) {
   const stageLabel = {
     idle: '等待输入',
     verify: '正在核验',
@@ -459,6 +459,18 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
   const pushConfirmed = Boolean(flow.pushResult?.import_verification?.confirmed || flow.pushed);
   const isActive = busy || importing;
   const configuredRedeemUrl = /^https?:\/\//i.test(redeemConfig.base_url || '') ? redeemConfig.base_url : 'https://30d.team';
+  const fingerprintModes = [
+    {value: 'off', label: '透传'},
+    {value: 'device', label: '设备'},
+    {value: 'session', label: '设备 + 会话'},
+    {value: 'full', label: '完全'},
+  ];
+  const selectedProxy = options.proxies.find(proxy => `proxy:${proxy.id}` === proxyChoice);
+  const activeGroups = options.groups.filter(group => !group.status || group.status === 'active');
+  const selectActiveGroups = () => activeGroups.forEach(group => {
+    if (!groupIds.includes(group.id)) onToggleGroup?.(group.id);
+  });
+  const clearGroups = () => groupIds.forEach(groupId => onToggleGroup?.(groupId));
 
   return (
     <section className="card-import-console" data-testid="sub2api-card-import">
@@ -497,6 +509,14 @@ function Sub2ApiCardImportPanel({redeemConfig, setRedeemConfig, onSaveRedeem, co
           </div>
         </div>
       </div>
+      <section className="card-import-assignment">
+        <div className="card-import-assignment-head"><div><span className="detail-kicker">CARD IMPORT POLICY</span><h3>卡密导入分配策略</h3><p>仅影响当前卡密核验与推送，不会修改定时找回策略</p></div><button className="icon-button" type="button" title="刷新代理和分组" aria-label="刷新卡密导入代理和分组" onClick={onLoadOptions} disabled={optionsBusy}><RefreshCw size={15} className={optionsBusy ? 'spin' : ''}/></button></div>
+        <div className="card-import-assignment-grid">
+          <label><span>固定代理</span><select value={proxyChoice} onChange={event => onProxyChoice?.(event.target.value)}><option value="json">JSON 自带代理</option><option value="none">不绑定代理</option>{options.proxies.map(proxy => <option value={`proxy:${proxy.id}`} key={proxy.id}>{proxy.name} · {proxy.status || 'unknown'}{proxy.latency_ms == null ? '' : ` · ${proxy.latency_ms}ms`}</option>)}</select>{selectedProxy && <small className="card-assignment-meta">{selectedProxy.protocol}://{selectedProxy.host}:{selectedProxy.port} · {selectedProxy.account_count} 个账号</small>}</label>
+          <div className="fingerprint-field"><span>Codex 指纹收敛</span><div className="fingerprint-segment" data-testid="card-codex-fingerprint-mode">{fingerprintModes.map(item => <button type="button" className={codexFingerprintMode === item.value ? 'active' : ''} key={item.value} onClick={() => onCodexFingerprintMode?.(item.value)}>{item.label}</button>)}</div></div>
+          <div className="group-picker card-group-picker"><div className="group-picker-head"><span>导入分组 <strong>{groupIds.length}</strong></span><div><button type="button" onClick={selectActiveGroups}>全选活跃</button><button type="button" onClick={clearGroups} disabled={!groupIds.length}>清空</button></div></div>{options.groups.length ? <div>{options.groups.map(group => <label className={group.status && group.status !== 'active' ? 'inactive' : ''} key={group.id}><input type="checkbox" checked={groupIds.includes(group.id)} onChange={() => onToggleGroup?.(group.id)}/><span><strong>{group.name}</strong><small>{group.platform || '通用'} · {group.account_count} 个账号 · {group.status || 'active'}</small></span></label>)}</div> : <p>{options.loaded ? '当前没有可用分组' : '连接后加载分组'}</p>}</div>
+        </div>
+      </section>
       <CardImportHistoryPanel data={historyData} filter={historyFilter} onFilter={onHistoryFilter} page={historyPage} pageSize={historyPageSize} onPage={onHistoryPage} onPageSize={onHistoryPageSize} busy={historyBusy} actions={historyActions} onRefresh={onRefreshHistory} onRetry={onRetryHistory} onDelete={onDeleteHistory} onCopyCode={onCopyCode}/>
     </section>
   );
@@ -557,7 +577,7 @@ function Sub2ApiRecoveryResult({result, busy = false, onRetry, compact = false, 
   );
 }
 
-export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName, onManualReclaim, section = 'cards', onSectionChange, canUseReclaim = true, canUseImport = true, canConfigure = true}) {
+export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, redeemConfig, setRedeemConfig, onSaveRedeem, cardCodes, onCardCodes, cardMode, onCardMode, cardBusy, cardFlow, onRunCardImport, onPushCards, cardHistory, cardHistoryFilter, onCardHistoryFilter, cardHistoryPage, cardHistoryPageSize, onCardHistoryPage, onCardHistoryPageSize, cardHistoryBusy, cardHistoryActions, onRefreshCardHistory, onRetryCardHistory, onDeleteCardHistory, onCopyCardCode, fileName, payload, result, busy, optionsBusy, options, proxyChoice, groupIds, codexFingerprintMode, onCodexFingerprintMode, cardProxyChoice = 'json', cardGroupIds = [], cardCodexFingerprintMode = 'off', onCardProxyChoice, onCardCodexFingerprintMode, onCardToggleGroup, reclaimBusy, reclaimResult, onReclaim401, onRetry401, retryBusy, automation, automationState, automationRetryResult, automationBusy, onAutomationChange, onSaveAutomation, onRunAutomation, onRetryAutomation, onSave, onTest, onLoadOptions, onProxyChoice, onToggleGroup, onFile, onFiles, onImport, accountsData, accountFilters, onAccountFiltersChange, accountBusy, accountError, accountActions, testedAccounts, accountRefresh, onLoadAccounts, onRefreshAllAccounts, onTestAccount, onDeleteAccount, onCopyAccountName, onManualReclaim, section = 'cards', onSectionChange, canUseReclaim = true, canUseImport = true, canConfigure = true}) {
   const activeSection = normalizeSub2ApiSection(section);
   const [dragging, setDragging] = useState(false);
   const accountCount = Array.isArray(payload?.accounts) ? payload.accounts.length : 0;
@@ -569,6 +589,8 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
   const monitorReady = Boolean(config.admin_key_set);
   const importEnabled = Boolean(canUseImport);
   const reclaimEnabled = Boolean(canUseReclaim);
+  const selectedCardProxy = options.proxies.find(proxy => `proxy:${proxy.id}` === cardProxyChoice);
+  const selectedCardGroups = options.groups.filter(group => cardGroupIds.includes(group.id));
   const fingerprintModes = [
     {value: 'off', label: '透传'},
     {value: 'device', label: '设备'},
@@ -576,6 +598,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
     {value: 'full', label: '完全'},
   ];
   const fingerprintLabel = fingerprintModes.find(mode => mode.value === codexFingerprintMode)?.label || '透传';
+  const cardFingerprintLabel = fingerprintModes.find(mode => mode.value === cardCodexFingerprintMode)?.label || '透传';
   const fingerprintConfigured = fingerprintModes.some(mode => mode.value === codexFingerprintMode);
   const importReady = Boolean(monitorReady && selectedProxy && groupIds.length && fingerprintConfigured && automation.auto_import);
   const automationReady = monitorReady;
@@ -596,6 +619,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
   ];
   const importMissingCount = readiness.filter(item => !item.ready).length;
   const proxyLabel = proxyChoice === 'json' ? `JSON 自带（${jsonProxyCount}）` : selectedProxy?.name || '不绑定代理';
+  const cardProxyLabel = cardProxyChoice === 'json' ? `JSON 自带（${jsonProxyCount}）` : selectedCardProxy?.name || '不绑定代理';
   const maxPlatformCount = Math.max(1, ...platforms.map(item => Number(item.count || 0)));
   const selectActiveGroups = () => activeGroups.forEach(group => {
     if (!groupIds.includes(group.id)) onToggleGroup(group.id);
@@ -633,19 +657,22 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           <div className="section-heading"><div><span className="detail-kicker">ACCOUNT JSON</span><h2>账号导入</h2><p>sub2api-data / sub2api-bundle</p></div><FileUp size={21}/></div>
           <label className={`file-drop sub2api-file-drop ${dragging ? 'dragging' : ''}`} onDragEnter={event => { event.preventDefault(); setDragging(true); }} onDragOver={event => event.preventDefault()} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={event => { event.preventDefault(); setDragging(false); onFiles(event.dataTransfer.files); }}><input type="file" accept="application/json,.json" multiple onChange={onFile}/><FileUp size={22}/><strong>{fileName || '选择或拖入账号 JSON'}</strong><small>{accountCount ? `${accountCount} 个账号 · ${jsonProxyCount} 个代理` : '支持多文件合并'}</small></label>
           <div className="import-strategy-summary">
-            <div><Network size={15}/><span>代理<strong>{proxyLabel}</strong></span></div>
-            <div><Layers3 size={15}/><span>分组<strong>{selectedGroups.length ? `${selectedGroups.length} 个已选` : '未分组'}</strong></span></div>
-            <div><ShieldCheck size={15}/><span>指纹<strong>{fingerprintLabel}</strong></span></div>
+            <div><Network size={15}/><span>代理<strong>{cardProxyLabel}</strong></span></div>
+            <div><Layers3 size={15}/><span>分组<strong>{selectedCardGroups.length ? `${selectedCardGroups.length} 个已选` : '未分组'}</strong></span></div>
+            <div><ShieldCheck size={15}/><span>指纹<strong>{cardFingerprintLabel}</strong></span></div>
           </div>
           <button className="button primary import-button" onClick={onImport} disabled={!payload || busy}><Upload size={15}/>{busy ? '正在导入' : accountCount ? `导入 ${accountCount} 个账号` : '导入账号'}</button>
         </div>}
       </div>
 
-      {reclaimEnabled && <Sub2ApiCardImportPanel
-          redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={onSaveRedeem}
-          codes={cardCodes} onCodes={onCardCodes} mode={cardMode} onMode={onCardMode}
-          busy={cardBusy} importing={busy} flow={cardFlow} payload={payload} canAutoPush={Boolean(config.admin_key_set && importEnabled)}
-          onRun={onRunCardImport} onPush={onPushCards}
+       {reclaimEnabled && <Sub2ApiCardImportPanel
+           redeemConfig={redeemConfig} setRedeemConfig={setRedeemConfig} onSaveRedeem={onSaveRedeem}
+           codes={cardCodes} onCodes={onCardCodes} mode={cardMode} onMode={onCardMode}
+           busy={cardBusy} importing={busy} flow={cardFlow} payload={payload} canAutoPush={Boolean(config.admin_key_set && importEnabled)}
+           options={options} optionsBusy={optionsBusy} onLoadOptions={onLoadOptions}
+           proxyChoice={cardProxyChoice} groupIds={cardGroupIds} codexFingerprintMode={cardCodexFingerprintMode}
+           onProxyChoice={onCardProxyChoice} onCodexFingerprintMode={onCardCodexFingerprintMode} onToggleGroup={onCardToggleGroup}
+           onRun={onRunCardImport} onPush={onPushCards}
           historyData={cardHistory} historyFilter={cardHistoryFilter} onHistoryFilter={onCardHistoryFilter}
           historyPage={cardHistoryPage} historyPageSize={cardHistoryPageSize} onHistoryPage={onCardHistoryPage} onHistoryPageSize={onCardHistoryPageSize}
            historyBusy={cardHistoryBusy} historyActions={cardHistoryActions} onRefreshHistory={onRefreshCardHistory} onRetryHistory={onRetryCardHistory} onDeleteHistory={onDeleteCardHistory} onCopyCode={onCopyCardCode}
@@ -685,7 +712,7 @@ export default function Sub2ApiView({config, setConfig, adminKey, setAdminKey, r
           </section>
 
           <section className="automation-setting-card assignment-card">
-            <div className="automation-card-head"><Network size={17}/><span><strong>代理、分组与指纹</strong><small>手动导入与自动导入共用</small></span><button className="icon-button" title="刷新代理和分组" aria-label="刷新代理和分组" onClick={onLoadOptions} disabled={optionsBusy}><RefreshCw size={15} className={optionsBusy ? 'spin' : ''}/></button></div>
+             <div className="automation-card-head"><Network size={17}/><span><strong>自动化分配策略</strong><small>仅作用于 401 定时找回后的自动导入</small></span><button className="icon-button" title="刷新代理和分组" aria-label="刷新自动化代理和分组" onClick={onLoadOptions} disabled={optionsBusy}><RefreshCw size={15} className={optionsBusy ? 'spin' : ''}/></button></div>
             <label><span>固定代理</span><select value={proxyChoice} onChange={event => onProxyChoice(event.target.value)}><option value="json">JSON 自带代理（仅手动导入）</option><option value="none">不绑定代理</option>{options.proxies.map(proxy => <option value={`proxy:${proxy.id}`} key={proxy.id}>{proxy.name} · {proxy.status || 'unknown'}{proxy.latency_ms == null ? '' : ` · ${proxy.latency_ms}ms`}</option>)}</select></label>
             {selectedProxy && <div className="selected-proxy-meta"><span>{selectedProxy.protocol}://{selectedProxy.host}:{selectedProxy.port}</span><span>{selectedProxy.account_count} 个账号</span><span>{selectedProxy.quality_grade || selectedProxy.country_code || '未评级'}</span></div>}
             <div className="fingerprint-field"><span>Codex 指纹收敛</span><div className="fingerprint-segment" data-testid="codex-fingerprint-mode">{fingerprintModes.map(mode => <button className={codexFingerprintMode === mode.value ? 'active' : ''} key={mode.value} onClick={() => onCodexFingerprintMode(mode.value)}>{mode.label}</button>)}</div></div>
