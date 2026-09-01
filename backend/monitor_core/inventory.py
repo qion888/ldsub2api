@@ -456,15 +456,13 @@ class InventoryService:
             """
             SELECT w.id, w.url, s.goods_key, s.raw_data
             FROM watches w
-            JOIN snapshots s ON s.watch_id = w.id AND s.status = 'success'
-            WHERE s.id = (
+            JOIN snapshots s ON s.id = (
                 SELECT latest.id FROM snapshots latest
                 WHERE latest.watch_id = w.id AND latest.status = 'success'
                 ORDER BY latest.id DESC LIMIT 1
             )
-            AND NOT EXISTS (
-                SELECT 1 FROM shop_products existing WHERE existing.watch_id = w.id
-            )
+            LEFT JOIN shop_products existing ON existing.watch_id = w.id
+            WHERE existing.watch_id IS NULL
             """
         ).fetchall()
         for row in rows:
