@@ -133,6 +133,8 @@ def initialize_database(
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_watch_time
                 ON snapshots(watch_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_shop_products_watch
+                ON shop_products(watch_id);
             CREATE INDEX IF NOT EXISTS idx_shop_runs_shop_time
                 ON shop_runs(shop_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_preorders_status_check

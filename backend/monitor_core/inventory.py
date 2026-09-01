@@ -18,11 +18,13 @@ class InventoryService:
         commerce_tags: Callable[[dict[str, Any]], list[dict[str, str]]],
         is_unlisted_error: Callable[[Any], bool],
         sync_intervals: Callable[[Any, int, int], int],
+        discover_shop: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> None:
         self.database = database
         self.now = now
         self.fetch_goods = fetch_goods
         self.fetch_shop_catalog = fetch_shop_catalog
+        self.discover_shop = discover_shop
         self.commerce_tags = commerce_tags
         self.is_unlisted_error = is_unlisted_error
         self.sync_intervals = sync_intervals
@@ -446,9 +448,50 @@ class InventoryService:
                 shop_refresh_cache[shop_id] = summary
         return self._latest_watch_product(watch_id, shop_id=shop_id, shop_summary=summary)
 
+    def _backfill_discovered_shops(self, connection: sqlite3.Connection, stamp: str) -> None:
+        """Restore shop links for snapshots created before shop discovery existed."""
+        if self.discover_shop is None:
+            return
+        rows = connection.execute(
+            """
+            SELECT w.id, w.url, s.goods_key, s.raw_data
+            FROM watches w
+            JOIN snapshots s ON s.id = (
+                SELECT latest.id FROM snapshots latest
+                WHERE latest.watch_id = w.id AND latest.status = 'success'
+                ORDER BY latest.id DESC LIMIT 1
+            )
+            LEFT JOIN shop_products existing ON existing.watch_id = w.id
+            WHERE existing.watch_id IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            raw_data = self._json_value(row["raw_data"], {})
+            if not isinstance(raw_data, dict):
+                continue
+            goods_key = str(
+                row["goods_key"]
+                or raw_data.get("goods_key")
+                or str(row["url"]).rstrip("/").rsplit("/", 1)[-1]
+            ).strip()
+            try:
+                shop_info = self.discover_shop(raw_data)
+                if goods_key and shop_info:
+                    self._link_discovered_shop(
+                        connection,
+                        row["id"],
+                        {"goods_key": goods_key, "shop": shop_info},
+                        stamp,
+                    )
+            except Exception:
+                # A stale or malformed upstream snapshot must not make either
+                # monitor list unavailable.
+                continue
 
     def list_shops(self) -> list[dict[str, Any]]:
+        stamp = self.now()
         with self.database() as connection:
+            self._backfill_discovered_shops(connection, stamp)
             result: list[dict[str, Any]] = []
             for row in connection.execute("SELECT * FROM shops ORDER BY id DESC"):
                 latest_run = connection.execute(
@@ -489,7 +532,9 @@ class InventoryService:
 
 
     def list_watches(self) -> list[dict[str, Any]]:
+        stamp = self.now()
         with self.database() as connection:
+            self._backfill_discovered_shops(connection, stamp)
             result: list[dict[str, Any]] = []
             for row in connection.execute("SELECT * FROM watches ORDER BY id DESC"):
                 latest = connection.execute(

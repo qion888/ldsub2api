@@ -314,6 +314,43 @@ class MonitorCoreModuleTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
 
+    def test_list_watches_backfills_shop_from_legacy_snapshot(self) -> None:
+        service = InventoryService(
+            database=self.database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: {},
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+            discover_shop=storefront.discover_goods_shop,
+        )
+        with self.database() as connection:
+            watch_id = connection.execute(
+                "INSERT INTO watches(url, name, created_at) VALUES(?, ?, ?)",
+                ("https://pay.ldxp.cn/item/legacy-product", "旧商品", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO snapshots(watch_id, title, price, specs, goods_key, raw_data, sale_status, fetched_at, status)
+                VALUES(?, '旧商品', '1.00', '{}', 'legacy-product', ?, 'on_sale', ?, 'success')
+                """,
+                (
+                    watch_id,
+                    '{"goods_key":"legacy-product","goods_type":"card","category":{"id":1,"name":"分类"},"user":{"token":"LEGACYSHOP","nickname":"旧店铺","link":"https://pay.ldxp.cn/shop/LEGACYSHOP"}}',
+                    "2026-08-30T08:00:00+00:00",
+                ),
+            )
+
+        shops = service.list_shops()
+        watches = service.list_watches()
+
+        self.assertEqual(shops[0]["token"], "LEGACYSHOP")
+        self.assertEqual(watches[0]["shops"], [{"id": 1, "name": "旧店铺", "token": "LEGACYSHOP"}])
+        with self.database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 1)
+
     def test_preorder_module_rejects_disabled_request_before_storage(self) -> None:
         with self.assertRaisesRegex(ValueError, "启用自动预购"):
             preorders.create_preorders(

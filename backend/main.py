@@ -276,6 +276,7 @@ INVENTORY = InventoryService(
     commerce_tags=lambda item: commerce_tags_from_goods(item),
     is_unlisted_error=lambda value: is_unlisted_error(value),
     sync_intervals=sync_shop_product_intervals,
+    discover_shop=lambda item: storefront.discover_goods_shop(item),
 )
 
 
