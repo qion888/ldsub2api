@@ -138,6 +138,47 @@ class UserServiceTests(unittest.TestCase):
         self.assertEqual(value["basic"]["base_url"], "https://example.test")
         self.assertEqual(self.service.installation_status()["initialized_at"], stamp)
 
+    def test_shop_batch_sync_interval_persists_and_rejects_non_integers(self):
+        self.service.setup({"username": "admin", "password": "password123", "mode": "self_use"})
+        self.assertEqual(
+            self.service.settings()["system"]["shop_batch_sync_interval_seconds"],
+            3,
+        )
+
+        saved = self.service.update_settings(
+            {"shop_batch_sync_interval_seconds": 12},
+            section="system",
+        )
+        self.assertEqual(saved["system"]["shop_batch_sync_interval_seconds"], 12)
+        reopened = AuthService(self.service._database, now=lambda: self.clock_value)
+        self.assertEqual(
+            reopened.settings()["system"]["shop_batch_sync_interval_seconds"],
+            12,
+        )
+
+        for invalid in (True, False, 1.5, "12", None, 0, 61):
+            with self.subTest(invalid=invalid), self.assertRaises(UserServiceError) as raised:
+                self.service.update_settings(
+                    {"shop_batch_sync_interval_seconds": invalid},
+                    section="system",
+                )
+            self.assertEqual(raised.exception.code, "invalid_setting")
+            self.assertEqual(
+                self.service.settings()["system"]["shop_batch_sync_interval_seconds"],
+                12,
+            )
+
+        for boundary in (1, 60):
+            with self.subTest(boundary=boundary):
+                value = self.service.update_settings(
+                    {"shop_batch_sync_interval_seconds": boundary},
+                    section="system",
+                )
+                self.assertEqual(
+                    value["system"]["shop_batch_sync_interval_seconds"],
+                    boundary,
+                )
+
     def test_legacy_enabled_admin_migrates_install_state(self):
         self.service.initialize()
         with self.service._database() as connection:

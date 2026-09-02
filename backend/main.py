@@ -44,7 +44,7 @@ from monitor_core import preorders as preorder_service
 from monitor_core import settings as monitor_setting_store
 from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
-from monitor_core.workers import MonitorWorker as CoreMonitorWorker
+from monitor_core.workers import MonitorWorker as CoreMonitorWorker, ShopBatchSyncInProgress
 from order_query.complaint import build_complaint_preview
 from order_query.browser_verification import OrderQueryBrowserVerificationManager
 from order_query import routes as order_query_routes
@@ -357,6 +357,11 @@ def record_inventory_fetch(
 
 def list_shops() -> list[dict[str, Any]]:
     return INVENTORY.list_shops()
+
+
+def shop_batch_sync_interval_seconds() -> int:
+    settings = USER_SERVICE.settings().get("system", {})
+    return int(settings["shop_batch_sync_interval_seconds"])
 
 
 def is_waf_error(value: Any) -> bool:
@@ -1288,6 +1293,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_shop_batch_conflict(self, detail: str = "店铺批量同步正在进行，请稍后重试") -> None:
+        self._send_json(
+            {"detail": detail, "code": "shop_batch_sync_in_progress"},
+            409,
+        )
+
+    def _reject_if_shop_batch_syncing(self) -> bool:
+        if not WORKER.shop_batch_sync_in_progress():
+            return False
+        self._send_shop_batch_conflict()
+        return True
+
     def _send_json_compat(
         self,
         data: Any,
@@ -1433,6 +1450,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "order_complaint_history": True,
                 "monitor_min_interval_seconds": MIN_INTERVAL,
                 "upstream_min_interval_seconds": storefront.upstream_min_interval(),
+                "shop_batch_sync_interval_seconds": shop_batch_sync_interval_seconds(),
                 "auth_enabled": bool(installation.get("auth_required")),
                 "install_required": bool(installation.get("needs_setup")),
                 "mode": installation.get("mode", "self_use"),
@@ -1539,6 +1557,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             data = self._read_json()
         except ValueError as exc:
             return self._send_json({"detail": str(exc)}, 400)
+
+        if (
+            path == "/api/shops"
+            or path.startswith("/api/shops/")
+            or path == "/api/watches"
+            or path.startswith("/api/watches/")
+        ) and self._reject_if_shop_batch_syncing():
+            return
 
         if user_routes.handle_post(
             path,
@@ -1805,6 +1831,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._send_json(WORKER.fetch_shop(int(shop_fetch_match.group(1))))
             except KeyError as exc:
                 return self._send_json({"detail": str(exc.args[0])}, 404)
+            except ShopBatchSyncInProgress as exc:
+                return self._send_shop_batch_conflict(str(exc))
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
 
@@ -1866,20 +1894,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._send_json({"detail": str(exc)}, 502)
 
         if path == "/api/shops/fetch-all":
-            results = []
+            shop_ids = [shop["id"] for shop in list_shops() if shop["enabled"]]
+            interval_seconds = shop_batch_sync_interval_seconds()
+            try:
+                result = WORKER.fetch_shops(shop_ids, interval_seconds)
+            except ShopBatchSyncInProgress as exc:
+                return self._send_shop_batch_conflict(str(exc))
             waf_shop_ids = []
-            for shop in list_shops():
-                if not shop["enabled"]:
+            for entry in result["results"]:
+                if entry["ok"]:
                     continue
-                try:
-                    results.append({"id": shop["id"], "ok": True, "data": WORKER.fetch_shop(shop["id"])})
-                except Exception as exc:
-                    error = str(exc)
-                    if is_waf_error(error):
-                        waf_shop_ids.append(shop["id"])
-                    results.append({"id": shop["id"], "ok": False, "error": error, "waf": is_waf_error(error)})
+                entry["waf"] = is_waf_error(entry.get("error"))
+                if entry["waf"]:
+                    waf_shop_ids.append(entry["id"])
             verification = BROWSER_VERIFICATION.status()
-            return self._send_json({"results": results, "waf_shop_ids": waf_shop_ids, "verification": verification})
+            return self._send_json({
+                **result,
+                "waf_shop_ids": waf_shop_ids,
+                "verification": verification,
+            })
 
         if path == "/api/watches/inventory-refresh":
             raw_ids = data.get("ids")
@@ -1891,7 +1924,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._send_json({"detail": "商品编号无效"}, 400)
             if any(value < 1 for value in watch_ids):
                 return self._send_json({"detail": "商品编号无效"}, 400)
-            return self._send_json({"results": WORKER.fetch_many(watch_ids)})
+            try:
+                return self._send_json({"results": WORKER.fetch_many(watch_ids)})
+            except ShopBatchSyncInProgress as exc:
+                return self._send_shop_batch_conflict(str(exc))
 
         fetch_match = re.fullmatch(r"/api/watches/(\d+)/fetch", path)
         if fetch_match:
@@ -1899,12 +1935,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._send_json(WORKER.fetch(int(fetch_match.group(1))))
             except KeyError as exc:
                 return self._send_json({"detail": str(exc.args[0])}, 404)
+            except ShopBatchSyncInProgress as exc:
+                return self._send_shop_batch_conflict(str(exc))
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
 
         if path == "/api/watches/fetch-all":
-            watch_ids = [watch["id"] for watch in list_watches() if watch["enabled"]]
-            return self._send_json({"results": WORKER.fetch_many(watch_ids) if watch_ids else []})
+            enabled_watches = [watch for watch in list_watches() if watch["enabled"]]
+            independent_only = data.get("independent_only") is True
+            watch_ids = [
+                watch["id"]
+                for watch in enabled_watches
+                if not independent_only or not watch.get("shops")
+            ]
+            try:
+                results = WORKER.fetch_many(watch_ids) if watch_ids else []
+            except ShopBatchSyncInProgress as exc:
+                return self._send_shop_batch_conflict(str(exc))
+            return self._send_json({
+                "results": results,
+                "independent_only": independent_only,
+                "skipped_shop_linked": len(enabled_watches) - len(watch_ids),
+            })
 
         if path == "/api/checkout/prepare":
             cart = data.get("items")
@@ -2087,6 +2139,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         match = re.fullmatch(r"/api/watches/(\d+)", path)
         if match:
+            if self._reject_if_shop_batch_syncing():
+                return
             watch_id = int(match.group(1))
             try:
                 with database() as connection:
@@ -2099,6 +2153,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         shop_match = re.fullmatch(r"/api/shops/(\d+)", path)
         if shop_match:
+            if self._reject_if_shop_batch_syncing():
+                return
             shop_id = int(shop_match.group(1))
             try:
                 with database() as connection:
@@ -2221,12 +2277,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True})
         shop_match = re.fullmatch(r"/api/shops/(\d+)", path)
         if shop_match:
+            if self._reject_if_shop_batch_syncing():
+                return
             if delete_shops([int(shop_match.group(1))]) == 0:
                 return self._send_json({"detail": "监控店铺不存在"}, 404)
             return self._send_json({"ok": True})
         match = re.fullmatch(r"/api/watches/(\d+)", path)
         if not match:
             return self._send_json({"detail": "接口不存在"}, 404)
+        if self._reject_if_shop_batch_syncing():
+            return
         deleted_count = delete_watches([int(match.group(1))])
         if deleted_count == 0:
             return self._send_json({"detail": "监控商品不存在"}, 404)
