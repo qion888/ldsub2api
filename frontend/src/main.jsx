@@ -55,6 +55,15 @@ import {buildSub2ApiAutomationSaveNotice, buildSub2ApiImportNotice, sub2ApiHisto
 import {DEFAULT_SUB2API_SECTION, SUB2API_SECTIONS, normalizeSub2ApiSection} from './sub2apiNavigation.js';
 import {readSub2ApiCardAssignment, SUB2API_CARD_ASSIGNMENT_KEY} from './sub2apiAssignment.js';
 import {
+  EMPTY_SHOP_WAF_STATE,
+  normalizeShopWafState,
+  shopWafSessionActive,
+  shopWafShouldComplete,
+  shopWafShouldPoll,
+  shopWafProxyLabel,
+  shopWafResponseMatches,
+} from './shopWafModel.js';
+import {
   CARD_RECLAIM_POLL_TIMEOUT_MS,
   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
   pollForReclaimDownloads,
@@ -1057,15 +1066,11 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [sub2apiAutomationBusy, setSub2apiAutomationBusy] = useState(false);
   const [busy, setBusy] = useState({});
   const [verificationShopId, setVerificationShopId] = useState(null);
-  const [verificationBatch, setVerificationBatch] = useState({
-    status: 'idle',
-    browser: null,
-    completed: 0,
-    total: 0,
-    current_shop_id: null,
-    pending_shop_ids: [],
-    results: [],
-  });
+  const [verificationBatch, setVerificationBatch] = useState(() => ({...EMPTY_SHOP_WAF_STATE}));
+  const verificationBatchRef = useRef({...EMPTY_SHOP_WAF_STATE});
+  const verificationStartBusy = useRef(false);
+  const verificationPollBusy = useRef(false);
+  const verificationCompleteBusy = useRef(false);
   const [serviceOnline, setServiceOnline] = useState(false);
   const [featureLoadState, setFeatureLoadState] = useState({
     monitor: {status: 'loading', error: ''},
@@ -1506,7 +1511,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const visibleCheckedShopIds = filteredShops.filter(shop => checkedShopIds.includes(shop.id)).map(shop => shop.id);
   const allVisibleShopsChecked = filteredShops.length > 0 && visibleCheckedShopIds.length === filteredShops.length;
   const wafShopIds = shops.filter(shop => shop.enabled && needsBrowserVerification(shop)).map(shop => shop.id);
-  const batchVerificationPending = verificationBatch.status === 'awaiting_verification';
+  const batchVerificationPending = shopWafSessionActive(verificationBatch);
   const preorderByWatch = new Map(preorders.map(entry => [entry.watch_id, entry]));
   const displayedPreorders = preorders.filter(entry => entry.status !== 'cancelled');
 
@@ -1922,17 +1927,22 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   };
 
   const applyVerificationBatchState = result => {
-    setVerificationBatch(current => ({
-      ...current,
-      ...result,
-      pending_shop_ids: Array.isArray(result?.pending_shop_ids) ? result.pending_shop_ids : current.pending_shop_ids,
-      results: Array.isArray(result?.results) ? result.results : current.results,
-    }));
+    const next = normalizeShopWafState(result, verificationBatchRef.current);
+    verificationBatchRef.current = next;
+    setVerificationBatch(next);
+    if (shopWafSessionActive(next) && next.total === 1 && next.current_shop_id) {
+      setVerificationShopId(next.current_shop_id);
+    } else if (!shopWafSessionActive(next)) {
+      setVerificationShopId(null);
+    }
+    return next;
   };
 
   const startBrowserVerificationBatch = async (shopIds = wafShopIds) => {
     const ids = [...new Set((shopIds || []).map(Number).filter(Number.isInteger).filter(id => id > 0))];
     if (!ids.length) return notify('当前没有需要验证的 WAF 店铺');
+    if (verificationStartBusy.current || shopWafSessionActive(verificationBatchRef.current)) return notify('已有浏览器验证正在启动或进行，请先完成当前会话');
+    verificationStartBusy.current = true;
     setBusy(value => ({...value, verificationBatch: true}));
     try {
       const result = await request('/shops/browser-verification/start-all', {
@@ -1952,31 +1962,58 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       notify(error.message, 'error');
       return null;
     } finally {
+      verificationStartBusy.current = false;
       setBusy(value => ({...value, verificationBatch: false}));
     }
   };
 
-  const completeBrowserVerificationBatch = async () => {
+  const completeBrowserVerificationSession = async ({automatic = false} = {}) => {
+    if (verificationCompleteBusy.current) return null;
+    const active = verificationBatchRef.current;
+    if (!active.challenge_id) {
+      if (!automatic) notify('验证会话尚未就绪，请重新打开浏览器', 'error');
+      return null;
+    }
+    verificationCompleteBusy.current = true;
     setBusy(value => ({...value, verificationBatch: true}));
     try {
-      const result = await request('/shops/browser-verification/complete-all', {method: 'POST'});
-      applyVerificationBatchState(result);
+      const result = await request('/shops/browser-verification/complete-all', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({challenge_id: active.challenge_id}),
+      });
+      const next = applyVerificationBatchState(result);
       if (result.status === 'awaiting_verification') {
-        notify(result.detail || 'WAF 验证尚未完成', 'error');
+        if (!automatic) notify(result.detail || 'WAF 验证尚未完成', 'error');
+      } else if (['browser_closed', 'retry_exhausted', 'error'].includes(result.status)) {
+        setVerificationShopId(null);
+        notify(result.detail || '浏览器验证未完成，请重新打开验证窗口', 'error');
       } else {
+        setVerificationShopId(null);
         await loadItems({quiet: true});
-        notify(`批量验证完成，共 ${result.completed || 0} 个店铺`);
+        const failed = Number(result.failed || 0);
+        notify(
+          next.total === 1
+            ? failed ? browserSyncFailure(result) : '验证通过并完成店铺同步'
+            : `批量验证完成，共 ${result.completed || 0} 个店铺${failed ? `，${failed} 个失败` : ''}`,
+          failed ? 'error' : 'info',
+        );
       }
       return result;
     } catch (error) {
       notify(error.message, 'error');
       return null;
     } finally {
+      verificationCompleteBusy.current = false;
       setBusy(value => ({...value, verificationBatch: false}));
     }
   };
 
+  const completeBrowserVerificationBatch = () => completeBrowserVerificationSession();
+
   const startBrowserVerification = async shop => {
+    if (verificationStartBusy.current || shopWafSessionActive(verificationBatchRef.current)) return notify('已有浏览器验证正在启动或进行，请先完成当前会话');
+    verificationStartBusy.current = true;
     setBusy(value => ({...value, [`verify-${shop.id}`]: true}));
     try {
       const result = await request(`/shops/${shop.id}/browser-verification/start`, {method: 'POST'});
@@ -2001,6 +2038,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     } catch (error) {
       notify(error.message, 'error');
     } finally {
+      verificationStartBusy.current = false;
       setBusy(value => ({...value, [`verify-${shop.id}`]: false}));
     }
   };
@@ -2008,28 +2046,100 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const completeBrowserVerification = async shop => {
     setBusy(value => ({...value, [`verify-${shop.id}`]: true}));
     try {
-      const result = await request(`/shops/${shop.id}/browser-verification/complete`, {method: 'POST'});
-      if (result.status === 'awaiting_verification') {
-        applyVerificationBatchState(result);
-        return notify(result.detail, 'error');
-      }
-      setVerificationShopId(null);
-      const summary = browserSyncSummary(result);
-      if (!summary) {
-        applyVerificationBatchState({...result, status: 'idle'});
-        notify(result.failed ? browserSyncFailure(result) : '验证通过并完成同步', result.failed ? 'error' : 'info');
-        return;
-      }
-      if (!result.summary) result.summary = summary;
-      applyVerificationBatchState({...result, status: 'idle'});
-      await loadItems({quiet: true});
-      notify(`验证通过并同步完成，共 ${result.summary.product_count} 个商品`);
-    } catch (error) {
-      notify(error.message, 'error');
+      return await completeBrowserVerificationSession();
     } finally {
       setBusy(value => ({...value, [`verify-${shop.id}`]: false}));
     }
   };
+
+  useEffect(() => {
+    if (!canManageMonitor || !serviceOnline || !shopWafShouldPoll(verificationBatch)) return undefined;
+    let cancelled = false;
+    let timer = null;
+    let failureCount = 0;
+    let lastErrorKey = '';
+    let lastErrorNoticeAt = 0;
+    const schedule = delay => {
+      if (!cancelled) timer = window.setTimeout(poll, delay);
+    };
+    const poll = async () => {
+      if (cancelled) return;
+      if (verificationPollBusy.current || verificationCompleteBusy.current) {
+        schedule(1000);
+        return;
+      }
+      const expectedChallenge = verificationBatchRef.current.challenge_id;
+      if (!expectedChallenge) return;
+      let retryDelay = 3000;
+      verificationPollBusy.current = true;
+      try {
+        const result = await request('/shops/browser-verification/status', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({challenge_id: expectedChallenge}),
+        });
+        if (cancelled || !shopWafResponseMatches(expectedChallenge, verificationBatchRef.current, result)) return;
+        failureCount = 0;
+        const next = applyVerificationBatchState(result);
+        if (shopWafShouldComplete(next)) await completeBrowserVerificationSession({automatic: true});
+        if (['browser_closed', 'retry_exhausted', 'error'].includes(next.status)) {
+          notify(next.detail || '浏览器验证未完成，请重新打开', 'error');
+        }
+      } catch (error) {
+        if (cancelled) return;
+        let pollError = error;
+        if (error.status === 409 && verificationBatchRef.current.challenge_id === expectedChallenge) {
+          try {
+            const recovered = await request('/shops/browser-verification/status', {method: 'POST'});
+            if (cancelled || verificationBatchRef.current.challenge_id !== expectedChallenge) return;
+            failureCount = 0;
+            const next = applyVerificationBatchState(recovered);
+            if (shopWafShouldComplete(next)) await completeBrowserVerificationSession({automatic: true});
+            if (['browser_closed', 'retry_exhausted', 'error'].includes(next.status)) {
+              notify(next.detail || '浏览器验证未完成，请重新打开', 'error');
+            }
+            return;
+          } catch (recoveryError) {
+            pollError = recoveryError;
+          }
+        }
+        failureCount += 1;
+        retryDelay = Math.min(3000 * (2 ** Math.min(failureCount - 1, 4)), 30000);
+        const errorKey = `${pollError.status || 0}:${pollError.message}`;
+        const now = Date.now();
+        if (errorKey !== lastErrorKey || now - lastErrorNoticeAt >= 30000) {
+          lastErrorKey = errorKey;
+          lastErrorNoticeAt = now;
+          notify(pollError.message, 'error');
+        }
+      } finally {
+        verificationPollBusy.current = false;
+        if (
+          !cancelled
+          && verificationBatchRef.current.challenge_id === expectedChallenge
+          && shopWafShouldPoll(verificationBatchRef.current)
+        ) schedule(retryDelay);
+      }
+    };
+    schedule(800);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [canManageMonitor, serviceOnline, verificationBatch.status, verificationBatch.challenge_id]);
+
+  useEffect(() => {
+    if (!canManageMonitor || !serviceOnline) return undefined;
+    let cancelled = false;
+    request('/shops/browser-verification/status', {method: 'POST'})
+      .then(result => {
+        if (cancelled || !shopWafSessionActive(result)) return;
+        const next = applyVerificationBatchState(result);
+        if (next.total === 1) setVerificationShopId(next.current_shop_id);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [canManageMonitor, serviceOnline]);
 
   const persistCheckout = async (overrides = {}) => {
     const profile = {
@@ -3276,7 +3386,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
           <div className="topbar-actions">
             {['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary overview-button" onClick={() => { setDetailOpen(false); setOverviewOpen(true); }} aria-expanded={overviewOpen} aria-controls="product-overview-drawer" disabled={featureLoadState.monitor.status !== 'ready'}><PanelRight size={16}/>商品总览</button>}
             <IconButton label={theme === 'dark' ? '切换日间模式' : '切换夜间模式'} onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={16}/> : <Moon size={16}/>}</IconButton>
-            {canManageMonitor && ['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary refresh-all-button" onClick={fetchAll} disabled={busy.fetchAll || (!items.length && !shops.length)}>
+            {canManageMonitor && ['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary refresh-all-button" onClick={fetchAll} disabled={batchVerificationPending || busy.fetchAll || (!items.length && !shops.length)}>
               <RefreshCw size={16} className={busy.fetchAll ? 'spin' : ''}/>全部刷新
             </button>}
           </div>
@@ -3292,7 +3402,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         {['products', 'monitor', 'history'].includes(activeView) && featureLoadState.monitor.status !== 'ready' ? (
           <FeatureLoadingState feature="监控数据" state={featureLoadState.monitor} onRetry={() => retryFeature('monitor')}/>
         ) : activeView === 'products' ? (
-          <ProductOverviewView items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor ? fetchOne : null}/>
+          <ProductOverviewView items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor && !batchVerificationPending ? fetchOne : null}/>
         ) : activeView === 'monitor' ? (
           <>
             {canManageMonitor && <form className="watch-composer" onSubmit={addWatch}>
@@ -3303,7 +3413,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
                 {sourceMode === 'shop' && <label className="shop-category-field"><span>{shopCategoryState.token ? `商品分类 · ${shopCategoryState.token}` : '商品分类'}</span><div className="shop-category-control"><select value={categoryId} onChange={event => setCategoryId(event.target.value)} aria-label="选择店铺商品分类" title={shopCategoryState.error || '按店铺公开分类选择同步范围'}><option value="">{shopCategoryState.loading ? '正在读取分类…' : shopCategoryState.error ? '全部分类（读取失败，可重试）' : shopCategoryState.token && !shopCategoryState.categories.length ? '全部分类（暂无子分类）' : '全部分类'}</option>{shopCategoryState.categories.map(category => <option value={category.id} key={category.id}>{category.name} · ID {category.id}{category.goods_count ? ` · ${category.goods_count} 件` : ''}</option>)}</select>{shopCategoryState.loading && <RefreshCw className="category-loading spin" size={14}/>} {shopCategoryState.error && <button type="button" className="icon-button category-retry" aria-label="重新读取店铺分类" title="重新读取店铺分类" onClick={() => setShopCategoryRetry(value => value + 1)}><RefreshCw size={14}/></button>}</div></label>}
                 {sourceMode === 'shop' && <label><span>商品类型</span><select value={goodsType} onChange={event => setGoodsType(event.target.value)}>{SHOP_GOODS_TYPES.map(option => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>}
                 <label><span>监控频率</span><select value={intervalSeconds} onChange={event => setIntervalSeconds(Number(event.target.value))}>{MONITOR_INTERVAL_OPTIONS.map(seconds => <option value={seconds} key={seconds}>{intervalOptionLabel(seconds)}</option>)}</select></label>
-                <button className="button primary" disabled={busy.add}><Plus size={16}/>{busy.add ? '正在同步' : sourceMode === 'shop' ? '同步店铺' : '开始监控'}</button>
+                <button className="button primary" disabled={batchVerificationPending || busy.add}><Plus size={16}/>{busy.add ? '正在同步' : sourceMode === 'shop' ? '同步店铺' : '开始监控'}</button>
               </div>
             </form>}
 
@@ -3320,14 +3430,14 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
                 <div className="shop-batch-actions">
                   <span>{validCheckedShopIds.length ? `已选 ${validCheckedShopIds.length} 个店铺` : '尚未选择店铺'}</span>
                   {validCheckedShopIds.length > 0 && <IconButton label="取消选择店铺" onClick={() => setCheckedShopIds([])}><X size={14}/></IconButton>}
-                  <button className="button secondary" onClick={syncAllShops} disabled={busy.shopBatchSync || busy.fetchAll || !shops.length}><RefreshCw size={14} className={busy.shopBatchSync ? 'spin' : ''}/>{busy.shopBatchSync ? '正在同步' : '同步全部店铺'}</button>
-                  <button className="button secondary" onClick={() => batchVerificationPending ? completeBrowserVerificationBatch() : startBrowserVerificationBatch()} disabled={busy.verificationBatch || (!batchVerificationPending && !wafShopIds.length)} title={batchVerificationPending ? '完成浏览器验证后继续同步' : '使用共享浏览器会话验证所有 WAF 店铺'}>
-                    <ShieldCheck size={14} className={busy.verificationBatch ? 'spin' : ''}/>{batchVerificationPending ? `继续验证 ${verificationBatch.completed}/${verificationBatch.total}` : `验证全部 WAF${wafShopIds.length ? ` (${wafShopIds.length})` : ''}`}
+                  <button className="button secondary" onClick={syncAllShops} disabled={batchVerificationPending || busy.shopBatchSync || busy.fetchAll || !shops.length}><RefreshCw size={14} className={busy.shopBatchSync ? 'spin' : ''}/>{busy.shopBatchSync ? '正在同步' : '同步全部店铺'}</button>
+                  <button className="button secondary" onClick={() => batchVerificationPending ? completeBrowserVerificationBatch() : startBrowserVerificationBatch()} disabled={busy.verificationBatch || (!batchVerificationPending && !wafShopIds.length)} title={batchVerificationPending ? '立即检查浏览器验证状态' : '使用共享浏览器会话验证所有 WAF 店铺'}>
+                    <ShieldCheck size={14} className={busy.verificationBatch ? 'spin' : ''}/>{batchVerificationPending ? `立即检查 ${verificationBatch.completed}/${verificationBatch.total}` : `验证全部 WAF${wafShopIds.length ? ` (${wafShopIds.length})` : ''}`}
                   </button>
-                  <button className="button danger-button" onClick={removeCheckedShops} disabled={!validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button>
+                  <button className="button danger-button" onClick={removeCheckedShops} disabled={batchVerificationPending || !validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button>
                 </div>
               </div>}
-              {canManageMonitor && batchVerificationPending && <div className="shop-verification-banner"><ShieldCheck size={15}/><span>浏览器：{verificationBatch.browser || '自动选择'}，当前店铺 {verificationBatch.current_shop_id || '--'}，剩余 {verificationBatch.pending_shop_ids?.length || 0} 个</span><button className="button primary" onClick={completeBrowserVerificationBatch} disabled={busy.verificationBatch}><Check size={14}/>验证完成并继续</button></div>}
+              {canManageMonitor && batchVerificationPending && <div className="shop-verification-banner"><ShieldCheck size={15}/><span>浏览器：{verificationBatch.browser || '自动选择'} · {shopWafProxyLabel(verificationBatch.proxy_mode)}，当前店铺 {verificationBatch.current_shop_id || '--'}；验证通过后自动继续，剩余 {verificationBatch.pending_shop_ids?.length || 0} 个</span><button className="button primary" onClick={completeBrowserVerificationBatch} disabled={busy.verificationBatch}><Check size={14}/>立即检查</button></div>}
               <div className="shop-list">{!filteredShops.length ? <div className="monitor-filter-empty"><Store size={20}/><span>没有符合条件的店铺</span></div> : filteredShops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''} ${checkedShopIds.includes(shop.id) ? 'checked' : ''}`} key={shop.id}>
                 {canManageMonitor && <label className="check-wrap shop-select-cell" title={`选择店铺：${shop.name || shop.token}`} onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedShopIds.includes(shop.id)} onChange={() => toggleShopChecked(shop.id)} aria-label={`选择店铺：${shop.name || shop.token}`}/></label>}
                 <button className="shop-main" onClick={() => { setShopFilter(current => current === shop.id ? null : shop.id); setCheckedIds([]); }}>
@@ -3337,9 +3447,9 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
                 <div className="shop-stat"><span>在售</span><strong className="positive">{shop.on_sale_count}</strong></div>
                 <div className="shop-stat"><span>已知库存</span><strong>{shop.total_stock ?? '--'}</strong><small>{shop.known_stock_count}/{shop.product_count} 项公开</small></div>
                 <div className="shop-time" title={shop.last_attempt?.error || ''}><span className={`pill ${shop.last_attempt?.status === 'error' ? 'error' : 'live'}`}>{needsBrowserVerification(shop) ? '需要验证' : shop.last_attempt?.status === 'error' ? '同步异常' : '已同步'}</span><small>{compactTime(shop.last_attempt?.fetched_at)}</small></div>
-                {canManageMonitor && <><MonitorIntervalSelect value={shop.interval_seconds} label={`修改${shop.name || shop.token}监控频率`} caption="监控频率" disabled={busy[`shop-save-${shop.id}`]} onChange={value => updateShop(shop, {interval_seconds: value})}/>
-                <button className={`switch ${shop.enabled ? 'on' : ''}`} role="switch" aria-checked={shop.enabled} title={shop.enabled ? '暂停店铺监控' : '开启店铺监控'} disabled={busy[`shop-save-${shop.id}`]} onClick={() => updateShop(shop, {enabled: !shop.enabled})}><span/></button>
-                <div className="row-actions">{needsBrowserVerification(shop) && (verificationShopId === shop.id ? <IconButton label="验证完成并同步" tone="verify" onClick={() => completeBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ShieldCheck size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton> : <IconButton label="打开浏览器验证" tone="verify" onClick={() => startBrowserVerification(shop)} disabled={busy[`verify-${shop.id}`]}><ArrowUpRight size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton>)}<IconButton label="同步店铺" onClick={() => fetchShop(shop.id)} disabled={busy[`shop-${shop.id}`]}><RefreshCw size={15} className={busy[`shop-${shop.id}`] ? 'spin' : ''}/></IconButton><IconButton label="删除店铺监控" tone="danger" onClick={() => removeShop(shop)}><Trash2 size={15}/></IconButton></div></>}
+                {canManageMonitor && <><MonitorIntervalSelect value={shop.interval_seconds} label={`修改${shop.name || shop.token}监控频率`} caption="监控频率" disabled={batchVerificationPending || busy[`shop-save-${shop.id}`]} onChange={value => updateShop(shop, {interval_seconds: value})}/>
+                <button className={`switch ${shop.enabled ? 'on' : ''}`} role="switch" aria-checked={shop.enabled} title={shop.enabled ? '暂停店铺监控' : '开启店铺监控'} disabled={batchVerificationPending || busy[`shop-save-${shop.id}`]} onClick={() => updateShop(shop, {enabled: !shop.enabled})}><span/></button>
+                <div className="row-actions">{needsBrowserVerification(shop) && (verificationShopId === shop.id ? <IconButton label="立即检查验证状态" tone="verify" onClick={() => completeBrowserVerification(shop)} disabled={busy.verificationBatch || busy[`verify-${shop.id}`]}><ShieldCheck size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton> : <IconButton label={batchVerificationPending ? '已有浏览器验证正在进行' : '打开浏览器验证'} tone="verify" onClick={() => startBrowserVerification(shop)} disabled={batchVerificationPending || busy.verificationBatch || busy[`verify-${shop.id}`]}><ArrowUpRight size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton>)}<IconButton label="同步店铺" onClick={() => fetchShop(shop.id)} disabled={batchVerificationPending || busy[`shop-${shop.id}`]}><RefreshCw size={15} className={busy[`shop-${shop.id}`] ? 'spin' : ''}/></IconButton><IconButton label="删除店铺监控" tone="danger" onClick={() => removeShop(shop)} disabled={batchVerificationPending}><Trash2 size={15}/></IconButton></div></>}
               </div>)}</div>
             </section>}
 

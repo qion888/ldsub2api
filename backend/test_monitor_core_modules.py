@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 from monitor_core import database as database_module
@@ -163,7 +164,34 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
         self.assertFalse(manager._is_waf_html("<main>products</main>"))
 
+    def test_browser_close_terminates_webdriver_service_process(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+        driver = MagicMock()
+        service_process = driver.service.process
+        service_process.poll.return_value = None
+        manager.driver = driver
+
+        manager._close()
+
+        driver.quit.assert_called_once_with()
+        service_process.terminate.assert_called_once_with()
+
     def test_browser_challenge_keeps_first_party_page_context(self) -> None:
+        with self.database() as connection:
+            shop_id = connection.execute(
+                "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
+                ("https://pay.ldxp.cn/shop/CONTEXT", "CONTEXT", "Context", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
         manager = BrowserVerificationManager(
             database=self.database,
             worker_lock=object(),
@@ -178,17 +206,41 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         class FakeDriver:
             page_source = "<div id='aliyunCaptcha'></div>"
+            current_url = "https://pay.ldxp.cn/shopApi/Shop/goodsList"
+            window_handles = ["window"]
+            get_calls: list[str] = []
 
             def execute_script(self, *_args):
                 raise AssertionError("challenge HTML must not be injected into the page")
 
+            def get_cookies(self):
+                return []
+
+            def get(self, url):
+                self.get_calls.append(url)
+                self.current_url = url
+                self.page_source = "<div id='aliyunCaptcha'></div>"
+
         driver = FakeDriver()
         manager.batch_active = True
         manager.batch_total = 1
-        manager.batch_current_shop_id = 1
+        manager.batch_current_shop_id = shop_id
+        manager.challenge_id = "challenge-context"
         result = manager._render_challenge(driver, "<html>challenge</html>")
 
         self.assertEqual(result["status"], "awaiting_verification")
+        self.assertEqual(driver.get_calls, ["https://pay.ldxp.cn/shop/CONTEXT"])
+        self.assertEqual(result["challenge_id"], "challenge-context")
+
+        driver.current_url = "https://pay.ldxp.cn/waf/challenge"
+        driver.get_calls.clear()
+        result = manager._render_challenge(driver, "<html>challenge</html>")
+        self.assertEqual(result["status"], "awaiting_verification")
+        self.assertEqual(driver.get_calls, [])
+        manager._browser_request = lambda *_args: (_ for _ in ()).throw(RuntimeError("WAF challenge"))
+        with self.assertRaisesRegex(RuntimeError, "WAF challenge"):
+            manager._sync_shop(driver, shop_id)
+        self.assertEqual(driver.get_calls, [])
 
     def test_browser_request_uses_storefront_visitor_id_and_detects_status_only_waf(self) -> None:
         manager = BrowserVerificationManager(
@@ -229,6 +281,16 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         class FakeDriver:
             page_source = "<div id='challenge'></div>"
+            current_url = ""
+            window_handles = ["window"]
+            cookies: list[dict] = []
+
+            def get(self, url):
+                self.current_url = url
+                self.page_source = "<div id='aliyunCaptcha'></div>"
+
+            def get_cookies(self):
+                return self.cookies
 
             def execute_script(self, *_args):
                 return None
@@ -248,7 +310,15 @@ class MonitorCoreModuleTests(unittest.TestCase):
             profile_path=Path(self.directory.name) / "profile",
         )
         driver = FakeDriver()
-        manager._create_driver = lambda: (driver, "chrome")
+        create_urls = []
+
+        def create_driver(initial_url):
+            create_urls.append(initial_url)
+            driver.current_url = initial_url
+            driver.page_source = "<div id='aliyunCaptcha'></div>"
+            return driver, "chrome"
+
+        manager._create_driver = create_driver
         attempts = {shop_ids[0]: 0}
 
         def sync(_driver, shop_id):
@@ -262,6 +332,11 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertEqual(first["status"], "awaiting_verification")
         self.assertEqual(first["pending_shop_ids"], shop_ids)
         self.assertEqual(first["current_shop_id"], shop_ids[0])
+        duplicate = manager.start_all(shop_ids, first["challenge_id"])
+        self.assertEqual(duplicate["challenge_id"], first["challenge_id"])
+        self.assertEqual(len(create_urls), 1)
+        with self.assertRaisesRegex(RuntimeError, "already active"):
+            manager.start_all(list(reversed(shop_ids)), "different-challenge")
         # A solved Aliyun page can retain the challenge marker in its source;
         # completion must trust a fresh catalog request instead.
         driver.page_source = "<div id='aliyunCaptcha'></div><main>verified</main>"
@@ -270,6 +345,131 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertEqual(completed["completed"], 2)
         self.assertEqual([entry["id"] for entry in completed["results"]], shop_ids)
         self.assertEqual(completed["browser"], "chrome")
+
+    def test_challenge_navigation_cookie_is_baseline_not_success_evidence(self) -> None:
+        with self.database() as connection:
+            shop_id = connection.execute(
+                "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
+                ("https://pay.ldxp.cn/shop/COOKIE", "COOKIE", "Cookie", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+
+        class FakeDriver:
+            current_url = "https://pay.ldxp.cn/shopApi/Shop/goodsList"
+            page_source = "<div id='aliyunCaptcha'></div>"
+            window_handles = ["window"]
+            cookies: list[dict[str, str]] = []
+
+            def get(self, url):
+                self.current_url = url
+                self.cookies = [{"name": "acw_tc", "value": "challenge", "domain": ".ldxp.cn", "path": "/"}]
+
+            def get_cookies(self):
+                return self.cookies
+
+            def execute_script(self, _script):
+                return True
+
+            def quit(self):
+                return None
+
+        driver = FakeDriver()
+        manager.driver = driver
+        manager.batch_active = True
+        manager.batch_total = 1
+        manager.batch_shop_ids = (shop_id,)
+        manager.batch_queue = [shop_id]
+        manager.batch_current_shop_id = shop_id
+        manager.challenge_id = "challenge-cookie"
+
+        manager._render_challenge(driver, "<html>challenge</html>")
+        expected_baseline = manager._cookie_fingerprint(driver.cookies)
+        self.assertEqual(manager._challenge_cookie_baseline, expected_baseline)
+        self.assertEqual(manager.poll("challenge-cookie")["status"], "awaiting_verification")
+        self.assertEqual(manager.poll("challenge-cookie")["status"], "awaiting_verification")
+
+    def test_cookie_ready_observation_requires_a_stable_fingerprint(self) -> None:
+        with self.database() as connection:
+            shop_id = connection.execute(
+                "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
+                ("https://pay.ldxp.cn/shop/ROTATE", "ROTATE", "Rotate", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+
+        class FakeDriver:
+            current_url = "https://pay.ldxp.cn/shop/ROTATE"
+            page_source = "<script>aliyunCaptcha</script><main>storefront</main>"
+            window_handles = ["window"]
+            cookies = [
+                [{"name": "acw_tc", "value": "verified-1", "domain": ".ldxp.cn", "path": "/"}],
+                [{"name": "acw_tc", "value": "verified-2", "domain": ".ldxp.cn", "path": "/"}],
+                [{"name": "acw_tc", "value": "verified-2", "domain": ".ldxp.cn", "path": "/"}],
+            ]
+
+            def get_cookies(self):
+                return self.cookies.pop(0)
+
+            def execute_script(self, _script):
+                return False
+
+            def quit(self):
+                return None
+
+        manager.driver = FakeDriver()
+        manager.batch_active = True
+        manager.batch_total = 1
+        manager.batch_shop_ids = (shop_id,)
+        manager.batch_queue = [shop_id]
+        manager.batch_current_shop_id = shop_id
+        manager.challenge_id = "challenge-rotate"
+        manager._challenge_dom_seen = True
+        manager._challenge_cookie_baseline = manager._cookie_fingerprint(
+            [{"name": "acw_tc", "value": "pending", "domain": ".ldxp.cn", "path": "/"}]
+        )
+
+        self.assertEqual(manager.poll("challenge-rotate")["status"], "awaiting_verification")
+        self.assertEqual(manager.poll("challenge-rotate")["status"], "awaiting_verification")
+        self.assertEqual(manager.poll("challenge-rotate")["status"], "ready")
+
+    def test_old_completed_challenge_cannot_mask_an_active_session(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+        manager.batch_active = True
+        manager.challenge_id = "challenge-current"
+        manager._last_completed_challenge_id = "challenge-previous"
+        manager._last_completed_result = {"status": "success"}
+
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            manager.complete_all("challenge-previous")
 
     def test_browser_order_supports_linux_and_explicit_selection(self) -> None:
         manager = BrowserVerificationManager(
@@ -287,6 +487,104 @@ class MonitorCoreModuleTests(unittest.TestCase):
             self.assertEqual(manager._browser_order(), ["chrome", "chromium", "edge", "firefox"])
         with patch.dict("os.environ", {"LDXP_WAF_BROWSER": "firefox"}):
             self.assertEqual(manager._browser_order(), ["firefox"])
+
+    def test_browser_proxy_modes_and_firefox_system_proxy(self) -> None:
+        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "system"}):
+            self.assertEqual(BrowserVerificationManager._proxy_config()["mode"], "system")
+        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "direct"}):
+            self.assertEqual(BrowserVerificationManager._proxy_config()["mode"], "direct")
+        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "http://127.0.0.1:7890"}):
+            proxy = BrowserVerificationManager._proxy_config()
+            self.assertEqual((proxy["mode"], proxy["host"], proxy["port"]), ("http", "127.0.0.1", 7890))
+        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "socks://127.0.0.1:1080"}):
+            with self.assertRaisesRegex(RuntimeError, "http/https"):
+                BrowserVerificationManager._proxy_config()
+        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "http://user:secret@127.0.0.1:7890"}):
+            with self.assertRaisesRegex(RuntimeError, "cannot contain credentials"):
+                BrowserVerificationManager._proxy_config()
+
+        class FakeOptions:
+            def __init__(self):
+                self.preferences = {}
+
+            def set_preference(self, key, value):
+                self.preferences[key] = value
+
+        options = FakeOptions()
+        BrowserVerificationManager._apply_firefox_proxy(options, {"mode": "system"})
+        self.assertEqual(options.preferences, {"network.proxy.type": 5})
+
+        request = MagicMock()
+        response = MagicMock()
+        opener = MagicMock()
+        opener.open.return_value = response
+        handler = MagicMock()
+        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "http://127.0.0.1:7890"}), \
+                patch.object(storefront, "ProxyHandler", return_value=handler) as proxy_handler, \
+                patch.object(storefront, "build_opener", return_value=opener) as build_opener:
+            opened = storefront.open_storefront_request(request, timeout=15)
+        self.assertIs(opened, response)
+        proxy_handler.assert_called_once_with({
+            "http": "http://127.0.0.1:7890",
+            "https": "http://127.0.0.1:7890",
+        })
+        build_opener.assert_called_once_with(handler)
+        opener.open.assert_called_once_with(request, timeout=15)
+
+    def test_chromium_starts_natively_then_attaches_without_automation_switch(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+        process = MagicMock()
+        process.poll.return_value = None
+        driver = MagicMock()
+        with patch.dict(os.environ, {"LDXP_WAF_BROWSER": "edge", "LDXP_WAF_PROXY": "http://127.0.0.1:7890"}), \
+                patch.object(manager, "_browser_executable", return_value=Path("C:/Edge/msedge.exe")), \
+                patch.object(manager, "_available_port", return_value=45678), \
+                patch.object(manager, "_wait_for_cdp") as wait_for_cdp, \
+                patch("monitor_core.browser_verification.subprocess.Popen", return_value=process) as popen, \
+                patch("selenium.webdriver.Edge", return_value=driver) as edge:
+            created, browser = manager._create_driver("https://pay.ldxp.cn/shop/NATIVE")
+
+        self.assertIs(created, driver)
+        self.assertEqual(browser, "edge")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-1], "https://pay.ldxp.cn/shop/NATIVE")
+        self.assertIn("--remote-debugging-address=127.0.0.1", command)
+        self.assertIn("--proxy-server=http://127.0.0.1:7890", command)
+        self.assertFalse(any("enable-automation" in argument for argument in command))
+        wait_for_cdp.assert_called_once_with(45678, process, "https://pay.ldxp.cn/shop/NATIVE")
+        self.assertEqual(edge.call_args.kwargs["options"].debugger_address, "127.0.0.1:45678")
+        driver.execute_cdp_cmd.assert_called_once()
+        self.assertEqual(manager.browser_mode, "native_cdp")
+        self.assertNotIn("127.0.0.1:7890", str(manager._status()))
+        manager._close()
+
+    def test_cdp_waits_for_the_initial_first_party_target(self) -> None:
+        process = MagicMock()
+        process.poll.return_value = None
+        version = {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/1"}
+        blank_targets = [{"type": "page", "url": "about:blank"}]
+        challenge_targets = [{"type": "page", "url": "https://pay.ldxp.cn/waf/challenge"}]
+        with patch.object(
+            BrowserVerificationManager,
+            "_read_cdp_json",
+            side_effect=[version, blank_targets, version, challenge_targets],
+        ) as read_json, patch("monitor_core.browser_verification.time.sleep"):
+            BrowserVerificationManager._wait_for_cdp(
+                45678,
+                process,
+                "https://pay.ldxp.cn/shop/NATIVE",
+            )
+        self.assertEqual(read_json.call_count, 4)
 
     def test_storefront_normalizes_catalog_without_application_globals(self) -> None:
         product = storefront.normalize_goods_list_item(

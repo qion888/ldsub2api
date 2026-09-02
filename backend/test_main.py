@@ -325,6 +325,51 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("invalid id", result["detail"])
 
+    def test_shop_browser_verification_status_and_completion_use_challenge_id(self):
+        ready = {
+            "status": "ready",
+            "challenge_id": "challenge-123",
+            "current_shop_id": 4,
+            "pending_shop_ids": [4],
+        }
+        completed = {
+            "status": "success",
+            "challenge_id": None,
+            "completed": 1,
+            "total": 1,
+            "results": [{"id": 4, "ok": True}],
+        }
+        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                patch.object(main.BROWSER_VERIFICATION, "poll", return_value=ready) as poll, \
+                patch.object(main.BROWSER_VERIFICATION, "complete_all", return_value=completed) as complete_all:
+            status, result = self.request_api(
+                "POST",
+                "/api/shops/browser-verification/status",
+                {"challenge_id": "challenge-123"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(result, ready)
+            poll.assert_called_once_with("challenge-123")
+
+            status, result = self.request_api(
+                "POST",
+                "/api/shops/browser-verification/complete-all",
+                {"challenge_id": "challenge-123"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(result, completed)
+            complete_all.assert_called_once_with("challenge-123")
+
+        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                patch.object(main.BROWSER_VERIFICATION, "poll", side_effect=RuntimeError("browser verification challenge is stale")):
+            status, result = self.request_api(
+                "POST",
+                "/api/shops/browser-verification/status",
+                {"challenge_id": "stale-challenge"},
+            )
+        self.assertEqual(status, 409)
+        self.assertIn("stale", result["detail"])
+
     def test_monitor_interval_uses_minute_floor_and_clamps_bounds(self):
         self.assertEqual(main.normalize_interval(1), 60)
         self.assertEqual(main.normalize_interval("3"), 60)
@@ -1331,7 +1376,9 @@ class GoodsParserTests(unittest.TestCase):
 
         with patch.object(main, "sub2api_settings", return_value={"base_url": "https://sub2api.example", "admin_key": "secret"}), \
              patch.object(main, "_sub2api_fetch_accounts", return_value=accounts), \
-             patch.object(main, "_redeem_client", return_value=FakeClient()):
+             patch.object(main, "_redeem_client", return_value=FakeClient()), \
+             patch.object(main, "_sub2api_reclaim_call_context", return_value=({}, 3, set())), \
+             patch.object(main, "_persist_sub2api_reclaim_attempts"):
             result = main.reclaim_sub2api_401_accounts()
 
         self.assertEqual(result["scanned_accounts"], 5)
