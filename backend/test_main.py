@@ -297,20 +297,84 @@ class GoodsParserTests(unittest.TestCase):
             {"id": 12, "enabled": True},
             {"id": 13, "enabled": False},
         ]
-        def fetch_shop(shop_id):
-            if shop_id == 11:
-                raise RuntimeError("WAF challenge required")
-            return {"status": "success", "product_count": 2}
+        batch_result = {
+            "interval_seconds": 8,
+            "total": 2,
+            "succeeded": 1,
+            "failed": 1,
+            "results": [
+                {"id": 11, "ok": False, "error": "WAF challenge required"},
+                {"id": 12, "ok": True, "data": {"status": "success", "product_count": 2}},
+            ],
+        }
 
         with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
                 patch.object(main, "list_shops", return_value=shops), \
-                patch.object(main.WORKER, "fetch_shop", side_effect=fetch_shop), \
+                patch.object(main, "shop_batch_sync_interval_seconds", return_value=8), \
+                patch.object(main.WORKER, "fetch_shops", return_value=batch_result) as fetch_shops, \
                 patch.object(main.BROWSER_VERIFICATION, "status", return_value={"status": "idle"}):
             status, result = self.request_api("POST", "/api/shops/fetch-all", {})
         self.assertEqual(status, 200)
+        fetch_shops.assert_called_once_with([11, 12], 8)
+        self.assertEqual(result["interval_seconds"], 8)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["failed"], 1)
         self.assertEqual(result["waf_shop_ids"], [11])
         self.assertEqual(result["results"][0]["waf"], True)
         self.assertEqual(result["results"][1]["ok"], True)
+
+    def test_shop_fetch_all_rejects_an_overlapping_batch(self):
+        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                patch.object(main, "list_shops", return_value=[{"id": 11, "enabled": True}]), \
+                patch.object(main, "shop_batch_sync_interval_seconds", return_value=3), \
+                patch.object(
+                    main.WORKER,
+                    "fetch_shops",
+                    side_effect=main.ShopBatchSyncInProgress("店铺批量同步正在进行"),
+                ):
+            status, result = self.request_api("POST", "/api/shops/fetch-all", {})
+
+        self.assertEqual(status, 409)
+        self.assertEqual(result["code"], "shop_batch_sync_in_progress")
+
+    def test_watch_fetch_all_can_refresh_only_independent_products(self):
+        watches = [
+            {"id": 21, "enabled": True, "shops": []},
+            {"id": 22, "enabled": True, "shops": [{"id": 11}]},
+            {"id": 23, "enabled": False, "shops": []},
+            {"id": 24, "enabled": True, "shops": [{"id": 12}]},
+        ]
+        expected = [{"id": 21, "ok": True, "data": {"stock": 4}}]
+
+        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                patch.object(main, "list_watches", return_value=watches), \
+                patch.object(main.WORKER, "shop_batch_sync_in_progress", return_value=False), \
+                patch.object(main.WORKER, "fetch_many", return_value=expected) as fetch_many:
+            status, result = self.request_api(
+                "POST",
+                "/api/watches/fetch-all",
+                {"independent_only": True},
+            )
+
+        self.assertEqual(status, 200)
+        fetch_many.assert_called_once_with([21])
+        self.assertEqual(result["results"], expected)
+        self.assertTrue(result["independent_only"])
+        self.assertEqual(result["skipped_shop_linked"], 2)
+
+    def test_monitor_posts_fail_fast_while_shop_batch_is_running(self):
+        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
+                patch.object(main.WORKER, "shop_batch_sync_in_progress", return_value=True):
+            status, result = self.request_api(
+                "POST",
+                "/api/watches/fetch-all",
+                {"independent_only": True},
+            )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(result["code"], "shop_batch_sync_in_progress")
+        self.assertIn("店铺批量同步", result["detail"])
 
     def test_shop_batch_verification_route_validates_ids_and_dispatches(self):
         expected = {"status": "awaiting_verification", "completed": 0, "total": 2, "pending_shop_ids": [4, 5]}
@@ -1424,7 +1488,8 @@ class GoodsParserTests(unittest.TestCase):
         })
 
     def test_health_advertises_sub2api_capabilities(self):
-        status, payload = self.request_api("GET", "/api/health", {})
+        with patch.object(main, "shop_batch_sync_interval_seconds", return_value=9):
+            status, payload = self.request_api("GET", "/api/health", {})
 
         self.assertEqual(status, 200)
         self.assertTrue(payload["sub2api_accounts"])
@@ -1432,6 +1497,7 @@ class GoodsParserTests(unittest.TestCase):
         self.assertTrue(payload["sub2api_card_import_history_delete"])
         self.assertTrue(payload["order_complaint_submit"])
         self.assertTrue(payload["order_complaint_history"])
+        self.assertEqual(payload["shop_batch_sync_interval_seconds"], 9)
 
     def test_sub2api_card_import_history_http_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

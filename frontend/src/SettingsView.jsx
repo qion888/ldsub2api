@@ -22,12 +22,19 @@ import {
 } from 'lucide-react';
 
 import {AUTH_MODES, isAdmin, normalizeMode, normalizeUser, roleLabel} from './authModel.js';
+import {
+  DEFAULT_SHOP_BATCH_SYNC_INTERVAL_SECONDS,
+  MAX_SHOP_BATCH_SYNC_INTERVAL_SECONDS,
+  MIN_SHOP_BATCH_SYNC_INTERVAL_SECONDS,
+  normalizeShopBatchSyncInterval,
+} from './shopBatchSyncModel.js';
 import {normalizeBackupList, normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
 
 const EMPTY_BASIC = {site_name: '', announcement: '', contact_email: '', timezone: 'Asia/Shanghai', base_url: ''};
 const GITHUB_REPOSITORY_URL = 'https://github.com/qion888/ldsub2api';
 const EMPTY_SYSTEM = {
   session_ttl_hours: 24,
+  shop_batch_sync_interval_seconds: DEFAULT_SHOP_BATCH_SYNC_INTERVAL_SECONDS,
   maintenance_mode: false,
   log_level: 'info',
   force_login: true,
@@ -71,7 +78,7 @@ function ErrorNotice({message}) {
   return message ? <div className="settings-error" role="alert">{message}</div> : null;
 }
 
-export default function SettingsView({request, user, mode, notify, onUserUpdated, onModeChange, onPasswordChanged, initialTab = null}) {
+export default function SettingsView({request, user, mode, notify, onUserUpdated, onModeChange, onSystemUpdated, onPasswordChanged, initialTab = null}) {
   const admin = isAdmin(user);
   const [tab, setTab] = useState(initialTab || (admin ? 'basic' : 'profile'));
   const [basic, setBasic] = useState(EMPTY_BASIC);
@@ -152,7 +159,10 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
         payload = {basic: basicPayload, system: systemPayload};
       }
       setBasic(settingsPart(payload, 'basic', EMPTY_BASIC));
-      setSystem(settingsPart(payload, 'system', EMPTY_SYSTEM));
+      const nextSystem = settingsPart(payload, 'system', EMPTY_SYSTEM);
+      nextSystem.shop_batch_sync_interval_seconds = normalizeShopBatchSyncInterval(nextSystem.shop_batch_sync_interval_seconds);
+      setSystem(nextSystem);
+      onSystemUpdated?.(nextSystem);
       setSettingsMode(normalizeMode(payload?.mode || mode));
       setAllowRegistration(Boolean(payload?.allow_registration));
       // The settings form is independent from the heavier admin panels. Paint
@@ -209,7 +219,10 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
         if (requestError.status !== 404) throw requestError;
         result = await request('/settings', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: settingsMode, allow_registration: allowRegistration, system})});
       }
-      setSystem(settingsPart(result, 'system', system));
+      const nextSystem = settingsPart(result, 'system', system);
+      nextSystem.shop_batch_sync_interval_seconds = normalizeShopBatchSyncInterval(nextSystem.shop_batch_sync_interval_seconds);
+      setSystem(nextSystem);
+      onSystemUpdated?.(nextSystem);
       setSettingsMode(normalizeMode(result?.mode || settingsMode));
       if (result?.allow_registration !== undefined) setAllowRegistration(Boolean(result.allow_registration));
       const nextMode = normalizeMode(result?.mode || settingsMode);
@@ -530,6 +543,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
           <div className="settings-form-grid">
             <label><span>运行模式</span><select value={settingsMode} onChange={event => { const nextMode = normalizeMode(event.target.value); setSettingsMode(nextMode); if (nextMode === AUTH_MODES.EXTERNAL && settingsMode !== AUTH_MODES.EXTERNAL) setSystem({...system, force_login: true, allow_user_reclaim: false, allow_user_sub2api_import: false}); }}><option value={AUTH_MODES.SELF_USE}>自用模式</option><option value={AUTH_MODES.EXTERNAL}>对外模式</option></select></label>
             <label><span>会话有效期（小时）</span><input type="number" min="1" max="720" value={system.session_ttl_hours} onChange={event => setSystem({...system, session_ttl_hours: Math.max(1, Math.min(720, Number(event.target.value) || 1))})}/></label>
+            <label><span>批量同步店铺间隔 <small>相邻店铺请求之间等待</small></span><div className="settings-unit-input"><input type="number" min={MIN_SHOP_BATCH_SYNC_INTERVAL_SECONDS} max={MAX_SHOP_BATCH_SYNC_INTERVAL_SECONDS} step="1" value={system.shop_batch_sync_interval_seconds} onChange={event => setSystem({...system, shop_batch_sync_interval_seconds: normalizeShopBatchSyncInterval(event.target.value)})}/><em>秒</em></div></label>
             <label><span>日志级别</span><select value={system.log_level} onChange={event => setSystem({...system, log_level: event.target.value})}><option value="debug">debug</option><option value="info">info</option><option value="warning">warning</option><option value="error">error</option></select></label>
             <label className="auth-check-row"><input type="checkbox" checked={allowRegistration} onChange={event => setAllowRegistration(event.target.checked)} disabled={settingsMode !== AUTH_MODES.EXTERNAL}/><span><strong>允许公开注册</strong><small>对外模式下开放注册入口</small></span></label>
             <label className="auth-check-row"><input type="checkbox" checked={settingsMode === AUTH_MODES.EXTERNAL ? Boolean(system.force_login) : false} onChange={event => setSystem({...system, force_login: event.target.checked})} disabled={settingsMode !== AUTH_MODES.EXTERNAL}/><span><strong>强制登录</strong><small>关闭后允许匿名查看首页与公开数据</small></span></label>
@@ -537,7 +551,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
             <label className="auth-check-row"><input type="checkbox" checked={settingsMode === AUTH_MODES.EXTERNAL ? Boolean(system.allow_user_sub2api_import) : true} onChange={event => setSystem({...system, allow_user_sub2api_import: event.target.checked})} disabled={settingsMode !== AUTH_MODES.EXTERNAL}/><span><strong>普通用户使用 Sub2API 导入</strong><small>仅开放账号 JSON 导入，不开放管理密钥</small></span></label>
             <label className="auth-check-row"><input type="checkbox" checked={Boolean(system.maintenance_mode)} onChange={event => setSystem({...system, maintenance_mode: event.target.checked})}/><span><strong>维护模式</strong><small>暂时阻止写入操作</small></span></label>
           </div>
-          <div className="settings-mode-callout"><ShieldCheck size={16}/><span>{settingsMode === AUTH_MODES.EXTERNAL ? '对外模式：登录后按角色显示功能。' : '自用模式：保留本机工作流，可选择登录管理。'}</span></div>
+          <div className="settings-mode-callout"><ShieldCheck size={16}/><span>批量同步会逐个处理启用中的店铺，并在相邻店铺之间等待 {normalizeShopBatchSyncInterval(system.shop_batch_sync_interval_seconds)} 秒。{settingsMode === AUTH_MODES.EXTERNAL ? ' 对外模式下登录后按角色显示功能。' : ' 自用模式保留本机工作流。'}</span></div>
           <div className="settings-actions"><button className="button primary" type="button" onClick={saveSystem} disabled={saving}><Save size={15}/>{saving ? '保存中' : '保存系统设置'}</button></div>
         </section> : tab === 'users' ? <section className="settings-section users-section">
           <div className="settings-section-head"><div><span className="detail-kicker">USERS</span><h3>用户管理</h3></div><span className="settings-count">{userCountLabel}</span></div>

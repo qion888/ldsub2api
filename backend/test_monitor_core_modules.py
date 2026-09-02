@@ -12,7 +12,7 @@ from monitor_core import database as database_module
 from monitor_core import history, preorders, settings, storefront
 from monitor_core.browser_verification import BrowserVerificationManager
 from monitor_core.inventory import InventoryService
-from monitor_core.workers import MonitorWorker
+from monitor_core.workers import MonitorWorker, ShopBatchSyncInProgress
 
 
 class MonitorCoreModuleTests(unittest.TestCase):
@@ -121,6 +121,93 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertEqual([item["ok"] for item in result], [True, False, True])
         self.assertEqual(result[1]["error"], "failed")
+
+    def test_worker_syncs_shops_with_intervals_and_continues_after_failure(self) -> None:
+        events = []
+
+        def fetch_shop(shop_id):
+            events.append(("fetch", shop_id))
+            if shop_id == 2:
+                raise RuntimeError("WAF challenge required")
+            return {"shop_id": shop_id}
+
+        worker = MonitorWorker(
+            database=self.database,
+            record_inventory_fetch=lambda watch_id, cache=None: {"watch_id": watch_id},
+            record_shop_fetch=fetch_shop,
+            process_preorder=lambda preorder_id, product: None,
+            mark_preorder_check_error=lambda preorder_id, error: None,
+            default_interval=300,
+            sleeper=lambda seconds: events.append(("sleep", seconds)),
+        )
+
+        result = worker.fetch_shops([1, 2, 2, 3], 7)
+
+        self.assertEqual(events, [
+            ("fetch", 1),
+            ("sleep", 7),
+            ("fetch", 2),
+            ("sleep", 7),
+            ("fetch", 3),
+        ])
+        self.assertEqual(result["interval_seconds"], 7)
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["succeeded"], 2)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual([entry["ok"] for entry in result["results"]], [True, False, True])
+
+    def test_worker_rejects_a_second_shop_batch(self) -> None:
+        worker = MonitorWorker(
+            database=self.database,
+            record_inventory_fetch=lambda watch_id, cache=None: {"watch_id": watch_id},
+            record_shop_fetch=lambda shop_id: {"shop_id": shop_id},
+            process_preorder=lambda preorder_id, product: None,
+            mark_preorder_check_error=lambda preorder_id, error: None,
+            default_interval=300,
+        )
+        worker._shop_batch_lock.acquire()
+        try:
+            with self.assertRaises(ShopBatchSyncInProgress):
+                worker.fetch_shops([1], 3)
+        finally:
+            worker._shop_batch_lock.release()
+
+    def test_worker_rejects_manual_fetches_during_shop_batch(self) -> None:
+        worker = MonitorWorker(
+            database=self.database,
+            record_inventory_fetch=lambda watch_id, cache=None: {"watch_id": watch_id},
+            record_shop_fetch=lambda shop_id: {"shop_id": shop_id},
+            process_preorder=lambda preorder_id, product: None,
+            mark_preorder_check_error=lambda preorder_id, error: None,
+            default_interval=300,
+        )
+        worker._shop_batch_active.set()
+        try:
+            with self.assertRaises(ShopBatchSyncInProgress):
+                worker.fetch(1)
+            with self.assertRaises(ShopBatchSyncInProgress):
+                worker.fetch_many([1, 2])
+            with self.assertRaises(ShopBatchSyncInProgress):
+                worker.fetch_shop(1)
+        finally:
+            worker._shop_batch_active.clear()
+
+    def test_worker_clears_shop_batch_state_when_waiting_fails(self) -> None:
+        worker = MonitorWorker(
+            database=self.database,
+            record_inventory_fetch=lambda watch_id, cache=None: {"watch_id": watch_id},
+            record_shop_fetch=lambda shop_id: {"shop_id": shop_id},
+            process_preorder=lambda preorder_id, product: None,
+            mark_preorder_check_error=lambda preorder_id, error: None,
+            default_interval=300,
+            sleeper=lambda _seconds: (_ for _ in ()).throw(RuntimeError("sleep failed")),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "sleep failed"):
+            worker.fetch_shops([1, 2], 3)
+
+        self.assertFalse(worker.shop_batch_sync_in_progress())
+        self.assertEqual(worker.fetch_shop(3), {"shop_id": 3})
 
     def test_worker_uses_minute_floor_for_legacy_rows(self) -> None:
         worker = MonitorWorker(

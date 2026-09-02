@@ -14,6 +14,9 @@ from typing import Any, Callable, Iterable
 
 VALID_ROLES = frozenset({"admin", "user"})
 VALID_MODES = frozenset({"self_use", "external"})
+DEFAULT_SHOP_BATCH_SYNC_INTERVAL_SECONDS = 3
+MIN_SHOP_BATCH_SYNC_INTERVAL_SECONDS = 1
+MAX_SHOP_BATCH_SYNC_INTERVAL_SECONDS = 60
 
 DEFAULT_BASIC_SETTINGS: dict[str, Any] = {
     "site_name": "链动小铺本地监控台",
@@ -26,6 +29,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "session_ttl_hours": 24,
     "maintenance_mode": False,
     "log_level": "info",
+    "shop_batch_sync_interval_seconds": DEFAULT_SHOP_BATCH_SYNC_INTERVAL_SECONDS,
     # External installations can expose a read-only homepage without forcing
     # an authentication gate. Feature switches are deliberately separate so
     # ordinary users never inherit management access implicitly.

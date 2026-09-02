@@ -2903,6 +2903,9 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .settings-form-grid { margin-top: 17px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 12px; }
 .settings-form-grid .wide { grid-column: 1 / -1; }
 .settings-form-grid label > span { display: block; }
+.settings-unit-input { display: grid; grid-template-columns: minmax(0, 1fr) 42px; align-items: stretch; }
+.settings-unit-input input { min-width: 0; border-radius: 4px 0 0 4px !important; }
+.settings-unit-input em { display: grid; place-items: center; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border); border-left: 0; border-radius: 0 4px 4px 0; font-size: 11px; font-style: normal; font-weight: 650; }
 .settings-actions { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; }
 .settings-note, .settings-mode-callout { margin-top: 15px; padding: 10px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 4px; font-size: 11px; line-height: 1.5; }
 .password-form { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--ui-border-soft); }
@@ -3291,6 +3294,14 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .shop-batch-toolbar .icon-button { width: 29px; height: 29px; }
 .shop-batch-toolbar .button { min-height: 30px; padding-inline: 9px; font-size: 9px; }
 .shop-batch-actions { flex-wrap: wrap; }
+.shop-sync-policy { min-height: 24px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-muted); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 3px; white-space: nowrap; }
+.shop-sync-policy svg { flex: 0 0 auto; }
+.shop-sync-progress { min-height: 46px; padding: 8px 10px; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 9px; color: var(--ui-text); background: color-mix(in srgb, var(--ui-success) 6%, var(--ui-surface)); border: 1px solid color-mix(in srgb, var(--ui-success) 26%, var(--ui-border)); border-top: 0; }
+.shop-sync-progress-icon { width: 28px; height: 28px; display: grid; place-items: center; color: var(--ui-success); background: var(--ui-surface); border: 1px solid var(--ui-border-soft); border-radius: 4px; }
+.shop-sync-progress strong, .shop-sync-progress small { display: block; }
+.shop-sync-progress strong { font-size: 11px; }
+.shop-sync-progress small { margin-top: 3px; color: var(--ui-text-muted); font-size: 9px; line-height: 1.4; }
+.shop-sync-progress > em { color: var(--ui-success); font-size: 10px; font-style: normal; font-weight: 700; white-space: nowrap; }
 .shop-verification-banner {
   min-height: 38px;
   padding: 7px 9px;
@@ -3460,6 +3471,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .shop-batch-toolbar { align-items: flex-start; flex-direction: column; }
   .shop-batch-toolbar > div { width: 100%; justify-content: space-between; }
   .shop-batch-actions { align-items: center; }
+  .shop-sync-progress { grid-template-columns: 28px minmax(0, 1fr); }
+  .shop-sync-progress > em { grid-column: 2; }
   .shop-verification-banner { align-items: flex-start; flex-wrap: wrap; }
   .shop-verification-banner .button { margin-left: 23px; }
   .product-row { grid-template-columns: 22px minmax(0, 1fr) auto; }

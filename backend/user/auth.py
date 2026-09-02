@@ -236,6 +236,16 @@ class AuthService:
         except (TypeError, ValueError):
             ttl = DEFAULT_SESSION_TTL_HOURS
         merged["session_ttl_hours"] = ttl
+        interval = merged.get(
+            "shop_batch_sync_interval_seconds",
+            store.DEFAULT_SHOP_BATCH_SYNC_INTERVAL_SECONDS,
+        )
+        if type(interval) is not int:
+            interval = store.DEFAULT_SHOP_BATCH_SYNC_INTERVAL_SECONDS
+        merged["shop_batch_sync_interval_seconds"] = min(
+            max(interval, store.MIN_SHOP_BATCH_SYNC_INTERVAL_SECONDS),
+            store.MAX_SHOP_BATCH_SYNC_INTERVAL_SECONDS,
+        )
         merged["maintenance_mode"] = _bool_value(merged.get("maintenance_mode"))
         level = str(merged.get("log_level") or "info").strip().lower()
         merged["log_level"] = level if level in {"debug", "info", "warning", "error"} else "info"
@@ -644,6 +654,23 @@ class AuthService:
                         if level not in {"debug", "info", "warning", "error"}:
                             raise UserServiceError("日志级别无效", code="invalid_setting")
                         system["log_level"] = level
+                    if "shop_batch_sync_interval_seconds" in incoming:
+                        interval = incoming["shop_batch_sync_interval_seconds"]
+                        if type(interval) is not int:
+                            raise UserServiceError(
+                                "店铺批量同步间隔必须为整数秒",
+                                code="invalid_setting",
+                            )
+                        if not (
+                            store.MIN_SHOP_BATCH_SYNC_INTERVAL_SECONDS
+                            <= interval
+                            <= store.MAX_SHOP_BATCH_SYNC_INTERVAL_SECONDS
+                        ):
+                            raise UserServiceError(
+                                "店铺批量同步间隔需要在 1 到 60 秒之间",
+                                code="invalid_setting",
+                            )
+                        system["shop_batch_sync_interval_seconds"] = interval
                     if "force_login" in incoming:
                         system["force_login"] = _bool_value(incoming["force_login"], default=True)
                     if "allow_user_reclaim" in incoming:
