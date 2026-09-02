@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 from pathlib import Path
 
@@ -42,6 +45,35 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertTrue({"watches", "snapshots", "shops", "preorders"}.issubset(tables))
         self.assertEqual(settings.read_json(self.database, "feature", {}), {"enabled": True})
         self.assertEqual(settings.normalize_service_url("https://example.test/", ""), "https://example.test")
+
+    def test_database_migration_clamps_legacy_second_intervals(self) -> None:
+        with self.database() as connection:
+            watch_id = connection.execute(
+                "INSERT INTO watches(url, name, interval_seconds, created_at) VALUES(?, ?, 1, ?)",
+                ("https://pay.ldxp.cn/item/legacy-interval", "Legacy", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            shop_id = connection.execute(
+                "INSERT INTO shops(url, token, name, interval_seconds, created_at) VALUES(?, ?, ?, 2, ?)",
+                ("https://pay.ldxp.cn/shop/legacy-interval", "legacy-interval", "Legacy", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO preorders(watch_id, quantity, interval_seconds, contact, created_at) VALUES(?, 1, 3, ?, ?)",
+                (watch_id, "buyer@example.com", "2026-08-30T08:00:00+00:00"),
+            )
+
+        database_module.initialize_database(
+            self.database,
+            now=lambda: "2026-08-30T08:01:00+00:00",
+            default_interval=300,
+            default_redeem_url="https://redeem.example",
+            default_sub2api_url="https://sub2api.example",
+            default_automation={"enabled": False},
+        )
+
+        with self.database() as connection:
+            self.assertEqual(connection.execute("SELECT interval_seconds FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 60)
+            self.assertEqual(connection.execute("SELECT interval_seconds FROM shops WHERE id = ?", (shop_id,)).fetchone()[0], 60)
+            self.assertEqual(connection.execute("SELECT interval_seconds FROM preorders WHERE watch_id = ?", (watch_id,)).fetchone()[0], 60)
 
     def test_history_calculates_price_and_stock_transitions(self) -> None:
         with self.database() as connection:
@@ -90,6 +122,31 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertEqual([item["ok"] for item in result], [True, False, True])
         self.assertEqual(result[1]["error"], "failed")
 
+    def test_worker_uses_minute_floor_for_legacy_rows(self) -> None:
+        worker = MonitorWorker(
+            database=self.database,
+            record_inventory_fetch=lambda watch_id, cache=None: {"watch_id": watch_id},
+            record_shop_fetch=lambda shop_id: {"shop_id": shop_id},
+            process_preorder=lambda preorder_id, product: None,
+            mark_preorder_check_error=lambda preorder_id, error: None,
+            default_interval=300,
+        )
+
+        self.assertEqual(worker._interval(1, 1), 60)
+        self.assertEqual(worker._interval("invalid", 300), 300)
+
+    def test_storefront_throttle_enforces_configured_gap(self) -> None:
+        with patch.dict(os.environ, {"LDXP_UPSTREAM_MIN_INTERVAL": "0.01"}), \
+             patch.object(storefront.time, "monotonic", side_effect=[0.0, 0.0]), \
+             patch.object(storefront.time, "sleep") as sleep:
+            storefront._UPSTREAM_NEXT_ALLOWED = 0.0
+            storefront.wait_for_upstream_request()
+            storefront.wait_for_upstream_request()
+
+        self.assertEqual(sleep.call_count, 1)
+        self.assertGreaterEqual(sleep.call_args.args[0], 0.01)
+        storefront._UPSTREAM_NEXT_ALLOWED = 0.0
+
     def test_browser_verification_detects_configured_waf_markers(self) -> None:
         manager = BrowserVerificationManager(
             database=self.database,
@@ -105,6 +162,61 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
         self.assertFalse(manager._is_waf_html("<main>products</main>"))
+
+    def test_browser_challenge_keeps_first_party_page_context(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+
+        class FakeDriver:
+            page_source = "<div id='aliyunCaptcha'></div>"
+
+            def execute_script(self, *_args):
+                raise AssertionError("challenge HTML must not be injected into the page")
+
+        driver = FakeDriver()
+        manager.batch_active = True
+        manager.batch_total = 1
+        manager.batch_current_shop_id = 1
+        result = manager._render_challenge(driver, "<html>challenge</html>")
+
+        self.assertEqual(result["status"], "awaiting_verification")
+
+    def test_browser_request_uses_storefront_visitor_id_and_detects_status_only_waf(self) -> None:
+        manager = BrowserVerificationManager(
+            database=self.database,
+            worker_lock=object(),
+            record_shop_fetch=lambda *args, **kwargs: {},
+            goods_list_rows=lambda payload: ([], {}),
+            normalize_goods=lambda item, token: item,
+            first_value=lambda item, keys: None,
+            waf_error=RuntimeError,
+            waf_markers=(b"aliyunCaptcha",),
+            profile_path=Path(self.directory.name) / "profile",
+        )
+
+        class FakeDriver:
+            script = ""
+
+            def set_script_timeout(self, _seconds):
+                return None
+
+            def execute_async_script(self, script, _payload):
+                self.script = script
+                return {"status": 403, "content_type": "text/html", "text": "<html>challenge</html>"}
+
+        driver = FakeDriver()
+        with self.assertRaises(RuntimeError):
+            manager._browser_request(driver, {"token": "SHOP", "current": 1})
+        self.assertIn("Visitorid", driver.script)
 
     def test_browser_verification_batches_shops_after_one_challenge(self) -> None:
         with self.database() as connection:
@@ -150,7 +262,9 @@ class MonitorCoreModuleTests(unittest.TestCase):
         self.assertEqual(first["status"], "awaiting_verification")
         self.assertEqual(first["pending_shop_ids"], shop_ids)
         self.assertEqual(first["current_shop_id"], shop_ids[0])
-        driver.page_source = "<main>verified</main>"
+        # A solved Aliyun page can retain the challenge marker in its source;
+        # completion must trust a fresh catalog request instead.
+        driver.page_source = "<div id='aliyunCaptcha'></div><main>verified</main>"
         completed = manager.complete_all()
         self.assertEqual(completed["status"], "success")
         self.assertEqual(completed["completed"], 2)
@@ -225,6 +339,139 @@ class MonitorCoreModuleTests(unittest.TestCase):
 
         self.assertEqual(product["sale_status"], "off_sale")
         self.assertIsNone(product["stock"])
+
+    def test_delete_shops_cleans_children_before_parent_for_legacy_schema(self) -> None:
+        legacy_path = Path(self.directory.name) / "legacy-shop-delete.db"
+
+        @contextmanager
+        def legacy_database() -> sqlite3.Connection:
+            connection = sqlite3.connect(legacy_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            try:
+                yield connection
+                connection.commit()
+            finally:
+                connection.close()
+
+        with legacy_database() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE watches (id INTEGER PRIMARY KEY, url TEXT NOT NULL);
+                CREATE TABLE snapshots (
+                    id INTEGER PRIMARY KEY,
+                    watch_id INTEGER NOT NULL,
+                    FOREIGN KEY (watch_id) REFERENCES watches(id)
+                );
+                CREATE TABLE preorders (
+                    id INTEGER PRIMARY KEY,
+                    watch_id INTEGER NOT NULL,
+                    FOREIGN KEY (watch_id) REFERENCES watches(id)
+                );
+                CREATE TABLE shops (id INTEGER PRIMARY KEY, url TEXT NOT NULL, token TEXT NOT NULL);
+                CREATE TABLE shop_products (
+                    shop_id INTEGER NOT NULL,
+                    goods_key TEXT NOT NULL,
+                    watch_id INTEGER NOT NULL,
+                    listed INTEGER NOT NULL DEFAULT 1,
+                    last_seen TEXT NOT NULL,
+                    PRIMARY KEY (shop_id, goods_key),
+                    FOREIGN KEY (shop_id) REFERENCES shops(id),
+                    FOREIGN KEY (watch_id) REFERENCES watches(id)
+                );
+                CREATE TABLE shop_exclusions (
+                    shop_id INTEGER NOT NULL,
+                    goods_key TEXT NOT NULL,
+                    removed_at TEXT NOT NULL,
+                    PRIMARY KEY (shop_id, goods_key),
+                    FOREIGN KEY (shop_id) REFERENCES shops(id)
+                );
+                CREATE TABLE shop_runs (
+                    id INTEGER PRIMARY KEY,
+                    shop_id INTEGER NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    FOREIGN KEY (shop_id) REFERENCES shops(id)
+                );
+                """
+            )
+            watch_id = connection.execute(
+                "INSERT INTO watches(url) VALUES(?)",
+                ("https://pay.ldxp.cn/item/legacy-shop-product",),
+            ).lastrowid
+            connection.execute("INSERT INTO snapshots(watch_id) VALUES(?)", (watch_id,))
+            connection.execute("INSERT INTO preorders(watch_id) VALUES(?)", (watch_id,))
+            shop_id = connection.execute(
+                "INSERT INTO shops(url, token) VALUES(?, ?)",
+                ("https://pay.ldxp.cn/shop/LEGACYDELETE", "LEGACYDELETE"),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO shop_products(shop_id, goods_key, watch_id, last_seen) VALUES(?, ?, ?, ?)",
+                (shop_id, "legacy-product", watch_id, "2026-08-30T08:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO shop_exclusions(shop_id, goods_key, removed_at) VALUES(?, ?, ?)",
+                (shop_id, "legacy-product", "2026-08-30T08:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO shop_runs(shop_id, fetched_at, status) VALUES(?, ?, 'success')",
+                (shop_id, "2026-08-30T08:00:00+00:00"),
+            )
+
+        service = InventoryService(
+            database=legacy_database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: {},
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+        )
+        self.assertEqual(service.delete_shops([shop_id]), 1)
+
+        with legacy_database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_exclusions").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_runs").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM preorders").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches").fetchone()[0], 0)
+
+    def test_delete_shops_keeps_product_shared_with_another_shop(self) -> None:
+        with self.database() as connection:
+            watch_id = connection.execute(
+                "INSERT INTO watches(url, created_at) VALUES(?, ?)",
+                ("https://pay.ldxp.cn/item/shared-shop-product", "2026-08-30T08:00:00+00:00"),
+            ).lastrowid
+            shop_ids = [
+                connection.execute(
+                    "INSERT INTO shops(url, token, created_at) VALUES(?, ?, ?)",
+                    (f"https://pay.ldxp.cn/shop/SHARED{index}", f"SHARED{index}", "2026-08-30T08:00:00+00:00"),
+                ).lastrowid
+                for index in (1, 2)
+            ]
+            for shop_id in shop_ids:
+                connection.execute(
+                    "INSERT INTO shop_products(shop_id, goods_key, watch_id, last_seen) VALUES(?, 'shared-product', ?, ?)",
+                    (shop_id, watch_id, "2026-08-30T08:00:00+00:00"),
+                )
+
+        service = InventoryService(
+            database=self.database,
+            now=lambda: "2026-08-30T08:00:00+00:00",
+            fetch_goods=lambda url: {},
+            fetch_shop_catalog=lambda url, **kwargs: [],
+            commerce_tags=lambda item: [],
+            is_unlisted_error=lambda value: False,
+            sync_intervals=lambda connection, shop_id, interval: 0,
+        )
+        self.assertEqual(service.delete_shops([shop_ids[0]]), 1)
+
+        with self.database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 1)
 
     def test_inventory_links_single_product_to_discovered_shop_and_reuses_it(self) -> None:
         product = {

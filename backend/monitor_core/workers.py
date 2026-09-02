@@ -18,6 +18,7 @@ class MonitorWorker(threading.Thread):
         process_preorder: Callable[[int, dict[str, Any]], Any],
         mark_preorder_check_error: Callable[[int, Exception], None],
         default_interval: int,
+        minimum_interval: int = 60,
     ) -> None:
         super().__init__(name="product-monitor", daemon=True)
         self._database = database
@@ -26,6 +27,10 @@ class MonitorWorker(threading.Thread):
         self._process_preorder = process_preorder
         self._mark_preorder_check_error = mark_preorder_check_error
         self._default_interval = default_interval
+        try:
+            self._minimum_interval = max(60, int(minimum_interval))
+        except (TypeError, ValueError):
+            self._minimum_interval = 60
         self.stop_event = threading.Event()
         self.fetch_lock = threading.Lock()
 
@@ -38,6 +43,13 @@ class MonitorWorker(threading.Thread):
         except (TypeError, ValueError, OverflowError):
             return 0.0
 
+    def _interval(self, value: Any, fallback: int) -> int:
+        try:
+            requested = int(value or fallback)
+        except (TypeError, ValueError):
+            requested = fallback
+        return max(self._minimum_interval, requested)
+
     def run(self) -> None:
         while not self.stop_event.wait(0.25):
             current = time.time()
@@ -48,7 +60,7 @@ class MonitorWorker(threading.Thread):
                     "WHERE enabled = 1 AND status = 'watching'"
                 ).fetchall()
             for row in preorder_rows:
-                if current - self._timestamp(row["last_check"]) < int(row["interval_seconds"] or 1):
+                if current - self._timestamp(row["last_check"]) < self._interval(row["interval_seconds"], self._minimum_interval):
                     continue
                 if not self.fetch_lock.acquire(blocking=False):
                     break
@@ -65,7 +77,7 @@ class MonitorWorker(threading.Thread):
                     "SELECT id, last_run, interval_seconds FROM watches WHERE enabled = 1"
                 ).fetchall()
             for row in rows:
-                if current - self._timestamp(row["last_run"]) < int(row["interval_seconds"] or self._default_interval):
+                if current - self._timestamp(row["last_run"]) < self._interval(row["interval_seconds"], self._default_interval):
                     continue
                 if not self.fetch_lock.acquire(blocking=False):
                     break
@@ -83,8 +95,8 @@ class MonitorWorker(threading.Thread):
                     "FROM shops s WHERE s.enabled = 1"
                 ).fetchall()
             for row in shop_rows:
-                retry_interval = int(row["interval_seconds"] or 300)
-                if "WAF" in str(row["last_error"] or ""):
+                retry_interval = self._interval(row["interval_seconds"], 300)
+                if "waf" in str(row["last_error"] or "").lower():
                     retry_interval = max(retry_interval, 3600)
                 if current - self._timestamp(row["last_run"]) < retry_interval or row["id"] in shop_refresh_cache:
                     continue

@@ -43,8 +43,13 @@ def initialize_database(
     default_redeem_url: str,
     default_sub2api_url: str,
     default_automation: dict,
+    minimum_interval: int = 60,
 ) -> None:
     """Create tables and apply additive migrations without owning app globals."""
+    try:
+        minimum_interval = max(60, int(minimum_interval))
+    except (TypeError, ValueError):
+        minimum_interval = 60
     with database_factory() as connection:
         connection.executescript(
             """
@@ -149,6 +154,24 @@ def initialize_database(
         _add_column(connection, "snapshots", "goods_key TEXT")
         _add_column(connection, "snapshots", "raw_data TEXT")
         _add_column(connection, "shops", "category_name TEXT")
+        # Older installations accepted second-level schedules. Normalize them
+        # during startup so the worker cannot immediately replay a burst after
+        # an upgrade, including preorders which also call the storefront.
+        connection.execute(
+            "UPDATE watches SET interval_seconds = ? "
+            "WHERE interval_seconds IS NULL OR interval_seconds < ?",
+            (minimum_interval, minimum_interval),
+        )
+        connection.execute(
+            "UPDATE shops SET interval_seconds = ? "
+            "WHERE interval_seconds IS NULL OR interval_seconds < ?",
+            (minimum_interval, minimum_interval),
+        )
+        connection.execute(
+            "UPDATE preorders SET interval_seconds = ? "
+            "WHERE interval_seconds IS NULL OR interval_seconds < ?",
+            (minimum_interval, minimum_interval),
+        )
         connection.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('contact', ?)",
             (json.dumps({"contact": "", "note": ""}, ensure_ascii=False),),

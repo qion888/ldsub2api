@@ -600,6 +600,55 @@ class InventoryService:
             return 0
         placeholders = ",".join("?" for _ in shop_ids)
         with self.database() as connection:
+            linked_watch_rows = connection.execute(
+                f"SELECT DISTINCT watch_id FROM shop_products WHERE shop_id IN ({placeholders})",
+                shop_ids,
+            ).fetchall()
+            linked_watch_ids = [int(row["watch_id"]) for row in linked_watch_rows]
+            # Existing installations may have created these child tables
+            # before their ON DELETE CASCADE clauses were introduced. Delete
+            # the known dependants explicitly so both schemas behave alike.
+            connection.execute(
+                f"DELETE FROM shop_exclusions WHERE shop_id IN ({placeholders})",
+                shop_ids,
+            )
+            connection.execute(
+                f"DELETE FROM shop_products WHERE shop_id IN ({placeholders})",
+                shop_ids,
+            )
+            connection.execute(
+                f"DELETE FROM shop_runs WHERE shop_id IN ({placeholders})",
+                shop_ids,
+            )
+            if linked_watch_ids:
+                watch_placeholders = ",".join("?" for _ in linked_watch_ids)
+                orphan_watch_rows = connection.execute(
+                    f"""
+                    SELECT w.id FROM watches w
+                    WHERE w.id IN ({watch_placeholders})
+                      AND NOT EXISTS (
+                        SELECT 1 FROM shop_products sp WHERE sp.watch_id = w.id
+                      )
+                    """,
+                    linked_watch_ids,
+                ).fetchall()
+                orphan_watch_ids = [int(row["id"]) for row in orphan_watch_rows]
+                if orphan_watch_ids:
+                    orphan_placeholders = ",".join("?" for _ in orphan_watch_ids)
+                    # Remove catalog rows after links are gone. A shared
+                    # product remains because it still has another shop link.
+                    connection.execute(
+                        f"DELETE FROM preorders WHERE watch_id IN ({orphan_placeholders})",
+                        orphan_watch_ids,
+                    )
+                    connection.execute(
+                        f"DELETE FROM snapshots WHERE watch_id IN ({orphan_placeholders})",
+                        orphan_watch_ids,
+                    )
+                    connection.execute(
+                        f"DELETE FROM watches WHERE id IN ({orphan_placeholders})",
+                        orphan_watch_ids,
+                    )
             cursor = connection.execute(
                 f"DELETE FROM shops WHERE id IN ({placeholders})",
                 shop_ids,

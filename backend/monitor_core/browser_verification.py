@@ -9,6 +9,8 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from .storefront import is_waf_response
+
 
 class BrowserVerificationManager:
     """Coordinate one persistent browser session across one or many shops.
@@ -30,6 +32,7 @@ class BrowserVerificationManager:
         waf_error: type[Exception],
         waf_markers: tuple[bytes, ...],
         profile_path: Path,
+        request_waiter: Callable[[], None] | None = None,
     ) -> None:
         self._database = database
         self._worker_lock = worker_lock
@@ -40,6 +43,7 @@ class BrowserVerificationManager:
         self._waf_error = waf_error
         self._waf_markers = waf_markers
         self._profile_path = profile_path
+        self._request_waiter = request_waiter or (lambda: None)
         self.lock = threading.RLock()
         self.driver: Any = None
         self.shop_id: int | None = None
@@ -147,15 +151,28 @@ class BrowserVerificationManager:
         raise RuntimeError(f"Unable to start a WAF browser ({detail})")
 
     def _browser_request(self, driver: Any, data: dict[str, Any]) -> dict[str, Any]:
+        self._request_waiter()
         driver.set_script_timeout(30)
         result = driver.execute_async_script(
             """
             const payload = arguments[0];
             const done = arguments[arguments.length - 1];
+            let visitorId = '';
+            try {
+              visitorId = window.localStorage.getItem('visitorId') || '';
+              if (!visitorId) {
+                visitorId = Math.random().toString(36).slice(2, 11);
+                window.localStorage.setItem('visitorId', visitorId);
+              }
+            } catch (_) {}
             fetch('/shopApi/Shop/goodsList', {
               method: 'POST',
               credentials: 'include',
-              headers: {'Accept': 'application/json, text/plain, */*', 'Content-Type': 'application/json'},
+              headers: {
+                'Accept': 'application/json, text/plain, */*',
+                'Content-Type': 'application/json',
+                ...(visitorId ? {'Visitorid': visitorId} : {}),
+              },
               body: JSON.stringify(payload)
             }).then(async response => done({
               status: response.status,
@@ -168,7 +185,14 @@ class BrowserVerificationManager:
         if not isinstance(result, dict) or result.get("error"):
             raise RuntimeError(str((result or {}).get("error") or "browser request failed")[:200])
         text = str(result.get("text") or "")
-        if self._is_waf_html(text):
+        try:
+            status = int(result.get("status") or 0)
+        except (TypeError, ValueError):
+            status = None
+        content_type = str(result.get("content_type") or "")
+        if self._is_waf_html(text) or is_waf_response(
+            text.encode("utf-8", "ignore"), content_type=content_type, status=status
+        ):
             raise self._waf_error(text)
         try:
             payload = json.loads(text)
@@ -203,12 +227,22 @@ class BrowserVerificationManager:
         return list(products.values())
 
     def _render_challenge(self, driver: Any, html_text: str) -> dict[str, Any]:
+        # Keep the challenge in the first-party page context.  Replacing the
+        # document with HTML fetched through XHR strips the browser's original
+        # navigation state and can make Aliyun reject a perfectly valid slider.
         try:
-            driver.execute_script("document.open(); document.write(arguments[0]); document.close();", html_text)
-        except Exception as exc:
-            self._close()
-            self._reset_batch()
-            raise RuntimeError("Unable to display the WAF challenge in the browser") from exc
+            page_source = str(driver.page_source or "")
+        except Exception:
+            page_source = ""
+        if not self._is_waf_html(page_source) and self.batch_current_shop_id is not None and hasattr(driver, "get"):
+            try:
+                shop = self._shop(self.batch_current_shop_id)
+                self._request_waiter()
+                driver.get(shop["url"])
+            except Exception as exc:
+                self._close()
+                self._reset_batch()
+                raise RuntimeError("Unable to display the WAF challenge in the browser") from exc
         return self._status("Complete the WAF challenge in the open browser, then continue the batch")
 
     def _status(self, detail: str = "", status: str | None = None) -> dict[str, Any]:
@@ -239,6 +273,7 @@ class BrowserVerificationManager:
 
     def _sync_shop(self, driver: Any, shop_id: int) -> dict[str, Any]:
         shop = self._shop(shop_id)
+        self._request_waiter()
         driver.get(shop["url"])
         first_payload = self._browser_request(driver, self._request_data(shop, 1))
         products = self._catalog(driver, shop, first_payload)
@@ -302,8 +337,8 @@ class BrowserVerificationManager:
         with self.lock:
             if not self.batch_active or self.batch_total != 1 or self.batch_current_shop_id != shop_id or self.driver is None:
                 raise RuntimeError("no pending browser verification session for this shop")
-            if self._is_waf_html(str(self.driver.page_source or "")):
-                return self._status("The WAF challenge is still pending")
+            # Re-run the catalog request as the source of truth. Challenge pages
+            # can retain WAF markers after the slider has already issued a cookie.
             return self._advance_batch_locked()
 
     def start_all(self, shop_ids: list[int]) -> dict[str, Any]:
@@ -314,8 +349,8 @@ class BrowserVerificationManager:
         with self.lock:
             if not self.batch_active or self.driver is None:
                 raise RuntimeError("no pending batch browser verification session")
-            if self._is_waf_html(str(self.driver.page_source or "")):
-                return self._status("The WAF challenge is still pending")
+            # Re-run the catalog request as the source of truth. Challenge pages
+            # can retain WAF markers after the slider has already issued a cookie.
             return self._advance_batch_locked()
 
     def status(self) -> dict[str, Any]:

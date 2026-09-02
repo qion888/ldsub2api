@@ -92,7 +92,7 @@ class MonitorSettingsTests(unittest.TestCase):
         self.assertEqual(result["interval_seconds"], MAX_INTERVAL)
 
     def test_invalid_or_missing_monitor_is_rejected(self):
-        self.assertEqual(normalize_interval(-10), 1)
+        self.assertEqual(normalize_interval(-10), 60)
         with self.assertRaises(ValueError):
             update_shop_monitoring(
                 self.connection,

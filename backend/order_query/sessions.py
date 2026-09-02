@@ -266,6 +266,19 @@ class OrderQuerySessionStore:
     def remaining(self, session: OrderQuerySession) -> int:
         return max(0, int(session.expires_at - self._clock()))
 
+    def renew(self, session: OrderQuerySession, *, ttl_seconds: int | None = None) -> int:
+        """Extend a live session for a bounded interactive verification lease."""
+        now = self._clock()
+        lease = self.ttl_seconds if ttl_seconds is None else int(ttl_seconds)
+        lease = max(30, min(1800, lease))
+        with self._lock:
+            if self._sessions.get(session.session_id) is not session or session.expires_at <= now:
+                self._sessions.pop(session.session_id, None)
+                raise OrderQuerySessionExpired()
+            with session.lock:
+                session.expires_at = max(session.expires_at, now + lease)
+                return max(0, int(session.expires_at - now))
+
     def now(self) -> float:
         return self._clock()
 

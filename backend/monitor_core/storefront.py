@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
+import threading
+import time
 import uuid
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
@@ -17,6 +20,9 @@ ALLOWED_HOST = "pay.ldxp.cn"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 USER_AGENT = "LDXP-Local-Monitor/2.0"
 VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
+DEFAULT_UPSTREAM_MIN_INTERVAL = 1.0
+_UPSTREAM_THROTTLE_LOCK = threading.Lock()
+_UPSTREAM_NEXT_ALLOWED = 0.0
 WAF_MARKERS = (b"aliyunCaptcha", b"aliyunCaptcha-sliding-slider", b"waf_nc", b"u_atoken")
 # Aliyun occasionally changes the challenge wrapper while keeping the response
 # status at 403.  Keep these secondary markers deliberately narrow and only
@@ -28,6 +34,29 @@ UNLISTED_ERROR_MARKERS = ("商品未上架", "商品不存在", "已下架", "�
 
 class WafChallengeRequired(RuntimeError):
     pass
+
+
+def upstream_min_interval() -> float:
+    """Return the minimum gap between storefront requests in seconds."""
+    try:
+        value = float(os.environ.get("LDXP_UPSTREAM_MIN_INTERVAL", DEFAULT_UPSTREAM_MIN_INTERVAL))
+    except (TypeError, ValueError):
+        value = DEFAULT_UPSTREAM_MIN_INTERVAL
+    return max(0.0, min(value, 60.0))
+
+
+def wait_for_upstream_request() -> None:
+    """Reserve the next storefront request slot across HTTP and browser calls."""
+    global _UPSTREAM_NEXT_ALLOWED
+    interval = upstream_min_interval()
+    if interval <= 0:
+        return
+    with _UPSTREAM_THROTTLE_LOCK:
+        now = time.monotonic()
+        delay = max(0.0, _UPSTREAM_NEXT_ALLOWED - now)
+        _UPSTREAM_NEXT_ALLOWED = max(now, _UPSTREAM_NEXT_ALLOWED) + interval
+    if delay:
+        time.sleep(delay)
 
 
 def is_waf_response(raw: bytes, *, content_type: str = "", status: int | None = None) -> bool:
@@ -354,6 +383,10 @@ def _post_shop_api(
     visitor_id: str | None = None,
     opener: Callable[..., Any] = urlopen,
 ) -> dict[str, Any]:
+    # Unit callers can inject an opener without incurring production pacing;
+    # real requests share one process-wide gate with browser verification.
+    if opener is urlopen:
+        wait_for_upstream_request()
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "User-Agent": USER_AGENT,
@@ -432,6 +465,8 @@ def fetch_buyer_juuid(
         method="GET",
     )
     try:
+        if opener is urlopen:
+            wait_for_upstream_request()
         with opener(script_request, timeout=15) as response:
             script = response.read(MAX_RESPONSE_BYTES + 1).decode("utf-8", "replace")
     except (HTTPError, URLError, UnicodeError) as exc:
@@ -444,6 +479,8 @@ def fetch_buyer_juuid(
         method="GET",
     )
     try:
+        if opener is urlopen:
+            wait_for_upstream_request()
         with opener(iframe_request, timeout=15) as response:
             iframe = response.read(MAX_RESPONSE_BYTES + 1).decode("utf-8", "replace")
     except (HTTPError, URLError, UnicodeError) as exc:

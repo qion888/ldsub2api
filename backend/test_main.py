@@ -253,8 +253,40 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertEqual(delete_result["deleted_count"], 2)
                 with main.database() as connection:
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 1)
-                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (watch_id,)).fetchone()[0], 0)
                     self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
+
+                    single_watch_id = connection.execute(
+                        "INSERT INTO watches(url, name, enabled) VALUES(?, 'single shop product', 1)",
+                        ("https://pay.ldxp.cn/item/single-shop-delete",),
+                    ).lastrowid
+                    connection.execute(
+                        "INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen) VALUES(?, 'single-shop-delete', ?, 1, ?)",
+                        (shop_ids[2], single_watch_id, main.utc_now()),
+                    )
+                    connection.execute(
+                        "INSERT INTO shop_exclusions(shop_id, goods_key, removed_at) VALUES(?, 'single-shop-delete', ?)",
+                        (shop_ids[2], main.utc_now()),
+                    )
+                    connection.execute(
+                        "INSERT INTO shop_runs(shop_id, fetched_at, status) VALUES(?, ?, 'success')",
+                        (shop_ids[2], main.utc_now()),
+                    )
+
+                single_status, single_result = self.request_api(
+                    "DELETE", f"/api/shops/{shop_ids[2]}", {}
+                )
+                self.assertEqual(single_status, 200)
+                self.assertEqual(single_result, {"ok": True})
+                with main.database() as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shops").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_products").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_exclusions").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM shop_runs").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM watches WHERE id = ?", (single_watch_id,)).fetchone()[0], 0)
+
+                missing_status, _ = self.request_api("DELETE", f"/api/shops/{shop_ids[2]}", {})
+                self.assertEqual(missing_status, 404)
 
                 invalid_status, _ = self.request_api("POST", "/api/shops/batch-delete", {"ids": []})
                 self.assertEqual(invalid_status, 400)
@@ -293,11 +325,11 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("invalid id", result["detail"])
 
-    def test_monitor_interval_supports_one_second_and_clamps_bounds(self):
-        self.assertEqual(main.normalize_interval(1), 1)
-        self.assertEqual(main.normalize_interval("3"), 3)
+    def test_monitor_interval_uses_minute_floor_and_clamps_bounds(self):
+        self.assertEqual(main.normalize_interval(1), 60)
+        self.assertEqual(main.normalize_interval("3"), 60)
         self.assertEqual(main.normalize_interval(0), main.DEFAULT_INTERVAL)
-        self.assertEqual(main.normalize_interval(-10), 1)
+        self.assertEqual(main.normalize_interval(-10), 60)
         self.assertEqual(main.normalize_interval(999999), main.MAX_INTERVAL)
 
     def test_shop_monitor_route_syncs_linked_product_interval(self):
@@ -768,7 +800,7 @@ class GoodsParserTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 201)
                 self.assertEqual(result[0]["quantity"], 5)
-                self.assertEqual(result[0]["interval_seconds"], 3)
+                self.assertEqual(result[0]["interval_seconds"], 60)
                 with main.database() as connection:
                     row = connection.execute("SELECT * FROM preorders WHERE watch_id = ?", (watch_id,)).fetchone()
                 self.assertEqual(row["contact"], "buyer@example.com")

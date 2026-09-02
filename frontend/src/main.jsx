@@ -112,7 +112,7 @@ const EMPTY_CARD_IMPORT_HISTORY = {
   status: 'all',
   summary: {total: 0, success: 0, failed: 0, pending: 0, successful_accounts: 0, failed_accounts: 0},
 };
-const MONITOR_INTERVAL_OPTIONS = [1, 3, 5, 10, 30, 60, 300, 900, 1800];
+const MONITOR_INTERVAL_OPTIONS = [60, 300, 900, 1800, 3600];
 const SHOP_GOODS_TYPES = [
   {value: 'card', label: '卡密商品'},
   {value: 'article', label: '文章商品'},
@@ -130,6 +130,21 @@ function getVisitorId() {
 
 function needsBrowserVerification(shop) {
   return /WAF|无法解析|HTML 页面|HTML页面/.test(shop.last_attempt?.error || '');
+}
+
+function browserSyncSummary(result) {
+  if (result?.summary && typeof result.summary === 'object') return result.summary;
+  const successfulEntry = Array.isArray(result?.results)
+    ? result.results.find(entry => entry?.ok && entry.data && typeof entry.data === 'object')
+    : null;
+  return successfulEntry?.data || null;
+}
+
+function browserSyncFailure(result) {
+  const failedEntry = Array.isArray(result?.results)
+    ? result.results.find(entry => entry && entry.ok === false)
+    : null;
+  return failedEntry?.error || result?.detail || '浏览器会话同步失败';
 }
 
 async function request(path, options = {}, {auth = true} = {}) {
@@ -193,20 +208,21 @@ function cardImportVerificationPatch(result) {
 
 function intervalLabel(value) {
   const seconds = Number(value || 0);
-  if (seconds < 60) return `${seconds}秒`;
-  if (seconds % 60 === 0) return `${seconds / 60}分钟`;
-  return `${seconds}秒`;
+  const normalizedSeconds = Number.isFinite(seconds) ? seconds : 60;
+  return `${Math.max(1, Math.ceil(normalizedSeconds / 60))}分钟`;
 }
 
 function intervalOptionLabel(value) {
   const seconds = Number(value || 0);
-  return seconds < 60 ? `每 ${seconds} 秒` : `每 ${seconds / 60} 分钟`;
+  const normalizedSeconds = Number.isFinite(seconds) ? seconds : 60;
+  return `每 ${Math.max(1, Math.ceil(normalizedSeconds / 60))} 分钟`;
 }
 
 function MonitorIntervalSelect({value, onChange, label, disabled = false, caption = ''}) {
+  const normalizedValue = Math.max(60, Number(value) || 60);
   return <label className={`monitor-interval-control ${disabled ? 'disabled' : ''}`} onClick={event => event.stopPropagation()}>
     {caption && <span>{caption}</span>}
-    <div><TimerReset size={13}/><select value={Number(value)} onChange={event => onChange(Number(event.target.value))} aria-label={label} disabled={disabled}>
+    <div><TimerReset size={13}/><select value={normalizedValue} onChange={event => onChange(Number(event.target.value))} aria-label={label} disabled={disabled}>
       {MONITOR_INTERVAL_OPTIONS.map(seconds => <option value={seconds} key={seconds}>{intervalOptionLabel(seconds)}</option>)}
     </select></div>
   </label>;
@@ -1609,13 +1625,13 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   };
 
   const removeShop = async shop => {
-    if (!window.confirm(`停止监控店铺“${shop.name || shop.token}”？已导入的商品记录会保留。`)) return;
+    if (!window.confirm(`删除店铺“${shop.name || shop.token}”？该店铺独占的商品和价格记录也会删除，共享商品会保留。`)) return;
     try {
       await request(`/shops/${shop.id}`, {method: 'DELETE'});
       if (shopFilter === shop.id) setShopFilter(null);
       setCheckedShopIds(current => current.filter(id => id !== shop.id));
       await loadItems({quiet: true});
-      notify('店铺监控已删除');
+      notify('店铺监控及其独占商品已删除');
     } catch (error) {
       notify(error.message, 'error');
     }
@@ -1634,7 +1650,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
 
   const removeCheckedShops = async () => {
     if (!validCheckedShopIds.length) return;
-    if (!window.confirm(`删除 ${validCheckedShopIds.length} 个店铺监控？已导入的商品和价格记录会保留。`)) return;
+    if (!window.confirm(`删除 ${validCheckedShopIds.length} 个店铺监控？独占商品和价格记录也会删除，共享商品会保留。`)) return;
     setBusy(value => ({...value, shopBatchDelete: true}));
     try {
       const result = await request('/shops/batch-delete', {
@@ -1645,7 +1661,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       if (validCheckedShopIds.includes(shopFilter)) setShopFilter(null);
       setCheckedShopIds([]);
       await loadItems({quiet: true});
-      notify(`已删除 ${result.deleted_count} 个店铺监控，商品记录已保留`);
+      notify(`已删除 ${result.deleted_count} 个店铺监控及其独占商品`);
     } catch (error) {
       notify(error.message, 'error');
     } finally {
@@ -1673,10 +1689,10 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const fetchAll = async () => {
     setBusy(value => ({...value, fetchAll: true}));
     try {
-      const [watchResult, shopResult] = await Promise.all([
-        request('/watches/fetch-all', {method: 'POST'}),
-        request('/shops/fetch-all', {method: 'POST'}),
-      ]);
+      // Keep the two batch jobs sequential so their upstream requests cannot
+      // start in parallel and trip the storefront risk threshold.
+      const watchResult = await request('/watches/fetch-all', {method: 'POST'});
+      const shopResult = await request('/shops/fetch-all', {method: 'POST'});
       await loadItems({quiet: true});
       const wafIds = Array.isArray(shopResult.waf_shop_ids) ? shopResult.waf_shop_ids : [];
       const failed = [...watchResult.results, ...shopResult.results].filter(entry => !entry.ok && !entry.waf).length;
@@ -1811,7 +1827,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       if (failures.length === refreshed.results.length) throw new Error(failures[0]?.error || '库存刷新失败');
       setPreorderDraft({
         enabled: false,
-        interval_seconds: 1,
+        interval_seconds: 60,
         items: selectedItems.map(item => {
           const entry = byId.get(item.id);
           const product = entry?.ok ? entry.data : null;
@@ -1965,6 +1981,14 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     try {
       const result = await request(`/shops/${shop.id}/browser-verification/start`, {method: 'POST'});
       if (result.status === 'success') {
+        const summary = browserSyncSummary(result);
+        if (!summary) {
+          setVerificationShopId(null);
+          applyVerificationBatchState({...result, status: 'idle'});
+          notify(result.failed ? browserSyncFailure(result) : '浏览器会话同步完成', result.failed ? 'error' : 'info');
+          return;
+        }
+        if (!result.summary) result.summary = summary;
         setVerificationShopId(null);
         applyVerificationBatchState({...result, status: 'idle'});
         await loadItems({quiet: true});
@@ -1990,6 +2014,13 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         return notify(result.detail, 'error');
       }
       setVerificationShopId(null);
+      const summary = browserSyncSummary(result);
+      if (!summary) {
+        applyVerificationBatchState({...result, status: 'idle'});
+        notify(result.failed ? browserSyncFailure(result) : '验证通过并完成同步', result.failed ? 'error' : 'info');
+        return;
+      }
+      if (!result.summary) result.summary = summary;
       applyVerificationBatchState({...result, status: 'idle'});
       await loadItems({quiet: true});
       notify(`验证通过并同步完成，共 ${result.summary.product_count} 个商品`);
@@ -3322,7 +3353,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
                   {(productQuery || productStatusFilter !== 'all') && <IconButton label="清除商品筛选" onClick={() => { setProductQuery(''); setProductStatusFilter('all'); }}><X size={14}/></IconButton>}
                 </div>
                 {canManageMonitor && visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
-                {!!displayedPreorders.length && <div className="preorder-list" aria-label="自动预购任务">{displayedPreorders.map(preorder => <div className={`preorder-row ${preorder.status}`} key={preorder.id}><span className="preorder-icon"><Clock3 size={15}/></span><div className="preorder-copy"><strong>{preorder.title}</strong><small>目标 {preorder.quantity} 件 · 每 {preorder.interval_seconds} 秒检查 · 当前库存 {preorder.stock_label}</small>{preorder.last_error && <small className="negative">{preorder.last_error}</small>}</div><span className={`pill ${preorder.status === 'triggered' ? 'live' : preorder.status === 'error' ? 'error' : 'neutral'}`}>{preorder.status === 'watching' ? '预购监控中' : preorder.status === 'processing' ? '正在创建订单' : preorder.status === 'triggered' ? '支付链接已创建' : '预购失败'}</span>{preorder.payment_url ? <a className="button official preorder-pay-link" href={preorder.payment_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>打开支付链接</a> : preorder.status === 'watching' || preorder.status === 'error' ? <IconButton label="停止自动预购" tone="danger" onClick={() => cancelPreorder(preorder)}><X size={15}/></IconButton> : <span/>}</div>)}</div>}
+                 {!!displayedPreorders.length && <div className="preorder-list" aria-label="自动预购任务">{displayedPreorders.map(preorder => <div className={`preorder-row ${preorder.status}`} key={preorder.id}><span className="preorder-icon"><Clock3 size={15}/></span><div className="preorder-copy"><strong>{preorder.title}</strong><small>目标 {preorder.quantity} 件 · 每 {intervalLabel(preorder.interval_seconds)} 检查 · 当前库存 {preorder.stock_label}</small>{preorder.last_error && <small className="negative">{preorder.last_error}</small>}</div><span className={`pill ${preorder.status === 'triggered' ? 'live' : preorder.status === 'error' ? 'error' : 'neutral'}`}>{preorder.status === 'watching' ? '预购监控中' : preorder.status === 'processing' ? '正在创建订单' : preorder.status === 'triggered' ? '支付链接已创建' : '预购失败'}</span>{preorder.payment_url ? <a className="button official preorder-pay-link" href={preorder.payment_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>打开支付链接</a> : preorder.status === 'watching' || preorder.status === 'error' ? <IconButton label="停止自动预购" tone="danger" onClick={() => cancelPreorder(preorder)}><X size={15}/></IconButton> : <span/>}</div>)}</div>}
                 <div className="table-head">{canManageMonitor ? <label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label> : <span/>}<span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控频率</span><span>操作</span></div>
                 <div className="product-list">
                   {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>{shopScopedItems.length ? '没有匹配的商品' : '暂无商品数据'}</strong><span>{shopScopedItems.length ? '调整搜索词或状态筛选后重试' : '在上方添加店铺或商品链接'}</span></div> : visibleItems.map(item => (
@@ -3414,7 +3445,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       <ProductOverviewDrawer id="product-overview-drawer" open={overviewOpen} items={items} shops={shops} stableOrder={stableItemOrder} busy={busy} selectedId={selectedId} shopFilter={shopFilter} onClose={() => setOverviewOpen(false)} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor ? fetchOne : null} onShopFilter={value => { setShopFilter(value); setCheckedIds([]); }}/>
       <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={busy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={canManageMonitor ? fetchOne : null} onDirect={openDirectProduct}/>
 
-      {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="86400" value={preorderDraft.interval_seconds} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(1, Math.min(86400, Number(event.target.value) || 1))})} inputMode="numeric"/><span>秒</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
+       {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="1440" value={Math.max(1, Math.ceil((Number(preorderDraft.interval_seconds) || 60) / 60))} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(60, Math.min(86400, (Number(event.target.value) || 1) * 60))})} inputMode="numeric"/><span>分钟</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
       {checkoutPrompt && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setCheckoutPrompt(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="完善购买配置"><div className="modal-head"><div><span>CHECKOUT PROFILE</span><h2>完善购买配置</h2></div><IconButton label="关闭" onClick={() => setCheckoutPrompt(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>购买前需要联系方式{checkoutPrompt.requiresPassword ? '和安全密码' : ''}，支付渠道与优惠券可按商品支持情况使用。</p></div><div className="purchase-form"><label><span>联系方式</span><input value={contact.contact} onChange={event => setContact({...contact, contact: event.target.value})} placeholder="邮箱、手机号或其他联系方式" autoComplete="email"/></label>{checkoutPrompt.requiresPassword && <label><span>安全密码</span><input type={passwordVisible ? 'text' : 'password'} value={queryPassword} onChange={event => setQueryPassword(event.target.value)} placeholder="用于查询订单详情" autoComplete="off"/></label>}<label><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><label><span>优惠券 <small>可选</small></span><input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="输入优惠券码" autoComplete="off"/></label><label><span>配置保存位置</span><select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select></label></div><div className="modal-foot"><span><ShieldCheck size={14}/>保存后会用于后续购买和订单查询</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setCheckoutPrompt(null)}>取消</button><button className="button official" onClick={submitCheckoutPrompt}><Save size={15}/>保存并继续</button></div></div></div></div>}
       {review && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setReview(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="购买确认"><div className="modal-head"><div><span>DIRECT CHECKOUT</span><h2>支付链接已准备</h2></div><IconButton label="关闭" onClick={() => setReview(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>{review.notice} 创建成功后会自动打开支付页面；下方仍保留“打开支付链接”入口，方便重复打开。</p></div><div className="review-list">{review.items.map(item => <div className="review-item" key={item.watch_id}><div><strong>{item.title}</strong><span>{money(item.unit_price)} × {item.quantity}</span><a className="payment-link" href={item.official_url} target="_blank" rel="noreferrer"><Link2 size={13}/>{item.official_url}</a></div><strong>{money(item.subtotal)}</strong><div className="review-actions"><button className="button secondary" onClick={() => copyPaymentLink(item)}><Clipboard size={15}/>复制商品链接</button></div></div>)}</div>{officialOrder && <div className="payment-order-result"><div><span>官方订单</span><strong>{officialOrder.trade_no}</strong></div><a href={officialOrder.payment_url} target="_blank" rel="noreferrer"><Link2 size={14}/>{officialOrder.payment_url}</a><small>{officialOrder.notice} 渠道：{officialOrder.channel === 'alipay' ? '支付宝' : '微信支付'}，金额：{money(officialOrder.amount)}</small><button className="button official" onClick={() => window.open(officialOrder.payment_url, '_blank', 'noopener,noreferrer')}><ArrowUpRight size={15}/>打开支付链接</button></div>}<div className="review-total"><span>清单合计</span><strong>{money(review.total)}</strong></div><div className="modal-foot"><span><ShieldCheck size={14}/>支付前请核对订单金额</span><div className="modal-foot-actions"><label className="payment-channel"><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><button className="button official auto-pay-button" onClick={createOfficialOrder} disabled={busy.officialOrder}><Package size={15}/>{busy.officialOrder ? '正在创建并跳转' : '创建订单并自动跳转'}</button><button className="button secondary" onClick={() => setReview(null)}>返回修改</button></div></div></div></div>}
       {toast && <div className={`toast ${toast.type} ${toast.sections?.length ? 'detailed' : ''}`} role={toast.type === 'error' ? 'alert' : 'status'} aria-live={toast.type === 'error' ? 'assertive' : 'polite'} aria-atomic="true" key={toast.id}>
