@@ -1246,7 +1246,7 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
             first_value=lambda item, keys: _first_value(item, keys),
             waf_error=WafChallengeRequired,
             waf_markers=WAF_MARKERS,
-            profile_path=Path(__file__).with_name("waf-browser-profile"),
+            profile_path=Path(os.environ.get("LDXP_WAF_PROFILE_PATH", str(Path(__file__).with_name("waf-browser-profile")))),
             request_waiter=storefront.wait_for_upstream_request,
         )
 
@@ -1857,9 +1857,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
 
+        if path == "/api/shops/browser-verification/status":
+            try:
+                result = BROWSER_VERIFICATION.status()
+                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+            except RuntimeError as exc:
+                return self._send_json({"detail": str(exc)}, 409)
+
         if path == "/api/shops/browser-verification/complete-all":
             try:
-                result = BROWSER_VERIFICATION.complete_all()
+                challenge_id = str(data.get("challenge_id") or "").strip() or None
+                result = BROWSER_VERIFICATION.complete_all(challenge_id=challenge_id)
                 return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 409)
@@ -1867,7 +1875,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         browser_complete_match = re.fullmatch(r"/api/shops/(\d+)/browser-verification/complete", path)
         if browser_complete_match:
             try:
-                result = BROWSER_VERIFICATION.complete(int(browser_complete_match.group(1)))
+                challenge_id = str(data.get("challenge_id") or "").strip() or None
+                result = BROWSER_VERIFICATION.complete(
+                    int(browser_complete_match.group(1)),
+                    challenge_id=challenge_id,
+                )
                 return self._send_json(result, 202 if result["status"] == "awaiting_verification" else 200)
             except KeyError as exc:
                 return self._send_json({"detail": str(exc.args[0])}, 404)

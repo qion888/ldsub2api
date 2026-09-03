@@ -211,6 +211,9 @@ $env:LDXP_API_TARGET = 'http://127.0.0.1:<backend-port>'
 | `LDXP_FRONTEND_URL` | `http://127.0.0.1:5173/` | 后端根路径跳转地址    |
 | `LDXP_DB_PATH`      | `backend/monitor.db`     | SQLite 数据库路径 |
 | `LDXP_API_TARGET`   | `http://127.0.0.1:8000`  | Vite 开发代理目标  |
+| `LDXP_WAF_PROFILE_PATH` | `backend/waf-browser-profile` | 店铺 WAF 独立浏览器配置目录 |
+| `LDXP_WAF_BROWSER_BINARY` | 自动查找 Edge/Chrome | WAF 验证浏览器可执行文件 |
+| `LDXP_WAF_AUTO_VERIFY` | `1` | Windows 上在真实验证页尝试一次原生滑块操作；设为 `0` 时只保留手动验证 |
 
 ## 开发验证
 
@@ -240,4 +243,3 @@ start.ps1             一键启动脚本
 PAYMENT.md            官方支付链路补充说明
 redeem_api_sdk.py     401 找回服务 SDK
 ```
-
