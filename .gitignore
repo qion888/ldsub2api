@@ -31,6 +31,7 @@ frontend/dist/
 *.py[cod]
 
 # Local test code and test output
+backend/test*.py
 **/test_*.py
 **/*_test.py
 
