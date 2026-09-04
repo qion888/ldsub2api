@@ -474,10 +474,11 @@ class GoodsParserTests(unittest.TestCase):
                 self.assertEqual(result["interval_seconds"], 900)
                 self.assertEqual(interval, 900)
 
-    def test_accepts_only_canonical_ldxp_item_urls(self):
-        key, url = main.parse_item_url("https://pay.ldxp.cn/item/tp7o88")
-        self.assertEqual(key, "tp7o88")
-        self.assertEqual(url, "https://pay.ldxp.cn/item/tp7o88")
+    def test_accepts_supported_storefront_item_urls(self):
+        for host in ("pay.ldxp.cn", "wzyp.cn"):
+            key, url = main.parse_item_url(f"https://{host}/item/tp7o88")
+            self.assertEqual(key, "tp7o88")
+            self.assertEqual(url, f"https://{host}/item/tp7o88")
 
         for invalid in (
             "http://pay.ldxp.cn/item/tp7o88",
@@ -563,11 +564,42 @@ class GoodsParserTests(unittest.TestCase):
         self.assertEqual(result["shop_discovery"]["shop"]["token"], "TESTSHOP")
 
     def test_accepts_shop_urls_and_rejects_foreign_hosts(self):
-        token, url = main.parse_shop_url("https://pay.ldxp.cn/shop/SHOPTEST")
-        self.assertEqual(token, "SHOPTEST")
-        self.assertEqual(url, "https://pay.ldxp.cn/shop/SHOPTEST")
+        for host in ("pay.ldxp.cn", "wzyp.cn"):
+            token, url = main.parse_shop_url(f"https://{host}/shop/SHOPTEST")
+            self.assertEqual(token, "SHOPTEST")
+            self.assertEqual(url, f"https://{host}/shop/SHOPTEST")
         with self.assertRaises(ValueError):
             main.parse_shop_url("https://example.com/shop/SHOPTEST")
+
+    def test_new_storefront_host_is_used_for_api_requests_and_products(self):
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps({"code": 1, "data": {"name": "wzyp", "status": 1}}).encode()
+
+        with patch.object(main, "urlopen", return_value=FakeResponse()) as opener:
+            product = main.fetch_goods("https://wzyp.cn/item/tp7o88")
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, "https://wzyp.cn/shopApi/Shop/goodsInfo")
+        self.assertEqual(request.headers["Origin"], "https://wzyp.cn")
+        self.assertEqual(product["source_url"], "https://wzyp.cn/item/tp7o88")
+
+        with patch.object(main, "_post_shop_api", return_value={"code": 1, "data": []}) as post:
+            main.fetch_payment_channels("SHOPTEST", source_url="https://wzyp.cn/shop/SHOPTEST")
+        self.assertEqual(post.call_args.args[2], "https://wzyp.cn/shop/SHOPTEST")
+
+        catalog_payload = {"code": 1, "data": {"list": [{"goods_key": "tp7o88", "name": "wzyp"}], "total": 1}}
+        with patch.object(main, "_post_shop_api", return_value=catalog_payload):
+            catalog = main.fetch_shop_catalog("https://wzyp.cn/shop/SHOPTEST")
+        self.assertEqual(catalog[0]["source_url"], "https://wzyp.cn/item/tp7o88")
 
     def test_normalizes_store_inventory_fields(self):
         item = main.normalize_goods_list_item(
