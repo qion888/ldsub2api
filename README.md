@@ -52,15 +52,16 @@ Sub2API 导入：
 ```powershell
 .\start.cmd -BootstrapOnly
 .\start.cmd -SkipInstall
+.\start.cmd -NoBrowser
 ```
 
 脚本会自动：
 
 - 安装缺失的前端依赖；
 - 检查并安装 Selenium；
-- 清理本项目遗留的开发进程；
+- 清理本项目记录的后端进程，不终止其他任务；
 - 为后端和前端选择可用端口；
-- 启动两个服务并打印访问地址。
+- 启动两个服务，等待前端就绪并调用系统默认浏览器打开地址。
 
 启动后终端会显示类似以下内容，使用其中的 Frontend 地址打开浏览器：
 
@@ -73,6 +74,8 @@ Ports:         frontend=<frontend-port>  backend=<backend-port>
 ```
 
 按 `Ctrl+C` 停止前端，脚本会同时停止由它启动的后端。
+
+Windows 使用 `-NoBrowser`，macOS / Linux 使用 `--no-browser` 可关闭自动打开浏览器。也可以设置 `LDXP_OPEN_BROWSER=0` 全局关闭。
 
 ### macOS / Linux 一键启动
 
@@ -89,7 +92,7 @@ chmod +x ./start.sh
 ./start.sh --auto-install
 ```
 
-其中 `--auto-install` 在 macOS 使用 Homebrew，在 Debian/Ubuntu 使用 `apt`，在 Fedora/RHEL 使用 `dnf`，在 Arch 使用 `pacman`，在 openSUSE 使用 `zypper`。只检查依赖、不启动服务时运行 `./start.sh --bootstrap-only`；不安装任何依赖时运行 `./start.sh --skip-install`。也可以设置 `LDXP_PYTHON` 或 `LDXP_NODE` 指定运行时路径。
+其中 `--auto-install` 在 macOS 使用 Homebrew，在 Debian/Ubuntu 使用 `apt`，在 Fedora/RHEL 使用 `dnf`，在 Arch 使用 `pacman`，在 openSUSE 使用 `zypper`。只检查依赖、不启动服务时运行 `./start.sh --bootstrap-only`；不安装任何依赖时运行 `./start.sh --skip-install`；不自动打开浏览器时运行 `./start.sh --no-browser`。启动完成后脚本会调用 macOS 的 `open`、Linux 的 `xdg-open`，或 Git Bash 的 Windows 默认浏览器。也可以设置 `LDXP_PYTHON` 或 `LDXP_NODE` 指定运行时路径。
 
 ### 分开启动
 

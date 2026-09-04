@@ -11,6 +11,7 @@ BACKEND_PID_FILE="$RUNTIME_DIR/backend.pid"
 PACKAGE_LOCK="$FRONTEND_DIR/package-lock.json"
 
 AUTO_INSTALL="${LDXP_AUTO_INSTALL:-0}"
+OPEN_BROWSER="${LDXP_OPEN_BROWSER:-1}"
 SKIP_INSTALL=0
 BOOTSTRAP_ONLY=0
 
@@ -22,6 +23,7 @@ Options:
   --auto-install    Install missing system/runtime dependencies when possible.
   --skip-install    Do not install system or project dependencies.
   --bootstrap-only  Check and install dependencies, then exit without starting services.
+  --no-browser      Start services without opening the frontend in the default browser.
   -h, --help        Show this help.
 
 Environment:
@@ -45,6 +47,7 @@ for argument in "$@"; do
     --auto-install) AUTO_INSTALL=1 ;;
     --skip-install) SKIP_INSTALL=1 ;;
     --bootstrap-only) BOOTSTRAP_ONLY=1 ;;
+    --no-browser) OPEN_BROWSER=0 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $argument (use --help for usage)" ;;
   esac
@@ -300,6 +303,38 @@ PY
   return 0
 }
 
+wait_frontend() {
+  local frontend_pid="$1"
+  local port="$2"
+  local attempt
+  for ((attempt=1; attempt<=60; attempt++)); do
+    if ! port_is_free "$port"; then
+      return 0
+    fi
+    if ! kill -0 "$frontend_pid" >/dev/null 2>&1; then
+      die 'Frontend exited before becoming ready. Check .runtime/logs/frontend.log.'
+    fi
+    sleep 0.25
+  done
+  die 'Frontend readiness check failed. Check .runtime/logs/frontend.log.'
+}
+
+open_browser() {
+  local url="$1"
+  [[ "$OPEN_BROWSER" == "1" ]] || return 0
+  case "$(uname -s)" in
+    Darwin*)
+      command_exists open && open "$url" >/dev/null 2>&1 &
+      ;;
+    Linux*)
+      command_exists xdg-open && xdg-open "$url" >/dev/null 2>&1 &
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      command_exists cmd.exe && cmd.exe /c start "" "$url" >/dev/null 2>&1 &
+      ;;
+  esac
+}
+
 find_free_port() {
   local start="$1"
   local port
@@ -342,6 +377,10 @@ PY
 cleanup() {
   local exit_code=$?
   trap - EXIT INT TERM
+  if [[ -n "${FRONTEND_PID:-}" ]] && kill -0 "$FRONTEND_PID" >/dev/null 2>&1; then
+    kill "$FRONTEND_PID" >/dev/null 2>&1 || true
+    wait "$FRONTEND_PID" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${BACKEND_PID:-}" ]] && kill -0 "$BACKEND_PID" >/dev/null 2>&1; then
     kill "$BACKEND_PID" >/dev/null 2>&1 || true
     wait "$BACKEND_PID" >/dev/null 2>&1 || true
@@ -381,13 +420,24 @@ trap cleanup EXIT INT TERM
 
 wait_backend "$PYTHON_EXECUTABLE" "$BACKEND_PORT"
 
+printf 'Starting frontend at http://127.0.0.1:%s\n' "$FRONTEND_PORT"
+"$NPM_COMMAND" --prefix "$FRONTEND_DIR" run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT" --strictPort >"$LOG_DIR/frontend.log" 2>&1 &
+FRONTEND_PID=$!
+wait_frontend "$FRONTEND_PID" "$FRONTEND_PORT"
+open_browser "http://127.0.0.1:$FRONTEND_PORT/"
+
 printf '\n========================================\n'
 printf 'LDXP services started\n'
 printf 'Frontend:      http://127.0.0.1:%s\n' "$FRONTEND_PORT"
 printf 'Backend API:   http://127.0.0.1:%s\n' "$BACKEND_PORT"
 printf 'Health check:  http://127.0.0.1:%s/api/health\n' "$BACKEND_PORT"
 printf 'Ports:         frontend=%s  backend=%s\n' "$FRONTEND_PORT" "$BACKEND_PORT"
+if [[ "$OPEN_BROWSER" == "1" ]]; then
+  printf 'Browser:       default browser open requested\n'
+else
+  printf 'Browser:       disabled\n'
+fi
 printf 'Press Ctrl+C to stop both services.\n'
 printf '========================================\n'
 
-"$NPM_COMMAND" --prefix "$FRONTEND_DIR" run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT" --strictPort
+wait "$FRONTEND_PID"

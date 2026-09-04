@@ -2,7 +2,8 @@
 param(
     [switch]$AutoInstall,
     [switch]$SkipInstall,
-    [switch]$BootstrapOnly
+    [switch]$BootstrapOnly,
+    [switch]$NoBrowser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +14,7 @@ $nodeModules = Join-Path $frontendDirectory 'node_modules'
 $viteCommand = Join-Path $nodeModules '.bin\vite.cmd'
 $requirements = Join-Path $backendDirectory 'requirements.txt'
 $runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
+$logDirectory = Join-Path $runtimeDirectory 'logs'
 $backendPidFile = Join-Path $runtimeDirectory 'backend.pid'
 $packageLock = Join-Path $frontendDirectory 'package-lock.json'
 
@@ -272,21 +274,6 @@ function Stop-RecordedLdxpBackend {
     Remove-Item -LiteralPath $backendPidFile -Force -ErrorAction SilentlyContinue
 }
 
-function Stop-StaleLdxpProcesses {
-    $root = $PSScriptRoot.ToLowerInvariant()
-    $backendScript = (Join-Path $root 'backend\main.py').ToLowerInvariant()
-    Get-CimInstance Win32_Process | ForEach-Object {
-        $commandLine = [string]$_.CommandLine
-        if ([string]::IsNullOrWhiteSpace($commandLine)) { return }
-        $normalized = $commandLine.ToLowerInvariant()
-        $isBackend = $normalized.Contains($backendScript)
-        $isFrontend = $normalized.Contains((Join-Path $root 'frontend\node_modules').ToLowerInvariant()) -and $normalized.Contains('vite')
-        if (($isBackend -or $isFrontend) -and $_.ProcessId -ne $PID) {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
 function Get-FreeLocalPort([int]$StartPort) {
     foreach ($port in $StartPort..($StartPort + 50)) {
         $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
@@ -333,13 +320,44 @@ function Wait-LdxpBackend([int]$Port, $Process) {
     throw 'Backend readiness check failed: required auth, Sub2API, or order complaint routes were not loaded'
 }
 
-New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
+function Wait-LdxpFrontend([int]$Port, $Process) {
+    foreach ($attempt in 1..60) {
+        if ($Process.HasExited) {
+            throw "Frontend exited before becoming ready (exit code $($Process.ExitCode))"
+        }
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $client.ConnectAsync('127.0.0.1', $Port)
+            if ($connect.Wait(500) -and $client.Connected) {
+                return
+            }
+        }
+        catch {}
+        finally {
+            $client.Dispose()
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw 'Frontend readiness check failed; inspect .runtime\logs\frontend.log'
+}
+
+function Open-LdxpBrowser([string]$Url) {
+    if ($NoBrowser -or $env:LDXP_OPEN_BROWSER -eq '0') { return }
+    try {
+        Start-Process -FilePath $Url | Out-Null
+        Write-Host "Browser:       default browser open requested" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Warning "无法打开默认浏览器，请手动访问：$Url"
+    }
+}
+
+New-Item -ItemType Directory -Path $runtimeDirectory, $logDirectory -Force | Out-Null
 $pythonExecutable = Ensure-LdxpPython
 $nodeRuntime = Ensure-LdxpNodeRuntime
 $npmExecutable = $nodeRuntime.Npm
 Ensure-LdxpFrontendDependencies $npmExecutable
 Stop-RecordedLdxpBackend
-Stop-StaleLdxpProcesses
 
 if (Test-Path $requirements) {
     $backendDependenciesReady = Test-LdxpBackendDependencies $pythonExecutable
@@ -391,11 +409,24 @@ $backendProcess = Start-Process $pythonExecutable `
     -WorkingDirectory $backendDirectory `
     -WindowStyle Hidden `
     -PassThru
+$frontendProcess = $null
 
 try {
     Set-Content -LiteralPath $backendPidFile -Value $backendProcess.Id -NoNewline
     Wait-LdxpBackend $backendPort $backendProcess
     $env:LDXP_API_TARGET = "http://127.0.0.1:$backendPort"
+    $frontendLog = Join-Path $logDirectory 'frontend.log'
+    $frontendErrorLog = Join-Path $logDirectory 'frontend.error.log'
+    $frontendArguments = "--prefix `"$frontendDirectory`" run dev -- --host 127.0.0.1 --port $frontendPort --strictPort"
+    $frontendProcess = Start-Process $npmExecutable `
+        -ArgumentList $frontendArguments `
+        -WorkingDirectory $frontendDirectory `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $frontendLog `
+        -RedirectStandardError $frontendErrorLog `
+        -PassThru
+    Wait-LdxpFrontend $frontendPort $frontendProcess
+    Open-LdxpBrowser "http://127.0.0.1:$frontendPort/"
     Write-Host ''
     Write-Host '========================================' -ForegroundColor DarkGray
     Write-Host 'LDXP services started' -ForegroundColor Green
@@ -404,11 +435,17 @@ try {
     Write-Host "Health check:  http://127.0.0.1:$backendPort/api/health" -ForegroundColor Cyan
     Write-Host "Account list:  http://127.0.0.1:$backendPort/api/sub2api/accounts" -ForegroundColor Cyan
     Write-Host "Ports:         frontend=$frontendPort  backend=$backendPort" -ForegroundColor Yellow
+    if ($NoBrowser -or $env:LDXP_OPEN_BROWSER -eq '0') {
+        Write-Host 'Browser:       disabled' -ForegroundColor DarkGray
+    }
     Write-Host 'Press Ctrl+C to stop both services.' -ForegroundColor DarkGray
     Write-Host '========================================' -ForegroundColor DarkGray
-    & $npmExecutable --prefix $frontendDirectory run dev -- --host 127.0.0.1 --port $frontendPort --strictPort
+    $frontendProcess.WaitForExit()
 }
 finally {
+    if ($frontendProcess -and -not $frontendProcess.HasExited) {
+        Stop-Process -Id $frontendProcess.Id -Force -ErrorAction SilentlyContinue
+    }
     if (-not $backendProcess.HasExited) {
         Stop-Process -Id $backendProcess.Id
     }
