@@ -127,6 +127,24 @@ const EMPTY_CARD_IMPORT_HISTORY = {
   summary: {total: 0, success: 0, failed: 0, pending: 0, successful_accounts: 0, failed_accounts: 0},
 };
 const MONITOR_INTERVAL_OPTIONS = [60, 300, 900, 1800, 3600];
+const STOREFRONT_HOSTS = new Set(['pay.ldxp.cn', 'wzyp.cn']);
+
+function parseStorefrontUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(String(value || '').trim());
+  } catch {
+    return null;
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (parsed.protocol !== 'https:' || !STOREFRONT_HOSTS.has(hostname)
+    || parsed.username || parsed.password || (parsed.port && parsed.port !== '443')) return null;
+  const itemMatch = parsed.pathname.match(/^\/item\/([A-Za-z0-9_-]{3,80})\/?$/);
+  if (itemMatch) return {type: 'item', key: itemMatch[1], host: hostname, url: `https://${hostname}/item/${itemMatch[1]}`};
+  const shopMatch = parsed.pathname.match(/^\/shop\/([A-Za-z0-9_-]{3,80})\/?$/);
+  if (shopMatch) return {type: 'shop', key: shopMatch[1], host: hostname, url: `https://${hostname}/shop/${shopMatch[1]}`};
+  return null;
+}
 const SHOP_GOODS_TYPES = [
   {value: 'card', label: '卡密商品'},
   {value: 'article', label: '文章商品'},
@@ -1122,20 +1140,14 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   }, [sub2apiCardAssignment]);
 
   useEffect(() => {
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      setShopCategoryState({token: '', goodsType, categories: [], loading: false, error: ''});
-      return undefined;
-    }
-    const match = parsed.pathname.match(/^\/shop\/([A-Za-z0-9_-]{3,80})\/?$/);
-    if (sourceMode !== 'shop' || parsed.protocol !== 'https:' || parsed.hostname !== 'pay.ldxp.cn' || !match) {
+    const parsed = parseStorefrontUrl(url);
+    if (sourceMode !== 'shop' || parsed?.type !== 'shop') {
       setShopCategoryState({token: '', goodsType, categories: [], loading: false, error: ''});
       return undefined;
     }
 
-    const token = match[1];
+    const token = parsed.key;
+    const canonicalUrl = parsed.url;
     let cancelled = false;
     setCategoryId('');
     setShopCategoryState({token, goodsType, categories: [], loading: true, error: ''});
@@ -1144,7 +1156,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         const result = await request('/shops/categories', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({url, goods_type: goodsType}),
+          body: JSON.stringify({url: canonicalUrl, goods_type: goodsType}),
         });
         if (!cancelled) setShopCategoryState({token: result.token || token, goodsType, categories: result.categories || [], loading: false, error: ''});
       } catch (error) {
@@ -1556,19 +1568,14 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     if (shopBatchRequestRunning.current) return;
     setBusy(value => ({...value, add: true}));
     try {
-      let isShop = sourceMode === 'shop';
-      try {
-        const path = new URL(url).pathname;
-        if (path.startsWith('/shop/')) isShop = true;
-        if (path.startsWith('/item/')) isShop = false;
-      } catch {
-        // The backend returns the precise URL validation error.
-      }
+      const parsedUrl = parseStorefrontUrl(url);
+      const isShop = parsedUrl?.type === 'shop' ? true : parsedUrl?.type === 'item' ? false : sourceMode === 'shop';
+      const normalizedUrl = parsedUrl?.url || url;
       const result = await request(isShop ? '/shops' : '/watches', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-          url,
+          url: normalizedUrl,
           name,
           interval_seconds: intervalSeconds,
           category_id: isShop ? categoryId : undefined,
@@ -1608,19 +1615,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   };
 
   const changeSourceUrl = value => {
-    setUrl(value);
-    try {
-      const path = new URL(value).pathname;
-      if (path.startsWith('/shop/') && sourceMode !== 'shop') {
+    const parsed = parseStorefrontUrl(value);
+    setUrl(parsed?.url || value);
+    if (parsed?.type === 'shop' && sourceMode !== 'shop') {
         setSourceMode('shop');
         setIntervalSeconds(300);
         setCategoryId('');
-      } else if (path.startsWith('/item/') && sourceMode !== 'item') {
+    } else if (parsed?.type === 'item' && sourceMode !== 'item') {
         setSourceMode('item');
         setIntervalSeconds(60);
-      }
-    } catch {
-      // Keep typing without switching modes until a complete URL is available.
     }
   };
 
@@ -2235,7 +2238,8 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       setReview(result);
       const token = result.items?.[0]?.shop_token;
       if (token) {
-        request(`/pay/channels?token=${encodeURIComponent(token)}`)
+        const sourceUrl = result.items?.[0]?.official_url || '';
+        request(`/pay/channels?token=${encodeURIComponent(token)}&source_url=${encodeURIComponent(sourceUrl)}`)
           .then(channels => {
             if (Array.isArray(channels) && channels.length) {
               setPaymentChannels(channels);
@@ -2260,7 +2264,8 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     if (!item.shop_token) throw new Error('未找到店铺 Token，请先从店铺同步商品');
     if (!config.contact) throw new Error('请先填写并保存联系方式');
     if (item.query_password_required && !config.query_password) throw new Error('该商品需要查询密码，请先填写并保存');
-    const identity = await request(`/pay/juuid?token=${encodeURIComponent(item.shop_token)}`);
+    const sourceUrl = item.official_url || '';
+    const identity = await request(`/pay/juuid?token=${encodeURIComponent(item.shop_token)}&source_url=${encodeURIComponent(sourceUrl)}`);
     const result = await request('/pay/order', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -2319,7 +2324,8 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({items: [{watch_id: item.id, quantity: minimum}]}),
       });
-      const channels = await request(`/pay/channels?token=${encodeURIComponent(checkout.items[0].shop_token)}`);
+      const sourceUrl = checkout.items[0].official_url || '';
+      const channels = await request(`/pay/channels?token=${encodeURIComponent(checkout.items[0].shop_token)}&source_url=${encodeURIComponent(sourceUrl)}`);
       const channelId = channels.some(channel => Number(channel.id) === Number(savedCheckout.channel_id))
         ? Number(savedCheckout.channel_id)
         : Number(channels[0]?.id || 1);

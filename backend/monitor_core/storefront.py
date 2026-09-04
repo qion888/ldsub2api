@@ -16,7 +16,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+# The storefront is available on both the legacy payment host and the new
+# public host.  Keep ALLOWED_HOST as the legacy default for callers that do not
+# have a source URL, while monitor requests preserve the host supplied by the
+# user.
 ALLOWED_HOST = "pay.ldxp.cn"
+ALLOWED_HOSTS = (ALLOWED_HOST, "wzyp.cn")
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 USER_AGENT = "LDXP-Local-Monitor/2.0"
 VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
@@ -92,25 +97,54 @@ def plain_text(value: Any) -> str:
     return " ".join(" ".join(parser.parts).split())
 
 
-def parse_item_url(value: str) -> tuple[str, str]:
+def _storefront_host(value: Any, *, default: str = ALLOWED_HOST) -> str:
+    """Return a validated storefront host, falling back to the legacy host."""
+    parsed = urlparse(str(value or "").strip())
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if parsed.scheme == "https" and hostname in ALLOWED_HOSTS:
+        try:
+            port = parsed.port
+        except ValueError:
+            port = -1
+        if parsed.username is None and parsed.password is None and port in (None, 443):
+            return hostname
+    return default
+
+
+def _canonical_storefront_url(value: str, kind: str) -> tuple[str, str, str]:
+    """Validate and normalize an item/shop URL, dropping query and fragment."""
     parsed = urlparse((value or "").strip())
-    match = re.fullmatch(r"/item/([A-Za-z0-9_-]{3,80})/?", parsed.path)
-    if parsed.scheme != "https" or parsed.hostname != ALLOWED_HOST or not match:
-        raise ValueError("仅支持 https://pay.ldxp.cn/item/商品编号 格式的商品链接")
-    goods_key = match.group(1)
-    return goods_key, f"https://{ALLOWED_HOST}/item/{goods_key}"
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    if (
+        parsed.scheme != "https"
+        or hostname not in ALLOWED_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        raise ValueError("仅支持 https://pay.ldxp.cn 或 https://wzyp.cn 的链动小铺链接")
+    match = re.fullmatch(rf"/{kind}/([A-Za-z0-9_-]{{3,80}})/?", parsed.path)
+    if not match:
+        raise ValueError("链动小铺链接路径格式无效")
+    key = match.group(1)
+    return key, hostname, f"https://{hostname}/{kind}/{key}"
+
+
+def parse_item_url(value: str) -> tuple[str, str]:
+    goods_key, _host, canonical = _canonical_storefront_url(value, "item")
+    return goods_key, canonical
 
 
 def parse_shop_url(value: str) -> tuple[str, str]:
-    parsed = urlparse((value or "").strip())
-    match = re.fullmatch(r"/shop/([A-Za-z0-9_-]{3,80})/?", parsed.path)
-    if parsed.scheme != "https" or parsed.hostname != ALLOWED_HOST or not match:
-        raise ValueError("仅支持 https://pay.ldxp.cn/shop/店铺Token 格式的店铺链接")
-    token = match.group(1)
-    return token, f"https://{ALLOWED_HOST}/shop/{token}"
+    token, _host, canonical = _canonical_storefront_url(value, "shop")
+    return token, canonical
 
 
-def discover_goods_shop(item: dict[str, Any]) -> dict[str, Any] | None:
+def discover_goods_shop(item: dict[str, Any], *, source_host: str = ALLOWED_HOST) -> dict[str, Any] | None:
     """Extract the canonical shop identity exposed by a goods detail payload."""
     seller = item.get("user") if isinstance(item.get("user"), dict) else {}
     nested_shop = item.get("shop") if isinstance(item.get("shop"), dict) else {}
@@ -130,13 +164,14 @@ def discover_goods_shop(item: dict[str, Any]) -> dict[str, Any] | None:
         item.get("shop_url"),
     )
 
+    normalized_source_host = source_host if source_host in ALLOWED_HOSTS else ALLOWED_HOST
     token = ""
     canonical_url = ""
     for candidate in token_candidates:
         value = str(candidate or "").strip()
         if re.fullmatch(r"[A-Za-z0-9_-]{3,80}", value):
             token = value
-            canonical_url = f"https://{ALLOWED_HOST}/shop/{token}"
+            canonical_url = f"https://{normalized_source_host}/shop/{token}"
             break
     if not token:
         for candidate in link_candidates:
@@ -330,7 +365,12 @@ def is_unlisted_error(value: Any) -> bool:
     return any(marker in message for marker in UNLISTED_ERROR_MARKERS)
 
 
-def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str, Any]:
+def normalize_goods_payload(
+    payload: dict[str, Any],
+    goods_key: str,
+    *,
+    source_url: str | None = None,
+) -> dict[str, Any]:
     if payload.get("code") != 1 or not isinstance(payload.get("data"), dict):
         message = str(payload.get("msg") or "商品接口未返回有效数据")
         raise RuntimeError(message[:160])
@@ -339,7 +379,8 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
     extend = item.get("extend") if isinstance(item.get("extend"), dict) else {}
     category = item.get("category") if isinstance(item.get("category"), dict) else {}
     seller = item.get("user") if isinstance(item.get("user"), dict) else {}
-    shop = discover_goods_shop(item)
+    source_host = _storefront_host(source_url)
+    shop = discover_goods_shop(item, source_host=source_host)
     limit_count = extend.get("limit_count")
     sale_status = "on_sale" if item.get("status") == 1 else "off_sale"
     stock_value = _stock_value(item) if sale_status == "on_sale" else None
@@ -352,6 +393,24 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "查询密码": "需要" if _upstream_enabled(extend.get("query_password_status")) else "不需要",
         "店铺": seller.get("nickname") or "链动小铺",
     }
+    normalized_source_url = ""
+    if source_url:
+        try:
+            parsed_key, _host, normalized_source_url = _canonical_storefront_url(source_url, "item")
+            if parsed_key != goods_key:
+                normalized_source_url = ""
+        except ValueError:
+            normalized_source_url = ""
+    if not normalized_source_url:
+        link = str(item.get("link") or item.get("url") or "").strip()
+        try:
+            parsed_key, _host, normalized_source_url = _canonical_storefront_url(link, "item")
+            if parsed_key != goods_key:
+                normalized_source_url = ""
+        except ValueError:
+            normalized_source_url = ""
+    if not normalized_source_url:
+        normalized_source_url = f"https://{ALLOWED_HOST}/item/{goods_key}"
     return {
         "goods_key": goods_key,
         "title": str(item.get("name") or f"链动小铺商品 {goods_key}"),
@@ -369,7 +428,7 @@ def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str
         "contact_format": str(item.get("contact_format") or "any"),
         "query_password_required": _upstream_enabled(extend.get("query_password_status")),
         "commerce_tags": commerce_tags_from_goods(item),
-        "source_url": str(item.get("link") or f"https://{ALLOWED_HOST}/item/{goods_key}"),
+        "source_url": normalized_source_url,
         "shop": shop,
         "raw_data": item,
     }
@@ -387,18 +446,31 @@ def _post_shop_api(
     # real requests share one process-wide gate with browser verification.
     if opener is urlopen:
         wait_for_upstream_request()
+    request_referer = str(referer or "").strip()
+    for url_kind in ("item", "shop"):
+        try:
+            _key, _host, request_referer = _canonical_storefront_url(request_referer, url_kind)
+            break
+        except ValueError:
+            continue
+    request_host = _storefront_host(request_referer)
+    # A canonical referer is produced by parse_item_url/parse_shop_url.  If a
+    # legacy integration passes an empty or non-storefront referer, retain the
+    # old host rather than allowing an arbitrary upstream destination.
+    if request_host not in ALLOWED_HOSTS:
+        request_host = ALLOWED_HOST
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "Origin": f"https://{ALLOWED_HOST}",
-        "Referer": referer,
+        "Origin": f"https://{request_host}",
+        "Referer": request_referer,
     }
     if visitor_id:
         headers["Visitorid"] = visitor_id
     request = Request(
-        f"https://{ALLOWED_HOST}{endpoint}",
+        f"https://{request_host}{endpoint}",
         data=body,
         headers=headers,
         method="POST",
@@ -448,15 +520,17 @@ def _random_visitor_id() -> str:
 def fetch_buyer_juuid(
     shop_token: str,
     *,
+    source_url: str | None = None,
     opener: Callable[..., Any] = urlopen,
 ) -> dict[str, Any]:
     """Resolve the juuid posted by buyerBlackIframe for a shop token."""
     token = str(shop_token or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{3,80}", token):
         raise ValueError("店铺 Token 格式无效")
-    referer = f"https://{ALLOWED_HOST}/shop/{token}"
+    source_host = _storefront_host(source_url)
+    referer = f"https://{source_host}/shop/{token}"
     script_request = Request(
-        f"https://{ALLOWED_HOST}/shopApi/Shop/buyerBlackJs?token={token}",
+        f"https://{source_host}/shopApi/Shop/buyerBlackJs?token={token}",
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/javascript, */*;q=0.8",
@@ -472,7 +546,7 @@ def fetch_buyer_juuid(
     except (HTTPError, URLError, UnicodeError) as exc:
         raise RuntimeError("无法获取店铺支付身份脚本") from exc
     iframe_match = re.search(r"iframe\.src\s*=\s*['\"]([^'\"]+)['\"]", script)
-    iframe_url = iframe_match.group(1) if iframe_match else f"https://{ALLOWED_HOST}/shopApi/common/buyerBlackIframe"
+    iframe_url = iframe_match.group(1) if iframe_match else f"https://{source_host}/shopApi/common/buyerBlackIframe"
     iframe_request = Request(
         iframe_url,
         headers={"User-Agent": USER_AGENT, "Accept": "text/html, */*;q=0.8", "Referer": referer},
@@ -498,6 +572,7 @@ def fetch_buyer_juuid(
 def fetch_payment_channels(
     shop_token: str,
     *,
+    source_url: str | None = None,
     post_api: Callable[..., dict[str, Any]] = _post_shop_api,
     visitor_id_factory: Callable[[], str] = _random_visitor_id,
 ) -> list[dict[str, Any]]:
@@ -507,7 +582,7 @@ def fetch_payment_channels(
     result = post_api(
         "/shopApi/Shop/getUserChannel",
         {"token": token},
-        f"https://{ALLOWED_HOST}/shop/{token}",
+        f"https://{_storefront_host(source_url)}/shop/{token}",
         visitor_id=visitor_id_factory(),
     )
     if result.get("code") != 1 or not isinstance(result.get("data"), list):
@@ -629,7 +704,11 @@ def create_official_payment_order(
     juuid = str(juuid or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", juuid):
         raise ValueError("juuid 格式无效，请重新获取")
-    if not re.fullmatch(rf"https://{re.escape(ALLOWED_HOST)}/item/[A-Za-z0-9_-]{{3,80}}", referer):
+    try:
+        referer_key, _referer_host, referer = _canonical_storefront_url(referer, "item")
+        if referer_key != goods_key:
+            raise ValueError("商品编号与 referer 不匹配")
+    except ValueError:
         referer = f"https://{ALLOWED_HOST}/item/{goods_key}"
     visitor_id = str(visitor_id or "").strip()
     if not VISITOR_ID_PATTERN.fullmatch(visitor_id):
@@ -655,7 +734,8 @@ def create_official_payment_order(
     data = result["data"]
     trade_no = str(data.get("trade_no") or "").strip()
     payurl = str(data.get("payurl") or data.get("pay_url") or "").strip()
-    if not trade_no or not payurl or not payurl.startswith(f"https://{ALLOWED_HOST}/"):
+    payurl_host = _storefront_host(payurl, default="")
+    if not trade_no or not payurl or payurl_host not in ALLOWED_HOSTS:
         raise RuntimeError("官方支付接口未返回有效支付链接")
     return {
         "mode": "official",
@@ -681,7 +761,7 @@ def fetch_goods(
         {"goods_key": goods_key, "trade_no": ""},
         canonical_url,
     )
-    return normalize_goods_payload(payload, goods_key)
+    return normalize_goods_payload(payload, goods_key, source_url=canonical_url)
 
 
 def _goods_list_rows(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -699,7 +779,12 @@ def _goods_list_rows(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], dic
     return [], data
 
 
-def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str, Any]:
+def normalize_goods_list_item(
+    item: dict[str, Any],
+    shop_token: str,
+    *,
+    source_host: str = ALLOWED_HOST,
+) -> dict[str, Any]:
     goods_key = str(
         _first_value(item, ("goods_key", "key", "goodsKey", "item_key")) or ""
     ).strip()
@@ -728,6 +813,17 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
     }
     if sales not in (None, ""):
         specs["累计销量"] = sales
+    source_url = ""
+    link = str(item.get("link") or item.get("url") or "").strip()
+    try:
+        parsed_key, _host, source_url = _canonical_storefront_url(link, "item")
+        if parsed_key != goods_key:
+            source_url = ""
+    except ValueError:
+        source_url = ""
+    if not source_url:
+        normalized_host = source_host if source_host in ALLOWED_HOSTS else ALLOWED_HOST
+        source_url = f"https://{normalized_host}/item/{goods_key}"
     return {
         "goods_key": goods_key,
         "title": str(item.get("name") or item.get("title") or f"链动小铺商品 {goods_key}"),
@@ -745,7 +841,7 @@ def normalize_goods_list_item(item: dict[str, Any], shop_token: str) -> dict[str
         "contact_format": str(item.get("contact_format") or "any"),
         "query_password_required": _upstream_enabled(extend.get("query_password_status")),
         "commerce_tags": commerce_tags_from_goods(item),
-        "source_url": f"https://{ALLOWED_HOST}/item/{goods_key}",
+        "source_url": source_url,
         "raw_data": item,
     }
 
@@ -774,7 +870,7 @@ def fetch_shop_catalog(
         payload = post_api("/shopApi/Shop/goodsList", request_data, canonical_url)
         rows, pagination = _goods_list_rows(payload)
         for row in rows:
-            product = normalize_goods_list_item(row, token)
+            product = normalize_goods_list_item(row, token, source_host=_storefront_host(canonical_url))
             products[product["goods_key"]] = product
 
         total_value = _first_value(pagination, ("total", "count", "total_count"))

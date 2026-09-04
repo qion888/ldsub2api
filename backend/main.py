@@ -183,8 +183,17 @@ def is_unlisted_error(value: Any) -> bool:
     return storefront.is_unlisted_error(value)
 
 
-def normalize_goods_payload(payload: dict[str, Any], goods_key: str) -> dict[str, Any]:
-    return storefront.normalize_goods_payload(payload, goods_key)
+def normalize_goods_payload(
+    payload: dict[str, Any],
+    goods_key: str,
+    *,
+    source_url: str | None = None,
+) -> dict[str, Any]:
+    return storefront.normalize_goods_payload(
+        payload,
+        goods_key,
+        source_url=source_url,
+    )
 
 
 def _post_shop_api(
@@ -207,13 +216,14 @@ def _random_visitor_id() -> str:
     return storefront._random_visitor_id()
 
 
-def fetch_buyer_juuid(shop_token: str) -> dict[str, Any]:
-    return storefront.fetch_buyer_juuid(shop_token, opener=urlopen)
+def fetch_buyer_juuid(shop_token: str, *, source_url: str | None = None) -> dict[str, Any]:
+    return storefront.fetch_buyer_juuid(shop_token, source_url=source_url, opener=urlopen)
 
 
-def fetch_payment_channels(shop_token: str) -> list[dict[str, Any]]:
+def fetch_payment_channels(shop_token: str, *, source_url: str | None = None) -> list[dict[str, Any]]:
     return storefront.fetch_payment_channels(
         shop_token,
+        source_url=source_url,
         post_api=_post_shop_api,
         visitor_id_factory=_random_visitor_id,
     )
@@ -1514,17 +1524,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         ):
             return
         if path == "/api/pay/juuid":
-            token = parse_qs(parsed.query).get("token", [""])[0]
+            query = parse_qs(parsed.query)
+            token = query.get("token", [""])[0]
+            source_url = query.get("source_url", [""])[0]
             try:
-                return self._send_json(fetch_buyer_juuid(token))
+                return self._send_json(fetch_buyer_juuid(token, source_url=source_url))
             except (TypeError, ValueError) as exc:
                 return self._send_json({"detail": str(exc)}, 400)
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
         if path == "/api/pay/channels":
-            token = parse_qs(parsed.query).get("token", [""])[0]
+            query = parse_qs(parsed.query)
+            token = query.get("token", [""])[0]
+            source_url = query.get("source_url", [""])[0]
             try:
-                return self._send_json(fetch_payment_channels(token))
+                return self._send_json(fetch_payment_channels(token, source_url=source_url))
             except (TypeError, ValueError) as exc:
                 return self._send_json({"detail": str(exc)}, 400)
             except RuntimeError as exc:
