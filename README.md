@@ -32,8 +32,10 @@ Sub2API 导入：
 
 ## 运行要求
 
-- Windows PowerShell；
-- 可联网安装依赖；脚本会**自动检查并引导安装 Python、Node.js/npm；**
+- Windows PowerShell，或 macOS/Linux 的 Bash；
+- Python 3.10-3.13；
+- Node.js 20.19+ 或 22+，以及 npm；
+- 可联网安装依赖；启动脚本会自动检查并引导安装项目依赖。
 
 ## 快速启动
 
@@ -72,17 +74,34 @@ Ports:         frontend=<frontend-port>  backend=<backend-port>
 
 按 `Ctrl+C` 停止前端，脚本会同时停止由它启动的后端。
 
+### macOS / Linux 一键启动
+
+在终端进入项目根目录后运行：
+
+```bash
+chmod +x ./start.sh
+./start.sh
+```
+
+首次运行如需自动安装系统运行时和项目依赖：
+
+```bash
+./start.sh --auto-install
+```
+
+其中 `--auto-install` 在 macOS 使用 Homebrew，在 Debian/Ubuntu 使用 `apt`，在 Fedora/RHEL 使用 `dnf`，在 Arch 使用 `pacman`，在 openSUSE 使用 `zypper`。只检查依赖、不启动服务时运行 `./start.sh --bootstrap-only`；不安装任何依赖时运行 `./start.sh --skip-install`。也可以设置 `LDXP_PYTHON` 或 `LDXP_NODE` 指定运行时路径。
+
 ### 分开启动
 
-适合需要分别查看前后端日志的场景。打开两个 PowerShell 窗口，并都定位到项目根目录。
+适合需要分别查看前后端日志的场景。打开两个终端窗口，并都定位到项目根目录。
 
-后端：
+Windows 后端：
 
 ```powershell
 python .\backend\main.py
 ```
 
-前端：
+Windows 前端：
 
 ```powershell
 npm --prefix .\frontend install
@@ -98,6 +117,25 @@ Vite 会把 `/api` 请求代理到 `127.0.0.1:8000`。后端端口变更时，�
 
 ```powershell
 $env:LDXP_API_TARGET = 'http://127.0.0.1:<backend-port>'
+```
+
+macOS / Linux 后端：
+
+```bash
+python3 ./backend/main.py
+```
+
+macOS / Linux 前端：
+
+```bash
+npm --prefix ./frontend ci
+npm --prefix ./frontend run dev -- --host 127.0.0.1 --port 5173
+```
+
+如果后端不是 `8000` 端口，启动前端前设置：
+
+```bash
+export LDXP_API_TARGET='http://127.0.0.1:<backend-port>'
 ```
 
 ## 版本更新
@@ -239,7 +277,9 @@ frontend/
   src/main.jsx        React 页面和交互逻辑
   src/style.css       页面样式
   package.json        前端脚本和依赖
-start.ps1             一键启动脚本
+start.ps1             Windows PowerShell 一键启动脚本
+start.cmd             Windows 双击启动入口
+start.sh              macOS / Linux Bash 一键启动脚本
 PAYMENT.md            官方支付链路补充说明
 redeem_api_sdk.py     401 找回服务 SDK
 ```
