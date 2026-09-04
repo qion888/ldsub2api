@@ -1056,6 +1056,8 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
   const [shopStatusFilter, setShopStatusFilter] = useState('all');
   const [productQuery, setProductQuery] = useState('');
   const [productStatusFilter, setProductStatusFilter] = useState('all');
+  const [productPage, setProductPage] = useState(1);
+  const [productPageSize, setProductPageSize] = useState(DEFAULT_PRODUCT_PAGE_SIZE);
   const [checkedIds, setCheckedIds] = useState([]);
   const [checkedShopIds, setCheckedShopIds] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -1557,10 +1559,10 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     return matchesQuery && matchesStatus;
   });
   const normalizedProductQuery = productQuery.trim().toLocaleLowerCase('zh-CN');
-  const shopScopedItems = shopFilter
+  const shopScopedItems = useMemo(() => shopFilter
     ? items.filter(item => item.shops?.some(shop => shop.id === shopFilter))
-    : items;
-  const visibleItems = shopScopedItems.filter(item => {
+    : items, [items, shopFilter]);
+  const filteredProductItems = useMemo(() => shopScopedItems.filter(item => {
     const matchesQuery = !normalizedProductQuery || [
       item.latest?.title,
       item.name,
@@ -1575,7 +1577,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       || (productStatusFilter === 'in_stock' && stock.key === 'in')
       || (productStatusFilter === 'out_of_stock' && stock.key === 'out');
     return matchesQuery && matchesStatus;
-  });
+  }), [itemMonitoringEnabled, normalizedProductQuery, productStatusFilter, shopScopedItems]);
+  const productTotalPages = productPageCount(filteredProductItems.length, productPageSize);
+  const visibleItems = useMemo(() => paginateProducts(filteredProductItems, productPage, productPageSize), [filteredProductItems, productPage, productPageSize]);
+  useEffect(() => {
+    setProductPage(1);
+  }, [productQuery, productStatusFilter, shopFilter]);
+  useEffect(() => {
+    setProductPage(current => clampProductPage(current, filteredProductItems.length, productPageSize));
+  }, [filteredProductItems.length, productPageSize]);
   const totalCart = cart.reduce((sum, entry) => sum + entry.quantity, 0);
   const estimatedTotal = cart.reduce((sum, entry) => {
     const item = items.find(candidate => candidate.id === entry.watch_id);
@@ -3457,6 +3467,10 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     setHistoryPageSize(value);
     setHistoryPage(1);
   };
+  const changeProductPageSize = value => {
+    setProductPageSize(value);
+    setProductPage(1);
+  };
 
   return (
     <div className="app-shell">
@@ -3561,16 +3575,16 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
 
             <div className="content-layout">
               <section className="monitor-panel">
-                <div className="section-heading"><div><h2>{shopFilter ? `${shops.find(shop => shop.id === shopFilter)?.name || '店铺'}商品` : '商品目录'}</h2><p>{visibleItems.length ? `最近状态已同步，共 ${visibleItems.length} 项` : shopScopedItems.length ? '没有符合当前搜索和筛选条件的商品' : '添加商品或同步店铺后会显示在这里'}</p></div><span className="count-badge">{visibleItems.length}</span></div>
+                <div className="section-heading"><div><h2>{shopFilter ? `${shops.find(shop => shop.id === shopFilter)?.name || '店铺'}商品` : '商品目录'}</h2><p>{filteredProductItems.length ? `最近状态已同步，共 ${filteredProductItems.length} 项${productTotalPages > 1 ? `，当前第 ${productPage} / ${productTotalPages} 页` : ''}` : shopScopedItems.length ? '没有符合当前搜索和筛选条件的商品' : '添加商品或同步店铺后会显示在这里'}</p></div><span className="count-badge">{filteredProductItems.length}</span></div>
                 <div className="monitor-filter-bar product-filter-bar">
                   <label className="monitor-search"><Search size={15}/><input value={productQuery} onChange={event => setProductQuery(event.target.value)} placeholder="搜索商品、店铺或链接" aria-label="搜索监控商品"/></label>
                   <label className="monitor-filter-select"><SlidersHorizontal size={14}/><select value={productStatusFilter} onChange={event => setProductStatusFilter(event.target.value)} aria-label="筛选商品状态"><option value="all">全部商品</option><option value="enabled">监控中</option><option value="paused">已暂停</option><option value="in_stock">有货</option><option value="out_of_stock">缺货</option><option value="error">抓取异常</option></select></label>
-                  <span className="monitor-result-count">{visibleItems.length} / {shopScopedItems.length}</span>
+                  <span className="monitor-result-count">{filteredProductItems.length} / {shopScopedItems.length}</span>
                   {(productQuery || productStatusFilter !== 'all') && <IconButton label="清除商品筛选" onClick={() => { setProductQuery(''); setProductStatusFilter('all'); }}><X size={14}/></IconButton>}
                 </div>
                 {canManageMonitor && visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={batchVerificationPending || shopSyncBusy || busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={batchVerificationPending || shopSyncBusy || busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
                  {!!displayedPreorders.length && <div className="preorder-list" aria-label="自动预购任务">{displayedPreorders.map(preorder => <div className={`preorder-row ${preorder.status}`} key={preorder.id}><span className="preorder-icon"><Clock3 size={15}/></span><div className="preorder-copy"><strong>{preorder.title}</strong><small>目标 {preorder.quantity} 件 · 每 {intervalLabel(preorder.interval_seconds)} 检查 · 当前库存 {preorder.stock_label}</small>{preorder.last_error && <small className="negative">{preorder.last_error}</small>}</div><span className={`pill ${preorder.status === 'triggered' ? 'live' : preorder.status === 'error' ? 'error' : 'neutral'}`}>{preorder.status === 'watching' ? '预购监控中' : preorder.status === 'processing' ? '正在创建订单' : preorder.status === 'triggered' ? '支付链接已创建' : '预购失败'}</span>{preorder.payment_url ? <a className="button official preorder-pay-link" href={preorder.payment_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>打开支付链接</a> : preorder.status === 'watching' || preorder.status === 'error' ? <IconButton label="停止自动预购" tone="danger" onClick={() => cancelPreorder(preorder)}><X size={15}/></IconButton> : <span/>}</div>)}</div>}
-                <div className="table-head">{canManageMonitor ? <label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label> : <span/>}<span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控频率</span><span>操作</span></div>
+                <div className="table-head">{canManageMonitor ? <label className="check-wrap" title="全选当前页"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label> : <span/>}<span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控频率</span><span>操作</span></div>
                 <div className="product-list">
                   {!visibleItems.length ? <div className="empty-state"><Package size={28}/><strong>{shopScopedItems.length ? '没有匹配的商品' : '暂无商品数据'}</strong><span>{shopScopedItems.length ? '调整搜索词或状态筛选后重试' : '在上方添加店铺或商品链接'}</span></div> : visibleItems.map(item => (
                     <div className={`product-row ${selectedId === item.id ? 'selected' : ''} ${checkedIds.includes(item.id) ? 'checked' : ''}`} key={item.id} onClick={() => openProductDetail(item.id)}>
@@ -3589,6 +3603,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
                     </div>
                   ))}
                 </div>
+                <ProductPagination page={productPage} pageCount={productTotalPages} pageSize={productPageSize} total={filteredProductItems.length} onPageChange={setProductPage} onPageSizeChange={changeProductPageSize}/>
 
               </section>
 
