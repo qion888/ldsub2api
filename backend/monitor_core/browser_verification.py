@@ -635,6 +635,38 @@ class BrowserVerificationManager:
                 self._request_waiter()
                 driver.get(shop["url"])
                 _current_url, page_source, cookies = self._browser_snapshot(driver)
+            # A background request can be challenged while the storefront page
+            # itself remains accessible. Probe the protected endpoint from the
+            # verified browser before exposing an unnecessary manual step.
+            if not self._challenge_is_visible(driver, page_source):
+                try:
+                    probe_payload = self._browser_request(driver, self._request_data(shop, 1))
+                except self._waf_error:
+                    probe_payload = None
+                except Exception as exc:
+                    shop_id = self.batch_current_shop_id
+                    if self.batch_queue and self.batch_queue[0] == shop_id:
+                        self.batch_queue.pop(0)
+                    self.batch_results.append({"id": shop_id, "ok": False, "error": str(exc)[:240]})
+                    self.batch_completed += 1
+                    return self._advance_batch_locked()
+                else:
+                    shop_id = self.batch_current_shop_id
+                    if self.batch_queue and self.batch_queue[0] == shop_id:
+                        self.batch_queue.pop(0)
+                    try:
+                        summary = self._sync_shop(driver, shop_id, first_payload=probe_payload)
+                    except self._waf_error as exc:
+                        self.batch_queue.insert(0, shop_id)
+                    except Exception as exc:
+                        self.batch_results.append({"id": shop_id, "ok": False, "error": str(exc)[:240]})
+                        self.batch_completed += 1
+                        return self._advance_batch_locked()
+                    else:
+                        self.batch_results.append({"id": shop_id, "ok": True, "data": summary})
+                        self.batch_completed += 1
+                        self.batch_current_shop_id = None
+                        return self._advance_batch_locked()
         except Exception as exc:
             self._terminal_status = "browser_closed"
             self._terminal_detail = "The WAF browser window was closed or became unavailable"
@@ -687,7 +719,13 @@ class BrowserVerificationManager:
             raise KeyError("monitored shop does not exist")
         return shop
 
-    def _sync_shop(self, driver: Any, shop_id: int) -> dict[str, Any]:
+    def _sync_shop(
+        self,
+        driver: Any,
+        shop_id: int,
+        *,
+        first_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         shop = self._shop(shop_id)
         try:
             current_url = str(getattr(driver, "current_url", "") or "")
@@ -699,8 +737,10 @@ class BrowserVerificationManager:
         if not self._same_top_level_url(current_url, shop["url"]) and not redirected_challenge:
             self._request_waiter()
             driver.get(shop["url"])
-        first_payload = self._browser_request(driver, self._request_data(shop, 1))
-        products = self._catalog(driver, shop, first_payload)
+        payload = first_payload if first_payload is not None else self._browser_request(
+            driver, self._request_data(shop, 1)
+        )
+        products = self._catalog(driver, shop, payload)
         with self._worker_lock:
             summary = self._record_shop_fetch(shop_id, products_override=products)
         self._publish_browser_state(driver, shop)
