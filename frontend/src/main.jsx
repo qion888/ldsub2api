@@ -1140,6 +1140,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     }
 
     const token = parsed.key;
+    const canonicalUrl = parsed.url;
     let cancelled = false;
     setCategoryId('');
     setShopCategoryState({token, goodsType, categories: [], loading: true, error: ''});
@@ -1148,7 +1149,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
         const result = await request('/shops/categories', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({url, goods_type: goodsType}),
+          body: JSON.stringify({url: canonicalUrl, goods_type: goodsType}),
         });
         if (!cancelled) setShopCategoryState({token: result.token || token, goodsType, categories: result.categories || [], loading: false, error: ''});
       } catch (error) {
