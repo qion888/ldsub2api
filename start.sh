@@ -250,15 +250,19 @@ ensure_frontend_dependencies() {
 }
 
 stop_stale_processes() {
-  local pattern
-  for pattern in "$BACKEND_DIR/main.py" "$FRONTEND_DIR/node_modules/.bin/vite"; do
-    if command_exists pgrep; then
-      while read -r pid; do
-        [[ -z "$pid" || "$pid" -eq "$$" ]] && continue
-        kill "$pid" >/dev/null 2>&1 || true
-      done < <(pgrep -f -- "$pattern" || true)
+  local stale_pid command_line
+  [[ -f "$BACKEND_PID_FILE" ]] || return 0
+  stale_pid="$(cat "$BACKEND_PID_FILE" 2>/dev/null || true)"
+  if [[ "$stale_pid" =~ ^[0-9]+$ ]] && [[ "$stale_pid" -ne "$$" ]] && kill -0 "$stale_pid" >/dev/null 2>&1; then
+    command_line="$(ps -p "$stale_pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_line" == *"$BACKEND_DIR/main.py"* ]]; then
+      kill "$stale_pid" >/dev/null 2>&1 || true
+      for _ in {1..20}; do
+        kill -0 "$stale_pid" >/dev/null 2>&1 || break
+        sleep 0.1
+      done
     fi
-  done
+  fi
   rm -f "$BACKEND_PID_FILE"
 }
 
