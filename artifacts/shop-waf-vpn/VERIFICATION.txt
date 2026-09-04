@@ -9,10 +9,10 @@ Changed branch/field:
           challenge_id/status polling, retry exhaustion, and WAF UI operation locks
 
 Artifacts:
-  MODIFIED_FILE: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\shop-waf-vpn\MODIFIED_FILE
-  DIFF_FILE: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\shop-waf-vpn\DIFF_FILE
-  VERIFICATION.txt: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\shop-waf-vpn\VERIFICATION.txt
-  ROLLBACK.sh: C:\Users\0\.codex\worktrees\0d29\ldxp\artifacts\shop-waf-vpn\ROLLBACK.sh
+  MODIFIED_FILE: E:\soft\java\ldxp\artifacts\shop-waf-vpn\MODIFIED_FILE
+  DIFF_FILE: E:\soft\java\ldxp\artifacts\shop-waf-vpn\DIFF_FILE
+  VERIFICATION.txt: E:\soft\java\ldxp\artifacts\shop-waf-vpn\VERIFICATION.txt
+  ROLLBACK.sh: E:\soft\java\ldxp\artifacts\shop-waf-vpn\ROLLBACK.sh
 
 Hashes:
   baseline backend/monitor_core/browser_verification.py SHA-256:
@@ -87,3 +87,21 @@ FINAL ISOLATED INSTANCE
   UI result: desktop and 390x844 views showed both the throttled shop-sync
              controls and the WAF batch/single-shop browser verification controls.
   process result: RECENT_BROWSER_PROCESSES=0 after runtime smoke.
+
+MAIN INTEGRATION
+  target branch: main
+  merge commit: c11dffda5bfbab941f35e6a310f38c1f3388485d
+  follow-up commit: e7dd2b2a2569f5daa2872d38d3faf9aa1e53bc0d
+  command: git -C E:\soft\java\ldxp merge --no-ff --no-edit codex/task-10-vpn-waf-verification
+  literal output/result: Merge VPN WAF verification into main; exit status 0
+  command: python -m compileall -q backend
+  literal output/result: no output; exit status 0
+  command: $env:PYTHONPATH='backend'; python -m unittest backend.test_waf_resilience -v
+  literal output/result: Ran 9 tests; OK; exit status 0
+  command: npm test
+  cwd/input: E:\soft\java\ldxp\frontend
+  literal output/result: tests 70; pass 70; fail 0; exit status 0
+  command: npm run build
+  cwd/input: E:\soft\java\ldxp\frontend
+  literal output/result: 2395 modules transformed; built in 394ms; exit status 0
+  restored behavior/status: main contains the VPN/WAF verification implementation; existing main worktree changes remain untouched.
