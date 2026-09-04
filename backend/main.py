@@ -1247,6 +1247,10 @@ AUTOMATION_WORKER = Sub2ApiAutomationWorker()
 
 class BrowserVerificationManager(CoreBrowserVerificationManager):
     def __init__(self) -> None:
+        configured_profile = os.environ.get("LDXP_WAF_PROFILE_PATH", "").strip()
+        profile_path = Path(configured_profile).expanduser() if configured_profile else Path(__file__).with_name("waf-browser-profile")
+        if not profile_path.is_absolute():
+            profile_path = PROJECT_ROOT / profile_path
         super().__init__(
             database=lambda: database(),
             worker_lock=WORKER.fetch_lock,
@@ -1256,8 +1260,13 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
             first_value=lambda item, keys: _first_value(item, keys),
             waf_error=WafChallengeRequired,
             waf_markers=WAF_MARKERS,
-            profile_path=Path(os.environ.get("LDXP_WAF_PROFILE_PATH", str(Path(__file__).with_name("waf-browser-profile")))),
+            profile_path=profile_path,
             request_waiter=storefront.wait_for_upstream_request,
+            publish_browser_session=lambda session: storefront.remember_browser_session(
+                session.get("cookies"),
+                str(session.get("user_agent") or ""),
+                str(session.get("visitor_id") or ""),
+            ),
         )
 
 
@@ -1872,28 +1881,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._send_json({"detail": str(exc)}, 502)
 
         if path == "/api/shops/browser-verification/status":
+            challenge_id = str(data.get("challenge_id") or "").strip() or None
             try:
-                result = BROWSER_VERIFICATION.status()
-                return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+                result = BROWSER_VERIFICATION.poll(challenge_id)
+                return self._send_json(result, 200)
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 409)
 
         if path == "/api/shops/browser-verification/complete-all":
+            challenge_id = str(data.get("challenge_id") or "").strip() or None
             try:
-                challenge_id = str(data.get("challenge_id") or "").strip() or None
-                result = BROWSER_VERIFICATION.complete_all(challenge_id=challenge_id)
+                result = BROWSER_VERIFICATION.complete_all(challenge_id)
                 return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 409)
 
         browser_complete_match = re.fullmatch(r"/api/shops/(\d+)/browser-verification/complete", path)
         if browser_complete_match:
+            challenge_id = str(data.get("challenge_id") or "").strip() or None
             try:
-                challenge_id = str(data.get("challenge_id") or "").strip() or None
-                result = BROWSER_VERIFICATION.complete(
-                    int(browser_complete_match.group(1)),
-                    challenge_id=challenge_id,
-                )
+                result = BROWSER_VERIFICATION.complete(int(browser_complete_match.group(1)), challenge_id)
                 return self._send_json(result, 202 if result["status"] == "awaiting_verification" else 200)
             except KeyError as exc:
                 return self._send_json({"detail": str(exc.args[0])}, 404)

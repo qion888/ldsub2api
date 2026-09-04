@@ -1377,6 +1377,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .table-head, .product-row { grid-template-columns: 22px minmax(130px, 2fr) 64px minmax(78px, .75fr) 48px 98px; gap: 6px; }
   .row-actions { gap: 3px; }
   .row-actions .icon-button { width: 29px; }
+  .composer-fields.shop-mode { grid-template-columns: minmax(190px, 2fr) minmax(90px, .75fr) minmax(150px, 1.2fr); gap: 7px; }
+  .composer-fields.shop-mode .button { grid-column: 3; }
 }
 
 @media (max-width: 1180px) and (min-width: 901px) {

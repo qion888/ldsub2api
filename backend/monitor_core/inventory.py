@@ -372,6 +372,14 @@ class InventoryService:
                     (shop_id, stamp, error),
                 )
                 connection.execute("UPDATE shops SET last_run = ? WHERE id = ?", (stamp, shop_id))
+                connection.execute(
+                    """
+                    UPDATE watches SET last_run = ? WHERE id IN (
+                        SELECT watch_id FROM shop_products WHERE shop_id = ? AND listed = 1
+                    )
+                    """,
+                    (stamp, shop_id),
+                )
             raise RuntimeError(error) from exc
 
 

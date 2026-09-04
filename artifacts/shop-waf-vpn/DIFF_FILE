@@ -1,0 +1,2435 @@
+diff --git a/backend/main.py b/backend/main.py
+index f9595ee..52e2bf0 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1237,6 +1237,10 @@ AUTOMATION_WORKER = Sub2ApiAutomationWorker()
+ 
+ class BrowserVerificationManager(CoreBrowserVerificationManager):
+     def __init__(self) -> None:
++        configured_profile = os.environ.get("LDXP_WAF_PROFILE_PATH", "").strip()
++        profile_path = Path(configured_profile).expanduser() if configured_profile else Path(__file__).with_name("waf-browser-profile")
++        if not profile_path.is_absolute():
++            profile_path = PROJECT_ROOT / profile_path
+         super().__init__(
+             database=lambda: database(),
+             worker_lock=WORKER.fetch_lock,
+@@ -1246,8 +1250,13 @@ class BrowserVerificationManager(CoreBrowserVerificationManager):
+             first_value=lambda item, keys: _first_value(item, keys),
+             waf_error=WafChallengeRequired,
+             waf_markers=WAF_MARKERS,
+-            profile_path=Path(__file__).with_name("waf-browser-profile"),
++            profile_path=profile_path,
+             request_waiter=storefront.wait_for_upstream_request,
++            publish_browser_session=lambda session: storefront.remember_browser_session(
++                session.get("cookies"),
++                str(session.get("user_agent") or ""),
++                str(session.get("visitor_id") or ""),
++            ),
+         )
+ 
+ 
+@@ -1857,17 +1866,27 @@ class ApiHandler(BaseHTTPRequestHandler):
+             except RuntimeError as exc:
+                 return self._send_json({"detail": str(exc)}, 502)
+ 
++        if path == "/api/shops/browser-verification/status":
++            challenge_id = str(data.get("challenge_id") or "").strip() or None
++            try:
++                result = BROWSER_VERIFICATION.poll(challenge_id)
++                return self._send_json(result, 200)
++            except RuntimeError as exc:
++                return self._send_json({"detail": str(exc)}, 409)
++
+         if path == "/api/shops/browser-verification/complete-all":
++            challenge_id = str(data.get("challenge_id") or "").strip() or None
+             try:
+-                result = BROWSER_VERIFICATION.complete_all()
++                result = BROWSER_VERIFICATION.complete_all(challenge_id)
+                 return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
+             except RuntimeError as exc:
+                 return self._send_json({"detail": str(exc)}, 409)
+ 
+         browser_complete_match = re.fullmatch(r"/api/shops/(\d+)/browser-verification/complete", path)
+         if browser_complete_match:
++            challenge_id = str(data.get("challenge_id") or "").strip() or None
+             try:
+-                result = BROWSER_VERIFICATION.complete(int(browser_complete_match.group(1)))
++                result = BROWSER_VERIFICATION.complete(int(browser_complete_match.group(1)), challenge_id)
+                 return self._send_json(result, 202 if result["status"] == "awaiting_verification" else 200)
+             except KeyError as exc:
+                 return self._send_json({"detail": str(exc.args[0])}, 404)
+diff --git a/backend/monitor_core/browser_verification.py b/backend/monitor_core/browser_verification.py
+index ebafeb9..f91e63e 100644
+--- a/backend/monitor_core/browser_verification.py
++++ b/backend/monitor_core/browser_verification.py
+@@ -2,24 +2,48 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
++import http.client
+ import json
+ import os
++import re
++import shutil
++import socket
++import subprocess
+ import sys
+ import threading
++import time
++import uuid
+ from pathlib import Path
+ from typing import Any, Callable
++from urllib.parse import urlparse
+ 
+-from .storefront import is_waf_response
++from .storefront import is_waf_response, waf_proxy_config
+ 
+ 
+ class BrowserVerificationManager:
+     """Coordinate one persistent browser session across one or many shops.
+ 
+-    WAF challenges are still completed by the operator in the browser window. The
+-    manager only automates the queue, reuses the browser profile, and resumes the
+-    remaining shops after the challenge is cleared.
++    Chromium starts as a normal persistent browser before WebDriver attaches, so
++    VPN/proxy state and the first challenge navigation retain a browser context.
++    Status polling is passive; only an explicit completion replays goodsList.
+     """
+ 
++    CDP_START_TIMEOUT = 15.0
++    READY_OBSERVATIONS = 2
++    MAX_COMPLETION_REPLAYS = 2
++    _CHALLENGE_ID = re.compile(r"[A-Za-z0-9._-]{8,128}")
++    _VISITOR_ID = re.compile(r"[A-Za-z0-9_-]{6,80}")
++    _WAF_COOKIE_MARKERS = (
++        "acw_",
++        "aliyun",
++        "captcha",
++        "cdn_sec",
++        "server_session",
++        "ssxmod_",
++        "waf",
++    )
++
+     def __init__(
+         self,
+         *,
+@@ -33,6 +57,7 @@ class BrowserVerificationManager:
+         waf_markers: tuple[bytes, ...],
+         profile_path: Path,
+         request_waiter: Callable[[], None] | None = None,
++        publish_browser_session: Callable[[dict[str, Any]], None] | None = None,
+     ) -> None:
+         self._database = database
+         self._worker_lock = worker_lock
+@@ -44,16 +69,33 @@ class BrowserVerificationManager:
+         self._waf_markers = waf_markers
+         self._profile_path = profile_path
+         self._request_waiter = request_waiter or (lambda: None)
++        self._publish_browser_session_callback = publish_browser_session
+         self.lock = threading.RLock()
+         self.driver: Any = None
++        self.browser_process: Any = None
+         self.shop_id: int | None = None
+         self.browser_name: str | None = None
++        self.browser_mode: str | None = None
++        self.proxy_mode = "system"
+         self.batch_queue: list[int] = []
++        self.batch_shop_ids: tuple[int, ...] = ()
+         self.batch_results: list[dict[str, Any]] = []
+         self.batch_total = 0
+         self.batch_completed = 0
+         self.batch_current_shop_id: int | None = None
+         self.batch_active = False
++        self.challenge_id: str | None = None
++        self.challenge_attempts = 0
++        self._completion_replays = 0
++        self._challenge_dom_seen = False
++        self._challenge_cookie_baseline = ""
++        self._challenge_observation = ""
++        self._challenge_observation_count = 0
++        self._challenge_ready = False
++        self._terminal_status: str | None = None
++        self._terminal_detail = ""
++        self._last_completed_challenge_id: str | None = None
++        self._last_completed_result: dict[str, Any] | None = None
+ 
+     @staticmethod
+     def _request_data(shop: Any, current: int) -> dict[str, Any]:
+@@ -67,26 +109,226 @@ class BrowserVerificationManager:
+         }
+ 
+     def _is_waf_html(self, text: str) -> bool:
+-        encoded = text.encode("utf-8", "ignore")
+-        return any(marker in encoded for marker in self._waf_markers)
++        encoded = text.encode("utf-8", "ignore").lower()
++        return any(marker.lower() in encoded for marker in self._waf_markers)
++
++    @staticmethod
++    def _terminate_process(process: Any) -> None:
++        if process is None:
++            return
++        try:
++            if process.poll() is not None:
++                return
++            process.terminate()
++            process.wait(timeout=3)
++        except Exception:
++            try:
++                process.kill()
++            except Exception:
++                pass
+ 
+     def _close(self) -> None:
+         driver, self.driver = self.driver, None
++        process, self.browser_process = self.browser_process, None
+         self.shop_id = None
+         self.browser_name = None
++        service_process = getattr(getattr(driver, "service", None), "process", None) if driver is not None else None
+         if driver is not None:
+             try:
+                 driver.quit()
+             except Exception:
+                 pass
++        self._terminate_process(service_process)
++        self._terminate_process(process)
+ 
+     def _reset_batch(self) -> None:
+         self.batch_queue = []
++        self.batch_shop_ids = ()
+         self.batch_results = []
+         self.batch_total = 0
+         self.batch_completed = 0
+         self.batch_current_shop_id = None
+         self.batch_active = False
++        self.browser_mode = None
++        self.proxy_mode = "system"
++        self.challenge_id = None
++        self.challenge_attempts = 0
++        self._completion_replays = 0
++        self._challenge_dom_seen = False
++        self._challenge_cookie_baseline = ""
++        self._challenge_observation = ""
++        self._challenge_observation_count = 0
++        self._challenge_ready = False
++        self._terminal_status = None
++        self._terminal_detail = ""
++
++    @staticmethod
++    def _proxy_config() -> dict[str, Any]:
++        return waf_proxy_config()
++
++    @staticmethod
++    def _apply_firefox_proxy(options: Any, proxy: dict[str, Any]) -> None:
++        mode = proxy["mode"]
++        if mode == "system":
++            options.set_preference("network.proxy.type", 5)
++            return
++        if mode == "direct":
++            options.set_preference("network.proxy.type", 0)
++            return
++        options.set_preference("network.proxy.type", 1)
++        options.set_preference("network.proxy.http", proxy["host"])
++        options.set_preference("network.proxy.http_port", proxy["port"])
++        options.set_preference("network.proxy.ssl", proxy["host"])
++        options.set_preference("network.proxy.ssl_port", proxy["port"])
++        options.set_preference("network.proxy.share_proxy_settings", True)
++
++    @staticmethod
++    def _available_port() -> int:
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
++            listener.bind(("127.0.0.1", 0))
++            return int(listener.getsockname()[1])
++
++    @staticmethod
++    def _browser_executable(browser: str) -> Path | None:
++        env_name = "LDXP_WAF_EDGE_BINARY" if browser == "edge" else "LDXP_WAF_CHROME_BINARY"
++        configured = os.environ.get(env_name, "").strip()
++        if configured:
++            candidate = Path(configured).expanduser()
++            return candidate if candidate.is_file() else None
++
++        names = {
++            "edge": ("msedge", "microsoft-edge", "microsoft-edge-stable"),
++            "chrome": ("chrome", "google-chrome", "google-chrome-stable"),
++            "chromium": ("chromium", "chromium-browser"),
++        }[browser]
++        for name in names:
++            resolved = shutil.which(name)
++            if resolved:
++                return Path(resolved)
++
++        candidates: list[Path] = []
++        if sys.platform == "win32":
++            roots = [
++                os.environ.get("PROGRAMFILES(X86)"),
++                os.environ.get("PROGRAMFILES"),
++                os.environ.get("LOCALAPPDATA"),
++            ]
++            suffixes = (
++                ("Microsoft", "Edge", "Application", "msedge.exe"),
++            ) if browser == "edge" else (
++                ("Google", "Chrome", "Application", "chrome.exe"),
++                ("Chromium", "Application", "chrome.exe"),
++            )
++            candidates.extend(
++                Path(root).joinpath(*suffix)
++                for root in roots if root
++                for suffix in suffixes
++            )
++        elif sys.platform == "darwin":
++            candidates.extend({
++                "edge": [Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge")],
++                "chrome": [Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")],
++                "chromium": [Path("/Applications/Chromium.app/Contents/MacOS/Chromium")],
++            }[browser])
++        return next((candidate for candidate in candidates if candidate.is_file()), None)
++
++    def _chromium_command(
++        self,
++        browser: str,
++        executable: Path,
++        port: int,
++        initial_url: str,
++        proxy: dict[str, Any],
++    ) -> list[str]:
++        command = [
++            str(executable),
++            f"--remote-debugging-port={port}",
++            "--remote-debugging-address=127.0.0.1",
++            f"--user-data-dir={self._profile_path}",
++            "--profile-directory=Default",
++            "--start-maximized",
++            "--no-first-run",
++            "--no-default-browser-check",
++            "--disable-dev-shm-usage",
++        ]
++        if browser == "edge":
++            command.append("--disable-features=EdgeFirstRunExperience")
++        if proxy["mode"] == "direct":
++            command.append("--no-proxy-server")
++        elif proxy["server"]:
++            command.append(f"--proxy-server={proxy['server']}")
++        command.append(initial_url)
++        return command
++
++    @staticmethod
++    def _read_cdp_json(port: int, path: str) -> Any:
++        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.35)
++        try:
++            connection.request("GET", path)
++            response = connection.getresponse()
++            payload = json.loads(response.read().decode("utf-8", "replace"))
++            if response.status != 200:
++                raise RuntimeError(f"browser debugger returned HTTP {response.status}")
++            return payload
++        finally:
++            connection.close()
++
++    @classmethod
++    def _cdp_has_initial_target(cls, targets: Any, initial_url: str) -> bool:
++        expected = urlparse(initial_url)
++        for target in targets if isinstance(targets, list) else []:
++            if not isinstance(target, dict) or target.get("type") != "page":
++                continue
++            actual_value = str(target.get("url") or "")
++            actual = urlparse(actual_value)
++            if expected.scheme in {"http", "https"}:
++                if (
++                    actual.scheme.lower() == expected.scheme.lower()
++                    and (actual.hostname or "").lower() == (expected.hostname or "").lower()
++                    and actual.port == expected.port
++                ):
++                    return True
++            elif actual_value == initial_url:
++                return True
++        return False
++
++    @classmethod
++    def _wait_for_cdp(cls, port: int, process: Any, initial_url: str) -> None:
++        deadline = time.monotonic() + cls.CDP_START_TIMEOUT
++        last_error = "browser did not expose its local debugger"
++        while time.monotonic() < deadline:
++            if process.poll() is not None:
++                raise RuntimeError("browser exited before its local debugger was ready")
++            try:
++                version = cls._read_cdp_json(port, "/json/version")
++                targets = cls._read_cdp_json(port, "/json/list")
++                if isinstance(version, dict) and version.get("webSocketDebuggerUrl") and cls._cdp_has_initial_target(
++                    targets, initial_url
++                ):
++                    return
++                last_error = "browser debugger is ready but the initial page target is still loading"
++            except Exception as exc:
++                last_error = str(exc)[:120]
++            time.sleep(0.1)
++        raise RuntimeError(f"browser local debugger did not become ready: {last_error}")
++
++    @staticmethod
++    def _prepare_attached_chromium(driver: Any) -> None:
++        source = """
++        for (const key of Object.getOwnPropertyNames(window)) {
++          if (/^cdc_[A-Za-z0-9]+_(Array|Object|Promise|Proxy|Symbol|JSON|Window)$/.test(key)) {
++            try { delete window[key]; } catch (_) {}
++          }
++        }
++        try {
++          Object.defineProperty(Navigator.prototype, 'webdriver', {
++            get: () => undefined,
++            configurable: true,
++          });
++        } catch (_) {}
++        """
++        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": source})
++        driver.execute_script(source)
+ 
+     def _browser_order(self) -> list[str]:
+         requested = os.environ.get("LDXP_WAF_BROWSER", "auto").strip().lower()
+@@ -102,7 +344,7 @@ class BrowserVerificationManager:
+             return ["chrome", "edge", "firefox"]
+         return ["edge", "chrome", "chromium", "firefox"]
+ 
+-    def _create_driver(self) -> tuple[Any, str]:
++    def _create_driver(self, initial_url: str) -> tuple[Any, str]:
+         try:
+             from selenium import webdriver
+             from selenium.webdriver.chrome.options import Options as ChromeOptions
+@@ -114,42 +356,188 @@ class BrowserVerificationManager:
+             ) from exc
+ 
+         self._profile_path.mkdir(parents=True, exist_ok=True)
++        proxy = self._proxy_config()
++        self.proxy_mode = str(proxy["mode"])
+         errors: list[str] = []
+         for browser in self._browser_order():
++            driver: Any = None
++            process: Any = None
+             try:
+-                if browser == "edge":
+-                    options = EdgeOptions()
+-                    options.add_argument(f"--user-data-dir={self._profile_path}")
+-                    options.add_argument("--start-maximized")
+-                    options.add_argument("--no-first-run")
+-                    options.add_argument("--disable-features=EdgeFirstRunExperience")
+-                    options.add_argument("--disable-dev-shm-usage")
+-                    driver = webdriver.Edge(options=options)
+-                elif browser in {"chrome", "chromium"}:
+-                    options = ChromeOptions()
+-                    options.add_argument(f"--user-data-dir={self._profile_path}")
+-                    options.add_argument("--start-maximized")
+-                    options.add_argument("--no-first-run")
+-                    options.add_argument("--disable-dev-shm-usage")
+-                    if browser == "chromium":
+-                        for binary in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
+-                            if Path(binary).exists():
+-                                options.binary_location = binary
+-                                break
+-                    driver = webdriver.Chrome(options=options)
++                if browser in {"edge", "chrome", "chromium"}:
++                    executable = self._browser_executable(browser)
++                    if executable is None:
++                        raise RuntimeError("browser executable was not found")
++                    port = self._available_port()
++                    popen_kwargs: dict[str, Any] = {
++                        "stdin": subprocess.DEVNULL,
++                        "stdout": subprocess.DEVNULL,
++                        "stderr": subprocess.DEVNULL,
++                    }
++                    if sys.platform == "win32":
++                        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
++                    else:
++                        popen_kwargs["start_new_session"] = True
++                    process = subprocess.Popen(
++                        self._chromium_command(browser, executable, port, initial_url, proxy),
++                        **popen_kwargs,
++                    )
++                    self._wait_for_cdp(port, process, initial_url)
++                    options = EdgeOptions() if browser == "edge" else ChromeOptions()
++                    options.debugger_address = f"127.0.0.1:{port}"
++                    driver = webdriver.Edge(options=options) if browser == "edge" else webdriver.Chrome(options=options)
++                    # The browser was created without WebDriver's
++                    # --enable-automation switch. Attaching only after its first
++                    # real top-level navigation preserves that browser context.
++                    self._prepare_attached_chromium(driver)
++                    self.browser_process = process
++                    self.browser_mode = "native_cdp"
+                 else:
+                     options = FirefoxOptions()
+                     options.add_argument("-profile")
+                     options.add_argument(str(self._profile_path))
++                    self._apply_firefox_proxy(options, proxy)
+                     driver = webdriver.Firefox(options=options)
++                    self.browser_mode = "webdriver"
+                 return driver, browser
+             except Exception as exc:
++                if driver is not None:
++                    try:
++                        driver.quit()
++                    except Exception:
++                        pass
++                self._terminate_process(process)
++                if self.browser_process is process:
++                    self.browser_process = None
+                 errors.append(f"{browser}: {str(exc)[:120]}")
+         detail = "; ".join(errors) or "no browser candidates"
+         if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+             detail += "; Linux needs a graphical session (DISPLAY/WAYLAND_DISPLAY) for the interactive challenge"
+         raise RuntimeError(f"Unable to start a WAF browser ({detail})")
+ 
++    @staticmethod
++    def _same_origin(actual: str, expected: str) -> bool:
++        try:
++            actual_url = urlparse(str(actual or ""))
++            expected_url = urlparse(str(expected or ""))
++        except ValueError:
++            return False
++        return (
++            actual_url.scheme.lower(),
++            (actual_url.hostname or "").lower(),
++            actual_url.port,
++        ) == (
++            expected_url.scheme.lower(),
++            (expected_url.hostname or "").lower(),
++            expected_url.port,
++        )
++
++    @staticmethod
++    def _same_top_level_url(actual: str, expected: str) -> bool:
++        try:
++            actual_url = urlparse(str(actual or ""))
++            expected_url = urlparse(str(expected or ""))
++        except ValueError:
++            return False
++        return (
++            actual_url.scheme.lower(),
++            (actual_url.hostname or "").lower(),
++            actual_url.port,
++            actual_url.path.rstrip("/"),
++        ) == (
++            expected_url.scheme.lower(),
++            (expected_url.hostname or "").lower(),
++            expected_url.port,
++            expected_url.path.rstrip("/"),
++        )
++
++    @classmethod
++    def _cookie_fingerprint(cls, cookies: Any) -> str:
++        selected: list[tuple[str, str, str, str]] = []
++        for raw in cookies if isinstance(cookies, list) else []:
++            if not isinstance(raw, dict):
++                continue
++            name = str(raw.get("name") or "")
++            if not any(marker in name.lower() for marker in cls._WAF_COOKIE_MARKERS):
++                continue
++            selected.append((
++                name,
++                str(raw.get("domain") or ""),
++                str(raw.get("path") or "/"),
++                str(raw.get("value") or ""),
++            ))
++        if not selected:
++            return ""
++        encoded = json.dumps(sorted(selected), ensure_ascii=True, separators=(",", ":")).encode("utf-8")
++        return hashlib.sha256(encoded).hexdigest()
++
++    @staticmethod
++    def _browser_snapshot(driver: Any) -> tuple[str, str, list[dict[str, Any]]]:
++        handles = getattr(driver, "window_handles", None)
++        if handles is not None and not list(handles):
++            raise RuntimeError("browser window is closed")
++        current_url = str(getattr(driver, "current_url", "") or "")
++        page_source = str(getattr(driver, "page_source", "") or "")
++        getter = getattr(driver, "get_cookies", None)
++        cookies = getter() if callable(getter) else []
++        return current_url, page_source, cookies if isinstance(cookies, list) else []
++
++    def _challenge_is_visible(self, driver: Any, page_source: str) -> bool:
++        script = """
++        const selectors = [
++          '#aliyunCaptcha', '[id*="aliyunCaptcha"]', '[class*="aliyunCaptcha"]',
++          '#nc_1_wrapper', '.nc_wrapper', '.nc-container', '[class*="sliding-slider"]'
++        ];
++        return selectors.some(selector => Array.from(document.querySelectorAll(selector)).some(element => {
++          const style = window.getComputedStyle(element);
++          const rect = element.getBoundingClientRect();
++          return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0
++            && rect.width > 1 && rect.height > 1;
++        }));
++        """
++        try:
++            visible = driver.execute_script(script)
++        except Exception:
++            visible = None
++        return bool(visible) if isinstance(visible, bool) else self._is_waf_html(page_source)
++
++    def _publish_browser_state(self, driver: Any, shop: Any) -> None:
++        callback = self._publish_browser_session_callback
++        if callback is None:
++            return
++        try:
++            user_agent = str(driver.execute_script("return navigator.userAgent") or "")[:512]
++            visitor_id = str(driver.execute_script(
++                "try { return window.localStorage.getItem('visitorId') || ''; } catch (_) { return ''; }"
++            ) or "")
++            if not self._VISITOR_ID.fullmatch(visitor_id):
++                visitor_id = ""
++            expected_host = (urlparse(str(shop["url"])).hostname or "").lower()
++            cookies = []
++            for raw in driver.get_cookies() or []:
++                if not isinstance(raw, dict):
++                    continue
++                domain = str(raw.get("domain") or expected_host).lstrip(".").lower()
++                if domain != expected_host and not expected_host.endswith(f".{domain}"):
++                    continue
++                cookies.append({
++                    key: raw[key]
++                    for key in ("name", "value", "domain", "path", "secure", "httpOnly", "expiry", "sameSite")
++                    if key in raw
++                })
++            callback({
++                "shop_id": int(shop["id"]),
++                "url": str(shop["url"]),
++                "browser": self.browser_name,
++                "proxy_mode": self.proxy_mode,
++                "user_agent": user_agent,
++                "visitor_id": visitor_id,
++                "cookies": cookies,
++            })
++        except Exception:
++            # Publishing is an integration hook; a consumer failure must not
++            # discard a catalog that was already fetched successfully.
++            return
++
+     def _browser_request(self, driver: Any, data: dict[str, Any]) -> dict[str, Any]:
+         self._request_waiter()
+         driver.set_script_timeout(30)
+@@ -227,31 +615,59 @@ class BrowserVerificationManager:
+         return list(products.values())
+ 
+     def _render_challenge(self, driver: Any, html_text: str) -> dict[str, Any]:
+-        # Keep the challenge in the first-party page context.  Replacing the
+-        # document with HTML fetched through XHR strips the browser's original
+-        # navigation state and can make Aliyun reject a perfectly valid slider.
++        del html_text
++        if self.batch_current_shop_id is None:
++            raise RuntimeError("WAF challenge has no current shop")
++        shop = self._shop(self.batch_current_shop_id)
+         try:
+-            page_source = str(driver.page_source or "")
+-        except Exception:
+-            page_source = ""
+-        if not self._is_waf_html(page_source) and self.batch_current_shop_id is not None and hasattr(driver, "get"):
+-            try:
+-                shop = self._shop(self.batch_current_shop_id)
++            current_url, page_source, cookies = self._browser_snapshot(driver)
++            # The XHR body is intentionally never injected and its POST URL is
++            # never opened as a GET. Preserve a real same-origin challenge
++            # redirect; otherwise reload only the canonical first-party shop.
++            parsed_current = urlparse(current_url)
++            protected_api_page = parsed_current.path.rstrip("/") == "/shopApi/Shop/goodsList"
++            keep_existing_challenge = (
++                self._same_origin(current_url, shop["url"])
++                and self._is_waf_html(page_source)
++                and not protected_api_page
++            )
++            if not keep_existing_challenge:
+                 self._request_waiter()
+                 driver.get(shop["url"])
+-            except Exception as exc:
+-                self._close()
+-                self._reset_batch()
+-                raise RuntimeError("Unable to display the WAF challenge in the browser") from exc
++                _current_url, page_source, cookies = self._browser_snapshot(driver)
++        except Exception as exc:
++            self._terminal_status = "browser_closed"
++            self._terminal_detail = "The WAF browser window was closed or became unavailable"
++            self.batch_active = False
++            self._close()
++            raise RuntimeError(self._terminal_detail) from exc
++        self.challenge_attempts += 1
++        # Reaching this method is itself proof that goodsList returned a WAF
++        # challenge. Record cookies only after the real top-level navigation so
++        # cookies created by loading the challenge are not mistaken for a solve.
++        self._challenge_dom_seen = True
++        self._challenge_cookie_baseline = self._cookie_fingerprint(cookies)
++        self._challenge_observation = ""
++        self._challenge_observation_count = 0
++        self._challenge_ready = False
+         return self._status("Complete the WAF challenge in the open browser, then continue the batch")
+ 
+     def _status(self, detail: str = "", status: str | None = None) -> dict[str, Any]:
+         if status is None:
+-            status = "awaiting_verification" if self.batch_active else "success"
++            status = self._terminal_status or (
++                "ready" if self._challenge_ready else "awaiting_verification" if self.batch_active else "idle"
++            )
+         payload: dict[str, Any] = {
+             "status": status,
+-            "detail": detail,
++            "detail": detail or self._terminal_detail,
+             "browser": self.browser_name,
++            "browser_mode": self.browser_mode,
++            "proxy_mode": self.proxy_mode,
++            "challenge_id": self.challenge_id,
++            "challenge_attempts": self.challenge_attempts,
++            "completion_replays": self._completion_replays,
++            "ready": status in {"ready", "success"},
++            "observation_count": self._challenge_observation_count,
+             "completed": self.batch_completed,
+             "total": self.batch_total,
+             "succeeded": sum(1 for entry in self.batch_results if entry.get("ok")),
+@@ -273,12 +689,22 @@ class BrowserVerificationManager:
+ 
+     def _sync_shop(self, driver: Any, shop_id: int) -> dict[str, Any]:
+         shop = self._shop(shop_id)
+-        self._request_waiter()
+-        driver.get(shop["url"])
++        try:
++            current_url = str(getattr(driver, "current_url", "") or "")
++            page_source = str(getattr(driver, "page_source", "") or "")
++        except Exception:
++            current_url = ""
++            page_source = ""
++        redirected_challenge = self._same_origin(current_url, shop["url"]) and self._is_waf_html(page_source)
++        if not self._same_top_level_url(current_url, shop["url"]) and not redirected_challenge:
++            self._request_waiter()
++            driver.get(shop["url"])
+         first_payload = self._browser_request(driver, self._request_data(shop, 1))
+         products = self._catalog(driver, shop, first_payload)
+         with self._worker_lock:
+-            return self._record_shop_fetch(shop_id, products_override=products)
++            summary = self._record_shop_fetch(shop_id, products_override=products)
++        self._publish_browser_state(driver, shop)
++        return summary
+ 
+     def _advance_batch_locked(self) -> dict[str, Any]:
+         driver = self.driver
+@@ -309,62 +735,182 @@ class BrowserVerificationManager:
+             "success",
+         )
+         result["browser"] = browser_name
++        self._last_completed_challenge_id = self.challenge_id
++        self._last_completed_result = dict(result)
+         return result
+ 
+-    def _begin_batch_locked(self, shop_ids: list[int]) -> dict[str, Any]:
++    def _begin_batch_locked(
++        self,
++        shop_ids: list[int],
++        challenge_id: str | None = None,
++    ) -> dict[str, Any]:
+         unique_ids = list(dict.fromkeys(int(value) for value in shop_ids))
+         if not unique_ids:
+             return {"status": "success", "detail": "No shops require WAF verification", "completed": 0, "total": 0, "results": []}
+-        for shop_id in unique_ids:
+-            self._shop(shop_id)
++        requested_challenge_id = str(challenge_id or "").strip() or None
++        if requested_challenge_id is not None and not self._CHALLENGE_ID.fullmatch(requested_challenge_id):
++            raise RuntimeError("invalid WAF challenge id")
++        if (
++            not self.batch_active
++            and requested_challenge_id == self._last_completed_challenge_id
++            and self._last_completed_result is not None
++        ):
++            return dict(self._last_completed_result)
++        if self.batch_active:
++            if requested_challenge_id is not None and requested_challenge_id != self.challenge_id:
++                raise RuntimeError("another WAF browser verification session is already active")
++            if requested_challenge_id == self.challenge_id or tuple(unique_ids) == self.batch_shop_ids:
++                return self._status("The existing WAF browser verification session is still active")
++            raise RuntimeError("another WAF browser verification session is already active")
++
++        shops = [self._shop(shop_id) for shop_id in unique_ids]
+         self._close()
+         self._reset_batch()
+         self.batch_queue = unique_ids
++        self.batch_shop_ids = tuple(unique_ids)
+         self.batch_total = len(unique_ids)
+         self.batch_active = True
++        self.challenge_id = requested_challenge_id or uuid.uuid4().hex
+         try:
+-            self.driver, self.browser_name = self._create_driver()
++            self.driver, self.browser_name = self._create_driver(str(shops[0]["url"]))
+         except Exception:
+             self._reset_batch()
+             raise
+         return self._advance_batch_locked()
+ 
+-    def start(self, shop_id: int) -> dict[str, Any]:
++    def start(self, shop_id: int, challenge_id: str | None = None) -> dict[str, Any]:
+         with self.lock:
+-            return self._begin_batch_locked([shop_id])
++            return self._begin_batch_locked([shop_id], challenge_id)
+ 
+-    def complete(self, shop_id: int) -> dict[str, Any]:
++    def _require_active_locked(self, challenge_id: str | None = None) -> None:
++        if challenge_id is not None and str(challenge_id) != self.challenge_id:
++            raise RuntimeError("WAF browser verification session has changed")
++        if self._terminal_status == "browser_closed":
++            raise RuntimeError(self._terminal_detail or "The WAF browser window is closed")
++        if not self.batch_active or self.driver is None:
++            raise RuntimeError("no pending browser verification session")
++        try:
++            handles = getattr(self.driver, "window_handles", None)
++            if handles is not None and not list(handles):
++                raise RuntimeError("browser window is closed")
++        except Exception as exc:
++            self._terminal_status = "browser_closed"
++            self._terminal_detail = "The WAF browser window was closed before verification completed"
++            self.batch_active = False
++            self._close()
++            raise RuntimeError(self._terminal_detail) from exc
++
++    def complete(self, shop_id: int, challenge_id: str | None = None) -> dict[str, Any]:
+         with self.lock:
+-            if not self.batch_active or self.batch_total != 1 or self.batch_current_shop_id != shop_id or self.driver is None:
++            if (
++                challenge_id is not None
++                and str(challenge_id) == self._last_completed_challenge_id
++                and self._last_completed_result is not None
++                and not self.batch_active
++            ):
++                return dict(self._last_completed_result)
++            self._require_active_locked(challenge_id)
++            if self.batch_total != 1 or self.batch_current_shop_id != shop_id:
+                 raise RuntimeError("no pending browser verification session for this shop")
+-            # Re-run the catalog request as the source of truth. Challenge pages
+-            # can retain WAF markers after the slider has already issued a cookie.
++            if self._completion_replays >= self.MAX_COMPLETION_REPLAYS:
++                self._terminal_status = "retry_exhausted"
++                self._terminal_detail = "WAF verification retries were exhausted; start a new browser session"
++                self.batch_active = False
++                self._close()
++                return self._status()
++            self._completion_replays += 1
++            # Completion is the only polling path that replays goodsList. One
++            # WAF response returns immediately, so repeated challenges cannot
++            # create an internal request loop.
+             return self._advance_batch_locked()
+ 
+-    def start_all(self, shop_ids: list[int]) -> dict[str, Any]:
++    def start_all(self, shop_ids: list[int], challenge_id: str | None = None) -> dict[str, Any]:
+         with self.lock:
+-            return self._begin_batch_locked(shop_ids)
++            return self._begin_batch_locked(shop_ids, challenge_id)
+ 
+-    def complete_all(self) -> dict[str, Any]:
++    def complete_all(self, challenge_id: str | None = None) -> dict[str, Any]:
+         with self.lock:
+-            if not self.batch_active or self.driver is None:
+-                raise RuntimeError("no pending batch browser verification session")
+-            # Re-run the catalog request as the source of truth. Challenge pages
+-            # can retain WAF markers after the slider has already issued a cookie.
++            if (
++                challenge_id is not None
++                and str(challenge_id) == self._last_completed_challenge_id
++                and self._last_completed_result is not None
++                and not self.batch_active
++            ):
++                return dict(self._last_completed_result)
++            self._require_active_locked(challenge_id)
++            if self._completion_replays >= self.MAX_COMPLETION_REPLAYS:
++                self._terminal_status = "retry_exhausted"
++                self._terminal_detail = "WAF verification retries were exhausted; start a new browser session"
++                self.batch_active = False
++                self._close()
++                return self._status()
++            self._completion_replays += 1
+             return self._advance_batch_locked()
+ 
+-    def status(self) -> dict[str, Any]:
++    def status(self, challenge_id: str | None = None) -> dict[str, Any]:
+         with self.lock:
++            if (
++                challenge_id is not None
++                and str(challenge_id) == self._last_completed_challenge_id
++                and self._last_completed_result is not None
++                and not self.batch_active
++            ):
++                return dict(self._last_completed_result)
++            if challenge_id is not None and self.challenge_id is not None and str(challenge_id) != self.challenge_id:
++                raise RuntimeError("WAF browser verification session has changed")
++            if self._terminal_status is not None:
++                return self._status()
+             if not self.batch_active:
+-                return {
+-                    "status": "idle",
+-                    "browser": self.browser_name,
+-                    "completed": self.batch_completed,
+-                    "total": self.batch_total,
+-                    "succeeded": sum(1 for entry in self.batch_results if entry.get("ok")),
+-                    "failed": sum(1 for entry in self.batch_results if not entry.get("ok")),
+-                    "current_shop_id": None,
+-                    "pending_shop_ids": list(self.batch_queue),
+-                    "results": list(self.batch_results),
+-                }
+-            return self._status()
++                return self._status(status="idle")
++            if self.driver is None or self.batch_current_shop_id is None:
++                self._terminal_status = "browser_closed"
++                self._terminal_detail = "The WAF browser window is no longer available"
++                self.batch_active = False
++                self._close()
++                return self._status()
++            try:
++                current_url, page_source, cookies = self._browser_snapshot(self.driver)
++                shop = self._shop(self.batch_current_shop_id)
++            except Exception:
++                self._terminal_status = "browser_closed"
++                self._terminal_detail = "The WAF browser window was closed before verification completed"
++                self.batch_active = False
++                self._close()
++                return self._status()
++
++            page_cleared = (
++                self._challenge_dom_seen
++                and self._same_top_level_url(current_url, shop["url"])
++                and not self._is_waf_html(page_source)
++            )
++            cookie_fingerprint = self._cookie_fingerprint(cookies)
++            challenge_visible = self._challenge_is_visible(self.driver, page_source)
++            cookie_changed = (
++                bool(cookie_fingerprint)
++                and cookie_fingerprint != self._challenge_cookie_baseline
++                and not challenge_visible
++            )
++            observation = (
++                "page_cleared"
++                if page_cleared
++                else f"session_cookie_changed:{cookie_fingerprint}"
++                if cookie_changed
++                else ""
++            )
++            if observation:
++                if observation == self._challenge_observation:
++                    self._challenge_observation_count += 1
++                else:
++                    self._challenge_observation = observation
++                    self._challenge_observation_count = 1
++            else:
++                self._challenge_observation = ""
++                self._challenge_observation_count = 0
++            self._challenge_ready = self._challenge_observation_count >= self.READY_OBSERVATIONS
++            if self._challenge_ready:
++                return self._status("Browser verification appears complete; confirm to synchronize", "ready")
++            return self._status("Waiting for the browser challenge to complete", "awaiting_verification")
++
++    def poll(self, challenge_id: str | None = None) -> dict[str, Any]:
++        """Read browser state without navigating or calling the protected API."""
++        return self.status(challenge_id)
+diff --git a/backend/monitor_core/inventory.py b/backend/monitor_core/inventory.py
+index aab3f5d..23e59c4 100644
+--- a/backend/monitor_core/inventory.py
++++ b/backend/monitor_core/inventory.py
+@@ -372,6 +372,14 @@ class InventoryService:
+                     (shop_id, stamp, error),
+                 )
+                 connection.execute("UPDATE shops SET last_run = ? WHERE id = ?", (stamp, shop_id))
++                connection.execute(
++                    """
++                    UPDATE watches SET last_run = ? WHERE id IN (
++                        SELECT watch_id FROM shop_products WHERE shop_id = ? AND listed = 1
++                    )
++                    """,
++                    (stamp, shop_id),
++                )
+             raise RuntimeError(error) from exc
+ 
+ 
+diff --git a/backend/monitor_core/storefront.py b/backend/monitor_core/storefront.py
+index bef2775..2ee71ea 100644
+--- a/backend/monitor_core/storefront.py
++++ b/backend/monitor_core/storefront.py
+@@ -14,15 +14,18 @@ from html.parser import HTMLParser
+ from typing import Any, Callable
+ from urllib.error import HTTPError, URLError
+ from urllib.parse import urlparse
+-from urllib.request import Request, urlopen
++from urllib.request import ProxyHandler, Request, build_opener, urlopen
+ 
+ ALLOWED_HOST = "pay.ldxp.cn"
+ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+ USER_AGENT = "LDXP-Local-Monitor/2.0"
+ VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
+ DEFAULT_UPSTREAM_MIN_INTERVAL = 1.0
++DEFAULT_BROWSER_SESSION_MAX_AGE = 12 * 60 * 60
+ _UPSTREAM_THROTTLE_LOCK = threading.Lock()
+ _UPSTREAM_NEXT_ALLOWED = 0.0
++_BROWSER_SESSION_LOCK = threading.Lock()
++_BROWSER_SESSION: dict[str, Any] = {}
+ WAF_MARKERS = (b"aliyunCaptcha", b"aliyunCaptcha-sliding-slider", b"waf_nc", b"u_atoken")
+ # Aliyun occasionally changes the challenge wrapper while keeping the response
+ # status at 403.  Keep these secondary markers deliberately narrow and only
+@@ -36,6 +39,113 @@ class WafChallengeRequired(RuntimeError):
+     pass
+ 
+ 
++def waf_proxy_config() -> dict[str, Any]:
++    """Return one proxy policy shared by browser and background requests."""
++    raw = os.environ.get("LDXP_WAF_PROXY", "system").strip()
++    lowered = raw.lower()
++    if lowered in {"", "auto", "system"}:
++        return {"mode": "system", "server": None, "host": None, "port": None}
++    if lowered in {"direct", "none", "off"}:
++        return {"mode": "direct", "server": None, "host": None, "port": None}
++    try:
++        parsed = urlparse(raw)
++        port = parsed.port
++    except ValueError as exc:
++        raise RuntimeError("LDXP_WAF_PROXY must be system, direct, or a valid proxy URL") from exc
++    scheme = parsed.scheme.lower()
++    if scheme not in {"http", "https"} or not parsed.hostname:
++        raise RuntimeError("LDXP_WAF_PROXY must be system, direct, or an http/https proxy URL")
++    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
++        raise RuntimeError("LDXP_WAF_PROXY proxy URLs cannot contain credentials, paths, queries, or fragments")
++    if port is None:
++        port = 443 if scheme == "https" else 80
++    host = parsed.hostname
++    display_host = f"[{host}]" if ":" in host else host
++    return {
++        "mode": scheme,
++        "server": f"{scheme}://{display_host}:{port}",
++        "host": host,
++        "port": port,
++    }
++
++
++def open_storefront_request(request: Request, *, timeout: float) -> Any:
++    """Open a storefront request through the same explicit proxy as WAF Chromium."""
++    proxy = waf_proxy_config()
++    if proxy["mode"] == "system":
++        return urlopen(request, timeout=timeout)
++    proxy_urls = {} if proxy["mode"] == "direct" else {
++        "http": str(proxy["server"]),
++        "https": str(proxy["server"]),
++    }
++    return build_opener(ProxyHandler(proxy_urls)).open(request, timeout=timeout)
++
++
++def remember_browser_session(
++    cookies: list[dict[str, Any]] | None,
++    user_agent: str,
++    visitor_id: str = "",
++) -> int:
++    """Keep verified first-party browser state for later storefront requests."""
++    current = time.time()
++    accepted: dict[str, str] = {}
++    for cookie in cookies or []:
++        if not isinstance(cookie, dict):
++            continue
++        name = str(cookie.get("name") or "").strip()
++        value = str(cookie.get("value") or "")
++        domain = str(cookie.get("domain") or "").strip().lstrip(".").lower()
++        try:
++            expires = float(cookie.get("expiry") or 0)
++        except (TypeError, ValueError):
++            expires = 0
++        if domain and domain != ALLOWED_HOST and not ALLOWED_HOST.endswith(f".{domain}"):
++            continue
++        if expires and expires <= current:
++            continue
++        if not name or any(char in name for char in "\r\n;=") or any(char in value for char in "\r\n"):
++            continue
++        accepted[name] = value
++
++    normalized_agent = str(user_agent or "").strip()
++    if not normalized_agent or len(normalized_agent) > 512 or any(char in normalized_agent for char in "\r\n"):
++        normalized_agent = USER_AGENT
++    normalized_visitor = str(visitor_id or "").strip()
++    if not VISITOR_ID_PATTERN.fullmatch(normalized_visitor):
++        normalized_visitor = ""
++    with _BROWSER_SESSION_LOCK:
++        _BROWSER_SESSION.clear()
++        _BROWSER_SESSION.update(
++            {
++                "updated_at": current,
++                "user_agent": normalized_agent,
++                "cookie": "; ".join(f"{name}={value}" for name, value in sorted(accepted.items())),
++                "visitor_id": normalized_visitor,
++            }
++        )
++    return len(accepted)
++
++
++def browser_session_headers(*, now: float | None = None) -> dict[str, str]:
++    """Return a short-lived copy of verified browser headers without exposing state."""
++    current = time.time() if now is None else float(now)
++    try:
++        maximum_age = float(os.environ.get("LDXP_WAF_SESSION_MAX_AGE", DEFAULT_BROWSER_SESSION_MAX_AGE))
++    except (TypeError, ValueError):
++        maximum_age = DEFAULT_BROWSER_SESSION_MAX_AGE
++    maximum_age = max(60.0, min(maximum_age, 7 * 24 * 60 * 60))
++    with _BROWSER_SESSION_LOCK:
++        session = dict(_BROWSER_SESSION)
++    if not session or current - float(session.get("updated_at") or 0) > maximum_age:
++        return {}
++    headers = {"User-Agent": str(session.get("user_agent") or USER_AGENT)}
++    if session.get("cookie"):
++        headers["Cookie"] = str(session["cookie"])
++    if session.get("visitor_id"):
++        headers["Visitorid"] = str(session["visitor_id"])
++    return headers
++
++
+ def upstream_min_interval() -> float:
+     """Return the minimum gap between storefront requests in seconds."""
+     try:
+@@ -395,6 +505,7 @@ def _post_shop_api(
+         "Origin": f"https://{ALLOWED_HOST}",
+         "Referer": referer,
+     }
++    headers.update(browser_session_headers())
+     if visitor_id:
+         headers["Visitorid"] = visitor_id
+     request = Request(
+@@ -403,8 +514,9 @@ def _post_shop_api(
+         headers=headers,
+         method="POST",
+     )
++    request_opener = open_storefront_request if opener is urlopen else opener
+     try:
+-        with opener(request, timeout=15) as response:
++        with request_opener(request, timeout=15) as response:
+             raw = response.read(MAX_RESPONSE_BYTES + 1)
+             content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
+             status = int(getattr(response, "status", 200) or 200)
+diff --git a/backend/monitor_core/workers.py b/backend/monitor_core/workers.py
+index 71f617a..b478448 100644
+--- a/backend/monitor_core/workers.py
++++ b/backend/monitor_core/workers.py
+@@ -58,6 +58,13 @@ class MonitorWorker(threading.Thread):
+             requested = fallback
+         return max(self._minimum_interval, requested)
+ 
++    def _retry_interval(self, value: Any, fallback: int, last_error: Any = None) -> int:
++        interval = self._interval(value, fallback)
++        lowered = str(last_error or "").lower()
++        if any(marker in lowered for marker in ("waf", "aliyun", "滑块", "人机验证")):
++            return max(interval, 3600)
++        return interval
++
+     def run(self) -> None:
+         while not self.stop_event.wait(0.25):
+             current = time.time()
+@@ -82,10 +89,23 @@ class MonitorWorker(threading.Thread):
+ 
+             with self._database() as connection:
+                 rows = connection.execute(
+-                    "SELECT id, last_run, interval_seconds FROM watches WHERE enabled = 1"
++                    """
++                    SELECT w.id, w.last_run, w.interval_seconds,
++                        (
++                            SELECT sr.error
++                            FROM shop_products sp
++                            JOIN shop_runs sr ON sr.shop_id = sp.shop_id
++                            WHERE sp.watch_id = w.id AND sp.listed = 1
++                            ORDER BY sr.id DESC LIMIT 1
++                        ) AS shop_last_error
++                    FROM watches w WHERE w.enabled = 1
++                    """
+                 ).fetchall()
+             for row in rows:
+-                if current - self._timestamp(row["last_run"]) < self._interval(row["interval_seconds"], self._default_interval):
++                retry_interval = self._retry_interval(
++                    row["interval_seconds"], self._default_interval, row["shop_last_error"]
++                )
++                if current - self._timestamp(row["last_run"]) < retry_interval:
+                     continue
+                 if not self.fetch_lock.acquire(blocking=False):
+                     break
+@@ -103,9 +123,7 @@ class MonitorWorker(threading.Thread):
+                     "FROM shops s WHERE s.enabled = 1"
+                 ).fetchall()
+             for row in shop_rows:
+-                retry_interval = self._interval(row["interval_seconds"], 300)
+-                if "waf" in str(row["last_error"] or "").lower():
+-                    retry_interval = max(retry_interval, 3600)
++                retry_interval = self._retry_interval(row["interval_seconds"], 300, row["last_error"])
+                 if current - self._timestamp(row["last_run"]) < retry_interval or row["id"] in shop_refresh_cache:
+                     continue
+                 if not self.fetch_lock.acquire(blocking=False):
+diff --git a/backend/test_main.py b/backend/test_main.py
+index 7ab55d3..dc811f9 100644
+--- a/backend/test_main.py
++++ b/backend/test_main.py
+@@ -389,6 +389,51 @@ class GoodsParserTests(unittest.TestCase):
+         self.assertEqual(status, 400)
+         self.assertIn("invalid id", result["detail"])
+ 
++    def test_shop_browser_verification_status_and_completion_use_challenge_id(self):
++        ready = {
++            "status": "ready",
++            "challenge_id": "challenge-123",
++            "current_shop_id": 4,
++            "pending_shop_ids": [4],
++        }
++        completed = {
++            "status": "success",
++            "challenge_id": None,
++            "completed": 1,
++            "total": 1,
++            "results": [{"id": 4, "ok": True}],
++        }
++        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
++                patch.object(main.BROWSER_VERIFICATION, "poll", return_value=ready) as poll, \
++                patch.object(main.BROWSER_VERIFICATION, "complete_all", return_value=completed) as complete_all:
++            status, result = self.request_api(
++                "POST",
++                "/api/shops/browser-verification/status",
++                {"challenge_id": "challenge-123"},
++            )
++            self.assertEqual(status, 200)
++            self.assertEqual(result, ready)
++            poll.assert_called_once_with("challenge-123")
++
++            status, result = self.request_api(
++                "POST",
++                "/api/shops/browser-verification/complete-all",
++                {"challenge_id": "challenge-123"},
++            )
++            self.assertEqual(status, 200)
++            self.assertEqual(result, completed)
++            complete_all.assert_called_once_with("challenge-123")
++
++        with patch.object(main.ApiHandler, "_authorize_request", return_value=(None, True)), \
++                patch.object(main.BROWSER_VERIFICATION, "poll", side_effect=RuntimeError("browser verification challenge is stale")):
++            status, result = self.request_api(
++                "POST",
++                "/api/shops/browser-verification/status",
++                {"challenge_id": "stale-challenge"},
++            )
++        self.assertEqual(status, 409)
++        self.assertIn("stale", result["detail"])
++
+     def test_monitor_interval_uses_minute_floor_and_clamps_bounds(self):
+         self.assertEqual(main.normalize_interval(1), 60)
+         self.assertEqual(main.normalize_interval("3"), 60)
+@@ -1395,7 +1440,9 @@ class GoodsParserTests(unittest.TestCase):
+ 
+         with patch.object(main, "sub2api_settings", return_value={"base_url": "https://sub2api.example", "admin_key": "secret"}), \
+              patch.object(main, "_sub2api_fetch_accounts", return_value=accounts), \
+-             patch.object(main, "_redeem_client", return_value=FakeClient()):
++             patch.object(main, "_redeem_client", return_value=FakeClient()), \
++             patch.object(main, "_sub2api_reclaim_call_context", return_value=({}, 3, set())), \
++             patch.object(main, "_persist_sub2api_reclaim_attempts"):
+             result = main.reclaim_sub2api_401_accounts()
+ 
+         self.assertEqual(result["scanned_accounts"], 5)
+diff --git a/backend/test_monitor_core_modules.py b/backend/test_monitor_core_modules.py
+index 84f35dd..fc761fb 100644
+--- a/backend/test_monitor_core_modules.py
++++ b/backend/test_monitor_core_modules.py
+@@ -3,9 +3,10 @@ from __future__ import annotations
+ import os
+ import sqlite3
+ import tempfile
++import threading
+ import unittest
+ from contextlib import contextmanager
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
+ from pathlib import Path
+ 
+ from monitor_core import database as database_module
+@@ -250,7 +251,34 @@ class MonitorCoreModuleTests(unittest.TestCase):
+         self.assertTrue(manager._is_waf_html('<div id="aliyunCaptcha"></div>'))
+         self.assertFalse(manager._is_waf_html("<main>products</main>"))
+ 
++    def test_browser_close_terminates_webdriver_service_process(self) -> None:
++        manager = BrowserVerificationManager(
++            database=self.database,
++            worker_lock=object(),
++            record_shop_fetch=lambda *args, **kwargs: {},
++            goods_list_rows=lambda payload: ([], {}),
++            normalize_goods=lambda item, token: item,
++            first_value=lambda item, keys: None,
++            waf_error=RuntimeError,
++            waf_markers=(b"aliyunCaptcha",),
++            profile_path=Path(self.directory.name) / "profile",
++        )
++        driver = MagicMock()
++        service_process = driver.service.process
++        service_process.poll.return_value = None
++        manager.driver = driver
++
++        manager._close()
++
++        driver.quit.assert_called_once_with()
++        service_process.terminate.assert_called_once_with()
++
+     def test_browser_challenge_keeps_first_party_page_context(self) -> None:
++        with self.database() as connection:
++            shop_id = connection.execute(
++                "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
++                ("https://pay.ldxp.cn/shop/CONTEXT", "CONTEXT", "Context", "2026-08-30T08:00:00+00:00"),
++            ).lastrowid
+         manager = BrowserVerificationManager(
+             database=self.database,
+             worker_lock=object(),
+@@ -265,17 +293,41 @@ class MonitorCoreModuleTests(unittest.TestCase):
+ 
+         class FakeDriver:
+             page_source = "<div id='aliyunCaptcha'></div>"
++            current_url = "https://pay.ldxp.cn/shopApi/Shop/goodsList"
++            window_handles = ["window"]
++            get_calls: list[str] = []
+ 
+             def execute_script(self, *_args):
+                 raise AssertionError("challenge HTML must not be injected into the page")
+ 
++            def get_cookies(self):
++                return []
++
++            def get(self, url):
++                self.get_calls.append(url)
++                self.current_url = url
++                self.page_source = "<div id='aliyunCaptcha'></div>"
++
+         driver = FakeDriver()
+         manager.batch_active = True
+         manager.batch_total = 1
+-        manager.batch_current_shop_id = 1
++        manager.batch_current_shop_id = shop_id
++        manager.challenge_id = "challenge-context"
+         result = manager._render_challenge(driver, "<html>challenge</html>")
+ 
+         self.assertEqual(result["status"], "awaiting_verification")
++        self.assertEqual(driver.get_calls, ["https://pay.ldxp.cn/shop/CONTEXT"])
++        self.assertEqual(result["challenge_id"], "challenge-context")
++
++        driver.current_url = "https://pay.ldxp.cn/waf/challenge"
++        driver.get_calls.clear()
++        result = manager._render_challenge(driver, "<html>challenge</html>")
++        self.assertEqual(result["status"], "awaiting_verification")
++        self.assertEqual(driver.get_calls, [])
++        manager._browser_request = lambda *_args: (_ for _ in ()).throw(RuntimeError("WAF challenge"))
++        with self.assertRaisesRegex(RuntimeError, "WAF challenge"):
++            manager._sync_shop(driver, shop_id)
++        self.assertEqual(driver.get_calls, [])
+ 
+     def test_browser_request_uses_storefront_visitor_id_and_detects_status_only_waf(self) -> None:
+         manager = BrowserVerificationManager(
+@@ -316,6 +368,16 @@ class MonitorCoreModuleTests(unittest.TestCase):
+ 
+         class FakeDriver:
+             page_source = "<div id='challenge'></div>"
++            current_url = ""
++            window_handles = ["window"]
++            cookies: list[dict] = []
++
++            def get(self, url):
++                self.current_url = url
++                self.page_source = "<div id='aliyunCaptcha'></div>"
++
++            def get_cookies(self):
++                return self.cookies
+ 
+             def execute_script(self, *_args):
+                 return None
+@@ -335,7 +397,15 @@ class MonitorCoreModuleTests(unittest.TestCase):
+             profile_path=Path(self.directory.name) / "profile",
+         )
+         driver = FakeDriver()
+-        manager._create_driver = lambda: (driver, "chrome")
++        create_urls = []
++
++        def create_driver(initial_url):
++            create_urls.append(initial_url)
++            driver.current_url = initial_url
++            driver.page_source = "<div id='aliyunCaptcha'></div>"
++            return driver, "chrome"
++
++        manager._create_driver = create_driver
+         attempts = {shop_ids[0]: 0}
+ 
+         def sync(_driver, shop_id):
+@@ -349,6 +419,11 @@ class MonitorCoreModuleTests(unittest.TestCase):
+         self.assertEqual(first["status"], "awaiting_verification")
+         self.assertEqual(first["pending_shop_ids"], shop_ids)
+         self.assertEqual(first["current_shop_id"], shop_ids[0])
++        duplicate = manager.start_all(shop_ids, first["challenge_id"])
++        self.assertEqual(duplicate["challenge_id"], first["challenge_id"])
++        self.assertEqual(len(create_urls), 1)
++        with self.assertRaisesRegex(RuntimeError, "already active"):
++            manager.start_all(list(reversed(shop_ids)), "different-challenge")
+         # A solved Aliyun page can retain the challenge marker in its source;
+         # completion must trust a fresh catalog request instead.
+         driver.page_source = "<div id='aliyunCaptcha'></div><main>verified</main>"
+@@ -358,6 +433,131 @@ class MonitorCoreModuleTests(unittest.TestCase):
+         self.assertEqual([entry["id"] for entry in completed["results"]], shop_ids)
+         self.assertEqual(completed["browser"], "chrome")
+ 
++    def test_challenge_navigation_cookie_is_baseline_not_success_evidence(self) -> None:
++        with self.database() as connection:
++            shop_id = connection.execute(
++                "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
++                ("https://pay.ldxp.cn/shop/COOKIE", "COOKIE", "Cookie", "2026-08-30T08:00:00+00:00"),
++            ).lastrowid
++        manager = BrowserVerificationManager(
++            database=self.database,
++            worker_lock=object(),
++            record_shop_fetch=lambda *args, **kwargs: {},
++            goods_list_rows=lambda payload: ([], {}),
++            normalize_goods=lambda item, token: item,
++            first_value=lambda item, keys: None,
++            waf_error=RuntimeError,
++            waf_markers=(b"aliyunCaptcha",),
++            profile_path=Path(self.directory.name) / "profile",
++        )
++
++        class FakeDriver:
++            current_url = "https://pay.ldxp.cn/shopApi/Shop/goodsList"
++            page_source = "<div id='aliyunCaptcha'></div>"
++            window_handles = ["window"]
++            cookies: list[dict[str, str]] = []
++
++            def get(self, url):
++                self.current_url = url
++                self.cookies = [{"name": "acw_tc", "value": "challenge", "domain": ".ldxp.cn", "path": "/"}]
++
++            def get_cookies(self):
++                return self.cookies
++
++            def execute_script(self, _script):
++                return True
++
++            def quit(self):
++                return None
++
++        driver = FakeDriver()
++        manager.driver = driver
++        manager.batch_active = True
++        manager.batch_total = 1
++        manager.batch_shop_ids = (shop_id,)
++        manager.batch_queue = [shop_id]
++        manager.batch_current_shop_id = shop_id
++        manager.challenge_id = "challenge-cookie"
++
++        manager._render_challenge(driver, "<html>challenge</html>")
++        expected_baseline = manager._cookie_fingerprint(driver.cookies)
++        self.assertEqual(manager._challenge_cookie_baseline, expected_baseline)
++        self.assertEqual(manager.poll("challenge-cookie")["status"], "awaiting_verification")
++        self.assertEqual(manager.poll("challenge-cookie")["status"], "awaiting_verification")
++
++    def test_cookie_ready_observation_requires_a_stable_fingerprint(self) -> None:
++        with self.database() as connection:
++            shop_id = connection.execute(
++                "INSERT INTO shops(url, token, name, goods_type, created_at) VALUES(?, ?, ?, 'card', ?)",
++                ("https://pay.ldxp.cn/shop/ROTATE", "ROTATE", "Rotate", "2026-08-30T08:00:00+00:00"),
++            ).lastrowid
++        manager = BrowserVerificationManager(
++            database=self.database,
++            worker_lock=object(),
++            record_shop_fetch=lambda *args, **kwargs: {},
++            goods_list_rows=lambda payload: ([], {}),
++            normalize_goods=lambda item, token: item,
++            first_value=lambda item, keys: None,
++            waf_error=RuntimeError,
++            waf_markers=(b"aliyunCaptcha",),
++            profile_path=Path(self.directory.name) / "profile",
++        )
++
++        class FakeDriver:
++            current_url = "https://pay.ldxp.cn/shop/ROTATE"
++            page_source = "<script>aliyunCaptcha</script><main>storefront</main>"
++            window_handles = ["window"]
++            cookies = [
++                [{"name": "acw_tc", "value": "verified-1", "domain": ".ldxp.cn", "path": "/"}],
++                [{"name": "acw_tc", "value": "verified-2", "domain": ".ldxp.cn", "path": "/"}],
++                [{"name": "acw_tc", "value": "verified-2", "domain": ".ldxp.cn", "path": "/"}],
++            ]
++
++            def get_cookies(self):
++                return self.cookies.pop(0)
++
++            def execute_script(self, _script):
++                return False
++
++            def quit(self):
++                return None
++
++        manager.driver = FakeDriver()
++        manager.batch_active = True
++        manager.batch_total = 1
++        manager.batch_shop_ids = (shop_id,)
++        manager.batch_queue = [shop_id]
++        manager.batch_current_shop_id = shop_id
++        manager.challenge_id = "challenge-rotate"
++        manager._challenge_dom_seen = True
++        manager._challenge_cookie_baseline = manager._cookie_fingerprint(
++            [{"name": "acw_tc", "value": "pending", "domain": ".ldxp.cn", "path": "/"}]
++        )
++
++        self.assertEqual(manager.poll("challenge-rotate")["status"], "awaiting_verification")
++        self.assertEqual(manager.poll("challenge-rotate")["status"], "awaiting_verification")
++        self.assertEqual(manager.poll("challenge-rotate")["status"], "ready")
++
++    def test_old_completed_challenge_cannot_mask_an_active_session(self) -> None:
++        manager = BrowserVerificationManager(
++            database=self.database,
++            worker_lock=object(),
++            record_shop_fetch=lambda *args, **kwargs: {},
++            goods_list_rows=lambda payload: ([], {}),
++            normalize_goods=lambda item, token: item,
++            first_value=lambda item, keys: None,
++            waf_error=RuntimeError,
++            waf_markers=(b"aliyunCaptcha",),
++            profile_path=Path(self.directory.name) / "profile",
++        )
++        manager.batch_active = True
++        manager.challenge_id = "challenge-current"
++        manager._last_completed_challenge_id = "challenge-previous"
++        manager._last_completed_result = {"status": "success"}
++
++        with self.assertRaisesRegex(RuntimeError, "changed"):
++            manager.complete_all("challenge-previous")
++
+     def test_browser_order_supports_linux_and_explicit_selection(self) -> None:
+         manager = BrowserVerificationManager(
+             database=self.database,
+@@ -375,6 +575,104 @@ class MonitorCoreModuleTests(unittest.TestCase):
+         with patch.dict("os.environ", {"LDXP_WAF_BROWSER": "firefox"}):
+             self.assertEqual(manager._browser_order(), ["firefox"])
+ 
++    def test_browser_proxy_modes_and_firefox_system_proxy(self) -> None:
++        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "system"}):
++            self.assertEqual(BrowserVerificationManager._proxy_config()["mode"], "system")
++        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "direct"}):
++            self.assertEqual(BrowserVerificationManager._proxy_config()["mode"], "direct")
++        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "http://127.0.0.1:7890"}):
++            proxy = BrowserVerificationManager._proxy_config()
++            self.assertEqual((proxy["mode"], proxy["host"], proxy["port"]), ("http", "127.0.0.1", 7890))
++        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "socks://127.0.0.1:1080"}):
++            with self.assertRaisesRegex(RuntimeError, "http/https"):
++                BrowserVerificationManager._proxy_config()
++        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "http://user:secret@127.0.0.1:7890"}):
++            with self.assertRaisesRegex(RuntimeError, "cannot contain credentials"):
++                BrowserVerificationManager._proxy_config()
++
++        class FakeOptions:
++            def __init__(self):
++                self.preferences = {}
++
++            def set_preference(self, key, value):
++                self.preferences[key] = value
++
++        options = FakeOptions()
++        BrowserVerificationManager._apply_firefox_proxy(options, {"mode": "system"})
++        self.assertEqual(options.preferences, {"network.proxy.type": 5})
++
++        request = MagicMock()
++        response = MagicMock()
++        opener = MagicMock()
++        opener.open.return_value = response
++        handler = MagicMock()
++        with patch.dict(os.environ, {"LDXP_WAF_PROXY": "http://127.0.0.1:7890"}), \
++                patch.object(storefront, "ProxyHandler", return_value=handler) as proxy_handler, \
++                patch.object(storefront, "build_opener", return_value=opener) as build_opener:
++            opened = storefront.open_storefront_request(request, timeout=15)
++        self.assertIs(opened, response)
++        proxy_handler.assert_called_once_with({
++            "http": "http://127.0.0.1:7890",
++            "https": "http://127.0.0.1:7890",
++        })
++        build_opener.assert_called_once_with(handler)
++        opener.open.assert_called_once_with(request, timeout=15)
++
++    def test_chromium_starts_natively_then_attaches_without_automation_switch(self) -> None:
++        manager = BrowserVerificationManager(
++            database=self.database,
++            worker_lock=object(),
++            record_shop_fetch=lambda *args, **kwargs: {},
++            goods_list_rows=lambda payload: ([], {}),
++            normalize_goods=lambda item, token: item,
++            first_value=lambda item, keys: None,
++            waf_error=RuntimeError,
++            waf_markers=(b"aliyunCaptcha",),
++            profile_path=Path(self.directory.name) / "profile",
++        )
++        process = MagicMock()
++        process.poll.return_value = None
++        driver = MagicMock()
++        with patch.dict(os.environ, {"LDXP_WAF_BROWSER": "edge", "LDXP_WAF_PROXY": "http://127.0.0.1:7890"}), \
++                patch.object(manager, "_browser_executable", return_value=Path("C:/Edge/msedge.exe")), \
++                patch.object(manager, "_available_port", return_value=45678), \
++                patch.object(manager, "_wait_for_cdp") as wait_for_cdp, \
++                patch("monitor_core.browser_verification.subprocess.Popen", return_value=process) as popen, \
++                patch("selenium.webdriver.Edge", return_value=driver) as edge:
++            created, browser = manager._create_driver("https://pay.ldxp.cn/shop/NATIVE")
++
++        self.assertIs(created, driver)
++        self.assertEqual(browser, "edge")
++        command = popen.call_args.args[0]
++        self.assertEqual(command[-1], "https://pay.ldxp.cn/shop/NATIVE")
++        self.assertIn("--remote-debugging-address=127.0.0.1", command)
++        self.assertIn("--proxy-server=http://127.0.0.1:7890", command)
++        self.assertFalse(any("enable-automation" in argument for argument in command))
++        wait_for_cdp.assert_called_once_with(45678, process, "https://pay.ldxp.cn/shop/NATIVE")
++        self.assertEqual(edge.call_args.kwargs["options"].debugger_address, "127.0.0.1:45678")
++        driver.execute_cdp_cmd.assert_called_once()
++        self.assertEqual(manager.browser_mode, "native_cdp")
++        self.assertNotIn("127.0.0.1:7890", str(manager._status()))
++        manager._close()
++
++    def test_cdp_waits_for_the_initial_first_party_target(self) -> None:
++        process = MagicMock()
++        process.poll.return_value = None
++        version = {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/1"}
++        blank_targets = [{"type": "page", "url": "about:blank"}]
++        challenge_targets = [{"type": "page", "url": "https://pay.ldxp.cn/waf/challenge"}]
++        with patch.object(
++            BrowserVerificationManager,
++            "_read_cdp_json",
++            side_effect=[version, blank_targets, version, challenge_targets],
++        ) as read_json, patch("monitor_core.browser_verification.time.sleep"):
++            BrowserVerificationManager._wait_for_cdp(
++                45678,
++                process,
++                "https://pay.ldxp.cn/shop/NATIVE",
++            )
++        self.assertEqual(read_json.call_count, 4)
++
+     def test_storefront_normalizes_catalog_without_application_globals(self) -> None:
+         product = storefront.normalize_goods_list_item(
+             {
+diff --git a/backend/test_waf_resilience.py b/backend/test_waf_resilience.py
+new file mode 100644
+index 0000000..e550257
+--- /dev/null
++++ b/backend/test_waf_resilience.py
+@@ -0,0 +1,284 @@
++from __future__ import annotations
++
++import json
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from monitor_core import database as database_module
++from monitor_core import storefront
++from monitor_core.browser_verification import BrowserVerificationManager
++from monitor_core.inventory import InventoryService
++from monitor_core.workers import MonitorWorker
++
++
++class WafResilienceTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.directory = tempfile.TemporaryDirectory()
++        self.db_path = Path(self.directory.name) / "monitor.db"
++        self.database = lambda: database_module.create_database(self.db_path)
++        database_module.initialize_database(
++            self.database,
++            now=lambda: "2026-09-02T08:00:00+00:00",
++            default_interval=300,
++            default_redeem_url="https://redeem.example",
++            default_sub2api_url="https://sub2api.example",
++            default_automation={"enabled": False},
++        )
++        with storefront._BROWSER_SESSION_LOCK:
++            storefront._BROWSER_SESSION.clear()
++
++    def tearDown(self) -> None:
++        with storefront._BROWSER_SESSION_LOCK:
++            storefront._BROWSER_SESSION.clear()
++        self.directory.cleanup()
++
++    def test_verified_browser_state_is_reused_without_foreign_or_expired_cookies(self) -> None:
++        with patch.object(storefront.time, "time", return_value=1000.0):
++            accepted = storefront.remember_browser_session(
++                [
++                    {"name": "acw_tc", "value": "verified", "domain": ".ldxp.cn", "expiry": 2000},
++                    {"name": "expired", "value": "old", "domain": "pay.ldxp.cn", "expiry": 900},
++                    {"name": "foreign", "value": "no", "domain": "example.com", "expiry": 2000},
++                ],
++                "Mozilla/5.0 Browser",
++                "visitor_test_1",
++            )
++
++        self.assertEqual(accepted, 1)
++        self.assertEqual(
++            storefront.browser_session_headers(now=1100),
++            {
++                "User-Agent": "Mozilla/5.0 Browser",
++                "Cookie": "acw_tc=verified",
++                "Visitorid": "visitor_test_1",
++            },
++        )
++        self.assertEqual(storefront.browser_session_headers(now=1000 + 13 * 60 * 60), {})
++
++    def test_storefront_request_uses_verified_browser_headers(self) -> None:
++        with patch.object(storefront.time, "time", return_value=1000.0):
++            storefront.remember_browser_session(
++                [{"name": "waf_session", "value": "passed", "domain": "pay.ldxp.cn"}],
++                "Verified Browser UA",
++                "visitor_saved",
++            )
++
++        captured = {}
++
++        class Response:
++            headers = {"Content-Type": "application/json"}
++            status = 200
++
++            def __enter__(self):
++                return self
++
++            def __exit__(self, *_args):
++                return False
++
++            def read(self, _limit):
++                return json.dumps({"code": 1, "data": []}).encode("utf-8")
++
++        def opener(request, timeout):
++            captured["request"] = request
++            captured["timeout"] = timeout
++            return Response()
++
++        with patch.object(storefront.time, "time", return_value=1001.0):
++            result = storefront._post_shop_api(
++                "/shopApi/Shop/goodsList",
++                {"token": "TEST"},
++                "https://pay.ldxp.cn/shop/TEST",
++                opener=opener,
++            )
++
++        request = captured["request"]
++        self.assertEqual(result["code"], 1)
++        self.assertEqual(request.get_header("User-agent"), "Verified Browser UA")
++        self.assertEqual(request.get_header("Cookie"), "waf_session=passed")
++        self.assertEqual(request.get_header("Visitorid"), "visitor_saved")
++
++    def test_failed_shop_refresh_advances_all_linked_watch_timestamps(self) -> None:
++        stamp = "2026-09-02T08:05:00+00:00"
++        with self.database() as connection:
++            shop_id = connection.execute(
++                "INSERT INTO shops(url, token, interval_seconds, created_at) VALUES(?, ?, 300, ?)",
++                ("https://pay.ldxp.cn/shop/WAFTEST", "WAFTEST", stamp),
++            ).lastrowid
++            watch_ids = []
++            for suffix in ("one", "two"):
++                watch_id = connection.execute(
++                    "INSERT INTO watches(url, enabled, interval_seconds, created_at) VALUES(?, 1, 300, ?)",
++                    (f"https://pay.ldxp.cn/item/{suffix}", stamp),
++                ).lastrowid
++                watch_ids.append(watch_id)
++                connection.execute(
++                    "INSERT INTO shop_products(shop_id, goods_key, watch_id, listed, last_seen) VALUES(?, ?, ?, 1, ?)",
++                    (shop_id, suffix, watch_id, stamp),
++                )
++
++        service = InventoryService(
++            database=self.database,
++            now=lambda: stamp,
++            fetch_goods=lambda _url: {},
++            fetch_shop_catalog=lambda _url, **_kwargs: (_ for _ in ()).throw(
++                storefront.WafChallengeRequired("WAF challenge required")
++            ),
++            commerce_tags=lambda _item: [],
++            is_unlisted_error=lambda _value: False,
++            sync_intervals=lambda _connection, _shop_id, _interval: 0,
++        )
++
++        with self.assertRaisesRegex(RuntimeError, "WAF challenge required"):
++            service.record_shop_fetch(shop_id)
++
++        with self.database() as connection:
++            last_runs = [
++                connection.execute("SELECT last_run FROM watches WHERE id = ?", (watch_id,)).fetchone()[0]
++                for watch_id in watch_ids
++            ]
++        self.assertEqual(last_runs, [stamp, stamp])
++
++    def test_worker_uses_hour_backoff_for_linked_waf_failures(self) -> None:
++        worker = MonitorWorker(
++            database=self.database,
++            record_inventory_fetch=lambda *_args: {},
++            record_shop_fetch=lambda *_args: {},
++            process_preorder=lambda *_args: None,
++            mark_preorder_check_error=lambda *_args: None,
++            default_interval=300,
++        )
++
++        self.assertEqual(worker._retry_interval(300, 300, "Aliyun WAF 滑块验证"), 3600)
++        self.assertEqual(worker._retry_interval(300, 300, "connection reset"), 300)
++
++    def _browser_manager(self) -> tuple[BrowserVerificationManager, int]:
++        with self.database() as connection:
++            shop_id = connection.execute(
++                "INSERT INTO shops(url, token, interval_seconds, created_at) VALUES(?, ?, 300, ?)",
++                ("https://pay.ldxp.cn/shop/STATUS", "STATUS", "2026-09-02T08:00:00+00:00"),
++            ).lastrowid
++        manager = BrowserVerificationManager(
++            database=self.database,
++            worker_lock=object(),
++            record_shop_fetch=lambda *_args, **_kwargs: {},
++            goods_list_rows=lambda _payload: ([], {}),
++            normalize_goods=lambda item, _token: item,
++            first_value=lambda _item, _keys: None,
++            waf_error=storefront.WafChallengeRequired,
++            waf_markers=storefront.WAF_MARKERS,
++            profile_path=Path(self.directory.name) / "waf-profile",
++        )
++        manager.batch_active = True
++        manager.batch_total = 1
++        manager.batch_shop_ids = (shop_id,)
++        manager.batch_queue = [shop_id]
++        manager.batch_current_shop_id = shop_id
++        manager.challenge_id = "challenge-status"
++        return manager, shop_id
++
++    def test_browser_status_is_passive_and_requires_real_verification_evidence(self) -> None:
++        manager, _shop_id = self._browser_manager()
++
++        class Driver:
++            window_handles = ["window"]
++            current_url = "https://pay.ldxp.cn/shop/STATUS"
++            page_source = "<main>ordinary storefront</main>"
++
++            def get_cookies(self):
++                return []
++
++            def quit(self):
++                return None
++
++        manager.driver = Driver()
++        manager._browser_request = lambda *_args: (_ for _ in ()).throw(
++            AssertionError("status polling must not request goodsList")
++        )
++
++        first = manager.poll("challenge-status")
++        second = manager.poll("challenge-status")
++
++        self.assertEqual(first["status"], "awaiting_verification")
++        self.assertEqual(second["status"], "awaiting_verification")
++        self.assertEqual(second["observation_count"], 0)
++
++    def test_browser_status_becomes_ready_after_verified_cookie_change_is_stable(self) -> None:
++        manager, _shop_id = self._browser_manager()
++
++        class Driver:
++            window_handles = ["window"]
++            current_url = "https://pay.ldxp.cn/shop/STATUS"
++            page_source = "<main>storefront</main>"
++
++            def get_cookies(self):
++                return [{"name": "acw_tc", "value": "verified", "domain": ".ldxp.cn", "path": "/"}]
++
++            def quit(self):
++                return None
++
++        manager.driver = Driver()
++        manager._challenge_cookie_baseline = manager._cookie_fingerprint(
++            [{"name": "acw_tc", "value": "pending", "domain": ".ldxp.cn", "path": "/"}]
++        )
++
++        first = manager.poll("challenge-status")
++        second = manager.poll("challenge-status")
++
++        self.assertEqual(first["status"], "awaiting_verification")
++        self.assertEqual(second["status"], "ready")
++        self.assertTrue(second["ready"])
++
++    def test_browser_status_reports_closed_window_without_restarting_session(self) -> None:
++        manager, _shop_id = self._browser_manager()
++
++        class Driver:
++            window_handles = []
++
++            def quit(self):
++                return None
++
++        manager.driver = Driver()
++        result = manager.poll("challenge-status")
++
++        self.assertEqual(result["status"], "browser_closed")
++        self.assertFalse(manager.batch_active)
++        self.assertIn("closed", result["detail"].lower())
++
++    def test_completed_challenge_is_idempotent_and_stale_ids_are_rejected(self) -> None:
++        manager, _shop_id = self._browser_manager()
++        manager.batch_active = False
++        manager.driver = None
++        manager._last_completed_challenge_id = "challenge-status"
++        manager._last_completed_result = {"status": "success", "completed": 1, "total": 1}
++
++        self.assertEqual(manager.complete_all("challenge-status")["status"], "success")
++        with self.assertRaisesRegex(RuntimeError, "changed|pending"):
++            manager.complete_all("challenge-stale")
++
++    def test_completion_replay_limit_is_hard_even_after_ready_observation(self) -> None:
++        manager, _shop_id = self._browser_manager()
++
++        class Driver:
++            window_handles = ["window"]
++
++            def quit(self):
++                return None
++
++        manager.driver = Driver()
++        manager._completion_replays = manager.MAX_COMPLETION_REPLAYS
++        manager._challenge_ready = True
++        manager._advance_batch_locked = lambda: (_ for _ in ()).throw(
++            AssertionError("retry exhaustion must not replay goodsList")
++        )
++
++        result = manager.complete_all("challenge-status")
++
++        self.assertEqual(result["status"], "retry_exhausted")
++        self.assertFalse(manager.batch_active)
++        self.assertIn("exhausted", result["detail"].lower())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 0cc6248..36546e5 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -54,6 +54,15 @@ import './style.css';
+ import {buildSub2ApiAutomationSaveNotice, buildSub2ApiImportNotice, sub2ApiHistoryDeleteErrorMessage} from './sub2apiNotices.js';
+ import {DEFAULT_SUB2API_SECTION, SUB2API_SECTIONS, normalizeSub2ApiSection} from './sub2apiNavigation.js';
+ import {readSub2ApiCardAssignment, SUB2API_CARD_ASSIGNMENT_KEY} from './sub2apiAssignment.js';
++import {
++  EMPTY_SHOP_WAF_STATE,
++  normalizeShopWafState,
++  shopWafSessionActive,
++  shopWafShouldComplete,
++  shopWafShouldPoll,
++  shopWafProxyLabel,
++  shopWafResponseMatches,
++} from './shopWafModel.js';
+ import {
+   CARD_RECLAIM_POLL_TIMEOUT_MS,
+   CARD_RECLAIM_POLL_TIMEOUT_SECONDS,
+@@ -1064,15 +1073,11 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+   const [shopBatchSyncIntervalSeconds, setShopBatchSyncIntervalSeconds] = useState(DEFAULT_SHOP_BATCH_SYNC_INTERVAL_SECONDS);
+   const [busy, setBusy] = useState({});
+   const [verificationShopId, setVerificationShopId] = useState(null);
+-  const [verificationBatch, setVerificationBatch] = useState({
+-    status: 'idle',
+-    browser: null,
+-    completed: 0,
+-    total: 0,
+-    current_shop_id: null,
+-    pending_shop_ids: [],
+-    results: [],
+-  });
++  const [verificationBatch, setVerificationBatch] = useState(() => ({...EMPTY_SHOP_WAF_STATE}));
++  const verificationBatchRef = useRef({...EMPTY_SHOP_WAF_STATE});
++  const verificationStartBusy = useRef(false);
++  const verificationPollBusy = useRef(false);
++  const verificationCompleteBusy = useRef(false);
+   const [serviceOnline, setServiceOnline] = useState(false);
+   const [featureLoadState, setFeatureLoadState] = useState({
+     monitor: {status: 'loading', error: ''},
+@@ -1526,12 +1531,12 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+   const visibleCheckedShopIds = filteredShops.filter(shop => checkedShopIds.includes(shop.id)).map(shop => shop.id);
+   const allVisibleShopsChecked = filteredShops.length > 0 && visibleCheckedShopIds.length === filteredShops.length;
+   const wafShopIds = shops.filter(shop => shop.enabled && needsBrowserVerification(shop)).map(shop => shop.id);
+-  const batchVerificationPending = verificationBatch.status === 'awaiting_verification';
++  const batchVerificationPending = shopWafSessionActive(verificationBatch);
+   const singleShopSyncBusy = Object.entries(busy).some(([key, value]) => value && /^shop-\d+$/.test(key));
+   const singleProductSyncBusy = Object.entries(busy).some(([key, value]) => value && /^fetch-\d+$/.test(key));
+   const shopBatchBusy = Boolean(busy.fetchAll || busy.shopBatchSync);
+   const shopSyncBusy = shopBatchBusy || singleShopSyncBusy || singleProductSyncBusy;
+-  const monitorBusy = {...busy, syncLocked: shopSyncBusy};
++  const monitorBusy = {...busy, syncLocked: shopSyncBusy || batchVerificationPending};
+   const preorderByWatch = new Map(preorders.map(entry => [entry.watch_id, entry]));
+   const displayedPreorders = preorders.filter(entry => entry.status !== 'cancelled');
+ 
+@@ -1975,17 +1980,22 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+   };
+ 
+   const applyVerificationBatchState = result => {
+-    setVerificationBatch(current => ({
+-      ...current,
+-      ...result,
+-      pending_shop_ids: Array.isArray(result?.pending_shop_ids) ? result.pending_shop_ids : current.pending_shop_ids,
+-      results: Array.isArray(result?.results) ? result.results : current.results,
+-    }));
++    const next = normalizeShopWafState(result, verificationBatchRef.current);
++    verificationBatchRef.current = next;
++    setVerificationBatch(next);
++    if (shopWafSessionActive(next) && next.total === 1 && next.current_shop_id) {
++      setVerificationShopId(next.current_shop_id);
++    } else if (!shopWafSessionActive(next)) {
++      setVerificationShopId(null);
++    }
++    return next;
+   };
+ 
+   const startBrowserVerificationBatch = async (shopIds = wafShopIds) => {
+     const ids = [...new Set((shopIds || []).map(Number).filter(Number.isInteger).filter(id => id > 0))];
+     if (!ids.length) return notify('当前没有需要验证的 WAF 店铺');
++    if (verificationStartBusy.current || shopWafSessionActive(verificationBatchRef.current)) return notify('已有浏览器验证正在启动或进行，请先完成当前会话');
++    verificationStartBusy.current = true;
+     setBusy(value => ({...value, verificationBatch: true}));
+     try {
+       const result = await request('/shops/browser-verification/start-all', {
+@@ -2005,31 +2015,58 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+       notify(error.message, 'error');
+       return null;
+     } finally {
++      verificationStartBusy.current = false;
+       setBusy(value => ({...value, verificationBatch: false}));
+     }
+   };
+ 
+-  const completeBrowserVerificationBatch = async () => {
++  const completeBrowserVerificationSession = async ({automatic = false} = {}) => {
++    if (verificationCompleteBusy.current) return null;
++    const active = verificationBatchRef.current;
++    if (!active.challenge_id) {
++      if (!automatic) notify('验证会话尚未就绪，请重新打开浏览器', 'error');
++      return null;
++    }
++    verificationCompleteBusy.current = true;
+     setBusy(value => ({...value, verificationBatch: true}));
+     try {
+-      const result = await request('/shops/browser-verification/complete-all', {method: 'POST'});
+-      applyVerificationBatchState(result);
++      const result = await request('/shops/browser-verification/complete-all', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify({challenge_id: active.challenge_id}),
++      });
++      const next = applyVerificationBatchState(result);
+       if (result.status === 'awaiting_verification') {
+-        notify(result.detail || 'WAF 验证尚未完成', 'error');
++        if (!automatic) notify(result.detail || 'WAF 验证尚未完成', 'error');
++      } else if (['browser_closed', 'retry_exhausted', 'error'].includes(result.status)) {
++        setVerificationShopId(null);
++        notify(result.detail || '浏览器验证未完成，请重新打开验证窗口', 'error');
+       } else {
++        setVerificationShopId(null);
+         await loadItems({quiet: true});
+-        notify(`批量验证完成，共 ${result.completed || 0} 个店铺`);
++        const failed = Number(result.failed || 0);
++        notify(
++          next.total === 1
++            ? failed ? browserSyncFailure(result) : '验证通过并完成店铺同步'
++            : `批量验证完成，共 ${result.completed || 0} 个店铺${failed ? `，${failed} 个失败` : ''}`,
++          failed ? 'error' : 'info',
++        );
+       }
+       return result;
+     } catch (error) {
+       notify(error.message, 'error');
+       return null;
+     } finally {
++      verificationCompleteBusy.current = false;
+       setBusy(value => ({...value, verificationBatch: false}));
+     }
+   };
+ 
++  const completeBrowserVerificationBatch = () => completeBrowserVerificationSession();
++
+   const startBrowserVerification = async shop => {
++    if (verificationStartBusy.current || shopWafSessionActive(verificationBatchRef.current)) return notify('已有浏览器验证正在启动或进行，请先完成当前会话');
++    verificationStartBusy.current = true;
+     setBusy(value => ({...value, [`verify-${shop.id}`]: true}));
+     try {
+       const result = await request(`/shops/${shop.id}/browser-verification/start`, {method: 'POST'});
+@@ -2054,6 +2091,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+     } catch (error) {
+       notify(error.message, 'error');
+     } finally {
++      verificationStartBusy.current = false;
+       setBusy(value => ({...value, [`verify-${shop.id}`]: false}));
+     }
+   };
+@@ -2061,29 +2099,101 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+   const completeBrowserVerification = async shop => {
+     setBusy(value => ({...value, [`verify-${shop.id}`]: true}));
+     try {
+-      const result = await request(`/shops/${shop.id}/browser-verification/complete`, {method: 'POST'});
+-      if (result.status === 'awaiting_verification') {
+-        applyVerificationBatchState(result);
+-        return notify(result.detail, 'error');
+-      }
+-      setVerificationShopId(null);
+-      const summary = browserSyncSummary(result);
+-      if (!summary) {
+-        applyVerificationBatchState({...result, status: 'idle'});
+-        notify(result.failed ? browserSyncFailure(result) : '验证通过并完成同步', result.failed ? 'error' : 'info');
+-        return;
+-      }
+-      if (!result.summary) result.summary = summary;
+-      applyVerificationBatchState({...result, status: 'idle'});
+-      await loadItems({quiet: true});
+-      notify(`验证通过并同步完成，共 ${result.summary.product_count} 个商品`);
+-    } catch (error) {
+-      notify(error.message, 'error');
++      return await completeBrowserVerificationSession();
+     } finally {
+       setBusy(value => ({...value, [`verify-${shop.id}`]: false}));
+     }
+   };
+ 
++  useEffect(() => {
++    if (!canManageMonitor || !serviceOnline || !shopWafShouldPoll(verificationBatch)) return undefined;
++    let cancelled = false;
++    let timer = null;
++    let failureCount = 0;
++    let lastErrorKey = '';
++    let lastErrorNoticeAt = 0;
++    const schedule = delay => {
++      if (!cancelled) timer = window.setTimeout(poll, delay);
++    };
++    const poll = async () => {
++      if (cancelled) return;
++      if (verificationPollBusy.current || verificationCompleteBusy.current) {
++        schedule(1000);
++        return;
++      }
++      const expectedChallenge = verificationBatchRef.current.challenge_id;
++      if (!expectedChallenge) return;
++      let retryDelay = 3000;
++      verificationPollBusy.current = true;
++      try {
++        const result = await request('/shops/browser-verification/status', {
++          method: 'POST',
++          headers: {'Content-Type': 'application/json'},
++          body: JSON.stringify({challenge_id: expectedChallenge}),
++        });
++        if (cancelled || !shopWafResponseMatches(expectedChallenge, verificationBatchRef.current, result)) return;
++        failureCount = 0;
++        const next = applyVerificationBatchState(result);
++        if (shopWafShouldComplete(next)) await completeBrowserVerificationSession({automatic: true});
++        if (['browser_closed', 'retry_exhausted', 'error'].includes(next.status)) {
++          notify(next.detail || '浏览器验证未完成，请重新打开', 'error');
++        }
++      } catch (error) {
++        if (cancelled) return;
++        let pollError = error;
++        if (error.status === 409 && verificationBatchRef.current.challenge_id === expectedChallenge) {
++          try {
++            const recovered = await request('/shops/browser-verification/status', {method: 'POST'});
++            if (cancelled || verificationBatchRef.current.challenge_id !== expectedChallenge) return;
++            failureCount = 0;
++            const next = applyVerificationBatchState(recovered);
++            if (shopWafShouldComplete(next)) await completeBrowserVerificationSession({automatic: true});
++            if (['browser_closed', 'retry_exhausted', 'error'].includes(next.status)) {
++              notify(next.detail || '浏览器验证未完成，请重新打开', 'error');
++            }
++            return;
++          } catch (recoveryError) {
++            pollError = recoveryError;
++          }
++        }
++        failureCount += 1;
++        retryDelay = Math.min(3000 * (2 ** Math.min(failureCount - 1, 4)), 30000);
++        const errorKey = `${pollError.status || 0}:${pollError.message}`;
++        const now = Date.now();
++        if (errorKey !== lastErrorKey || now - lastErrorNoticeAt >= 30000) {
++          lastErrorKey = errorKey;
++          lastErrorNoticeAt = now;
++          notify(pollError.message, 'error');
++        }
++      } finally {
++        verificationPollBusy.current = false;
++        if (
++          !cancelled
++          && verificationBatchRef.current.challenge_id === expectedChallenge
++          && shopWafShouldPoll(verificationBatchRef.current)
++        ) schedule(retryDelay);
++      }
++    };
++    schedule(800);
++    return () => {
++      cancelled = true;
++      window.clearTimeout(timer);
++    };
++  }, [canManageMonitor, serviceOnline, verificationBatch.status, verificationBatch.challenge_id]);
++
++  useEffect(() => {
++    if (!canManageMonitor || !serviceOnline) return undefined;
++    let cancelled = false;
++    request('/shops/browser-verification/status', {method: 'POST'})
++      .then(result => {
++        if (cancelled || !shopWafSessionActive(result)) return;
++        const next = applyVerificationBatchState(result);
++        if (next.total === 1) setVerificationShopId(next.current_shop_id);
++      })
++      .catch(() => {});
++    return () => { cancelled = true; };
++  }, [canManageMonitor, serviceOnline]);
++
+   const persistCheckout = async (overrides = {}) => {
+     const profile = {
+       contact: String(overrides.contact ?? contact.contact ?? '').trim(),
+@@ -3329,7 +3439,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+           <div className="topbar-actions">
+             {['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary overview-button" onClick={() => { setDetailOpen(false); setOverviewOpen(true); }} aria-expanded={overviewOpen} aria-controls="product-overview-drawer" disabled={featureLoadState.monitor.status !== 'ready'}><PanelRight size={16}/>商品总览</button>}
+             <IconButton label={theme === 'dark' ? '切换日间模式' : '切换夜间模式'} onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={16}/> : <Moon size={16}/>}</IconButton>
+-            {canManageMonitor && ['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary refresh-all-button" onClick={fetchAll} disabled={shopSyncBusy || (!items.length && !shops.length)}>
++            {canManageMonitor && ['products', 'monitor', 'history'].includes(activeView) && <button className="button secondary refresh-all-button" onClick={fetchAll} disabled={batchVerificationPending || shopSyncBusy || (!items.length && !shops.length)}>
+               <RefreshCw size={16} className={shopSyncBusy ? 'spin' : ''}/>{busy.shopBatchSync ? '逐店同步中' : busy.fetchAll ? '全部刷新中' : singleShopSyncBusy || singleProductSyncBusy ? '单项同步中' : '全部刷新'}
+             </button>}
+           </div>
+@@ -3345,7 +3455,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+         {['products', 'monitor', 'history'].includes(activeView) && featureLoadState.monitor.status !== 'ready' ? (
+           <FeatureLoadingState feature="监控数据" state={featureLoadState.monitor} onRetry={() => retryFeature('monitor')}/>
+         ) : activeView === 'products' ? (
+-          <ProductOverviewView items={items} shops={shops} stableOrder={stableItemOrder} busy={monitorBusy} selectedId={selectedId} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor ? fetchOne : null}/>
++          <ProductOverviewView items={items} shops={shops} stableOrder={stableItemOrder} busy={monitorBusy} selectedId={selectedId} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor && !batchVerificationPending ? fetchOne : null}/>
+         ) : activeView === 'monitor' ? (
+           <>
+             {canManageMonitor && <form className="watch-composer" onSubmit={addWatch}>
+@@ -3356,7 +3466,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+                 {sourceMode === 'shop' && <label className="shop-category-field"><span>{shopCategoryState.token ? `商品分类 · ${shopCategoryState.token}` : '商品分类'}</span><div className="shop-category-control"><select value={categoryId} onChange={event => setCategoryId(event.target.value)} aria-label="选择店铺商品分类" title={shopCategoryState.error || '按店铺公开分类选择同步范围'}><option value="">{shopCategoryState.loading ? '正在读取分类…' : shopCategoryState.error ? '全部分类（读取失败，可重试）' : shopCategoryState.token && !shopCategoryState.categories.length ? '全部分类（暂无子分类）' : '全部分类'}</option>{shopCategoryState.categories.map(category => <option value={category.id} key={category.id}>{category.name} · ID {category.id}{category.goods_count ? ` · ${category.goods_count} 件` : ''}</option>)}</select>{shopCategoryState.loading && <RefreshCw className="category-loading spin" size={14}/>} {shopCategoryState.error && <button type="button" className="icon-button category-retry" aria-label="重新读取店铺分类" title="重新读取店铺分类" onClick={() => setShopCategoryRetry(value => value + 1)}><RefreshCw size={14}/></button>}</div></label>}
+                 {sourceMode === 'shop' && <label><span>商品类型</span><select value={goodsType} onChange={event => setGoodsType(event.target.value)}>{SHOP_GOODS_TYPES.map(option => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>}
+                 <label><span>监控频率</span><select value={intervalSeconds} onChange={event => setIntervalSeconds(Number(event.target.value))}>{MONITOR_INTERVAL_OPTIONS.map(seconds => <option value={seconds} key={seconds}>{intervalOptionLabel(seconds)}</option>)}</select></label>
+-                <button className="button primary" disabled={busy.add || shopSyncBusy}><Plus size={16}/>{busy.add ? '正在同步' : sourceMode === 'shop' ? '同步店铺' : '开始监控'}</button>
++                <button className="button primary" disabled={batchVerificationPending || busy.add || shopSyncBusy}><Plus size={16}/>{busy.add ? '正在同步' : sourceMode === 'shop' ? '同步店铺' : '开始监控'}</button>
+               </div>
+             </form>}
+ 
+@@ -3374,15 +3484,15 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+                   <span>{validCheckedShopIds.length ? `已选 ${validCheckedShopIds.length} 个店铺` : '尚未选择店铺'}</span>
+                   <span className="shop-sync-policy"><Clock3 size={12}/>相邻间隔 {shopBatchSyncIntervalLabel(shopBatchSyncIntervalSeconds)}</span>
+                   {validCheckedShopIds.length > 0 && <IconButton label="取消选择店铺" onClick={() => setCheckedShopIds([])}><X size={14}/></IconButton>}
+-                  <button className="button secondary" onClick={syncAllShops} disabled={shopSyncBusy || !enabledShops.length}><RefreshCw size={14} className={busy.shopBatchSync ? 'spin' : ''}/>{busy.shopBatchSync ? '正在逐店同步' : '同步全部店铺'}</button>
+-                  <button className="button secondary" onClick={() => batchVerificationPending ? completeBrowserVerificationBatch() : startBrowserVerificationBatch()} disabled={shopSyncBusy || busy.verificationBatch || (!batchVerificationPending && !wafShopIds.length)} title={batchVerificationPending ? '完成浏览器验证后继续同步' : '使用共享浏览器会话验证所有 WAF 店铺'}>
+-                    <ShieldCheck size={14} className={busy.verificationBatch ? 'spin' : ''}/>{batchVerificationPending ? `继续验证 ${verificationBatch.completed}/${verificationBatch.total}` : `验证全部 WAF${wafShopIds.length ? ` (${wafShopIds.length})` : ''}`}
++                  <button className="button secondary" onClick={syncAllShops} disabled={batchVerificationPending || shopSyncBusy || !enabledShops.length}><RefreshCw size={14} className={busy.shopBatchSync ? 'spin' : ''}/>{busy.shopBatchSync ? '正在逐店同步' : '同步全部店铺'}</button>
++                  <button className="button secondary" onClick={() => batchVerificationPending ? completeBrowserVerificationBatch() : startBrowserVerificationBatch()} disabled={shopSyncBusy || busy.verificationBatch || (!batchVerificationPending && !wafShopIds.length)} title={batchVerificationPending ? '立即检查浏览器验证状态' : '使用共享浏览器会话验证所有 WAF 店铺'}>
++                    <ShieldCheck size={14} className={busy.verificationBatch ? 'spin' : ''}/>{batchVerificationPending ? `立即检查 ${verificationBatch.completed}/${verificationBatch.total}` : `验证全部 WAF${wafShopIds.length ? ` (${wafShopIds.length})` : ''}`}
+                   </button>
+-                  <button className="button danger-button" onClick={removeCheckedShops} disabled={shopSyncBusy || !validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button>
++                  <button className="button danger-button" onClick={removeCheckedShops} disabled={batchVerificationPending || shopSyncBusy || !validCheckedShopIds.length || busy.shopBatchDelete}><Trash2 size={14}/>{busy.shopBatchDelete ? '正在删除' : '批量删除'}</button>
+                 </div>
+               </div>}
+               {canManageMonitor && shopBatchBusy && <div className="shop-sync-progress" role="status" aria-live="polite"><span className="shop-sync-progress-icon"><RefreshCw size={15} className="spin"/></span><div><strong>{busy.fetchAll ? '正在逐店同步并刷新独立商品' : '正在同步全部店铺'}</strong><small>{enabledShops.length} 个启用店铺将串行处理，相邻店铺至少等待 {shopBatchSyncIntervalSeconds} 秒</small></div><em>间隔 {shopBatchSyncIntervalLabel(shopBatchSyncIntervalSeconds)}</em></div>}
+-              {canManageMonitor && batchVerificationPending && <div className="shop-verification-banner"><ShieldCheck size={15}/><span>浏览器：{verificationBatch.browser || '自动选择'}，当前店铺 {verificationBatch.current_shop_id || '--'}，剩余 {verificationBatch.pending_shop_ids?.length || 0} 个</span><button className="button primary" onClick={completeBrowserVerificationBatch} disabled={shopSyncBusy || busy.verificationBatch}><Check size={14}/>验证完成并继续</button></div>}
++              {canManageMonitor && batchVerificationPending && <div className="shop-verification-banner"><ShieldCheck size={15}/><span>浏览器：{verificationBatch.browser || '自动选择'} · {shopWafProxyLabel(verificationBatch.proxy_mode)}，当前店铺 {verificationBatch.current_shop_id || '--'}；验证通过后自动继续，剩余 {verificationBatch.pending_shop_ids?.length || 0} 个</span><button className="button primary" onClick={completeBrowserVerificationBatch} disabled={shopSyncBusy || busy.verificationBatch}><Check size={14}/>立即检查</button></div>}
+               <div className="shop-list">{!filteredShops.length ? <div className="monitor-filter-empty"><Store size={20}/><span>没有符合条件的店铺</span></div> : filteredShops.map(shop => <div className={`shop-row ${shopFilter === shop.id ? 'selected' : ''} ${checkedShopIds.includes(shop.id) ? 'checked' : ''}`} key={shop.id}>
+                 {canManageMonitor && <label className="check-wrap shop-select-cell" title={`选择店铺：${shop.name || shop.token}`} onClick={event => event.stopPropagation()}><input className="select-checkbox" type="checkbox" checked={checkedShopIds.includes(shop.id)} onChange={() => toggleShopChecked(shop.id)} aria-label={`选择店铺：${shop.name || shop.token}`}/></label>}
+                 <button className="shop-main" onClick={() => { setShopFilter(current => current === shop.id ? null : shop.id); setCheckedIds([]); }}>
+@@ -3392,9 +3502,9 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+                 <div className="shop-stat"><span>在售</span><strong className="positive">{shop.on_sale_count}</strong></div>
+                 <div className="shop-stat"><span>已知库存</span><strong>{shop.total_stock ?? '--'}</strong><small>{shop.known_stock_count}/{shop.product_count} 项公开</small></div>
+                 <div className="shop-time" title={shop.last_attempt?.error || ''}><span className={`pill ${shop.last_attempt?.status === 'error' ? 'error' : 'live'}`}>{needsBrowserVerification(shop) ? '需要验证' : shop.last_attempt?.status === 'error' ? '同步异常' : '已同步'}</span><small>{compactTime(shop.last_attempt?.fetched_at)}</small></div>
+-                {canManageMonitor && <><MonitorIntervalSelect value={shop.interval_seconds} label={`修改${shop.name || shop.token}监控频率`} caption="监控频率" disabled={shopSyncBusy || busy[`shop-save-${shop.id}`]} onChange={value => updateShop(shop, {interval_seconds: value})}/>
+-                <button className={`switch ${shop.enabled ? 'on' : ''}`} role="switch" aria-checked={shop.enabled} title={shop.enabled ? '暂停店铺监控' : '开启店铺监控'} disabled={shopSyncBusy || busy[`shop-save-${shop.id}`]} onClick={() => updateShop(shop, {enabled: !shop.enabled})}><span/></button>
+-                <div className="row-actions">{needsBrowserVerification(shop) && (verificationShopId === shop.id ? <IconButton label="验证完成并同步" tone="verify" onClick={() => completeBrowserVerification(shop)} disabled={shopSyncBusy || busy[`verify-${shop.id}`]}><ShieldCheck size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton> : <IconButton label="打开浏览器验证" tone="verify" onClick={() => startBrowserVerification(shop)} disabled={shopSyncBusy || busy[`verify-${shop.id}`]}><ArrowUpRight size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton>)}<IconButton label="同步店铺" onClick={() => fetchShop(shop.id)} disabled={shopSyncBusy || busy[`shop-${shop.id}`]}><RefreshCw size={15} className={busy[`shop-${shop.id}`] ? 'spin' : ''}/></IconButton><IconButton label="删除店铺监控" tone="danger" onClick={() => removeShop(shop)} disabled={shopSyncBusy}><Trash2 size={15}/></IconButton></div></>}
++                {canManageMonitor && <><MonitorIntervalSelect value={shop.interval_seconds} label={`修改${shop.name || shop.token}监控频率`} caption="监控频率" disabled={batchVerificationPending || shopSyncBusy || busy[`shop-save-${shop.id}`]} onChange={value => updateShop(shop, {interval_seconds: value})}/>
++                <button className={`switch ${shop.enabled ? 'on' : ''}`} role="switch" aria-checked={shop.enabled} title={shop.enabled ? '暂停店铺监控' : '开启店铺监控'} disabled={batchVerificationPending || shopSyncBusy || busy[`shop-save-${shop.id}`]} onClick={() => updateShop(shop, {enabled: !shop.enabled})}><span/></button>
++                <div className="row-actions">{needsBrowserVerification(shop) && (verificationShopId === shop.id ? <IconButton label="立即检查验证状态" tone="verify" onClick={() => completeBrowserVerification(shop)} disabled={shopSyncBusy || busy.verificationBatch || busy[`verify-${shop.id}`]}><ShieldCheck size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton> : <IconButton label={batchVerificationPending ? '已有浏览器验证正在进行' : '打开浏览器验证'} tone="verify" onClick={() => startBrowserVerification(shop)} disabled={batchVerificationPending || shopSyncBusy || busy.verificationBatch || busy[`verify-${shop.id}`]}><ArrowUpRight size={15} className={busy[`verify-${shop.id}`] ? 'spin' : ''}/></IconButton>)}<IconButton label="同步店铺" onClick={() => fetchShop(shop.id)} disabled={batchVerificationPending || shopSyncBusy || busy[`shop-${shop.id}`]}><RefreshCw size={15} className={busy[`shop-${shop.id}`] ? 'spin' : ''}/></IconButton><IconButton label="删除店铺监控" tone="danger" onClick={() => removeShop(shop)} disabled={batchVerificationPending || shopSyncBusy}><Trash2 size={15}/></IconButton></div></>}
+               </div>)}</div>
+             </section>}
+ 
+@@ -3407,7 +3517,7 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+                   <span className="monitor-result-count">{visibleItems.length} / {shopScopedItems.length}</span>
+                   {(productQuery || productStatusFilter !== 'all') && <IconButton label="清除商品筛选" onClick={() => { setProductQuery(''); setProductStatusFilter('all'); }}><X size={14}/></IconButton>}
+                 </div>
+-                {canManageMonitor && visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={shopSyncBusy || busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={shopSyncBusy || busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
++                {canManageMonitor && visibleCheckedIds.length > 0 && <div className="batch-toolbar"><span>已选 {visibleCheckedIds.length} 项</span><div><button className="button preorder-button" onClick={openPreorder} disabled={batchVerificationPending || shopSyncBusy || busy.preorderRefresh}><Clock3 size={14}/>{busy.preorderRefresh ? '正在同步库存' : '设置预购'}</button><button className="button secondary" onClick={() => copyLinks(visibleItems.filter(item => visibleCheckedIds.includes(item.id)))}><Clipboard size={14}/>复制链接</button><button className="button danger-button" onClick={removeChecked} disabled={batchVerificationPending || shopSyncBusy || busy.batchDelete}><Trash2 size={14}/>{busy.batchDelete ? '正在移除' : '移出本地目录'}</button></div></div>}
+                  {!!displayedPreorders.length && <div className="preorder-list" aria-label="自动预购任务">{displayedPreorders.map(preorder => <div className={`preorder-row ${preorder.status}`} key={preorder.id}><span className="preorder-icon"><Clock3 size={15}/></span><div className="preorder-copy"><strong>{preorder.title}</strong><small>目标 {preorder.quantity} 件 · 每 {intervalLabel(preorder.interval_seconds)} 检查 · 当前库存 {preorder.stock_label}</small>{preorder.last_error && <small className="negative">{preorder.last_error}</small>}</div><span className={`pill ${preorder.status === 'triggered' ? 'live' : preorder.status === 'error' ? 'error' : 'neutral'}`}>{preorder.status === 'watching' ? '预购监控中' : preorder.status === 'processing' ? '正在创建订单' : preorder.status === 'triggered' ? '支付链接已创建' : '预购失败'}</span>{preorder.payment_url ? <a className="button official preorder-pay-link" href={preorder.payment_url} target="_blank" rel="noreferrer"><ArrowUpRight size={14}/>打开支付链接</a> : preorder.status === 'watching' || preorder.status === 'error' ? <IconButton label="停止自动预购" tone="danger" onClick={() => cancelPreorder(preorder)}><X size={15}/></IconButton> : <span/>}</div>)}</div>}
+                 <div className="table-head">{canManageMonitor ? <label className="check-wrap" title="全选当前列表"><input className="select-checkbox" type="checkbox" checked={allVisibleChecked} onChange={toggleAllVisible}/></label> : <span/>}<span>商品</span><span>价格</span><span>库存 / 状态</span><span>监控频率</span><span>操作</span></div>
+                 <div className="product-list">
+@@ -3417,13 +3527,13 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+                       <div className="product-cell"><ProductImage item={item}/><div className="product-copy"><strong>{item.latest?.title || item.name || '等待首次抓取'}</strong><span>{item.shops?.length ? `${item.shops[0].name || item.shops[0].token} · ${item.url}` : item.name && item.latest ? item.name : item.url}</span><small>{compactTime(item.last_attempt?.fetched_at)}</small></div></div>
+                       <div className="price-cell"><strong>{money(item.latest?.price)}</strong>{item.price_changed && <span className="change-flag">有变化</span>}</div>
+                       <div className="state-cell"><StatusPill item={item}/><small>{itemStockLabel(item)}</small>{preorderByWatch.get(item.id)?.status === 'watching' && <small className="preorder-state">自动预购 {preorderByWatch.get(item.id).quantity} 件</small>}</div>
+-                      <div className="monitor-cell" onClick={event => event.stopPropagation()}>{canManageMonitor ? <><button className={`switch ${itemMonitoringEnabled(item) ? 'on' : ''}`} role="switch" aria-checked={itemMonitoringEnabled(item)} title={item.shops?.length ? '由所属店铺统一控制' : item.enabled ? '暂停自动监控' : '开启自动监控'} disabled={shopSyncBusy || busy[`watch-save-${item.id}`] || !!item.shops?.length} onClick={() => updateWatch(item, {enabled: !item.enabled})}><span/></button><MonitorIntervalSelect value={item.interval_seconds} label={`修改${item.latest?.title || item.name || '商品'}监控频率`} disabled={shopSyncBusy || busy[`watch-save-${item.id}`] || !!item.shops?.length} onChange={value => updateWatch(item, {interval_seconds: value})}/><small>{item.shops?.length ? '跟随店铺' : '独立设置'}</small></> : <small>只读</small>}</div>
++                      <div className="monitor-cell" onClick={event => event.stopPropagation()}>{canManageMonitor ? <><button className={`switch ${itemMonitoringEnabled(item) ? 'on' : ''}`} role="switch" aria-checked={itemMonitoringEnabled(item)} title={item.shops?.length ? '由所属店铺统一控制' : item.enabled ? '暂停自动监控' : '开启自动监控'} disabled={batchVerificationPending || shopSyncBusy || busy[`watch-save-${item.id}`] || !!item.shops?.length} onClick={() => updateWatch(item, {enabled: !item.enabled})}><span/></button><MonitorIntervalSelect value={item.interval_seconds} label={`修改${item.latest?.title || item.name || '商品'}监控频率`} disabled={batchVerificationPending || shopSyncBusy || busy[`watch-save-${item.id}`] || !!item.shops?.length} onChange={value => updateWatch(item, {interval_seconds: value})}/><small>{item.shops?.length ? '跟随店铺' : '独立设置'}</small></> : <small>只读</small>}</div>
+                       <div className="row-actions" onClick={event => event.stopPropagation()}>
+-                        {canManageMonitor && <IconButton label={item.shops?.length ? '同步所属店铺库存' : '立即抓取'} onClick={() => fetchOne(item.id)} disabled={shopSyncBusy || busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>}
++                        {canManageMonitor && <IconButton label={item.shops?.length ? '同步所属店铺库存' : '立即抓取'} onClick={() => fetchOne(item.id)} disabled={batchVerificationPending || shopSyncBusy || busy[`fetch-${item.id}`]}><RefreshCw size={15} className={busy[`fetch-${item.id}`] ? 'spin' : ''}/></IconButton>}
+                         <IconButton label="复制商品链接" onClick={() => copyLinks([item])}><Clipboard size={15}/></IconButton>
+                         <IconButton label="加入购买清单" onClick={() => addToCart(item)} disabled={!itemPurchasable(item)}><ShoppingBag size={15}/></IconButton>
+                         <IconButton label="使用已保存配置一键购买" tone="buy" onClick={() => oneClickBuy(item)} disabled={!itemPurchasable(item) || busy[`buy-${item.id}`]}><Zap size={15} className={busy[`buy-${item.id}`] ? 'spin' : ''}/></IconButton>
+-                        {canManageMonitor && <IconButton label="删除监控" tone="danger" onClick={() => removeWatch(item)} disabled={shopSyncBusy}><Trash2 size={15}/></IconButton>}
++                        {canManageMonitor && <IconButton label="删除监控" tone="danger" onClick={() => removeWatch(item)} disabled={batchVerificationPending || shopSyncBusy}><Trash2 size={15}/></IconButton>}
+                       </div>
+                     </div>
+                   ))}
+@@ -3497,8 +3607,8 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
+         )}
+       </main>
+ 
+-      <ProductOverviewDrawer id="product-overview-drawer" open={overviewOpen} items={items} shops={shops} stableOrder={stableItemOrder} busy={monitorBusy} selectedId={selectedId} shopFilter={shopFilter} onClose={() => setOverviewOpen(false)} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor ? fetchOne : null} onShopFilter={value => { setShopFilter(value); setCheckedIds([]); }}/>
+-      <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={monitorBusy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={canManageMonitor ? fetchOne : null} onDirect={openDirectProduct}/>
++      <ProductOverviewDrawer id="product-overview-drawer" open={overviewOpen} items={items} shops={shops} stableOrder={stableItemOrder} busy={monitorBusy} selectedId={selectedId} shopFilter={shopFilter} onClose={() => setOverviewOpen(false)} onSelect={setSelectedId} onOpenDetail={openProductDetail} onBuy={oneClickBuy} onAdd={addToCart} onDirect={openDirectProduct} onRefresh={canManageMonitor && !batchVerificationPending ? fetchOne : null} onShopFilter={value => { setShopFilter(value); setCheckedIds([]); }}/>
++      <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={monitorBusy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={canManageMonitor && !batchVerificationPending ? fetchOne : null} onDirect={openDirectProduct}/>
+ 
+        {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="1440" value={Math.max(1, Math.ceil((Number(preorderDraft.interval_seconds) || 60) / 60))} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(60, Math.min(86400, (Number(event.target.value) || 1) * 60))})} inputMode="numeric"/><span>分钟</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
+       {checkoutPrompt && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setCheckoutPrompt(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="完善购买配置"><div className="modal-head"><div><span>CHECKOUT PROFILE</span><h2>完善购买配置</h2></div><IconButton label="关闭" onClick={() => setCheckoutPrompt(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>购买前需要联系方式{checkoutPrompt.requiresPassword ? '和安全密码' : ''}，支付渠道与优惠券可按商品支持情况使用。</p></div><div className="purchase-form"><label><span>联系方式</span><input value={contact.contact} onChange={event => setContact({...contact, contact: event.target.value})} placeholder="邮箱、手机号或其他联系方式" autoComplete="email"/></label>{checkoutPrompt.requiresPassword && <label><span>安全密码</span><input type={passwordVisible ? 'text' : 'password'} value={queryPassword} onChange={event => setQueryPassword(event.target.value)} placeholder="用于查询订单详情" autoComplete="off"/></label>}<label><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><label><span>优惠券 <small>可选</small></span><input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="输入优惠券码" autoComplete="off"/></label><label><span>配置保存位置</span><select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select></label></div><div className="modal-foot"><span><ShieldCheck size={14}/>保存后会用于后续购买和订单查询</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setCheckoutPrompt(null)}>取消</button><button className="button official" onClick={submitCheckoutPrompt}><Save size={15}/>保存并继续</button></div></div></div></div>}
+diff --git a/frontend/src/shopWafModel.js b/frontend/src/shopWafModel.js
+new file mode 100644
+index 0000000..9bd4088
+--- /dev/null
++++ b/frontend/src/shopWafModel.js
+@@ -0,0 +1,68 @@
++export const EMPTY_SHOP_WAF_STATE = Object.freeze({
++  status: 'idle',
++  browser: null,
++  browser_mode: null,
++  proxy_mode: null,
++  challenge_id: null,
++  completed: 0,
++  total: 0,
++  current_shop_id: null,
++  pending_shop_ids: [],
++  results: [],
++  detail: '',
++});
++
++const VALID_STATUSES = new Set(['idle', 'awaiting_verification', 'ready', 'success', 'browser_closed', 'retry_exhausted', 'error']);
++
++export function normalizeShopWafState(value, current = EMPTY_SHOP_WAF_STATE) {
++  const input = value && typeof value === 'object' ? value : {};
++  const status = VALID_STATUSES.has(input.status) ? input.status : current.status || 'idle';
++  const terminal = ['idle', 'success', 'browser_closed', 'retry_exhausted', 'error'].includes(status);
++  return {
++    ...current,
++    ...input,
++    status,
++    browser: input.browser ?? current.browser ?? null,
++    browser_mode: input.browser_mode ?? current.browser_mode ?? null,
++    proxy_mode: input.proxy_mode ?? current.proxy_mode ?? null,
++    challenge_id: terminal ? null : String(input.challenge_id || current.challenge_id || '').trim() || null,
++    current_shop_id: terminal
++      ? null
++      : Number.isInteger(Number(input.current_shop_id)) && Number(input.current_shop_id) > 0
++        ? Number(input.current_shop_id)
++        : current.current_shop_id ?? null,
++    completed: Math.max(0, Number(input.completed ?? current.completed) || 0),
++    total: Math.max(0, Number(input.total ?? current.total) || 0),
++    pending_shop_ids: Array.isArray(input.pending_shop_ids)
++      ? input.pending_shop_ids.map(Number).filter(Number.isInteger).filter(id => id > 0)
++      : [...(current.pending_shop_ids || [])],
++    results: Array.isArray(input.results) ? input.results : [...(current.results || [])],
++    detail: String(input.detail || ''),
++  };
++}
++
++export function shopWafSessionActive(state) {
++  return state?.status === 'awaiting_verification' || state?.status === 'ready';
++}
++
++export function shopWafShouldPoll(state) {
++  return state?.status === 'awaiting_verification' && Boolean(state?.challenge_id);
++}
++
++export function shopWafShouldComplete(state) {
++  return state?.status === 'ready' && Boolean(state?.challenge_id);
++}
++
++export function shopWafResponseMatches(expectedChallengeId, current, response) {
++  const expected = String(expectedChallengeId || '').trim();
++  const currentChallenge = String(current?.challenge_id || '').trim();
++  const responseChallenge = String(response?.challenge_id || '').trim();
++  return Boolean(expected) && currentChallenge === expected && (!responseChallenge || responseChallenge === expected);
++}
++
++export function shopWafProxyLabel(mode) {
++  if (mode === 'system') return '跟随系统 VPN';
++  if (mode === 'direct') return '直连';
++  if (['http', 'https', 'socks'].includes(mode)) return '指定代理';
++  return '代理状态未知';
++}
+diff --git a/frontend/src/shopWafModel.test.js b/frontend/src/shopWafModel.test.js
+new file mode 100644
+index 0000000..c2ed88c
+--- /dev/null
++++ b/frontend/src/shopWafModel.test.js
+@@ -0,0 +1,82 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++
++import {
++  EMPTY_SHOP_WAF_STATE,
++  normalizeShopWafState,
++  shopWafSessionActive,
++  shopWafShouldComplete,
++  shopWafShouldPoll,
++  shopWafProxyLabel,
++  shopWafResponseMatches,
++} from './shopWafModel.js';
++
++test('normalizes a recoverable storefront WAF session', () => {
++  const state = normalizeShopWafState({
++    status: 'awaiting_verification',
++    challenge_id: 'challenge-1',
++    current_shop_id: '4',
++    pending_shop_ids: [4, '5', 'bad'],
++    browser_mode: 'native_attach',
++    proxy_mode: 'system',
++  });
++
++  assert.equal(state.current_shop_id, 4);
++  assert.deepEqual(state.pending_shop_ids, [4, 5]);
++  assert.equal(shopWafSessionActive(state), true);
++  assert.equal(shopWafShouldPoll(state), true);
++  assert.equal(shopWafShouldComplete(state), false);
++});
++
++test('only a ready challenge can trigger one completion request', () => {
++  const ready = normalizeShopWafState({status: 'ready', challenge_id: 'challenge-2'});
++  const stale = normalizeShopWafState({status: 'ready'});
++
++  assert.equal(shopWafShouldComplete(ready), true);
++  assert.equal(shopWafShouldComplete(stale), false);
++  assert.equal(shopWafShouldPoll(ready), false);
++});
++
++test('terminal status clears stale challenge and current shop', () => {
++  const pending = normalizeShopWafState({
++    status: 'awaiting_verification',
++    challenge_id: 'challenge-3',
++    current_shop_id: 8,
++  });
++  const completed = normalizeShopWafState({status: 'success'}, pending);
++
++  assert.equal(completed.challenge_id, null);
++  assert.equal(completed.current_shop_id, null);
++  assert.equal(shopWafSessionActive(completed), false);
++  assert.deepEqual(normalizeShopWafState(null), EMPTY_SHOP_WAF_STATE);
++});
++
++test('retry exhaustion stops polling and allows a fresh browser session', () => {
++  const exhausted = normalizeShopWafState({
++    status: 'retry_exhausted',
++    challenge_id: 'old-challenge',
++    current_shop_id: 8,
++    detail: 'start a new browser session',
++  });
++
++  assert.equal(exhausted.challenge_id, null);
++  assert.equal(exhausted.current_shop_id, null);
++  assert.equal(shopWafSessionActive(exhausted), false);
++  assert.equal(shopWafShouldPoll(exhausted), false);
++});
++
++test('rejects a poll response after the active challenge changes', () => {
++  const expected = 'challenge-old';
++
++  assert.equal(shopWafResponseMatches(expected, {challenge_id: expected}, {challenge_id: expected}), true);
++  assert.equal(shopWafResponseMatches(expected, {challenge_id: expected}, {status: 'idle'}), true);
++  assert.equal(shopWafResponseMatches(expected, {challenge_id: 'challenge-new'}, {challenge_id: expected}), false);
++  assert.equal(shopWafResponseMatches(expected, {challenge_id: expected}, {challenge_id: 'challenge-new'}), false);
++});
++
++test('describes only known proxy modes as configured', () => {
++  assert.equal(shopWafProxyLabel('system'), '跟随系统 VPN');
++  assert.equal(shopWafProxyLabel('direct'), '直连');
++  assert.equal(shopWafProxyLabel('socks'), '指定代理');
++  assert.equal(shopWafProxyLabel(null), '代理状态未知');
++});
+diff --git a/frontend/src/style.css b/frontend/src/style.css
+index ccbb8f1..eef3698 100644
+--- a/frontend/src/style.css
++++ b/frontend/src/style.css
+@@ -1377,6 +1377,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
+   .table-head, .product-row { grid-template-columns: 22px minmax(130px, 2fr) 64px minmax(78px, .75fr) 48px 98px; gap: 6px; }
+   .row-actions { gap: 3px; }
+   .row-actions .icon-button { width: 29px; }
++  .composer-fields.shop-mode { grid-template-columns: minmax(190px, 2fr) minmax(90px, .75fr) minmax(150px, 1.2fr); gap: 7px; }
++  .composer-fields.shop-mode .button { grid-column: 3; }
+ }
+ 
+ @media (max-width: 1180px) and (min-width: 901px) {

@@ -58,6 +58,13 @@ class MonitorWorker(threading.Thread):
             requested = fallback
         return max(self._minimum_interval, requested)
 
+    def _retry_interval(self, value: Any, fallback: int, last_error: Any = None) -> int:
+        interval = self._interval(value, fallback)
+        lowered = str(last_error or "").lower()
+        if any(marker in lowered for marker in ("waf", "aliyun", "滑块", "人机验证")):
+            return max(interval, 3600)
+        return interval
+
     def run(self) -> None:
         while not self.stop_event.wait(0.25):
             current = time.time()
@@ -82,10 +89,23 @@ class MonitorWorker(threading.Thread):
 
             with self._database() as connection:
                 rows = connection.execute(
-                    "SELECT id, last_run, interval_seconds FROM watches WHERE enabled = 1"
+                    """
+                    SELECT w.id, w.last_run, w.interval_seconds,
+                        (
+                            SELECT sr.error
+                            FROM shop_products sp
+                            JOIN shop_runs sr ON sr.shop_id = sp.shop_id
+                            WHERE sp.watch_id = w.id AND sp.listed = 1
+                            ORDER BY sr.id DESC LIMIT 1
+                        ) AS shop_last_error
+                    FROM watches w WHERE w.enabled = 1
+                    """
                 ).fetchall()
             for row in rows:
-                if current - self._timestamp(row["last_run"]) < self._interval(row["interval_seconds"], self._default_interval):
+                retry_interval = self._retry_interval(
+                    row["interval_seconds"], self._default_interval, row["shop_last_error"]
+                )
+                if current - self._timestamp(row["last_run"]) < retry_interval:
                     continue
                 if not self.fetch_lock.acquire(blocking=False):
                     break
@@ -103,9 +123,7 @@ class MonitorWorker(threading.Thread):
                     "FROM shops s WHERE s.enabled = 1"
                 ).fetchall()
             for row in shop_rows:
-                retry_interval = self._interval(row["interval_seconds"], 300)
-                if "waf" in str(row["last_error"] or "").lower():
-                    retry_interval = max(retry_interval, 3600)
+                retry_interval = self._retry_interval(row["interval_seconds"], 300, row["last_error"])
                 if current - self._timestamp(row["last_run"]) < retry_interval or row["id"] in shop_refresh_cache:
                     continue
                 if not self.fetch_lock.acquire(blocking=False):

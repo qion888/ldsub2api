@@ -14,7 +14,7 @@ from html.parser import HTMLParser
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 # The storefront is available on both the legacy payment host and the new
 # public host.  Keep ALLOWED_HOST as the legacy default for callers that do not
@@ -26,8 +26,11 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 USER_AGENT = "LDXP-Local-Monitor/2.0"
 VISITOR_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,80}")
 DEFAULT_UPSTREAM_MIN_INTERVAL = 1.0
+DEFAULT_BROWSER_SESSION_MAX_AGE = 12 * 60 * 60
 _UPSTREAM_THROTTLE_LOCK = threading.Lock()
 _UPSTREAM_NEXT_ALLOWED = 0.0
+_BROWSER_SESSION_LOCK = threading.Lock()
+_BROWSER_SESSION: dict[str, Any] = {}
 WAF_MARKERS = (b"aliyunCaptcha", b"aliyunCaptcha-sliding-slider", b"waf_nc", b"u_atoken")
 # Aliyun occasionally changes the challenge wrapper while keeping the response
 # status at 403.  Keep these secondary markers deliberately narrow and only
@@ -39,6 +42,113 @@ UNLISTED_ERROR_MARKERS = ("商品未上架", "商品不存在", "已下架", "�
 
 class WafChallengeRequired(RuntimeError):
     pass
+
+
+def waf_proxy_config() -> dict[str, Any]:
+    """Return one proxy policy shared by browser and background requests."""
+    raw = os.environ.get("LDXP_WAF_PROXY", "system").strip()
+    lowered = raw.lower()
+    if lowered in {"", "auto", "system"}:
+        return {"mode": "system", "server": None, "host": None, "port": None}
+    if lowered in {"direct", "none", "off"}:
+        return {"mode": "direct", "server": None, "host": None, "port": None}
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("LDXP_WAF_PROXY must be system, direct, or a valid proxy URL") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("LDXP_WAF_PROXY must be system, direct, or an http/https proxy URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise RuntimeError("LDXP_WAF_PROXY proxy URLs cannot contain credentials, paths, queries, or fragments")
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    host = parsed.hostname
+    display_host = f"[{host}]" if ":" in host else host
+    return {
+        "mode": scheme,
+        "server": f"{scheme}://{display_host}:{port}",
+        "host": host,
+        "port": port,
+    }
+
+
+def open_storefront_request(request: Request, *, timeout: float) -> Any:
+    """Open a storefront request through the same explicit proxy as WAF Chromium."""
+    proxy = waf_proxy_config()
+    if proxy["mode"] == "system":
+        return urlopen(request, timeout=timeout)
+    proxy_urls = {} if proxy["mode"] == "direct" else {
+        "http": str(proxy["server"]),
+        "https": str(proxy["server"]),
+    }
+    return build_opener(ProxyHandler(proxy_urls)).open(request, timeout=timeout)
+
+
+def remember_browser_session(
+    cookies: list[dict[str, Any]] | None,
+    user_agent: str,
+    visitor_id: str = "",
+) -> int:
+    """Keep verified first-party browser state for later storefront requests."""
+    current = time.time()
+    accepted: dict[str, str] = {}
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "").strip()
+        value = str(cookie.get("value") or "")
+        domain = str(cookie.get("domain") or "").strip().lstrip(".").lower()
+        try:
+            expires = float(cookie.get("expiry") or 0)
+        except (TypeError, ValueError):
+            expires = 0
+        if domain and domain != ALLOWED_HOST and not ALLOWED_HOST.endswith(f".{domain}"):
+            continue
+        if expires and expires <= current:
+            continue
+        if not name or any(char in name for char in "\r\n;=") or any(char in value for char in "\r\n"):
+            continue
+        accepted[name] = value
+
+    normalized_agent = str(user_agent or "").strip()
+    if not normalized_agent or len(normalized_agent) > 512 or any(char in normalized_agent for char in "\r\n"):
+        normalized_agent = USER_AGENT
+    normalized_visitor = str(visitor_id or "").strip()
+    if not VISITOR_ID_PATTERN.fullmatch(normalized_visitor):
+        normalized_visitor = ""
+    with _BROWSER_SESSION_LOCK:
+        _BROWSER_SESSION.clear()
+        _BROWSER_SESSION.update(
+            {
+                "updated_at": current,
+                "user_agent": normalized_agent,
+                "cookie": "; ".join(f"{name}={value}" for name, value in sorted(accepted.items())),
+                "visitor_id": normalized_visitor,
+            }
+        )
+    return len(accepted)
+
+
+def browser_session_headers(*, now: float | None = None) -> dict[str, str]:
+    """Return a short-lived copy of verified browser headers without exposing state."""
+    current = time.time() if now is None else float(now)
+    try:
+        maximum_age = float(os.environ.get("LDXP_WAF_SESSION_MAX_AGE", DEFAULT_BROWSER_SESSION_MAX_AGE))
+    except (TypeError, ValueError):
+        maximum_age = DEFAULT_BROWSER_SESSION_MAX_AGE
+    maximum_age = max(60.0, min(maximum_age, 7 * 24 * 60 * 60))
+    with _BROWSER_SESSION_LOCK:
+        session = dict(_BROWSER_SESSION)
+    if not session or current - float(session.get("updated_at") or 0) > maximum_age:
+        return {}
+    headers = {"User-Agent": str(session.get("user_agent") or USER_AGENT)}
+    if session.get("cookie"):
+        headers["Cookie"] = str(session["cookie"])
+    if session.get("visitor_id"):
+        headers["Visitorid"] = str(session["visitor_id"])
+    return headers
 
 
 def upstream_min_interval() -> float:
@@ -467,6 +577,7 @@ def _post_shop_api(
         "Origin": f"https://{request_host}",
         "Referer": request_referer,
     }
+    headers.update(browser_session_headers())
     if visitor_id:
         headers["Visitorid"] = visitor_id
     request = Request(
@@ -475,8 +586,9 @@ def _post_shop_api(
         headers=headers,
         method="POST",
     )
+    request_opener = open_storefront_request if opener is urlopen else opener
     try:
-        with opener(request, timeout=15) as response:
+        with request_opener(request, timeout=15) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
             content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
             status = int(getattr(response, "status", 200) or 200)
