@@ -1620,6 +1620,28 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
 .overview-empty span { margin-top: 6px; color: var(--ui-text-muted); font-size: 11px; }
 .overview-empty .button { margin-top: 14px; }
 
+.product-pagination {
+  min-height: 54px;
+  padding: 9px 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ui-text-muted);
+  background: var(--ui-surface);
+  border-top: 1px solid var(--ui-border);
+  font-size: 10px;
+}
+.product-pagination.compact { padding-inline: 18px; background: var(--ui-surface-muted); }
+.product-pagination-summary { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.product-pagination-actions { display: flex; align-items: center; gap: 6px; }
+.product-page-size { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.product-page-size span { color: var(--ui-text-muted); font-size: 9px; }
+.product-page-size select { width: 62px; height: 30px; padding-inline: 8px; font-size: 10px; }
+.product-pagination-button { width: 30px; height: 30px; padding: 0; display: inline-grid; place-items: center; color: var(--ui-text-muted); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 4px; }
+.product-pagination-button:hover:not(:disabled) { color: var(--ui-text); border-color: var(--ui-text-muted); background: var(--ui-surface-muted); }
+.product-pagination-button:disabled { opacity: .42; cursor: not-allowed; }
+
 .product-detail-drawer { width: min(960px, calc(100vw - 48px)); }
 
 @media (max-width: 1500px) {
@@ -1651,6 +1673,8 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   .overview-toolbar { grid-template-columns: 1fr 1fr; }
   .overview-toolbar .overview-search { grid-column: 1 / -1; }
   .overview-toolbar .overview-reset { align-self: end; }
+  .product-pagination { align-items: stretch; flex-direction: column; }
+  .product-pagination-actions { justify-content: space-between; }
   .product-detail-drawer { width: 100%; max-width: none; }
   .detail-drawer-tabs { top: auto; min-height: 42px; padding-inline: 14px; gap: 20px; }
   .detail-drawer-body { padding: 0 14px 20px; }

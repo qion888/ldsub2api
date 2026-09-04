@@ -94,6 +94,13 @@ import {
   requiresLogin,
   roleLabel,
 } from './authModel.js';
+import {
+  clampProductPage,
+  DEFAULT_PRODUCT_PAGE_SIZE,
+  paginateProducts,
+  PRODUCT_PAGE_SIZE_OPTIONS,
+  productPageCount,
+} from './productPagination.js';
 
 const API = '/api';
 const CHECKOUT_PROFILE_KEY = 'ldxp-checkout-profile-v1';
@@ -420,6 +427,20 @@ function useStableItemOrder(items) {
   }, [items]);
 }
 
+function ProductPagination({page, pageCount, pageSize, total, onPageChange, onPageSizeChange, compact = false}) {
+  if (!total) return null;
+  return <nav className={`product-pagination ${compact ? 'compact' : ''}`} aria-label="商品目录分页">
+    <span className="product-pagination-summary">第 {page} / {pageCount} 页 · 共 {total} 项</span>
+    <div className="product-pagination-actions">
+      <label className="product-page-size"><span>每页</span><select value={pageSize} onChange={event => onPageSizeChange(Number(event.target.value))} aria-label="每页商品数量">
+        {PRODUCT_PAGE_SIZE_OPTIONS.map(size => <option value={size} key={size}>{size}</option>)}
+      </select></label>
+      <button type="button" className="product-pagination-button" onClick={() => onPageChange(Math.max(1, page - 1))} disabled={page <= 1} aria-label="上一页" title="上一页"><ChevronLeft size={15}/></button>
+      <button type="button" className="product-pagination-button" onClick={() => onPageChange(Math.min(pageCount, page + 1))} disabled={page >= pageCount} aria-label="下一页" title="下一页"><ChevronRight size={15}/></button>
+    </div>
+  </nav>;
+}
+
 function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, onSelect, onOpenDetail, onBuy, onAdd, onDirect, onRefresh}) {
   const [query, setQuery] = useState('');
   const [stockFilter, setStockFilter] = useState('all');
@@ -427,6 +448,8 @@ function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, 
   const [shopChoice, setShopChoice] = useState('all');
   const [priceFilter, setPriceFilter] = useState('all');
   const [sort, setSort] = useState('stable');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PRODUCT_PAGE_SIZE);
 
   const categories = useMemo(() => [...new Set(items.map(itemCategory))].sort((a, b) => a.localeCompare(b, 'zh-CN')), [items]);
   const filteredItems = useMemo(() => {
@@ -456,6 +479,14 @@ function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, 
       return new Date(right.last_attempt?.fetched_at || right.last_run || 0).getTime() - new Date(left.last_attempt?.fetched_at || left.last_run || 0).getTime();
     });
   }, [categoryFilter, items, priceFilter, query, shopChoice, sort, stableOrder, stockFilter]);
+  const pageCount = productPageCount(filteredItems.length, pageSize);
+  const visibleItems = useMemo(() => paginateProducts(filteredItems, page, pageSize), [filteredItems, page, pageSize]);
+  useEffect(() => {
+    setPage(1);
+  }, [categoryFilter, priceFilter, query, shopChoice, sort, stockFilter]);
+  useEffect(() => {
+    setPage(current => clampProductPage(current, filteredItems.length, pageSize));
+  }, [filteredItems.length, pageSize]);
   const categoryMinimums = useMemo(() => {
     const result = new Map();
     items.forEach(item => {
@@ -477,6 +508,7 @@ function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, 
     setShopChoice('all');
     setPriceFilter('all');
     setSort('stable');
+    setPage(1);
   };
   const hasFilters = query || stockFilter !== 'all' || categoryFilter !== 'all' || shopChoice !== 'all' || priceFilter !== 'all' || sort !== 'stable';
 
@@ -542,7 +574,7 @@ function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, 
             <span>商品 / 分类</span><span>店铺</span><span>当前报价</span><span>同类最低</span><span>库存</span><span>最近同步</span><span>操作</span>
           </div>
           <div className="overview-table-body">
-            {!filteredItems.length ? <div className="overview-empty"><CircleDollarSign size={28}/><strong>暂无匹配商品</strong><span>调整筛选条件后重试</span><button className="button secondary" onClick={clearFilters}>清除筛选</button></div> : filteredItems.map(item => {
+            {!filteredItems.length ? <div className="overview-empty"><CircleDollarSign size={28}/><strong>暂无匹配商品</strong><span>调整筛选条件后重试</span><button className="button secondary" onClick={clearFilters}>清除筛选</button></div> : visibleItems.map(item => {
               const price = itemPrice(item);
               const floor = categoryMinimums.get(itemCategory(item));
               const unlisted = itemStock(item).key === 'off';
@@ -567,6 +599,7 @@ function ProductOverviewView({items, shops, stableOrder, busy = {}, selectedId, 
             })}
           </div>
         </div>
+        <ProductPagination page={page} pageCount={pageCount} pageSize={pageSize} total={filteredItems.length} onPageChange={setPage} onPageSizeChange={value => { setPageSize(value); setPage(1); }}/>
       </section>
     </div>
   </section>;
@@ -579,6 +612,8 @@ function ProductOverviewDrawer({id, open, items, shops, stableOrder, busy = {}, 
   const [shopChoice, setShopChoice] = useState('all');
   const [priceFilter, setPriceFilter] = useState('all');
   const [sort, setSort] = useState('stable');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PRODUCT_PAGE_SIZE);
 
   const categories = useMemo(() => [...new Set(items.map(itemCategory))].sort((a, b) => a.localeCompare(b, 'zh-CN')), [items]);
   const filteredItems = useMemo(() => {
@@ -608,6 +643,14 @@ function ProductOverviewDrawer({id, open, items, shops, stableOrder, busy = {}, 
       return new Date(right.last_attempt?.fetched_at || right.last_run || 0).getTime() - new Date(left.last_attempt?.fetched_at || left.last_run || 0).getTime();
     });
   }, [categoryFilter, items, priceFilter, query, shopChoice, sort, stableOrder, stockFilter]);
+  const pageCount = productPageCount(filteredItems.length, pageSize);
+  const visibleItems = useMemo(() => paginateProducts(filteredItems, page, pageSize), [filteredItems, page, pageSize]);
+  useEffect(() => {
+    setPage(1);
+  }, [categoryFilter, priceFilter, query, shopChoice, sort, stockFilter, shopFilter]);
+  useEffect(() => {
+    setPage(current => clampProductPage(current, filteredItems.length, pageSize));
+  }, [filteredItems.length, pageSize]);
   const quotedItems = filteredItems.filter(item => itemPrice(item) !== null);
   const inStock = filteredItems.filter(item => itemStock(item).key === 'in').length;
   const outOfStock = filteredItems.filter(item => itemStock(item).key === 'out').length;
@@ -670,7 +713,7 @@ function ProductOverviewDrawer({id, open, items, shops, stableOrder, busy = {}, 
       <div className="drawer-section radar-list-section">
         <div className="drawer-section-head"><div><span className="drawer-kicker">QUOTE BOARD</span><h3>价格雷达</h3></div><span className="drawer-count">{quotedItems.length} 报价</span></div>
         <div className="radar-list">
-          {!filteredItems.length ? <div className="radar-empty"><CircleDollarSign size={24}/><strong>暂无匹配商品</strong><span>调整筛选条件后重试</span></div> : filteredItems.map(item => {
+          {!filteredItems.length ? <div className="radar-empty"><CircleDollarSign size={24}/><strong>暂无匹配商品</strong><span>调整筛选条件后重试</span></div> : visibleItems.map(item => {
             const price = itemPrice(item);
             const floor = categoryMinimums.get(itemCategory(item));
             return <article className={`radar-item ${selectedId === item.id ? 'selected' : ''}`} key={item.id}>
@@ -683,6 +726,7 @@ function ProductOverviewDrawer({id, open, items, shops, stableOrder, busy = {}, 
             </article>;
           })}
         </div>
+        <ProductPagination page={page} pageCount={pageCount} pageSize={pageSize} total={filteredItems.length} compact onPageChange={setPage} onPageSizeChange={value => { setPageSize(value); setPage(1); }}/>
       </div>
       <div className="drawer-foot"><Tag size={14}/><span>报价为本地监控快照，最低价按全部监控商品分类计算</span></div>
     </aside>
