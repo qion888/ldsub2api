@@ -85,6 +85,9 @@ resolve_python() {
   if [[ -x "$RUNTIME_DIR/python/bin/python" ]]; then
     candidates+=("$RUNTIME_DIR/python/bin/python")
   fi
+  if [[ -x "$RUNTIME_DIR/python/Scripts/python.exe" ]]; then
+    candidates+=("$RUNTIME_DIR/python/Scripts/python.exe")
+  fi
   candidates+=(python3 python)
   for candidate in "${candidates[@]}"; do
     if [[ "$candidate" == */* && ! -x "$candidate" ]]; then
@@ -213,6 +216,9 @@ ensure_npm() {
 ensure_backend_dependencies() {
   local python_executable="$1"
   local runtime_python="$RUNTIME_DIR/python/bin/python"
+  if [[ ! -x "$runtime_python" && -x "$RUNTIME_DIR/python/Scripts/python.exe" ]]; then
+    runtime_python="$RUNTIME_DIR/python/Scripts/python.exe"
+  fi
   if "$python_executable" -c 'import selenium, ddddocr, numpy, onnxruntime' >/dev/null 2>&1; then
     return 0
   fi
