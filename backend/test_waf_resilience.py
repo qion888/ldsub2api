@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from http.cookiejar import CookieJar
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,12 @@ from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager
 from monitor_core.inventory import InventoryService
 from monitor_core.workers import MonitorWorker
+from order_query.captcha import CaptchaRecognizer
+from order_query.browser_verification import OrderQueryBrowserVerificationManager
+from order_query.client import OrderQueryClient
+from order_query.errors import OrderQueryWafVerificationRequired, UpstreamOrderError
+from order_query.service import OrderQueryService
+from order_query.sessions import OrderQuerySessionStore
 
 
 class WafResilienceTests(unittest.TestCase):
@@ -340,6 +347,241 @@ class WafResilienceTests(unittest.TestCase):
         self.assertEqual(result["status"], "awaiting_verification")
         self.assertEqual(manager.challenge_attempts, 1)
         self.assertTrue(manager._challenge_dom_seen)
+
+
+class OrderQueryBrowserVerificationTests(unittest.TestCase):
+    def _session_and_manager(self):
+        store = OrderQuerySessionStore(clock=lambda: 100.0)
+        client = type("Client", (), {"cookie_jar": CookieJar(), "visitor_id": "visitor_1"})()
+        session = store.create("buyer@example.com", client)
+        session.ticket = "ticket"
+        manager = OrderQueryBrowserVerificationManager(
+            sessions=store,
+            profile_path=Path(tempfile.gettempdir()) / "order-query-waf-tests",
+        )
+        manager.session_id = session.session_id
+        manager.keywords = "buyer@example.com"
+        manager.request = {"status": 999, "page": 1, "page_size": 10}
+        return store, session, manager
+
+    def test_browser_cookie_sync_accepts_both_official_hosts_and_parent_domain(self) -> None:
+        self.assertTrue(OrderQueryBrowserVerificationManager._is_storefront_cookie_domain("pay.ldxp.cn"))
+        self.assertTrue(OrderQueryBrowserVerificationManager._is_storefront_cookie_domain("wzyp.cn"))
+        self.assertTrue(OrderQueryBrowserVerificationManager._is_storefront_cookie_domain(".ldxp.cn"))
+        self.assertFalse(OrderQueryBrowserVerificationManager._is_storefront_cookie_domain("example.com"))
+
+    def test_challenge_replay_keeps_the_json_api_contract(self) -> None:
+        _store, session, manager = self._session_and_manager()
+
+        class Driver:
+            window_handles = ["window"]
+            current_url = "https://pay.ldxp.cn/order"
+            page_source = '<div id="aliyunCaptcha"></div>'
+
+            def __init__(self) -> None:
+                self.scripts = []
+
+            def execute_script(self, script, *_args):
+                self.scripts.append(script)
+                return True if "querySelectorAll" in script else None
+
+            def get_cookies(self):
+                return [{"name": "acw_tc", "value": "pending", "domain": ".ldxp.cn", "path": "/"}]
+
+        driver = Driver()
+        result = manager._render_challenge(
+            driver,
+            "<html>captured response must not be injected</html>",
+            session,
+            {"keywords": "buyer@example.com", "status": 999, "page": 1, "page_size": 10},
+        )
+
+        self.assertEqual(result["status"], "awaiting_verification")
+        submitted = driver.scripts[0]
+        self.assertIn("'Content-Type': 'application/json'", submitted)
+        self.assertIn("JSON.stringify(payload)", submitted)
+        self.assertIn("document.open('text/html', 'replace')", submitted)
+        self.assertIn("document.write(text)", submitted)
+        self.assertNotIn("form.enctype", submitted)
+
+    def test_status_waits_for_stable_verified_waf_cookie_before_replay(self) -> None:
+        _store, session, manager = self._session_and_manager()
+
+        class Driver:
+            window_handles = ["window"]
+            current_url = "https://pay.ldxp.cn/shopApi/Order/list"
+            page_source = "<main>verification complete</main>"
+
+            def execute_script(self, _script):
+                return False
+
+            def get_cookies(self):
+                return [{"name": "acw_tc", "value": "verified", "domain": ".ldxp.cn", "path": "/"}]
+
+        manager.driver = Driver()
+        manager._challenge_dom_seen = True
+        manager._challenge_cookie_baseline = manager._cookie_fingerprint(
+            [{"name": "acw_tc", "value": "pending", "domain": ".ldxp.cn", "path": "/"}]
+        )
+        request = {"session_id": session.session_id, "keywords": "buyer@example.com", "status": 999, "page": 1, "page_size": 10}
+
+        first = manager.status(request)
+        second = manager.status(request)
+
+        self.assertEqual(first["status"], "awaiting_verification")
+        self.assertEqual(second["status"], "ready")
+        self.assertTrue(second["ready"])
+
+    def test_waf_context_renews_the_lookup_session_before_opening_browser(self) -> None:
+        service = OrderQueryService()
+        session = service.sessions.create("buyer@example.com", type("Client", (), {})())
+        request = {"keywords": "buyer@example.com", "status": 999, "page": 1, "page_size": 10}
+
+        with self.assertRaises(OrderQueryWafVerificationRequired) as context:
+            service._with_waf_context(
+                session,
+                request,
+                lambda: (_ for _ in ()).throw(storefront.WafChallengeRequired("WAF")),
+            )
+
+        self.assertGreaterEqual(context.exception.expires_in, 899)
+
+    def test_browser_start_accepts_a_session_before_ticket_creation(self) -> None:
+        store, session, manager = self._session_and_manager()
+        session.ticket = None
+
+        class Driver:
+            window_handles = ["window"]
+            current_url = "https://pay.ldxp.cn/order"
+            page_source = "<main>order page</main>"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get(self, _url):
+                return None
+
+            def get_cookies(self):
+                return []
+
+            def set_script_timeout(self, _seconds):
+                return None
+
+            def execute_async_script(self, _script, *_args):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"status": 200, "content_type": "application/json", "text": '{"code":1,"data":{}}'}
+                return {"status": 200, "content_type": "application/json", "text": '{"code":0,"msg":"ticket required"}'}
+
+            def quit(self):
+                return None
+
+        driver = Driver()
+        manager._create_driver = lambda: (driver, "edge")
+        result = manager.start(
+            {
+                "session_id": session.session_id,
+                "keywords": "buyer@example.com",
+                "status": 999,
+                "page": 1,
+                "page_size": 10,
+            }
+        )
+
+        self.assertEqual(result["status"], "verified")
+        self.assertTrue(result["resume_search"])
+        self.assertEqual(driver.calls, 2)
+
+
+class OrderQueryCaptchaUrlTests(unittest.TestCase):
+    def test_captcha_urls_accept_all_supported_storefront_hosts(self) -> None:
+        image_url = OrderQueryClient._validated_url(
+            "https://wzyp.cn/shopApi/common/captchaImg.html?key=fixture",
+            {"/shopApi/common/captchaImg.html"},
+        )
+        check_url = OrderQueryClient._validated_url(
+            "https://pay.ldxp.cn/shopApi/common/captchaCheck.html?key=fixture",
+            {"/shopApi/common/captchaCheck.html"},
+        )
+
+        self.assertEqual(image_url, "https://wzyp.cn/shopApi/common/captchaImg.html?key=fixture")
+        self.assertEqual(check_url, "https://pay.ldxp.cn/shopApi/common/captchaCheck.html?key=fixture")
+
+    def test_captcha_urls_normalize_relative_upstream_values(self) -> None:
+        self.assertEqual(
+            OrderQueryClient._validated_url(
+                "/shopApi/common/captchaImg.html?key=fixture",
+                {"/shopApi/common/captchaImg.html"},
+            ),
+            "https://pay.ldxp.cn/shopApi/common/captchaImg.html?key=fixture",
+        )
+        self.assertEqual(
+            OrderQueryClient._validated_url(
+                "//wzyp.cn/shopApi/common/captchaCheck.html?key=fixture",
+                {"/shopApi/common/captchaCheck.html"},
+            ),
+            "https://wzyp.cn/shopApi/common/captchaCheck.html?key=fixture",
+        )
+
+    def test_captcha_url_rejects_untrusted_hosts(self) -> None:
+        with self.assertRaises(UpstreamOrderError) as context:
+            OrderQueryClient._validated_url(
+                "https://example.com/shopApi/common/captchaImg.html?key=fixture",
+                {"/shopApi/common/captchaImg.html"},
+            )
+
+        self.assertEqual(context.exception.code, "invalid_captcha_url")
+
+
+class OrderQueryOcrRecoveryTests(unittest.TestCase):
+    def test_recognizer_retries_an_unreadable_image_with_filtered_foreground(self) -> None:
+        calls: list[bytes] = []
+
+        class Classifier:
+            def classification(self, image: bytes) -> str:
+                calls.append(image)
+                return "bad" if image == b"source" else "Z9x8"
+
+        recognizer = CaptchaRecognizer(lambda: Classifier())
+        with patch.object(CaptchaRecognizer, "_saturated_foreground_png", return_value=b"filtered"):
+            self.assertEqual(recognizer.recognize_candidates(b"source"), ["Z9x8"])
+
+        self.assertEqual(calls, [b"source", b"filtered"])
+
+    def test_automatic_ticket_uses_five_bounded_challenges_before_manual_fallback(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.starts = 0
+                self.checked: list[str] = []
+
+            def start_captcha(self, previous_code: str = ""):
+                self.starts += 1
+                return type("Challenge", (), {"image_url": "", "check_url": "", "ip": ""})()
+
+            def download_captcha(self, _challenge):
+                return b"captcha", "image/png"
+
+            def check_captcha(self, _challenge, code: str):
+                self.checked.append(code)
+                return "ticket" if code == "AB12" else None
+
+        class Recognizer:
+            def __init__(self) -> None:
+                self.codes = iter(["AA00", "BB11", "CC22", "DD33", "AB12"])
+
+            def recognize(self, _image: bytes) -> str:
+                return next(self.codes)
+
+        client = Client()
+        service = OrderQueryService(client_factory=lambda: client, recognizer=Recognizer(), max_ocr_attempts=5)
+        session = service.sessions.create("buyer@example.com", client)
+
+        ticket, attempts = service._automatic_ticket(session, attempts_used=0)
+
+        self.assertEqual(ticket, "ticket")
+        self.assertEqual(attempts, 5)
+        self.assertEqual(client.starts, 5)
+        self.assertEqual(client.checked, ["AA00", "BB11", "CC22", "DD33", "AB12"])
 
 
 if __name__ == "__main__":

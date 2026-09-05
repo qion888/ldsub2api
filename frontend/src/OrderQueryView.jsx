@@ -1241,6 +1241,23 @@ export default function OrderQueryView({request, notify, initialKeywords = '', c
         notify({type: 'info', title: '独立浏览器验证已打开', message: '完成滑块后页面会自动继续查询', duration: 6000});
         return false;
       }
+      if (response.resume_search) {
+        // WAF may have interrupted captcha ticket creation before the order
+        // API was reached. Keep the verified lookup session and let the
+        // normal service flow obtain the ticket, then continue the query.
+        // Permit the resumed search to open a second browser challenge when
+        // the edge protects captcha creation and order listing separately.
+        wafAutoStartRef.current = '';
+        return await runSearchRef.current?.({
+          keywordValue: requestSpec.keywords,
+          statusValue: requestSpec.status,
+          pageValue: requestSpec.page,
+          pageSizeValue: requestSpec.page_size,
+          reuseSession: true,
+          autoRecovery: true,
+          quiet: true,
+        });
+      }
       commitSearchResponse(response, {
         keywords: requestSpec.keywords,
         status: requestSpec.status,

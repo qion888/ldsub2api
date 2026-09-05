@@ -55,13 +55,49 @@ class CaptchaRecognizer:
         return classifier
 
     def recognize(self, image: bytes) -> str:
+        candidates = self.recognize_candidates(image)
+        return candidates[0] if candidates else ""
+
+    @staticmethod
+    def _saturated_foreground_png(image: bytes) -> bytes:
+        """Keep the dark captcha glyphs while dropping the pale decoy text."""
+        try:
+            import cv2
+            import numpy as np
+
+            decoded = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if decoded is None:
+                return b""
+            hsv = cv2.cvtColor(decoded, cv2.COLOR_BGR2HSV)
+            foreground = cv2.inRange(
+                hsv,
+                np.array((0, 40, 0), dtype=np.uint8),
+                np.array((179, 255, 180), dtype=np.uint8),
+            )
+            success, encoded = cv2.imencode(".png", 255 - foreground)
+            return encoded.tobytes() if success else b""
+        except Exception:
+            return b""
+
+    def recognize_candidates(self, image: bytes) -> list[str]:
         if not image:
-            return ""
+            return []
         with self._lock:
             try:
-                value = self._load().classification(image)
+                classifier = self._load()
+                value = classifier.classification(image)
             except CaptchaRecognizerUnavailable:
                 raise
             except Exception:
-                return ""
-        return normalize_captcha_code(value)
+                return []
+            candidates = [normalize_captcha_code(value)]
+            if candidates[0]:
+                return candidates
+            filtered = self._saturated_foreground_png(image)
+            if not filtered:
+                return []
+            try:
+                recovered = normalize_captcha_code(classifier.classification(filtered))
+            except Exception:
+                return []
+        return [recovered] if recovered else []

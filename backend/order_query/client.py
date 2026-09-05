@@ -14,10 +14,17 @@ from decimal import Decimal, InvalidOperation
 from http.cookiejar import CookieJar
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-from monitor_core.storefront import ALLOWED_HOST, USER_AGENT, WAF_MARKERS, WafChallengeRequired, is_waf_response
+from monitor_core.storefront import (
+    ALLOWED_HOST,
+    ALLOWED_HOSTS,
+    USER_AGENT,
+    WAF_MARKERS,
+    WafChallengeRequired,
+    is_waf_response,
+)
 
 from .captcha import captcha_sign
 from .complaint import normalize_complaint_history
@@ -198,14 +205,20 @@ class OrderQueryClient:
 
     @staticmethod
     def _validated_url(url: str, allowed_paths: set[str]) -> str:
-        parsed = urlparse(str(url or ""))
+        raw = str(url or "").strip()
+        if not raw:
+            raise UpstreamOrderError("楠岃瘉鐮佹帴鍙ｅ湴鍧€鏃犳晥", code="invalid_captcha_url")
+        # The upstream service normally returns an absolute URL, but some
+        # edge nodes return a root-relative or protocol-relative URL. Resolve
+        # those against the official HTTPS storefront before validating them.
+        parsed = urlparse(urljoin(f"{BASE_URL}/", raw))
         try:
             port = parsed.port
         except ValueError as exc:
             raise UpstreamOrderError("验证码接口地址无效", code="invalid_captcha_url") from exc
         if (
             parsed.scheme != "https"
-            or parsed.hostname != ALLOWED_HOST
+            or (parsed.hostname or "").lower() not in ALLOWED_HOSTS
             or parsed.username is not None
             or parsed.password is not None
             or port not in (None, 443)
@@ -214,6 +227,14 @@ class OrderQueryClient:
         ):
             raise UpstreamOrderError("验证码接口地址无效", code="invalid_captcha_url")
         return parsed.geturl()
+
+    @staticmethod
+    def _captcha_value(data: dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = _safe_text(data.get(key), 1000)
+            if value:
+                return value
+        return ""
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -491,11 +512,11 @@ class OrderQueryClient:
             )
         data = result["data"]
         image_url = self._validated_url(
-            _safe_text(data.get("img_url"), 1000),
+            self._captcha_value(data, "img_url", "imgUrl", "image_url", "imageUrl"),
             {"/shopApi/common/captchaImg.html"},
         )
         check_url = self._validated_url(
-            _safe_text(data.get("check_url"), 1000),
+            self._captcha_value(data, "check_url", "checkUrl", "verify_url", "verifyUrl"),
             {"/shopApi/common/captchaCheck.html"},
         )
         ip = _safe_text(data.get("ip"), 128)
