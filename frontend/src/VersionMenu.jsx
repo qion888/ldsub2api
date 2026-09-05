@@ -16,7 +16,7 @@ import {isAdmin} from './authModel.js';
 import {normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
 
 export const GITHUB_REPOSITORY_URL = 'https://github.com/qion888/ldsub2api';
-const FALLBACK_VERSION = '2.1.2';
+const FALLBACK_VERSION = '2.1.3';
 
 function displayVersion(value) {
   const version = String(value || FALLBACK_VERSION).trim().replace(/^v/i, '');
