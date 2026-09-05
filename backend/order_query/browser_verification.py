@@ -7,21 +7,27 @@ order lookup challenge; sharing the driver would mix cookies and requests.
 
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.cookiejar import Cookie
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 # Keep imports explicit here instead of importing the service module (which
 # would create a service/manager cycle during application startup).
-from monitor_core.storefront import ALLOWED_HOST, WAF_MARKERS, WafChallengeRequired, is_waf_response
+from monitor_core.storefront import ALLOWED_HOST, ALLOWED_HOSTS, WAF_MARKERS, WafChallengeRequired, is_waf_response
 
-from .client import BASE_URL, normalize_order_list
+from .client import BASE_URL, ORDER_LIST_PATH, normalize_order_list
 from .errors import OrderQueryInputError, OrderQuerySessionExpired
 
 
@@ -30,6 +36,17 @@ class OrderQueryBrowserVerificationManager:
 
     WAF_LEASE_SECONDS = 900
     KEEPALIVE_SECONDS = 15
+    READY_OBSERVATIONS = 2
+    MAX_COMPLETION_REPLAYS = 2
+    _WAF_COOKIE_MARKERS = (
+        "acw_",
+        "aliyun",
+        "captcha",
+        "cdn_sec",
+        "server_session",
+        "ssxmod_",
+        "waf",
+    )
 
     def __init__(
         self,
@@ -43,13 +60,21 @@ class OrderQueryBrowserVerificationManager:
         self._profile_path = profile_path
         self.lock = threading.Lock()
         self.driver: Any = None
+        self.browser_process: Any = None
         self.browser_name: str | None = None
+        self.browser_mode: str | None = None
         self._active_profile_path: Path | None = None
         self._keepalive_stop = threading.Event()
         self._keepalive_thread: threading.Thread | None = None
         self.session_id: str | None = None
         self.keywords: str | None = None
         self.request: dict[str, int] | None = None
+        self._challenge_dom_seen = False
+        self._challenge_cookie_baseline = ""
+        self._challenge_observation = ""
+        self._challenge_observation_count = 0
+        self._challenge_ready = False
+        self._completion_replays = 0
 
     @staticmethod
     def _validated_request(data: Any) -> dict[str, Any]:
@@ -106,18 +131,44 @@ class OrderQueryBrowserVerificationManager:
         if keepalive_thread is not None and keepalive_thread is not threading.current_thread():
             keepalive_thread.join(timeout=2)
         driver, self.driver = self.driver, None
+        browser_process, self.browser_process = self.browser_process, None
         active_profile, self._active_profile_path = self._active_profile_path, None
         self.browser_name = None
+        self.browser_mode = None
         self.session_id = None
         self.keywords = None
         self.request = None
+        self._challenge_dom_seen = False
+        self._challenge_cookie_baseline = ""
+        self._challenge_observation = ""
+        self._challenge_observation_count = 0
+        self._challenge_ready = False
+        self._completion_replays = 0
         if driver is not None:
             try:
                 driver.quit()
             except Exception:
                 pass
+            service_process = getattr(getattr(driver, "service", None), "process", None)
+            self._terminate_process(service_process)
+        self._terminate_process(browser_process)
         if active_profile is not None:
             shutil.rmtree(active_profile, ignore_errors=True)
+
+    @staticmethod
+    def _terminate_process(process: Any) -> None:
+        if process is None:
+            return
+        try:
+            if process.poll() is not None:
+                return
+            process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
 
     def _start_keepalive(self, session: Any) -> None:
         self._keepalive_stop.set()
@@ -221,10 +272,22 @@ class OrderQueryBrowserVerificationManager:
         raise RuntimeError(f"无法启动 WAF 验证浏览器（{detail}）")
 
     @staticmethod
-    def _seed_browser_cookies(driver: Any, client: Any) -> None:
+    def _is_storefront_cookie_domain(value: Any) -> bool:
+        domain = str(value or "").strip().lstrip(".").lower()
+        if domain in ALLOWED_HOSTS:
+            return True
+        # The payment host also legitimately receives cookies scoped to the
+        # parent ldxp.cn domain. Do not broaden this to arbitrary suffixes.
+        return any(
+            allowed.count(".") >= 2 and domain == allowed.split(".", 1)[1]
+            for allowed in ALLOWED_HOSTS
+        )
+
+    @classmethod
+    def _seed_browser_cookies(cls, driver: Any, client: Any) -> None:
         for cookie in client.cookie_jar:
             domain = str(cookie.domain or ALLOWED_HOST).lstrip(".")
-            if domain != ALLOWED_HOST and not domain.endswith(f".{ALLOWED_HOST}"):
+            if not cls._is_storefront_cookie_domain(domain):
                 continue
             value: dict[str, Any] = {
                 "name": str(cookie.name),
@@ -232,8 +295,8 @@ class OrderQueryBrowserVerificationManager:
                 "path": str(cookie.path or "/"),
                 "secure": bool(cookie.secure),
             }
-            if cookie.expiry:
-                value["expiry"] = int(cookie.expiry)
+            if cookie.expires:
+                value["expiry"] = int(cookie.expires)
             # Selenium rejects a leading dot on some Edge versions; the
             # host-only domain is sufficient because the APIs share the host.
             try:
@@ -241,14 +304,14 @@ class OrderQueryBrowserVerificationManager:
             except Exception:
                 continue
 
-    @staticmethod
-    def _sync_browser_cookies(driver: Any, client: Any) -> None:
+    @classmethod
+    def _sync_browser_cookies(cls, driver: Any, client: Any) -> None:
         for raw in driver.get_cookies() or []:
             name = str(raw.get("name") or "").strip()
             if not name:
                 continue
             domain = str(raw.get("domain") or ALLOWED_HOST).lstrip(".")
-            if domain != ALLOWED_HOST and not domain.endswith(f".{ALLOWED_HOST}"):
+            if not cls._is_storefront_cookie_domain(domain):
                 continue
             path = str(raw.get("path") or "/")
             expiry = raw.get("expiry")
@@ -309,8 +372,6 @@ class OrderQueryBrowserVerificationManager:
         status = int(result.get("status") or 200)
         content_type = str(result.get("content_type") or "")
         if is_waf_response(raw, content_type=content_type, status=status):
-            # Keep the challenge document intact; its inline slider script is
-            # required for the Edge page to complete verification.
             raise WafChallengeRequired(text[:512_000])
         try:
             payload = json.loads(text)
@@ -320,9 +381,189 @@ class OrderQueryBrowserVerificationManager:
             raise RuntimeError("浏览器会话返回的订单数据格式无效")
         return payload
 
-    def _render_challenge(self, driver: Any, html_text: str, session: Any, request: dict[str, Any]) -> dict[str, Any]:
+    def _browser_probe_captcha(self, driver: Any, session: Any) -> dict[str, Any]:
+        """Probe the captcha endpoint in the interactive browser context.
+
+        The initial WAF response can happen before the OCR flow receives a
+        ticket. A browser request at this point is enough to load Aliyun's
+        challenge and, after completion, leave its verification cookie in the
+        same context that the resumed urllib session will use.
+        """
+        driver.set_script_timeout(30)
+        result = driver.execute_async_script(
+            """
+            const done = arguments[arguments.length - 1];
+            fetch('/shopApi/Common/captchaStart', {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'Accept': 'application/json, text/plain, */*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({code: ''})
+            }).then(async response => done({
+              status: response.status,
+              content_type: response.headers.get('content-type') || '',
+              text: await response.text()
+            })).catch(error => done({error: String(error)}));
+            """
+        )
+        if not isinstance(result, dict) or result.get("error"):
+            raise RuntimeError(str((result or {}).get("error") or "浏览器验证码请求失败")[:200])
+        text = str(result.get("text") or "")
         try:
-            driver.execute_script("document.open(); document.write(arguments[0]); document.close();", html_text)
+            status = int(result.get("status") or 0)
+        except (TypeError, ValueError):
+            status = None
+        content_type = str(result.get("content_type") or "")
+        if is_waf_response(text.encode("utf-8", "ignore"), content_type=content_type, status=status):
+            raise WafChallengeRequired(text[:512_000])
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("浏览器验证码接口返回了无法解析的数据") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("浏览器验证码接口返回的数据格式无效")
+        return payload
+
+    @classmethod
+    def _cookie_fingerprint(cls, cookies: Any) -> str:
+        selected: list[tuple[str, str, str, str]] = []
+        for raw in cookies if isinstance(cookies, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not any(marker in name.lower() for marker in cls._WAF_COOKIE_MARKERS):
+                continue
+            selected.append((
+                name,
+                str(raw.get("domain") or ""),
+                str(raw.get("path") or "/"),
+                str(raw.get("value") or ""),
+            ))
+        if not selected:
+            return ""
+        encoded = json.dumps(sorted(selected), ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _browser_snapshot(driver: Any) -> tuple[str, str, list[dict[str, Any]]]:
+        handles = getattr(driver, "window_handles", None)
+        if handles is not None and not list(handles):
+            raise RuntimeError("browser window is closed")
+        current_url = str(getattr(driver, "current_url", "") or "")
+        page_source = str(getattr(driver, "page_source", "") or "")
+        getter = getattr(driver, "get_cookies", None)
+        cookies = getter() if callable(getter) else []
+        return current_url, page_source, cookies if isinstance(cookies, list) else []
+
+    def _challenge_is_visible(self, driver: Any, page_source: str) -> bool:
+        script = """
+        const selectors = [
+          '#aliyunCaptcha', '[id*="aliyunCaptcha"]', '[class*="aliyunCaptcha"]',
+          '#nc_1_wrapper', '.nc_wrapper', '.nc-container', '[class*="sliding-slider"]'
+        ];
+        return selectors.some(selector => Array.from(document.querySelectorAll(selector)).some(element => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0
+            && rect.width > 1 && rect.height > 1;
+        }));
+        """
+        try:
+            visible = driver.execute_script(script)
+        except Exception:
+            visible = None
+        return bool(visible) if isinstance(visible, bool) else self._is_waf_html(page_source)
+
+    def _reset_challenge_observation(self, cookies: Any) -> None:
+        self._challenge_dom_seen = True
+        self._challenge_cookie_baseline = self._cookie_fingerprint(cookies)
+        self._challenge_observation = ""
+        self._challenge_observation_count = 0
+        self._challenge_ready = False
+
+    def _observe_challenge(self, driver: Any) -> bool:
+        _current_url, page_source, cookies = self._browser_snapshot(driver)
+        challenge_visible = self._challenge_is_visible(driver, page_source)
+        has_challenge_markup = self._is_waf_html(page_source)
+        if challenge_visible or (has_challenge_markup and not self._challenge_dom_seen):
+            self._reset_challenge_observation(cookies)
+            return False
+        if not self._challenge_dom_seen:
+            return False
+
+        cookie_fingerprint = self._cookie_fingerprint(cookies)
+        observation = (
+            f"verified_cookie:{cookie_fingerprint}"
+            if cookie_fingerprint and cookie_fingerprint != self._challenge_cookie_baseline and not challenge_visible
+            else ""
+        )
+        if observation and observation == self._challenge_observation:
+            self._challenge_observation_count += 1
+        elif observation:
+            self._challenge_observation = observation
+            self._challenge_observation_count = 1
+        else:
+            self._challenge_observation = ""
+            self._challenge_observation_count = 0
+        self._challenge_ready = self._challenge_observation_count >= self.READY_OBSERVATIONS
+        return self._challenge_ready
+
+    def _render_challenge(self, driver: Any, html_text: str, session: Any, request: dict[str, Any]) -> dict[str, Any]:
+        del html_text
+        if driver is None:
+            raise RuntimeError("订单 WAF 验证浏览器不可用")
+        try:
+            # Keep the challenge request identical to the protected API. A
+            # form POST changes the content type and can bind the slider to a
+            # different request fingerprint.
+            driver.execute_script(
+                """
+                const endpoint = arguments[0];
+                const payload = arguments[1];
+                fetch(endpoint, {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify(payload)
+                }).then(async response => {
+                  const text = await response.text();
+                  const contentType = response.headers.get('content-type') || '';
+                  if (contentType.toLowerCase().includes('text/html') || /aliyun|captcha|滑块|人机验证/i.test(text)) {
+                    document.open('text/html', 'replace');
+                    document.write(text);
+                    document.close();
+                    try { history.replaceState({}, '', endpoint); } catch (_) {}
+                    return;
+                  }
+                  document.open('text/html', 'replace');
+                  document.write('<pre id="order-waf-response"></pre>');
+                  document.close();
+                  const output = document.getElementById('order-waf-response');
+                  if (output) output.textContent = text;
+                }).catch(error => {
+                  document.open('text/html', 'replace');
+                  document.write('<pre id="order-waf-error"></pre>');
+                  document.close();
+                  const output = document.getElementById('order-waf-error');
+                  if (output) output.textContent = String(error);
+                });
+                """,
+                f"{BASE_URL}{ORDER_LIST_PATH}",
+                self._payload(session, request),
+            )
+            _current_url, page_source, cookies = self._browser_snapshot(driver)
+            self._reset_challenge_observation(cookies)
+            # A completed document is normally available by this point. Keep
+            # the post-navigation cookies as the baseline if the challenge is
+            # already visible, so the initial WAF cookie is not mistaken for
+            # proof that a person completed the slider.
+            if self._challenge_is_visible(driver, page_source) or self._is_waf_html(page_source):
+                self._reset_challenge_observation(cookies)
         except Exception as exc:
             self._close()
             raise RuntimeError("无法在独立浏览器中显示订单 WAF 验证页") from exc
@@ -339,6 +580,25 @@ class OrderQueryBrowserVerificationManager:
                 "page_size": request["page_size"],
             },
         }
+
+    def _resume_search(self, session: Any, request: dict[str, Any]) -> dict[str, Any]:
+        """Return control to the service when WAF happened before ticket creation."""
+        self._sync_browser_cookies(self.driver, session.client)
+        response = {
+            "status": "verified",
+            "resume_search": True,
+            "session_id": session.session_id,
+            "expires_in": self._sessions.remaining(session),
+            "verification": {"status": "verified", "mode": "browser", "attempts": 0},
+            "waf_request": {
+                "keywords": request["keywords"],
+                "status": request["status"],
+                "page": request["page"],
+                "page_size": request["page_size"],
+            },
+        }
+        self._close()
+        return response
 
     def _save_result(self, session: Any, request: dict[str, Any], result: dict[str, Any]) -> None:
         cached = {
@@ -376,8 +636,6 @@ class OrderQueryBrowserVerificationManager:
             except OrderQuerySessionExpired:
                 self._close()
                 raise
-            if not session.ticket:
-                raise OrderQuerySessionExpired()
             self._sessions.renew(session, ttl_seconds=self.WAF_LEASE_SECONDS)
             driver: Any = None
             try:
@@ -394,6 +652,26 @@ class OrderQueryBrowserVerificationManager:
                 driver.get(f"{BASE_URL}/order")
                 if self._is_waf_html(driver.page_source):
                     return self._render_challenge(driver, driver.page_source, session, request)
+                if not session.ticket:
+                    try:
+                        self._browser_probe_captcha(driver, session)
+                    except WafChallengeRequired as exc:
+                        return self._render_challenge(driver, str(exc), session, request)
+                    try:
+                        # Captcha creation and order listing can be protected
+                        # by different edge rules. Probe the actual protected
+                        # order endpoint too, so a successful captcha probe
+                        # does not falsely tell the UI that the query can
+                        # resume while the list API is still challenged.
+                        self._browser_request(driver, session, request)
+                    except WafChallengeRequired as exc:
+                        return self._render_challenge(driver, str(exc), session, request)
+                    except Exception:
+                        # A missing ticket is expected to produce a business
+                        # response; the resumed service flow will create the
+                        # ticket and perform the real query.
+                        pass
+                    return self._resume_search(session, request)
                 payload = self._browser_request(driver, session, request)
                 normalized = normalize_order_list(payload, page=request["page"], page_size=request["page_size"])
                 return self._success(session, request, normalized)
@@ -420,8 +698,7 @@ class OrderQueryBrowserVerificationManager:
                 raise
             driver = self.driver
             try:
-                page_source = str(driver.page_source or "")
-                ready = not self._is_waf_html(page_source)
+                ready = self._observe_challenge(driver)
                 return {
                     "status": "ready" if ready else "awaiting_verification",
                     "ready": ready,
@@ -444,9 +721,6 @@ class OrderQueryBrowserVerificationManager:
             if any(expected.get(key) != request[key] for key in ("status", "page", "page_size")):
                 raise OrderQueryInputError("订单浏览器验证上下文已变化，请重新发起验证")
             session = self._sessions.get(request["session_id"], request["keywords"])
-            if not session.ticket:
-                self._close()
-                raise OrderQuerySessionExpired()
             try:
                 self._sessions.renew(session, ttl_seconds=self.WAF_LEASE_SECONDS)
             except OrderQuerySessionExpired:
@@ -454,6 +728,26 @@ class OrderQueryBrowserVerificationManager:
                 raise
             driver = self.driver
             try:
+                if not session.ticket:
+                    if not self._challenge_ready:
+                        return {
+                            "status": "awaiting_verification",
+                            "ready": False,
+                            "browser": self.browser_name,
+                            "expires_in": self._sessions.remaining(session),
+                        }
+                    return self._resume_search(session, request)
+                if not self._challenge_ready:
+                    return {
+                        "status": "awaiting_verification",
+                        "ready": False,
+                        "browser": self.browser_name,
+                        "expires_in": self._sessions.remaining(session),
+                    }
+                if self._completion_replays >= self.MAX_COMPLETION_REPLAYS:
+                    self._close()
+                    raise RuntimeError("订单 WAF 验证重放次数已用尽，请重新发起查询")
+                self._completion_replays += 1
                 # Reload the first-party page before replaying the API call.
                 # Aliyun may leave the challenge DOM in place after the slider
                 # sets its cookie; reloading lets the browser use that cookie.

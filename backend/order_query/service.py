@@ -50,13 +50,13 @@ class OrderQueryService:
         client_factory: Callable[[], Any] = OrderQueryClient,
         recognizer: Any = None,
         sessions: OrderQuerySessionStore | None = None,
-        max_ocr_attempts: int = 3,
+        max_ocr_attempts: int = 5,
         max_concurrent: int = 2,
     ) -> None:
         self.client_factory = client_factory
         self.recognizer = recognizer or CaptchaRecognizer()
         self.sessions = sessions or OrderQuerySessionStore()
-        self.max_ocr_attempts = max(1, min(3, int(max_ocr_attempts)))
+        self.max_ocr_attempts = max(1, min(5, int(max_ocr_attempts)))
         self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent)))
         self._complaint_state_lock = threading.Lock()
         self._complaint_submitted_trades: set[str] = set()
@@ -182,7 +182,10 @@ class OrderQueryService:
         except WafChallengeRequired as exc:
             raise OrderQueryWafVerificationRequired(
                 session_id=session.session_id,
-                expires_in=self.sessions.remaining(session),
+                # The interactive browser flow starts after this response
+                # reaches the UI. Reserve its lease now, rather than leaving
+                # only the normal short lookup TTL for browser startup.
+                expires_in=self.sessions.renew(session, ttl_seconds=900),
                 request={"status": request["status"], "page": request["page"], "page_size": request["page_size"]},
                 detail=str(exc)[:240] or "链动小铺触发阿里云 WAF 滑块验证，请使用浏览器验证后重试",
             ) from exc
@@ -197,20 +200,32 @@ class OrderQueryService:
         while attempts_used < self.max_ocr_attempts:
             challenge, image, _ = self._new_challenge(session, previous_code)
             try:
-                code = normalize_captcha_code(self.recognizer.recognize(image))
+                recognizer_candidates = getattr(self.recognizer, "recognize_candidates", None)
+                raw_values = (
+                    recognizer_candidates(image)
+                    if callable(recognizer_candidates)
+                    else [self.recognizer.recognize(image)]
+                )
             except CaptchaRecognizerUnavailable:
                 return "", attempts_used
             attempts_used += 1
-            if not code:
+            values = [raw_values] if isinstance(raw_values, str) else raw_values or []
+            codes: list[str] = []
+            for value in values:
+                code = normalize_captcha_code(value)
+                if code and code not in codes:
+                    codes.append(code)
+            if not codes:
                 previous_code = ""
                 continue
-            previous_code = code
-            ticket = session.client.check_captcha(challenge, code)
-            if ticket:
-                session.ticket = ticket
-                session.challenge = None
-                session.captcha_image = b""
-                return ticket, attempts_used
+            previous_code = codes[-1]
+            for code in codes:
+                ticket = session.client.check_captcha(challenge, code)
+                if ticket:
+                    session.ticket = ticket
+                    session.challenge = None
+                    session.captcha_image = b""
+                    return ticket, attempts_used
         return "", attempts_used
 
     def _query_verified(

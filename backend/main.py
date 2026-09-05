@@ -1633,7 +1633,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     result = ORDER_QUERY_BROWSER_VERIFICATION.status(data)
                 return self._send_json(result, 202 if result.get("status") == "awaiting_verification" else 200)
             except order_query_routes.OrderQueryError as exc:
-                return self._send_json({"detail": exc.detail, "code": exc.code, "retryable": exc.retryable}, exc.status)
+                payload = {"detail": exc.detail, "code": exc.code, "retryable": exc.retryable}
+                # Keep the lookup lease and request context attached to WAF
+                # endpoint errors as well. This lets the UI recover a delayed
+                # browser completion without throwing away its session.
+                if hasattr(exc, "session_id"):
+                    payload["session_id"] = str(getattr(exc, "session_id"))
+                    payload["expires_in"] = int(getattr(exc, "expires_in", 0))
+                    payload["waf_request"] = dict(getattr(exc, "request", {}))
+                return self._send_json(payload, exc.status)
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
 
