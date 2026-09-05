@@ -19,6 +19,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .storefront import is_waf_response, waf_proxy_config
+from .windows_input import DISPATCHED, FAILED, NOT_READY, attempt_native_slider
 
 
 class BrowserVerificationManager:
@@ -96,6 +97,13 @@ class BrowserVerificationManager:
         self._terminal_detail = ""
         self._last_completed_challenge_id: str | None = None
         self._last_completed_result: dict[str, Any] | None = None
+        # Automatic input is deliberately bounded per shop.  A failed native
+        # drag must never turn status polling into a retry loop or invalidate a
+        # browser session that the user can still complete manually.
+        self.automatic_attempted_shop_ids: set[int] = set()
+        self.automatic_status = "not_started"
+        self._automatic_probe_count = 0
+        self._automatic_probe_shop_id: int | None = None
 
     @staticmethod
     def _request_data(shop: Any, current: int) -> dict[str, Any]:
@@ -161,6 +169,10 @@ class BrowserVerificationManager:
         self._challenge_ready = False
         self._terminal_status = None
         self._terminal_detail = ""
+        self.automatic_attempted_shop_ids = set()
+        self.automatic_status = "not_started"
+        self._automatic_probe_count = 0
+        self._automatic_probe_shop_id = None
 
     @staticmethod
     def _proxy_config() -> dict[str, Any]:
@@ -590,6 +602,42 @@ class BrowserVerificationManager:
             raise RuntimeError("browser session returned an invalid catalog payload")
         return payload
 
+    def _attempt_automatic_slider(self, driver: Any) -> str:
+        """Try one native Windows drag while preserving a manual fallback.
+
+        The challenge DOM can take a few status polls to finish loading.  Probe
+        at most three times while it is still not ready, then stop.  Once a drag
+        is dispatched or fails, remember the shop so a failed slider cannot be
+        replayed by the frontend's polling timer.
+        """
+        enabled = os.environ.get("LDXP_WAF_AUTO_VERIFY", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        shop_id = self.batch_current_shop_id
+        if not enabled:
+            return "disabled"
+        if shop_id is None:
+            return "not_retrying"
+        if self._automatic_probe_shop_id != shop_id:
+            self._automatic_probe_shop_id = shop_id
+            self._automatic_probe_count = 0
+            self.automatic_status = "not_started"
+        if shop_id in self.automatic_attempted_shop_ids:
+            return "not_retrying"
+        if self._automatic_probe_count >= 3:
+            return NOT_READY
+        self._automatic_probe_count += 1
+        try:
+            outcome = attempt_native_slider(driver, self.browser_process)
+        except Exception:
+            outcome = FAILED
+        if outcome in {DISPATCHED, FAILED}:
+            self.automatic_attempted_shop_ids.add(shop_id)
+        return outcome
+
     def _catalog(self, driver: Any, shop: Any, first_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         products: dict[str, dict[str, Any]] = {}
         for current in range(1, 51):
@@ -682,7 +730,17 @@ class BrowserVerificationManager:
         self._challenge_observation = ""
         self._challenge_observation_count = 0
         self._challenge_ready = False
-        return self._status("Complete the WAF challenge in the open browser, then continue the batch")
+        self.automatic_status = self._attempt_automatic_slider(driver)
+        attempted = self.automatic_status == DISPATCHED
+        if attempted:
+            detail = "Automatic WAF verification was submitted; confirming the result"
+        elif self.automatic_status == FAILED:
+            detail = "Automatic WAF verification did not complete; finish it in the open browser"
+        else:
+            detail = "Complete the WAF challenge in the open browser; synchronization will resume automatically"
+        result = self._status(detail)
+        result["automatic_attempted"] = attempted
+        return result
 
     def _status(self, detail: str = "", status: str | None = None) -> dict[str, Any]:
         if status is None:
@@ -698,6 +756,9 @@ class BrowserVerificationManager:
             "challenge_id": self.challenge_id,
             "challenge_attempts": self.challenge_attempts,
             "completion_replays": self._completion_replays,
+            "automatic_status": self.automatic_status,
+            "automatic_probe_count": self._automatic_probe_count,
+            "automatic_attempted": self.automatic_status == DISPATCHED,
             "ready": status in {"ready", "success"},
             "observation_count": self._challenge_observation_count,
             "completed": self.batch_completed,
@@ -925,6 +986,13 @@ class BrowserVerificationManager:
             )
             cookie_fingerprint = self._cookie_fingerprint(cookies)
             challenge_visible = self._challenge_is_visible(self.driver, page_source)
+            if (
+                not page_cleared
+                and challenge_visible
+                and self.automatic_status in {"not_started", NOT_READY}
+                and self._automatic_probe_count < 3
+            ):
+                self.automatic_status = self._attempt_automatic_slider(self.driver)
             cookie_changed = (
                 bool(cookie_fingerprint)
                 and cookie_fingerprint != self._challenge_cookie_baseline

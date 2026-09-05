@@ -10,6 +10,7 @@ from unittest.mock import patch
 from monitor_core import database as database_module
 from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager
+from monitor_core import browser_verification as browser_verification_module
 from monitor_core.inventory import InventoryService
 from monitor_core.workers import MonitorWorker
 from order_query.captcha import CaptchaRecognizer
@@ -18,6 +19,7 @@ from order_query.client import OrderQueryClient
 from order_query.errors import OrderQueryWafVerificationRequired, UpstreamOrderError
 from order_query.service import OrderQueryService
 from order_query.sessions import OrderQuerySessionStore
+from monitor_core.windows_input import DISPATCHED, NOT_READY
 
 
 class WafResilienceTests(unittest.TestCase):
@@ -252,6 +254,77 @@ class WafResilienceTests(unittest.TestCase):
         self.assertEqual(result["status"], "browser_closed")
         self.assertFalse(manager.batch_active)
         self.assertIn("closed", result["detail"].lower())
+
+    def test_challenge_uses_one_bounded_native_slider_attempt(self) -> None:
+        manager, _shop_id = self._browser_manager()
+
+        class Driver:
+            window_handles = ["window"]
+            current_url = "https://pay.ldxp.cn/shop/STATUS"
+            page_source = "<main>aliyunCaptcha</main>"
+
+            def execute_script(self, _script):
+                return True
+
+            def get_cookies(self):
+                return []
+
+            def quit(self):
+                return None
+
+        manager.driver = Driver()
+        manager.browser_process = object()
+        with patch.object(browser_verification_module, "attempt_native_slider", return_value=DISPATCHED) as attempt:
+            started = manager._render_challenge(manager.driver, "challenge")
+            self.assertEqual(started["automatic_status"], DISPATCHED)
+            self.assertTrue(started["automatic_attempted"])
+            manager.poll("challenge-status")
+            manager.poll("challenge-status")
+
+        self.assertEqual(attempt.call_count, 1)
+
+    def test_native_slider_not_ready_probes_three_times_then_stops(self) -> None:
+        manager, _shop_id = self._browser_manager()
+
+        class Driver:
+            window_handles = ["window"]
+            current_url = "https://pay.ldxp.cn/shop/STATUS"
+            page_source = "<main>aliyunCaptcha</main>"
+
+            def execute_script(self, _script):
+                return True
+
+            def get_cookies(self):
+                return []
+
+            def quit(self):
+                return None
+
+        manager.driver = Driver()
+        manager.browser_process = object()
+        with patch.object(browser_verification_module, "attempt_native_slider", return_value=NOT_READY) as attempt:
+            started = manager._render_challenge(manager.driver, "challenge")
+            self.assertEqual(started["automatic_status"], NOT_READY)
+            for _ in range(5):
+                manager.poll("challenge-status")
+
+        self.assertEqual(attempt.call_count, 3)
+        self.assertEqual(manager._automatic_probe_count, 3)
+
+    def test_native_slider_probe_budget_is_isolated_per_shop(self) -> None:
+        manager, first_shop_id = self._browser_manager()
+        manager.batch_current_shop_id = first_shop_id
+        manager.browser_process = object()
+        with patch.object(browser_verification_module, "attempt_native_slider", return_value=NOT_READY) as attempt:
+            manager._attempt_automatic_slider(object())
+            manager._attempt_automatic_slider(object())
+            self.assertEqual(manager._automatic_probe_count, 2)
+
+            manager.batch_current_shop_id = first_shop_id + 1
+            manager._attempt_automatic_slider(object())
+
+        self.assertEqual(attempt.call_count, 3)
+        self.assertEqual(manager._automatic_probe_count, 1)
 
     def test_completed_challenge_is_idempotent_and_stale_ids_are_rejected(self) -> None:
         manager, _shop_id = self._browser_manager()
