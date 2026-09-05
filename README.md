@@ -163,7 +163,7 @@ export LDXP_API_TARGET='http://127.0.0.1:<backend-port>'
 
 ### 店铺和商品监控
 
-- 支持 `https://pay.ldxp.cn/shop/<SHOP_TOKEN>` 整店同步，以及 `https://pay.ldxp.cn/item/<ITEM_KEY>` 单商品监控。
+- 支持 `https://pay.ldxp.cn/shop/<SHOP_TOKEN>`、`https://wzyp.cn/shop/<SHOP_TOKEN>` 整店同步，以及对应域名的 `/item/<ITEM_KEY>` 单商品监控。
 - 粘贴链接后会自动识别类型；整店同步支持商品类型和可选分类 ID。
 - 整店接口分页获取商品名称、价格、市场价、图片、销售状态和公开库存。
 - 店铺和商品可单独暂停、刷新、删除；商品也可以批量移出本地目录。

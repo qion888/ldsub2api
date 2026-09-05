@@ -279,6 +279,68 @@ class WafResilienceTests(unittest.TestCase):
         self.assertFalse(manager.batch_active)
         self.assertIn("exhausted", result["detail"].lower())
 
+    def test_render_challenge_probes_accessible_storefront_before_waiting(self) -> None:
+        manager, shop_id = self._browser_manager()
+
+        class Driver:
+            window_handles = ["window"]
+            current_url = ""
+            page_source = "<main>ordinary storefront</main>"
+
+            def get(self, url):
+                self.current_url = url
+
+            def get_cookies(self):
+                return []
+
+            def quit(self):
+                return None
+
+        driver = Driver()
+        probe_payload = {"code": 1, "data": {"list": []}}
+        observed = {}
+        manager.driver = driver
+        manager._browser_request = lambda _driver, _data: probe_payload
+        manager._sync_shop = lambda _driver, current_shop_id, *, first_payload=None: observed.update(
+            shop_id=current_shop_id, first_payload=first_payload
+        ) or {"status": "success", "product_count": 0}
+        manager._advance_batch_locked = lambda: {"status": "success", "completed": 1, "total": 1}
+
+        result = manager._render_challenge(driver, "waf response")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(observed, {"shop_id": shop_id, "first_payload": probe_payload})
+        self.assertEqual(manager.batch_results[0]["id"], shop_id)
+        self.assertTrue(manager.batch_results[0]["ok"])
+
+    def test_render_challenge_waits_when_browser_probe_is_still_waf(self) -> None:
+        manager, _shop_id = self._browser_manager()
+
+        class Driver:
+            window_handles = ["window"]
+            current_url = ""
+            page_source = "<main>ordinary storefront</main>"
+
+            def get(self, url):
+                self.current_url = url
+
+            def get_cookies(self):
+                return []
+
+            def quit(self):
+                return None
+
+        manager.driver = Driver()
+        manager._browser_request = lambda *_args: (_ for _ in ()).throw(
+            storefront.WafChallengeRequired("WAF challenge required")
+        )
+
+        result = manager._render_challenge(manager.driver, "waf response")
+
+        self.assertEqual(result["status"], "awaiting_verification")
+        self.assertEqual(manager.challenge_attempts, 1)
+        self.assertTrue(manager._challenge_dom_seen)
+
 
 if __name__ == "__main__":
     unittest.main()
