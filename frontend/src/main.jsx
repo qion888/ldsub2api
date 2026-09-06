@@ -5,6 +5,7 @@ import {
   AlertCircle,
   ArrowUpRight,
   BadgePercent,
+  Bell,
   BellRing,
   BarChart3,
   CalendarDays,
@@ -3463,6 +3464,46 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
     settings: {title: '系统设置', description: '管理基础配置、运行模式与用户账号'},
   }[activeView];
   const resetHistoryFilters = () => setHistoryFilters({query: '', startDate: '', endDate: '', status: 'all', stock: 'all'});
+  const [alertItem, setAlertItem] = useState(null);
+  const [alertMap, setAlertMap] = useState({});
+  const [alertBusy, setAlertBusy] = useState('');
+  const loadAlerts = async (quiet = false) => {
+    try {
+      const payload = await request('/alerts');
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      const next = {};
+      items.forEach(entry => { if (entry.watch_id != null && entry.kind) next[`${entry.watch_id}:${entry.kind}`] = true; });
+      setAlertMap(next);
+    } catch (requestError) {
+      if (!quiet) notify?.(requestError.message || '提醒列表加载失败', 'error');
+    }
+  };
+  const toggleAlert = async (item, kind) => {
+    const key = `${item.id}:${kind}`;
+    const currentlyOn = Boolean(alertMap[key]);
+    setAlertBusy(key);
+    try {
+      if (currentlyOn) {
+        await request('/alerts/remove', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({watch_id: item.id, kind})});
+      } else {
+        await request('/alerts/add', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({watch_id: item.id, kind})});
+      }
+      setAlertMap(prev => {
+        const next = {...prev};
+        if (currentlyOn) delete next[key]; else next[key] = true;
+        return next;
+      });
+      notify?.(currentlyOn ? '已关闭提醒' : `已开启${kind === 'restock' ? '补货' : '降价'}提醒`);
+    } catch (requestError) {
+      notify?.(requestError.message || '提醒设置失败', 'error');
+    } finally {
+      setAlertBusy('');
+    }
+  };
+  const openAlertModal = async (item) => {
+    setAlertItem({id: item.id, name: item.latest?.title || item.name || '商品'});
+    await loadAlerts(true);
+  };
   const changeHistoryPageSize = value => {
     setHistoryPageSize(value);
     setHistoryPage(1);
@@ -3677,6 +3718,24 @@ function WorkspaceApp({sessionUser = null, authMode = AUTH_MODES.SELF_USE, acces
       <ProductDetailDrawer open={detailOpen} item={selected} history={history} trend={historyTrend} historyTotal={historyMeta.total} priceDelta={selectedPriceDelta} lowestPrice={localLowestPrice} historyBusy={historyBusy} busy={monitorBusy} onClose={() => setDetailOpen(false)} onBuy={oneClickBuy} onAdd={addToCart} onRefresh={canManageMonitor && !batchVerificationPending ? fetchOne : null} onDirect={openDirectProduct}/>
 
        {preorderDraft && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setPreorderDraft(null)}><div className="checkout-modal preorder-modal" role="dialog" aria-modal="true" aria-label="设置自动预购"><div className="modal-head"><div><span>STOCK PREORDER</span><h2>设置自动预购</h2></div><IconButton label="关闭" onClick={() => setPreorderDraft(null)}><X size={17}/></IconButton></div><div className="preorder-config"><label className="preorder-enable"><input type="checkbox" checked={preorderDraft.enabled} onChange={event => setPreorderDraft({...preorderDraft, enabled: event.target.checked})}/><span><strong>启用自动预购</strong><small>仅缺货商品进入监控，有货商品不会创建任务</small></span></label><label className="preorder-interval"><span>库存检查间隔</span><div><input type="number" min="1" max="1440" value={Math.max(1, Math.ceil((Number(preorderDraft.interval_seconds) || 60) / 60))} onChange={event => setPreorderDraft({...preorderDraft, interval_seconds: Math.max(60, Math.min(86400, (Number(event.target.value) || 1) * 60))})} inputMode="numeric"/><span>分钟</span></div></label></div><div className="preorder-items">{preorderDraft.items.map(entry => { const eligible = entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0; return <div className={`preorder-item ${eligible ? '' : 'unavailable'}`} key={entry.watch_id}><div><strong>{entry.title}</strong><small>当前库存：{entry.stock_label}{entry.minimum > 1 ? ` · 最低 ${entry.minimum} 件起购` : ''}</small></div>{eligible ? <label><span>预购数量</span><input type="number" min={entry.minimum} max="99" value={entry.quantity} onChange={event => updatePreorderQuantity(entry.watch_id, event.target.value)} inputMode="numeric"/></label> : <span className="pill paused">{entry.sale_status === 'off_sale' ? '未上架' : entry.stock === null ? '库存未知' : '当前有货'}</span>}</div>; })}</div><div className={`preorder-checkout-status ${savedCheckout.contact ? 'ready' : 'missing'}`}><ShieldCheck size={16}/><span>{savedCheckout.contact ? `使用已保存联系方式 · ${Number(savedCheckout.channel_id) === 4 ? '微信支付' : '支付宝'}` : '请先在右侧购买配置中保存联系方式'}</span></div><div className="modal-foot"><span><Clock3 size={14}/>库存达到预购数量后只创建一次支付链接</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setPreorderDraft(null)}>取消</button><button className="button official" onClick={savePreorders} disabled={!preorderDraft.enabled || !savedCheckout.contact || busy.preorder || !preorderDraft.items.some(entry => entry.sale_status === 'on_sale' && entry.stock !== null && Number(entry.stock) === 0)}><Zap size={15}/>{busy.preorder ? '正在保存' : '启用预购'}</button></div></div></div></div>}
+      {alertItem && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setAlertItem(null)}>
+        <div className="checkout-modal alert-modal" role="dialog" aria-modal="true" aria-label="设置商品提醒">
+          <div className="modal-head"><div><span>PRODUCT ALERT</span><h2>设置提醒</h2></div><IconButton label="关闭" onClick={() => setAlertItem(null)}><X size={17}/></IconButton></div>
+          <div className="modal-notice"><Bell size={18}/><p>开启后，当商品<b>补货</b>或<b>价格下降</b>时会自动发邮件通知你（需在系统设置中配置邮箱）。</p></div>
+          <div className="alert-options">
+            <div className="alert-item-copy"><strong>{alertItem.name}</strong></div>
+            <label className="alert-option-row">
+              <span><strong>补货提醒</strong><small>缺货/未上架 → 变为有货时通知</small></span>
+              <button className={`switch ${alertMap[`${alertItem.id}:restock`] ? 'on' : ''}`} role="switch" aria-checked={Boolean(alertMap[`${alertItem.id}:restock`])} onClick={() => toggleAlert(alertItem, 'restock')} disabled={Boolean(alertBusy)}><span/></button>
+            </label>
+            <label className="alert-option-row">
+              <span><strong>降价提醒</strong><small>价格比上次监控更低时通知</small></span>
+              <button className={`switch ${alertMap[`${alertItem.id}:price_drop`] ? 'on' : ''}`} role="switch" aria-checked={Boolean(alertMap[`${alertItem.id}:price_drop`])} onClick={() => toggleAlert(alertItem, 'price_drop')} disabled={Boolean(alertBusy)}><span/></button>
+            </label>
+          </div>
+          <div className="modal-foot"><span><Bell size={14}/>通知默认发往系统设置的收件邮箱</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setAlertItem(null)}>完成</button></div></div>
+        </div>
+      </div>}
       {checkoutPrompt && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setCheckoutPrompt(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="完善购买配置"><div className="modal-head"><div><span>CHECKOUT PROFILE</span><h2>完善购买配置</h2></div><IconButton label="关闭" onClick={() => setCheckoutPrompt(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>购买前需要联系方式{checkoutPrompt.requiresPassword ? '和安全密码' : ''}，支付渠道与优惠券可按商品支持情况使用。</p></div><div className="purchase-form"><label><span>联系方式</span><input value={contact.contact} onChange={event => setContact({...contact, contact: event.target.value})} placeholder="邮箱、手机号或其他联系方式" autoComplete="email"/></label>{checkoutPrompt.requiresPassword && <label><span>安全密码</span><input type={passwordVisible ? 'text' : 'password'} value={queryPassword} onChange={event => setQueryPassword(event.target.value)} placeholder="用于查询订单详情" autoComplete="off"/></label>}<label><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><label><span>优惠券 <small>可选</small></span><input value={couponCode} onChange={event => setCouponCode(event.target.value)} placeholder="输入优惠券码" autoComplete="off"/></label><label><span>配置保存位置</span><select value={checkoutStorageMode} onChange={event => setCheckoutStorageMode(event.target.value)}><option value="local">本机数据库</option><option value="browser">浏览器缓存</option></select></label></div><div className="modal-foot"><span><ShieldCheck size={14}/>保存后会用于后续购买和订单查询</span><div className="modal-foot-actions"><button className="button secondary" onClick={() => setCheckoutPrompt(null)}>取消</button><button className="button official" onClick={submitCheckoutPrompt}><Save size={15}/>保存并继续</button></div></div></div></div>}
       {review && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setReview(null)}><div className="checkout-modal" role="dialog" aria-modal="true" aria-label="购买确认"><div className="modal-head"><div><span>DIRECT CHECKOUT</span><h2>支付链接已准备</h2></div><IconButton label="关闭" onClick={() => setReview(null)}><X size={17}/></IconButton></div><div className="modal-notice"><ShieldCheck size={18}/><p>{review.notice} 创建成功后会自动打开支付页面；下方仍保留“打开支付链接”入口，方便重复打开。</p></div><div className="review-list">{review.items.map(item => <div className="review-item" key={item.watch_id}><div><strong>{item.title}</strong><span>{money(item.unit_price)} × {item.quantity}</span><a className="payment-link" href={item.official_url} target="_blank" rel="noreferrer"><Link2 size={13}/>{item.official_url}</a></div><strong>{money(item.subtotal)}</strong><div className="review-actions"><button className="button secondary" onClick={() => copyPaymentLink(item)}><Clipboard size={15}/>复制商品链接</button></div></div>)}</div>{officialOrder && <div className="payment-order-result"><div><span>官方订单</span><strong>{officialOrder.trade_no}</strong></div><a href={officialOrder.payment_url} target="_blank" rel="noreferrer"><Link2 size={14}/>{officialOrder.payment_url}</a><small>{officialOrder.notice} 渠道：{officialOrder.channel === 'alipay' ? '支付宝' : '微信支付'}，金额：{money(officialOrder.amount)}</small><button className="button official" onClick={() => window.open(officialOrder.payment_url, '_blank', 'noopener,noreferrer')}><ArrowUpRight size={15}/>打开支付链接</button></div>}<div className="review-total"><span>清单合计</span><strong>{money(review.total)}</strong></div><div className="modal-foot"><span><ShieldCheck size={14}/>支付前请核对订单金额</span><div className="modal-foot-actions"><label className="payment-channel"><span>支付渠道</span><select value={paymentChannel} onChange={event => setPaymentChannel(Number(event.target.value))}>{paymentChannels.map(channel => <option value={channel.id} key={channel.id}>{channel.name}</option>)}</select></label><button className="button official auto-pay-button" onClick={createOfficialOrder} disabled={busy.officialOrder}><Package size={15}/>{busy.officialOrder ? '正在创建并跳转' : '创建订单并自动跳转'}</button><button className="button secondary" onClick={() => setReview(null)}>返回修改</button></div></div></div></div>}
       {toast && <div className={`toast ${toast.type} ${toast.sections?.length ? 'detailed' : ''}`} role={toast.type === 'error' ? 'alert' : 'status'} aria-live={toast.type === 'error' ? 'assertive' : 'polite'} aria-atomic="true" key={toast.id}>

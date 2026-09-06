@@ -29,6 +29,7 @@ import {
   normalizeShopBatchSyncInterval,
 } from './shopBatchSyncModel.js';
 import {normalizeBackupList, normalizeVersionInfo, versionBlockReason, versionStatusLabel} from './versionModel.js';
+import EmailAlertPanel from './AlertSettingsPanel.jsx';
 
 const EMPTY_BASIC = {site_name: '', announcement: '', contact_email: '', timezone: 'Asia/Shanghai', base_url: ''};
 const GITHUB_REPOSITORY_URL = 'https://github.com/qion888/ldsub2api';
@@ -613,6 +614,7 @@ export default function SettingsView({request, user, mode, notify, onUserUpdated
             {versionInfo && <button className="button primary" type="button" onClick={installVersionUpdate} disabled={Boolean(versionBusy) || (versionInfo.update_available && !versionInfo.update_ready)}><CloudDownload size={15}/>{versionBusy === 'update' ? '更新中' : '立即更新'}</button>}
           </div>
         </section>}
+        <EmailAlertPanel request={request} notify={notify}/>
       </div>
     </div>
     {resetId && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setResetId(null)}><form className="settings-modal" role="dialog" aria-modal="true" aria-label="重置用户密码" onSubmit={resetUserPassword}><div className="settings-section-head"><div><span className="detail-kicker">PASSWORD</span><h3>重置密码</h3></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setResetId(null)}><X size={15}/></button></div><label><span>新密码</span><input type="password" value={resetPassword} onChange={event => setResetPassword(event.target.value)} autoComplete="new-password" autoFocus placeholder="输入新密码"/></label><div className="settings-actions"><button className="button secondary" type="button" onClick={() => setResetId(null)}>取消</button><button className="button primary" type="submit" disabled={resetBusy || !resetPassword}><Check size={15}/>{resetBusy ? '保存中' : '确认重置'}</button></div></form></div>}
