@@ -3660,3 +3660,59 @@ input, select { height: 36px; padding: 0 10px; font-size: 12px; }
   }
   .feature-loading-state .button { grid-column: 1 / -1; width: 100%; }
 }
+
+/* ===== 商品提醒 (补货/降价邮箱通知) ===== */
+.icon-button .alert-active { color: var(--ui-warning); }
+.icon-button:hover .alert-active { color: var(--ui-warning); }
+.alert-modal .modal-notice p b { color: var(--ui-warning); font-weight: 700; }
+.alert-options { margin-top: 14px; display: grid; gap: 8px; }
+.alert-item-copy { padding: 9px 11px; color: var(--ui-text); background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 6px; font-size: 12px; font-weight: 650; word-break: break-all; }
+.alert-option-row { padding: 11px 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; color: var(--ui-text); background: var(--ui-surface); border: 1px solid var(--ui-border-soft); border-radius: 6px; cursor: pointer; }
+.alert-option-row > span { min-width: 0; }
+.alert-option-row strong { display: block; font-size: 13px; font-weight: 700; }
+.alert-option-row small { display: block; margin-top: 3px; color: var(--ui-text-muted); font-size: 10px; line-height: 1.5; }
+.email-alert-section { margin-top: 14px; }
+.email-alert-intro { margin: 10px 0 0; color: var(--ui-text-muted); font-size: 12px; line-height: 1.6; }
+.email-alert-intro b { color: var(--ui-warning); }
+.email-alert-grid { margin-top: 12px; padding: 12px 13px; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 6px; display: grid; gap: 12px; }
+.email-alert-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.email-alert-switch span { min-width: 0; }
+.email-alert-switch strong { display: block; color: var(--ui-text); font-size: 13px; font-weight: 700; }
+.email-alert-switch small { display: block; margin-top: 3px; color: var(--ui-text-muted); font-size: 10px; }
+.email-alert-fields { display: grid; gap: 9px; }
+.email-alert-fields label { display: grid; gap: 5px; }
+.email-alert-fields label > span { color: var(--ui-text-muted); font-size: 11px; font-weight: 600; }
+.email-alert-fields label > span small { color: var(--ui-text-faint); font-weight: 400; }
+.email-alert-fields input { min-width: 0; height: 36px; border: 1px solid var(--ui-border); border-radius: 5px; padding: 0 11px; color: var(--ui-text); background: var(--ui-surface); font-size: 12px; }
+.email-alert-fields input:focus { outline: none; border-color: var(--ui-text-muted); }
+.email-alert-smtp { margin-top: 12px; padding: 12px 13px; border: 1px solid var(--ui-border-soft); border-radius: 6px; }
+.email-alert-smtp-head { margin-bottom: 11px; display: flex; align-items: center; gap: 8px; }
+.email-alert-smtp-head strong { display: inline-flex; align-items: center; gap: 6px; color: var(--ui-text); font-size: 12px; }
+.email-alert-smtp-head small { color: var(--ui-text-faint); font-size: 10px; }
+.email-alert-smtp .email-alert-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.email-alert-tls-row { grid-column: 1 / -1 !important; min-height: 36px; padding: 0 11px; display: flex !important; flex-direction: row !important; align-items: center; gap: 12px; border: 1px solid var(--ui-border); border-radius: 5px; background: var(--ui-surface); }
+.email-alert-tls-row > span:first-child { color: var(--ui-text-muted); font-size: 11px; font-weight: 600; flex: 0 0 auto; }
+.email-alert-tls-row .switch { margin-left: auto; }
+.email-alert-tls-row small { color: var(--ui-text-faint); font-size: 10px; flex: 1 1 auto; }
+.email-alert-list-head { margin-top: 16px; color: var(--ui-text); font-size: 12px; font-weight: 700; }
+.email-alert-list { margin-top: 9px; display: grid; gap: 6px; }
+.email-alert-item { padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 5px; }
+.email-alert-item-main { min-width: 0; }
+.email-alert-item-main strong { display: block; overflow: hidden; color: var(--ui-text); font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.email-alert-item-main small { display: block; margin-top: 3px; color: var(--ui-text-muted); font-size: 10px; }
+.email-alert-item .icon-button { width: 28px; height: 28px; flex: 0 0 auto; }
+.email-alert-empty { margin-top: 9px; }
+@media (max-width: 640px) {
+  .email-alert-smtp .email-alert-fields { grid-template-columns: 1fr; }
+}
+
+/* ===== 分组上新 ===== */
+.category-alert-divider { margin-top: 18px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.category-alert-divider strong { color: var(--ui-text); font-size: 12px; }
+.category-alert-divider small { color: var(--ui-text-faint); font-size: 10px; }
+.category-alert-picker { margin-top: 9px; padding: 10px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; align-items: center; background: var(--ui-surface-muted); border: 1px solid var(--ui-border-soft); border-radius: 6px; }
+.category-alert-picker select { min-width: 0; height: 36px; border: 1px solid var(--ui-border); border-radius: 5px; padding: 0 9px; color: var(--ui-text); background: var(--ui-surface); font-size: 12px; }
+.category-alert-list { margin-top: 8px; }
+@media (max-width: 640px) {
+  .category-alert-picker { grid-template-columns: 1fr; }
+}

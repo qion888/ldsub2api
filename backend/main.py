@@ -42,6 +42,7 @@ from monitor_core import history as monitor_history
 from monitor_core.inventory import InventoryService
 from monitor_core import preorders as preorder_service
 from monitor_core import settings as monitor_setting_store
+from monitor_core.alerting import AlertService
 from monitor_core import storefront
 from monitor_core.browser_verification import BrowserVerificationManager as CoreBrowserVerificationManager
 from monitor_core.workers import MonitorWorker as CoreMonitorWorker, ShopBatchSyncInProgress
@@ -311,6 +312,20 @@ INVENTORY = InventoryService(
     sync_intervals=sync_shop_product_intervals,
     discover_shop=lambda item: storefront.discover_goods_shop(item),
 )
+
+ALERT_SERVICE = AlertService(
+    database=lambda: database(),
+    now=lambda: utc_now(),
+    scan_interval_seconds=60,
+)
+
+
+def serialize_alert_settings() -> dict:
+    settings = dict(ALERT_SERVICE.get_settings())
+    # Never leak the password over the wire.
+    if settings.get("smtp_password"):
+        settings["smtp_password"] = "********"
+    return settings
 
 
 def _json_value(value: str | None, fallback: Any) -> Any:
@@ -1441,6 +1456,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             backups_loader=VERSION_SERVICE.list_backups,
         ):
             return
+        if path == "/api/alerts":
+            try:
+                return self._send_json({"ok": True, "items": ALERT_SERVICE.list()}, 200)
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+        if path == "/api/settings/alert":
+            return self._send_json(serialize_alert_settings(), 200)
+        if path == "/api/category-alerts":
+            return self._send_json({"ok": True, "items": ALERT_SERVICE.list_category_alerts()}, 200)
+        if path == "/api/category-alerts/options":
+            return self._send_json({"ok": True, "shops": ALERT_SERVICE.category_options()}, 200)
         if path == "/":
             return self._send_redirect(FRONTEND_URL)
         if path == "/api/health":
@@ -1645,6 +1671,58 @@ class ApiHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 return self._send_json({"detail": str(exc)}, 502)
 
+        if path == "/api/category-alerts/add":
+            try:
+                result = ALERT_SERVICE.add_category_alert(
+                    data.get("shop_token"), data.get("category"), data.get("shop_name") or ""
+                )
+            except ValueError as exc:
+                return self._send_json({"detail": str(exc)}, 400)
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+            return self._send_json(result, 201)
+        if path == "/api/category-alerts/remove":
+            try:
+                result = ALERT_SERVICE.remove_category_alert(data.get("shop_token"), data.get("category"))
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+            return self._send_json(result, 200)
+        if path == "/api/alerts/add":
+            try:
+                result = ALERT_SERVICE.add(data.get("watch_id"), data.get("kind"))
+            except ValueError as exc:
+                return self._send_json({"detail": str(exc)}, 400)
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+            return self._send_json(result, 201)
+        if path == "/api/alerts/remove":
+            try:
+                result = ALERT_SERVICE.remove(data.get("watch_id"), data.get("kind"))
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+            return self._send_json(result, 200)
+        if path == "/api/settings/alert":
+            patch = {
+                key: data.get(key)
+                for key in ("enabled", "smtp_host", "smtp_port", "smtp_user",
+                            "smtp_password", "smtp_from", "recipient", "use_tls")
+                if key in data
+            }
+            if str(patch.get("smtp_password") or "") == "********":
+                patch.pop("smtp_password", None)
+            try:
+                saved = ALERT_SERVICE.save_settings(patch)
+                if saved.get("smtp_password"):
+                    saved["smtp_password"] = "********"
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+            return self._send_json(saved, 200)
+        if path == "/api/settings/alert/test":
+            try:
+                result = ALERT_SERVICE.send_test()
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+            return self._send_json({"ok": result["delivered"], "delivered": result["delivered"]}, 200 if result["delivered"] else 502)
         if path == "/api/preorders":
             try:
                 result = create_preorders(data)
@@ -2159,6 +2237,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         ):
             return
 
+        if path == "/api/settings/alert":
+            patch = {
+                key: data.get(key)
+                for key in ("enabled", "smtp_host", "smtp_port", "smtp_user",
+                            "smtp_password", "smtp_from", "recipient", "use_tls")
+                if key in data
+            }
+            if str(patch.get("smtp_password") or "") == "********":
+                patch.pop("smtp_password", None)
+            try:
+                saved = ALERT_SERVICE.save_settings(patch)
+                if saved.get("smtp_password"):
+                    saved["smtp_password"] = "********"
+            except Exception as exc:
+                return self._send_json({"detail": str(exc)[:240]}, 500)
+            return self._send_json(saved, 200)
+
         match = re.fullmatch(r"/api/watches/(\d+)", path)
         if match:
             if self._reject_if_shop_batch_syncing():
@@ -2321,6 +2416,7 @@ def run() -> None:
         WORKER.start()
     if not AUTOMATION_WORKER.is_alive():
         AUTOMATION_WORKER.start()
+    ALERT_SERVICE.start()
     server = ThreadingHTTPServer((HOST, PORT), ApiHandler)
     print(f"LDXP backend running at http://{HOST}:{PORT}")
     try:
@@ -2330,6 +2426,7 @@ def run() -> None:
     finally:
         WORKER.stop_event.set()
         AUTOMATION_WORKER.stop_event.set()
+        ALERT_SERVICE.stop()
         BROWSER_VERIFICATION._close()
         ORDER_QUERY_BROWSER_VERIFICATION._close()
         ORDER_QUERY_SERVICE.sessions.clear()
