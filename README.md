@@ -79,20 +79,56 @@ Windows 使用 `-NoBrowser`，macOS / Linux 使用 `--no-browser` 可关闭自�
 
 ### macOS / Linux 一键启动
 
-在终端进入项目根目录后运行：
+在终端进入项目根目录后执行。`chmod` 只需在首次启动时执行一次：
 
 ```bash
+cd /path/to/ldxp
 chmod +x ./start.sh
 ./start.sh
 ```
 
-首次运行如需自动安装系统运行时和项目依赖：
+脚本会检查 Python、Node.js 和项目依赖，随后启动前后端并打开本机界面。使用 `Ctrl+C` 可同时停止这两个服务。
+
+#### macOS
+
+若已安装 Python 3.10-3.13、Node.js 20.19+ 或 22+，直接运行 `./start.sh`。缺少依赖时，可由 Homebrew 自动安装：
 
 ```bash
 ./start.sh --auto-install
 ```
 
-其中 `--auto-install` 在 macOS 使用 Homebrew，在 Debian/Ubuntu 使用 `apt`，在 Fedora/RHEL 使用 `dnf`，在 Arch 使用 `pacman`，在 openSUSE 使用 `zypper`。只检查依赖、不启动服务时运行 `./start.sh --bootstrap-only`；不安装任何依赖时运行 `./start.sh --skip-install`；不自动打开浏览器时运行 `./start.sh --no-browser`。启动完成后脚本会调用 macOS 的 `open`、Linux 的 `xdg-open`，或 Git Bash 的 Windows 默认浏览器。也可以设置 `LDXP_PYTHON` 或 `LDXP_NODE` 指定运行时路径。
+自动安装需要先具备 [Homebrew](https://brew.sh)。脚本会识别 Homebrew 安装的 `python3.10` 至 `python3.13`，无需手动调整 `PATH`。
+
+#### Linux
+
+在 Debian/Ubuntu、Fedora/RHEL、Arch 和 openSUSE 上，使用相同命令自动安装缺失依赖：
+
+```bash
+./start.sh --auto-install
+```
+
+脚本会分别使用 `apt`、`dnf`、`pacman` 或 `zypper`，并在需要时请求 `sudo` 权限。自动安装后仍会校验 Python 和 Node.js 的版本；系统仓库版本过旧时，按错误提示安装 Python 3.10-3.13 与 Node.js 20.19+ 或 22+ 后重试。
+
+#### 常用启动选项
+
+```bash
+# 仅检查或安装依赖，不启动服务
+./start.sh --bootstrap-only
+
+# 已自行安装依赖时使用；缺失依赖会直接报错
+./start.sh --skip-install
+
+# 不自动打开浏览器，终端会显示本机访问地址
+./start.sh --no-browser
+
+# 显式指定 Python 或 Node.js 可执行文件
+LDXP_PYTHON=python3.12 LDXP_NODE=node ./start.sh
+
+# 查看全部参数
+./start.sh --help
+```
+
+启动完成后，macOS 会使用 `open`、Linux 会使用 `xdg-open` 打开本机界面。也可设置 `LDXP_OPEN_BROWSER=0`，在任何启动方式下关闭自动打开浏览器。
 
 ### 分开启动
 

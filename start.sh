@@ -91,7 +91,9 @@ resolve_python() {
   if [[ -x "$RUNTIME_DIR/python/Scripts/python.exe" ]]; then
     candidates+=("$RUNTIME_DIR/python/Scripts/python.exe")
   fi
-  candidates+=(python3 python)
+  # Homebrew's versioned Python binaries (for example, python3.12) are not
+  # always exposed as python3. Check them before the system default.
+  candidates+=(python3.13 python3.12 python3.11 python3.10 python3 python)
   for candidate in "${candidates[@]}"; do
     if [[ "$candidate" == */* && ! -x "$candidate" ]]; then
       continue
